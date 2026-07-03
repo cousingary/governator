@@ -1,3 +1,4 @@
+task: Regenerate the approved clipart outputs and validate transparency and resolution.
 job_id: clipart-regen-2026-07-03
 job_type: batch_image
 agent: claude

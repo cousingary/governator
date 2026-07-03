@@ -1,6 +1,7 @@
+task: Apply the smallest contract schema fix needed for the validator tests.
 job_id: governator-contract-fix
 job_type: code_change
-agent: codex
+agent: claude-code
 mode: surgeon
 workspace:
   root: /mnt/e/downloads/governator

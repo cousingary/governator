@@ -28,6 +28,7 @@ var validModes = map[Mode]bool{
 var jobIDPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]*$`)
 
 type Contract struct {
+	Task        string      `yaml:"task,omitempty" json:"task,omitempty"`
 	JobID       string      `yaml:"job_id" json:"job_id"`
 	JobType     string      `yaml:"job_type" json:"job_type"`
 	Agent       string      `yaml:"agent" json:"agent"`

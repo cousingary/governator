@@ -1,95 +1,172 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
 
 	"github.com/cousingary/governator/internal/contracts"
 	"github.com/cousingary/governator/internal/doctor"
+	govruntime "github.com/cousingary/governator/internal/runtime"
 )
 
-const version = "0.1.0-phase0"
+const version = "0.2.0-phase1"
 
-func main() {
-	os.Exit(run(os.Args[1:]))
-}
+func main() { os.Exit(run(os.Args[1:])) }
 
 func run(args []string) int {
 	if len(args) == 0 {
-		usage(os.Stderr)
+		usage()
 		return 2
 	}
-
 	switch args[0] {
 	case "validate":
-		return validateCommand(args[1:])
+		if len(args) != 2 {
+			return bad("usage: gov validate <job.yaml>")
+		}
+		c, err := contracts.ParseFile(args[1])
+		if err != nil {
+			return contractError(args[1], err)
+		}
+		fmt.Printf("VALID %s (job_id=%s mode=%s agent=%s)\n", args[1], c.JobID, c.Mode, c.Agent)
+		return 0
+	case "run":
+		if len(args) != 2 && len(args) != 4 {
+			return bad("usage: gov run <job.yaml> [--agent <name>]")
+		}
+		c, err := contracts.ParseFile(args[1])
+		if err != nil {
+			return contractError(args[1], err)
+		}
+		if len(args) == 4 {
+			if args[2] != "--agent" {
+				return bad("usage: gov run <job.yaml> [--agent <name>]")
+			}
+			c.Agent = args[3]
+		}
+		rec, err := govruntime.New().Run(context.Background(), *c)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "run:", err)
+			return 1
+		}
+		fmt.Println(govruntime.MarshalRecord(rec))
+		if rec.Status != "APPROVED" {
+			return 1
+		}
+		return 0
+	case "diff":
+		if len(args) > 2 {
+			return bad("usage: gov diff [last|run_id]")
+		}
+		id := "last"
+		if len(args) == 2 {
+			id = args[1]
+		}
+		rec, err := govruntime.Last(id)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "diff:", err)
+			return 1
+		}
+		fmt.Print(rec.Diff)
+		return 0
+	case "rollback":
+		if len(args) != 2 {
+			return bad("usage: gov rollback <run_id>")
+		}
+		rec, err := govruntime.Rollback(context.Background(), args[1])
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "rollback:", err)
+			return 1
+		}
+		fmt.Println(govruntime.MarshalRecord(rec))
+		return 0
+	case "quarantine":
+		return quarantine(args[1:])
 	case "doctor":
-		return doctorCommand(args[1:])
+		if len(args) != 1 {
+			return bad("usage: gov doctor")
+		}
+		checks := doctor.Run()
+		for _, c := range checks {
+			label := "OK"
+			if c.Status == doctor.StatusWarn {
+				label = "WARN"
+			} else if c.Status == doctor.StatusFail {
+				label = "FAIL"
+			}
+			fmt.Printf("[%s] %-18s %s\n", label, c.Name, c.Detail)
+		}
+		if !doctor.Passed(checks) {
+			fmt.Println("doctor: FAILED")
+			return 1
+		}
+		fmt.Println("doctor: OK")
+		return 0
 	case "version", "--version", "-version":
 		fmt.Printf("gov %s\n", version)
 		return 0
 	case "help", "--help", "-h":
-		usage(os.Stdout)
+		usage()
 		return 0
 	default:
-		fmt.Fprintf(os.Stderr, "unknown command %q\n\n", args[0])
-		usage(os.Stderr)
-		return 2
+		return bad(fmt.Sprintf("unknown command %q", args[0]))
 	}
 }
 
-func validateCommand(args []string) int {
-	if len(args) != 1 {
-		fmt.Fprintln(os.Stderr, "usage: gov validate <job.yaml>")
-		return 2
+func quarantine(args []string) int {
+	if len(args) == 1 && args[0] == "list" {
+		rs, err := govruntime.Quarantines()
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			return 1
+		}
+		for _, r := range rs {
+			fmt.Printf("%s\t%s\t%s\t%s\n", r.ID, r.JobID, r.Created, r.Message)
+		}
+		return 0
 	}
-	contract, err := contracts.ParseFile(args[0])
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "INVALID %s\n", args[0])
-		var validation contracts.ValidationErrors
-		if errors.As(err, &validation) {
-			for _, item := range validation.Sorted() {
-				fmt.Fprintf(os.Stderr, "  - %s\n", item.Error())
-			}
+	if len(args) == 2 && (args[0] == "show" || args[0] == "diff") {
+		r, err := govruntime.Last(args[1])
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			return 1
+		}
+		if r.Status != "QUARANTINED" {
+			fmt.Fprintln(os.Stderr, "run is not quarantined")
+			return 1
+		}
+		if args[0] == "diff" {
+			fmt.Print(r.Diff)
 		} else {
-			fmt.Fprintf(os.Stderr, "  - %v\n", err)
+			fmt.Println(govruntime.MarshalRecord(r))
 		}
-		return 1
+		return 0
 	}
-	fmt.Printf("VALID %s (job_id=%s mode=%s agent=%s)\n", args[0], contract.JobID, contract.Mode, contract.Agent)
-	return 0
+	return bad("usage: gov quarantine list|show <id>|diff <id>")
 }
-
-func doctorCommand(args []string) int {
-	if len(args) != 0 {
-		fmt.Fprintln(os.Stderr, "usage: gov doctor")
-		return 2
-	}
-	checks := doctor.Run()
-	for _, check := range checks {
-		label := "OK"
-		switch check.Status {
-		case doctor.StatusWarn:
-			label = "WARN"
-		case doctor.StatusFail:
-			label = "FAIL"
+func bad(s string) int { fmt.Fprintln(os.Stderr, s); return 2 }
+func contractError(path string, err error) int {
+	fmt.Fprintf(os.Stderr, "INVALID %s\n", path)
+	var es contracts.ValidationErrors
+	if errors.As(err, &es) {
+		for _, e := range es.Sorted() {
+			fmt.Fprintf(os.Stderr, "  - %s\n", e.Error())
 		}
-		fmt.Printf("[%s] %-18s %s\n", label, check.Name, check.Detail)
+	} else {
+		fmt.Fprintf(os.Stderr, "  - %v\n", err)
 	}
-	if !doctor.Passed(checks) {
-		fmt.Println("doctor: FAILED")
-		return 1
-	}
-	fmt.Println("doctor: OK")
-	return 0
+	return 1
 }
+func usage() {
+	fmt.Println(`Governator - contract-first runtime for replaceable coding agents
 
-func usage(out *os.File) {
-	fmt.Fprintln(out, "Governator — contract-first runtime for replaceable coding agents")
-	fmt.Fprintln(out)
-	fmt.Fprintln(out, "Usage:")
-	fmt.Fprintln(out, "  gov validate <job.yaml>  validate a sovereign job contract")
-	fmt.Fprintln(out, "  gov doctor               verify Phase 0 runtime prerequisites")
-	fmt.Fprintln(out, "  gov version              print the binary version")
+Usage:
+  gov validate <job.yaml>
+  gov run <job.yaml> [--agent <name>]
+  gov diff [last|run_id]
+  gov rollback <run_id>
+  gov quarantine list|show <id>|diff <id>
+  gov doctor
+  gov version`)
 }
