@@ -1,0 +1,22 @@
+job_id: clipart-regen-2026-07-03
+job_type: batch_image
+agent: claude
+mode: batch_worker
+workspace:
+  root: /mnt/e/downloads/emmaNader
+  worktree: auto
+allowed:
+  read: ["designs/**", "mockups/**"]
+  write: ["output/clipart/**"]
+  execute: ["python3 remove_blue_fringe.py *", "python3 -c *"]
+forbidden:
+  paths: ["done/**", "*.psd"]
+  commands: ["rm -rf", "git push"]
+  behaviors: [refactor, reformat, rename_files, scope_expansion]
+budget: {max_minutes: 20, max_commands: 60, max_files_changed: 30, max_deleted: 0}
+success:
+  required_files: ["output/clipart/*.png"]
+  validators:
+    - "python3 validators/image/check_transparency.py output/clipart"
+    - "python3 validators/image/check_min_resolution.py --min 2000 output/clipart"
+on_violation: quarantine

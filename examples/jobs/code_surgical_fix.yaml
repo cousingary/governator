@@ -1,0 +1,20 @@
+job_id: governator-contract-fix
+job_type: code_change
+agent: codex
+mode: surgeon
+workspace:
+  root: /mnt/e/downloads/governator
+  worktree: auto
+allowed:
+  read: ["internal/contracts/**", "go.mod", "go.sum"]
+  write: ["internal/contracts/schema.go"]
+  execute: ["go test ./internal/contracts"]
+forbidden:
+  paths: ["agents/**", ".git/**"]
+  commands: ["rm -rf", "git push"]
+  behaviors: [refactor, reformat, scope_expansion]
+budget: {max_minutes: 10, max_commands: 20, max_files_changed: 1, max_deleted: 0}
+success:
+  required_files: ["internal/contracts/schema.go"]
+  validators: ["go test ./internal/contracts"]
+on_violation: quarantine

@@ -1,0 +1,209 @@
+package contracts
+
+import (
+	"fmt"
+	"path"
+	"path/filepath"
+	"regexp"
+	"sort"
+	"strings"
+)
+
+type Mode string
+
+const (
+	ModeScout       Mode = "scout"
+	ModeSurgeon     Mode = "surgeon"
+	ModeBatchWorker Mode = "batch_worker"
+	ModeVerifier    Mode = "verifier"
+	ModeRepair      Mode = "repair"
+	ModeArchitect   Mode = "architect"
+)
+
+var validModes = map[Mode]bool{
+	ModeScout: true, ModeSurgeon: true, ModeBatchWorker: true,
+	ModeVerifier: true, ModeRepair: true, ModeArchitect: true,
+}
+
+var jobIDPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]*$`)
+
+type Contract struct {
+	JobID       string      `yaml:"job_id" json:"job_id"`
+	JobType     string      `yaml:"job_type" json:"job_type"`
+	Agent       string      `yaml:"agent" json:"agent"`
+	Mode        Mode        `yaml:"mode" json:"mode"`
+	Workspace   Workspace   `yaml:"workspace" json:"workspace"`
+	Allowed     Permissions `yaml:"allowed" json:"allowed"`
+	Forbidden   Forbidden   `yaml:"forbidden" json:"forbidden"`
+	Budget      Budget      `yaml:"budget" json:"budget"`
+	Success     Success     `yaml:"success" json:"success"`
+	OnViolation string      `yaml:"on_violation" json:"on_violation"`
+}
+
+type Workspace struct {
+	Root     string `yaml:"root" json:"root"`
+	Worktree string `yaml:"worktree" json:"worktree"`
+}
+
+type Permissions struct {
+	Read    []string `yaml:"read" json:"read"`
+	Write   []string `yaml:"write" json:"write"`
+	Execute []string `yaml:"execute" json:"execute"`
+}
+
+type Forbidden struct {
+	Paths     []string `yaml:"paths" json:"paths"`
+	Commands  []string `yaml:"commands" json:"commands"`
+	Behaviors []string `yaml:"behaviors" json:"behaviors"`
+}
+
+type Budget struct {
+	MaxMinutes      int `yaml:"max_minutes" json:"max_minutes"`
+	MaxCommands     int `yaml:"max_commands" json:"max_commands"`
+	MaxFilesChanged int `yaml:"max_files_changed" json:"max_files_changed"`
+	MaxDeleted      int `yaml:"max_deleted" json:"max_deleted"`
+	MaxTokens       int `yaml:"max_tokens,omitempty" json:"max_tokens,omitempty"`
+}
+
+type Success struct {
+	RequiredFiles []string `yaml:"required_files" json:"required_files"`
+	Validators    []string `yaml:"validators" json:"validators"`
+}
+
+type ValidationError struct {
+	Field   string
+	Message string
+}
+
+func (e ValidationError) Error() string { return fmt.Sprintf("%s: %s", e.Field, e.Message) }
+
+type ValidationErrors []ValidationError
+
+func (e ValidationErrors) Error() string {
+	parts := make([]string, 0, len(e))
+	for _, item := range e {
+		parts = append(parts, item.Error())
+	}
+	return strings.Join(parts, "; ")
+}
+
+func (e ValidationErrors) Sorted() ValidationErrors {
+	out := append(ValidationErrors(nil), e...)
+	sort.SliceStable(out, func(i, j int) bool { return out[i].Field < out[j].Field })
+	return out
+}
+
+func (c Contract) Validate() error {
+	var errs ValidationErrors
+	add := func(field, message string) { errs = append(errs, ValidationError{Field: field, Message: message}) }
+
+	if strings.TrimSpace(c.JobID) == "" {
+		add("job_id", "is required")
+	} else if !jobIDPattern.MatchString(c.JobID) {
+		add("job_id", "must start with an alphanumeric character and contain only alphanumerics, '.', '_' or '-'")
+	}
+	if strings.TrimSpace(c.JobType) == "" {
+		add("job_type", "is required")
+	}
+	if strings.TrimSpace(c.Agent) == "" {
+		add("agent", "is required")
+	}
+	if !validModes[c.Mode] {
+		add("mode", "must be one of scout, surgeon, batch_worker, verifier, repair, architect")
+	}
+	if strings.TrimSpace(c.Workspace.Root) == "" {
+		add("workspace.root", "is required")
+	} else if !filepath.IsAbs(c.Workspace.Root) {
+		add("workspace.root", "must be an absolute path")
+	}
+	if c.Workspace.Worktree != "auto" && c.Workspace.Worktree != "none" {
+		add("workspace.worktree", "must be 'auto' or 'none'")
+	}
+
+	readOnly := c.Mode == ModeScout || c.Mode == ModeVerifier || c.Mode == ModeArchitect
+	if c.Workspace.Worktree == "none" && !readOnly {
+		add("workspace.worktree", "'none' is allowed only for read-only modes")
+	}
+	if len(c.Allowed.Read) == 0 {
+		add("allowed.read", "must contain at least one path pattern")
+	}
+	if readOnly && len(c.Allowed.Write) != 0 {
+		add("allowed.write", "must be empty in a read-only mode")
+	}
+	if !readOnly && len(c.Allowed.Write) == 0 {
+		add("allowed.write", "must contain at least one path pattern for a write-capable mode")
+	}
+
+	validatePathPatterns("allowed.read", c.Allowed.Read, add)
+	validatePathPatterns("allowed.write", c.Allowed.Write, add)
+	validatePathPatterns("forbidden.paths", c.Forbidden.Paths, add)
+	validateNonBlank("allowed.execute", c.Allowed.Execute, add)
+	validateNonBlank("forbidden.commands", c.Forbidden.Commands, add)
+	validateNonBlank("forbidden.behaviors", c.Forbidden.Behaviors, add)
+
+	if c.Budget.MaxMinutes <= 0 {
+		add("budget.max_minutes", "must be greater than zero")
+	}
+	if c.Budget.MaxCommands <= 0 {
+		add("budget.max_commands", "must be greater than zero")
+	}
+	if c.Budget.MaxFilesChanged <= 0 {
+		add("budget.max_files_changed", "must be greater than zero")
+	}
+	if c.Budget.MaxDeleted < 0 {
+		add("budget.max_deleted", "must be zero or greater")
+	}
+	if c.Budget.MaxTokens < 0 {
+		add("budget.max_tokens", "must be zero or greater")
+	}
+
+	if !readOnly && len(c.Success.RequiredFiles) == 0 {
+		add("success.required_files", "must contain at least one path pattern for a write-capable mode")
+	}
+	validatePathPatterns("success.required_files", c.Success.RequiredFiles, add)
+	if len(c.Success.Validators) == 0 {
+		add("success.validators", "must contain at least one deterministic validator command")
+	}
+	validateNonBlank("success.validators", c.Success.Validators, add)
+
+	switch c.OnViolation {
+	case "quarantine", "halt", "rollback":
+	default:
+		add("on_violation", "must be one of quarantine, halt, rollback")
+	}
+
+	if len(errs) > 0 {
+		return errs.Sorted()
+	}
+	return nil
+}
+
+func validatePathPatterns(field string, patterns []string, add func(string, string)) {
+	for i, raw := range patterns {
+		itemField := fmt.Sprintf("%s[%d]", field, i)
+		value := strings.TrimSpace(raw)
+		if value == "" {
+			add(itemField, "must not be blank")
+			continue
+		}
+		if strings.ContainsAny(value, "\x00\r\n") {
+			add(itemField, "must not contain control characters")
+		}
+		if filepath.IsAbs(value) {
+			add(itemField, "must be relative to workspace.root")
+			continue
+		}
+		cleaned := path.Clean(strings.ReplaceAll(value, `\`, "/"))
+		if cleaned == ".." || strings.HasPrefix(cleaned, "../") {
+			add(itemField, "must not escape workspace.root")
+		}
+	}
+}
+
+func validateNonBlank(field string, values []string, add func(string, string)) {
+	for i, value := range values {
+		if strings.TrimSpace(value) == "" {
+			add(fmt.Sprintf("%s[%d]", field, i), "must not be blank")
+		}
+	}
+}
