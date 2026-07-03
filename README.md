@@ -20,8 +20,9 @@ The existing Python governed harness remains the live safety plane. Governator d
 
 ```bash
 PATH=/home/lam/.local/go1.26.4/bin:$PATH
-go test -v /mnt/e/downloads/governator/...
-go build -trimpath -o /mnt/e/downloads/governator/bin/gov /mnt/e/downloads/governator/cmd/gov
+cd /mnt/e/downloads/governator
+go test -v ./...
+go build -trimpath -o /mnt/e/downloads/governator/bin/gov ./cmd/gov
 /mnt/e/downloads/governator/bin/gov validate /mnt/e/downloads/governator/examples/jobs/clipart_regen.yaml
 /mnt/e/downloads/governator/bin/gov doctor
 ```
