@@ -25,6 +25,7 @@ import (
 	"github.com/cousingary/governator/internal/contracts"
 	"github.com/cousingary/governator/internal/observability"
 	"github.com/cousingary/governator/internal/policy"
+	"github.com/cousingary/governator/internal/prompts"
 )
 
 type RunRecord struct {
@@ -47,6 +48,7 @@ type RunRecord struct {
 	ValidOutput     bool                      `json:"valid_output"`
 	FailureTaxonomy string                    `json:"failure_taxonomy,omitempty"`
 	SelfReview      *contracts.ResultDocument `json:"self_review,omitempty"`
+	PromptVersion   string                    `json:"prompt_version,omitempty"`
 }
 
 type Runner struct{ Home string }
@@ -66,8 +68,8 @@ func dbOpen(home string) (*sql.DB, error) {
 }
 
 func insertRun(db *sql.DB, r RunRecord, ch, head string) error {
-	_, err := db.Exec(`INSERT INTO runs(id,job_id,job_type,agent,mode,status,root,worktree,branch,contract_hash,base_head,diff,transcript,message,created)
-VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, r.ID, r.JobID, r.JobType, r.Agent, r.Mode, r.Status, r.Root, r.Worktree, r.Branch, ch, head, r.Diff, r.Transcript, r.Message, r.Created)
+	_, err := db.Exec(`INSERT INTO runs(id,job_id,job_type,agent,mode,status,root,worktree,branch,contract_hash,base_head,diff,transcript,message,created,prompt_version)
+VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, r.ID, r.JobID, r.JobType, r.Agent, r.Mode, r.Status, r.Root, r.Worktree, r.Branch, ch, head, r.Diff, r.Transcript, r.Message, r.Created, r.PromptVersion)
 	return err
 }
 
@@ -83,7 +85,7 @@ func Last(id string) (RunRecord, error) {
 		return RunRecord{}, err
 	}
 	defer db.Close()
-	q := `SELECT id,job_id,COALESCE(job_type,''),COALESCE(agent,''),COALESCE(mode,''),status,root,worktree,branch,diff,transcript,message,commit_hash,created,cost_usd,valid_output,failure_taxonomy,result_json FROM runs`
+	q := `SELECT id,job_id,COALESCE(job_type,''),COALESCE(agent,''),COALESCE(mode,''),status,root,worktree,branch,diff,transcript,message,commit_hash,created,cost_usd,valid_output,failure_taxonomy,result_json,COALESCE(prompt_version,'') FROM runs`
 	var row *sql.Row
 	if id == "" || id == "last" {
 		row = db.QueryRow(q + ` ORDER BY created DESC LIMIT 1`)
@@ -100,7 +102,7 @@ func Quarantines() ([]RunRecord, error) {
 		return nil, err
 	}
 	defer db.Close()
-	rows, err := db.Query(`SELECT id,job_id,COALESCE(job_type,''),COALESCE(agent,''),COALESCE(mode,''),status,root,worktree,branch,diff,transcript,message,commit_hash,created,cost_usd,valid_output,failure_taxonomy,result_json FROM runs WHERE status='QUARANTINED' ORDER BY created DESC`)
+	rows, err := db.Query(`SELECT id,job_id,COALESCE(job_type,''),COALESCE(agent,''),COALESCE(mode,''),status,root,worktree,branch,diff,transcript,message,commit_hash,created,cost_usd,valid_output,failure_taxonomy,result_json,COALESCE(prompt_version,'') FROM runs WHERE status='QUARANTINED' ORDER BY created DESC`)
 	if err != nil {
 		return nil, err
 	}
@@ -123,7 +125,7 @@ type rowScanner interface {
 func scanRun(row rowScanner) (RunRecord, error) {
 	var r RunRecord
 	var resultJSON string
-	err := row.Scan(&r.ID, &r.JobID, &r.JobType, &r.Agent, &r.Mode, &r.Status, &r.Root, &r.Worktree, &r.Branch, &r.Diff, &r.Transcript, &r.Message, &r.Commit, &r.Created, &r.CostUSD, &r.ValidOutput, &r.FailureTaxonomy, &resultJSON)
+	err := row.Scan(&r.ID, &r.JobID, &r.JobType, &r.Agent, &r.Mode, &r.Status, &r.Root, &r.Worktree, &r.Branch, &r.Diff, &r.Transcript, &r.Message, &r.Commit, &r.Created, &r.CostUSD, &r.ValidOutput, &r.FailureTaxonomy, &resultJSON, &r.PromptVersion)
 	if err == nil && resultJSON != "" {
 		var review contracts.ResultDocument
 		if json.Unmarshal([]byte(resultJSON), &review) == nil {
@@ -508,30 +510,6 @@ func readSelfReview(work string) (*contracts.ResultDocument, string) {
 	return &review, string(normalized)
 }
 
-func classifyFailure(violations []string) string {
-	lower := strings.ToLower(strings.Join(violations, "\n"))
-	switch {
-	case strings.Contains(lower, "scope-expansion tripwire"):
-		return "UNAUTHORIZED_REFACTOR"
-	case strings.Contains(lower, "out-of-worktree mutation"), strings.Contains(lower, "write outside"):
-		return "SCOPE_DRIFT"
-	case strings.Contains(lower, "canary mutation"), strings.Contains(lower, "protected path"), strings.Contains(lower, "forbidden path"):
-		return "OVERWRITE_RISK"
-	case strings.Contains(lower, "max_commands"):
-		return "REPEATED_COMMAND_LOOP"
-	case strings.Contains(lower, "validator failed"), strings.Contains(lower, "required file missing"):
-		return "VALIDATION_FAILED"
-	case strings.Contains(lower, "destructive command"), strings.Contains(lower, "forbidden command"):
-		return "DESTRUCTIVE_COMMAND"
-	case strings.Contains(lower, "max_"):
-		return "BUDGET_EXCEEDED"
-	case strings.Contains(lower, "agent"):
-		return "AGENT_FAILURE"
-	default:
-		return "POLICY_VIOLATION"
-	}
-}
-
 type diffMetrics struct {
 	Lines    int
 	NewFiles int
@@ -663,7 +641,15 @@ func (r *Runner) Run(ctx context.Context, c contracts.Contract) (RunRecord, erro
 		return RunRecord{}, fmt.Errorf("create canary: %w", err)
 	}
 	transcript := filepath.Join(r.Home, "transcripts", id+".jsonl")
-	rec := RunRecord{ID: id, JobID: c.JobID, JobType: c.JobType, Agent: c.Agent, Mode: string(c.Mode), Status: "RUNNING", Root: root, Worktree: work, Branch: branch, Transcript: transcript, Created: time.Now().UTC().Format(time.RFC3339Nano)}
+	promptRoot := os.Getenv("GOV_PROMPTS")
+	if promptRoot == "" {
+		promptRoot = "prompts"
+	}
+	promptVersion, err := prompts.Resolve(promptRoot, c.Agent, string(c.Mode))
+	if err != nil {
+		return RunRecord{}, err
+	}
+	rec := RunRecord{ID: id, JobID: c.JobID, JobType: c.JobType, Agent: c.Agent, Mode: string(c.Mode), Status: "RUNNING", Root: root, Worktree: work, Branch: branch, Transcript: transcript, Created: time.Now().UTC().Format(time.RFC3339Nano), PromptVersion: promptVersion.ID}
 	if err = insertRun(db, rec, hash, head); err != nil {
 		return rec, err
 	}
@@ -687,6 +673,7 @@ func (r *Runner) Run(ctx context.Context, c contracts.Contract) (RunRecord, erro
 		return rec, err
 	}
 	prompt += "\nController canary: " + canaryName + " must remain byte-for-byte unchanged. Touching it quarantines the run.\n"
+	prompt += prompts.Annotation(promptVersion)
 	agent, err := agents.New(c.Agent)
 	if err != nil {
 		return rec, err
@@ -851,7 +838,7 @@ func (r *Runner) Run(ctx context.Context, c contracts.Contract) (RunRecord, erro
 	} else {
 		rec.Status = "QUARANTINED"
 		rec.Message = strings.Join(violations, "; ")
-		rec.FailureTaxonomy = classifyFailure(violations)
+		rec.FailureTaxonomy = observability.ClassifyFailure(violations)
 		if git {
 			_, _, _ = shell(ctx, work, "git add -A")
 			_, _, _ = shell(ctx, work, "git commit --allow-empty -m "+shQuote("Quarantined Governator run "+id))

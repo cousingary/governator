@@ -71,6 +71,15 @@ func TestApprovedReplayRedactionAndRollback(t *testing.T) {
 	t.Setenv("GOV_HOME", home)
 	t.Setenv("GOV_CLAUDE_BIN", bin)
 	t.Setenv("FAKE_ALLOWED_COMMAND", "1")
+	promptRoot := t.TempDir()
+	promptDir := filepath.Join(promptRoot, "claude-code", "surgeon")
+	if err := os.MkdirAll(promptDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(promptDir, "v007.md"), []byte("test prompt"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("GOV_PROMPTS", promptRoot)
 	r, err := New().Run(context.Background(), contract(root))
 	if err != nil {
 		t.Fatal(err)
@@ -83,6 +92,9 @@ func TestApprovedReplayRedactionAndRollback(t *testing.T) {
 	}
 	if r.SelfReview == nil || r.SelfReview.Status != "complete" {
 		t.Fatalf("structured self-review missing: %#v", r.SelfReview)
+	}
+	if r.PromptVersion != "v007" {
+		t.Fatalf("prompt version=%s", r.PromptVersion)
 	}
 	scores, err := observability.ScoreAgents(home, "test")
 	if err != nil {

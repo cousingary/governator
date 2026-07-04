@@ -14,7 +14,7 @@ import (
 	govruntime "github.com/cousingary/governator/internal/runtime"
 )
 
-const version = "0.4.0-phase3"
+const version = "0.5.0-phase4"
 
 func main() { os.Exit(run(os.Args[1:])) }
 
@@ -157,6 +157,74 @@ func run(args []string) int {
 		}
 		fmt.Println(summary.String())
 		return 0
+	case "route":
+		if len(args) != 3 || args[1] != "--job-type" {
+			return bad("usage: gov route --job-type <type>")
+		}
+		candidates, err := observability.RouteAgents(govruntime.Home(), args[2])
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "route:", err)
+			return 1
+		}
+		if len(candidates) == 0 {
+			fmt.Printf("no routing evidence for job_type=%s\n", args[2])
+			return 0
+		}
+		fmt.Println("agent\tjob_type\truns\tfailures\tfailure_rate")
+		for _, candidate := range candidates {
+			fmt.Println(candidate.String())
+		}
+		return 0
+	case "repair-packet":
+		if len(args) != 2 {
+			return bad("usage: gov repair-packet <run_id>")
+		}
+		packet, err := observability.GenerateRepairPacket(govruntime.Home(), args[1])
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "repair-packet:", err)
+			return 1
+		}
+		output, err := json.MarshalIndent(packet, "", "  ")
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "repair-packet:", err)
+			return 1
+		}
+		fmt.Println(string(output))
+		return 0
+	case "eval":
+		if len(args) == 3 && args[1] == "harness" {
+			results, err := observability.RunEvalSuite(govruntime.Home(), args[2])
+			if err != nil {
+				fmt.Fprintln(os.Stderr, "eval:", err)
+				return 1
+			}
+			failed := false
+			for _, result := range results {
+				status := "PASS"
+				if !result.Passed {
+					status = "FAIL"
+					failed = true
+				}
+				fmt.Printf("%s\t%s\t%s\t%s\n", status, result.CaseName, result.Expected, result.Actual)
+			}
+			if failed {
+				return 1
+			}
+			return 0
+		}
+		if len(args) == 2 && args[1] == "scorecard" {
+			scores, err := observability.EvalScorecard(govruntime.Home())
+			if err != nil {
+				fmt.Fprintln(os.Stderr, "eval:", err)
+				return 1
+			}
+			fmt.Println("agent\tmode\truns\tpassed\tpass_rate\tcost")
+			for _, score := range scores {
+				fmt.Println(score.String())
+			}
+			return 0
+		}
+		return bad("usage: gov eval harness <case-dir> | gov eval scorecard")
 	case "doctor":
 		if len(args) != 1 {
 			return bad("usage: gov doctor")
@@ -245,6 +313,10 @@ Usage:
   gov score agents --job-type <type>
   gov failures
   gov cost --per-valid-output
+  gov route --job-type <type>
+  gov repair-packet <run_id>
+  gov eval harness <case-dir>
+  gov eval scorecard
   gov doctor
   gov version`)
 }

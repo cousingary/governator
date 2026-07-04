@@ -2,7 +2,7 @@
 
 Governator is a contract-first runtime for replaceable coding-agent backends. The model proposes; deterministic validators and the merge gate decide; the SQLite ledger remembers.
 
-## Implemented through Phase 3
+## Implemented through Phase 4
 
 Phase 1 provides the complete user-triggered `gov run` spine:
 
@@ -35,6 +35,13 @@ Phase 3 adds ledger intelligence without invoking any model:
 
 The Phase 3 implementation is complete. Its operational acceptance gate remains open until at least 10 explicitly user-triggered real runs provide a representative scoring sample.
 
+Phase 4 adds deterministic routing, repair, evaluation, and prompt provenance:
+
+- negative-capability routing from observed failure rates;
+- compact repair packets derived from structured ledger facts rather than transcripts;
+- a one-command `harness_eval` suite with agent-by-mode scorecards stored in SQLite;
+- versioned prompt resolution tied to run outcomes, plus a checksum mutation test.
+
 The existing Python governed harness remains untouched and is still the control plane for Codex sessions. Governator does not replace it.
 
 ## Canonical commands
@@ -54,9 +61,13 @@ go build -trimpath -o /mnt/e/downloads/governator/bin/gov ./cmd/gov
 /mnt/e/downloads/governator/bin/gov score agents --job-type JOB_TYPE
 /mnt/e/downloads/governator/bin/gov failures
 /mnt/e/downloads/governator/bin/gov cost --per-valid-output
+/mnt/e/downloads/governator/bin/gov route --job-type JOB_TYPE
+/mnt/e/downloads/governator/bin/gov repair-packet RUN_ID
+/mnt/e/downloads/governator/bin/gov eval harness /mnt/e/downloads/governator/harness_eval
+/mnt/e/downloads/governator/bin/gov eval scorecard
 ```
 
-The Claude adapter uses the installed subscription-authenticated `claude` CLI and never embeds an API key. `GOV_CLAUDE_BIN` exists for deterministic adapter tests. State defaults to `$HOME/.governator`; `GOV_HOME` may redirect it for tests.
+The Claude adapter uses the installed subscription-authenticated `claude` CLI and never embeds an API key. `GOV_CLAUDE_BIN` exists for deterministic adapter tests. State defaults to `$HOME/.governator`; `GOV_HOME` may redirect it for tests. Prompt lookup defaults to the repository-relative `prompts/` registry; set `GOV_PROMPTS` to its absolute path when invoking `gov` from another directory.
 
 Protected paths are read from `/home/lam/.governed-harness/state/protected_paths.txt`. Set `GOV_PROTECTED_PATHS` only for an alternate test manifest.
 

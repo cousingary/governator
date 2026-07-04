@@ -1,0 +1,11 @@
+{
+  "Name": "clipart_missing_files_repair",
+  "Agent": "claude-code",
+  "Mode": "repair",
+  "JobType": "asset_repair",
+  "Violations": [
+    "required file missing: output/card-03.png"
+  ],
+  "ExpectedTaxonomy": "VALIDATION_FAILED",
+  "CostUSD": 0.0
+}
