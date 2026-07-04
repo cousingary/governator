@@ -12,6 +12,8 @@ import (
 	"time"
 
 	"github.com/cousingary/governator/internal/policy"
+	"github.com/cousingary/governator/internal/protectedpaths"
+	"github.com/cousingary/governator/internal/snapshots"
 )
 
 // GateDecision is the output of the Phase 5 parity gate. It mirrors the JSON
@@ -72,71 +74,32 @@ func fallbackDangerHit(cmd string) string {
 // Same manifest path the Python plane and runtime.protectedFingerprint use, so
 // the three enforcers (CC gate, OS locks, Governator runtime) never disagree.
 
-func protectedManifestPath() string {
-	if p := os.Getenv("GOV_PROTECTED_PATHS"); p != "" {
-		return p
-	}
-	if state := os.Getenv("CLAUDE_HARNESS_STATE"); state != "" {
-		return filepath.Join(state, "protected_paths.txt")
-	}
-	home, _ := os.UserHomeDir()
-	return filepath.Join(home, ".governed-harness", "state", "protected_paths.txt")
-}
+func protectedManifestPath() string { return protectedpaths.Manifest() }
 
 func loadProtectedPatterns() []string {
-	data, err := os.ReadFile(protectedManifestPath())
-	if err != nil {
-		return nil
-	}
-	var out []string
-	for _, line := range strings.Split(string(data), "\n") {
-		s := strings.TrimSpace(strings.SplitN(line, "#", 2)[0])
-		if s != "" {
-			out = append(out, s)
-		}
-	}
-	return out
+	patterns, _ := protectedpaths.Patterns()
+	return patterns
 }
 
-func matchProtected(abspath, pattern string) bool {
-	expanded := expandPath(pattern)
-	pat, _ := filepath.Abs(expanded)
-	if abspath == pat || strings.HasPrefix(abspath, strings.TrimRight(pat, "/")+"/") {
-		return true
-	}
-	ok, _ := filepath.Match(pat, abspath)
-	return ok
-}
+func matchProtected(abspath, pattern string) bool { return protectedpaths.Match(abspath, pattern) }
 
-// expandPath resolves a leading ~ to the home directory (mirrors Python's
-// os.path.expanduser). Env vars are left for the shell.
-func expandPath(p string) string {
-	if p == "~" {
-		home, _ := os.UserHomeDir()
-		return home
-	}
-	if strings.HasPrefix(p, "~/") {
-		home, _ := os.UserHomeDir()
-		return filepath.Join(home, p[2:])
-	}
-	return p
-}
+func expandPath(path string) string { return protectedpaths.Expand(path) }
 
 func protectedReasonForPath(path string) string {
 	if path == "" {
 		return ""
 	}
-	abspath, err := filepath.Abs(expandPath(path))
+	absolute, err := filepath.Abs(expandPath(path))
 	if err != nil {
 		return ""
 	}
 	unlock := strings.TrimSpace(os.Getenv("HARNESS_UNLOCK"))
-	for _, raw := range loadProtectedPatterns() {
-		if matchProtected(abspath, raw) {
-			if unlock != "" && (unlock == "all" || strings.Contains(abspath, unlock)) {
+	for _, pattern := range loadProtectedPatterns() {
+		if matchProtected(absolute, pattern) {
+			if unlock != "" && (unlock == "all" || strings.Contains(absolute, unlock)) {
 				return ""
 			}
-			return abspath + " is a PROTECTED path (matched '" + raw + "')" + remediationHint()
+			return absolute + " is a PROTECTED path (matched '" + pattern + "')" + remediationHint()
 		}
 	}
 	return ""
@@ -394,6 +357,9 @@ func hookJSON(d GateDecision) []byte {
 // still writes no stdout JSON, but prints a loud warning to stderr (parity
 // with Python's _degraded_guard warning) so the operator knows the full
 // evaluation was unavailable and only the denylist net was in effect.
+// HookPayload returns the exact stdout bytes for a Claude Code hook decision.
+func HookPayload(d GateDecision) []byte { return hookJSON(d) }
+
 func EmitHookJSON(d GateDecision) int {
 	if d.Degraded && d.Allow {
 		fmt.Fprintln(os.Stderr, "GOVERNATOR GATE — running in degraded denylist-only mode; full evaluation unavailable, only known-dangerous commands are blocked")
@@ -411,12 +377,7 @@ func EmitHookJSON(d GateDecision) int {
 // Throttled, time-boxed, and NEVER blocks or changes the decision — call this
 // only on the interactive hook plane, only AFTER GateDecide has allowed.
 
-func snapshotStoreDir() string {
-	if d := strings.TrimSpace(os.Getenv("HARNESS_SNAPSHOT_DIR")); d != "" {
-		return d
-	}
-	return "/mnt/e/downloads/.harness_snapshots"
-}
+func snapshotStoreDir() string { return snapshots.StoreDir() }
 
 // snapshotThrottled reports whether a snapshot was already taken within the
 // last 120s (newest subdirectory mtime under the store), so a burst of
@@ -442,18 +403,6 @@ func snapshotThrottled(dir string) bool {
 	return false
 }
 
-func recallScriptPath() string {
-	script := strings.TrimSpace(os.Getenv("GOV_RECALL_SCRIPT"))
-	if script == "" {
-		script = "~/.claude/hooks/harness_recall.py"
-	}
-	script = expandPath(script)
-	if _, err := os.Stat(script); err != nil {
-		return "" // missing recall script — skip silently
-	}
-	return script
-}
-
 // PreflightSnapshotIfDelete takes a best-effort pre-delete recovery snapshot.
 // Call ONLY on the interactive hook plane, and only after GateDecide has
 // already allowed the command — a snapshot failure must NEVER change the
@@ -470,13 +419,16 @@ func PreflightSnapshotIfDelete(cmd string) {
 	if snapshotThrottled(snapshotStoreDir()) {
 		return
 	}
-	script := recallScriptPath()
-	if script == "" {
+	if script := strings.TrimSpace(os.Getenv("GOV_RECALL_SCRIPT")); script != "" {
+		script = expandPath(script)
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		if err := exec.CommandContext(ctx, "python3", script, "snapshot", "pre-delete").Run(); err != nil {
+			fmt.Fprintln(os.Stderr, "GOVERNATOR GATE — pre-delete snapshot failed (non-blocking):", err)
+		}
 		return
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-	if err := exec.CommandContext(ctx, "python3", script, "snapshot", "pre-delete").Run(); err != nil {
+	if _, err := snapshots.Create("pre-delete"); err != nil {
 		fmt.Fprintln(os.Stderr, "GOVERNATOR GATE — pre-delete snapshot failed (non-blocking):", err)
 	}
 }

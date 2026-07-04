@@ -2,7 +2,7 @@
 
 Governator is a contract-first runtime for replaceable coding-agent backends. The model proposes; deterministic validators and the merge gate decide; the SQLite ledger remembers.
 
-## Implemented through Phase 4
+## Implemented through Phase 6
 
 Phase 1 provides the complete user-triggered `gov run` spine:
 
@@ -42,7 +42,17 @@ Phase 4 adds deterministic routing, repair, evaluation, and prompt provenance:
 - a one-command `harness_eval` suite with agent-by-mode scorecards stored in SQLite;
 - versioned prompt resolution tied to run outcomes, plus a checksum mutation test.
 
-The existing Python governed harness remains untouched and is still the control plane for Codex sessions. Governator does not replace it.
+Phase 5 adds replaceable Claude Code, Codex, and GLM backends plus the F1–F7 `PreToolUse` gate.
+
+Phase 6 completes the native harness-replacement surface:
+
+- shared protected-path resolution and verified `gov protect` filesystem locks;
+- compatible hardlink snapshots with create, list, diff, dry-run, and restore commands;
+- native pre-delete snapshots with a transitional Python override;
+- Python-authoritative shadow parity events and `gov parity report`;
+- an operator migration and rollback runbook in `docs/migration.md`.
+
+The existing Python governed harness remains untouched and authoritative until the documented shadow-parity criterion is met; cutover is an operator action.
 
 ## Canonical commands
 
@@ -65,10 +75,14 @@ go build -trimpath -o /mnt/e/downloads/governator/bin/gov ./cmd/gov
 /mnt/e/downloads/governator/bin/gov repair-packet RUN_ID
 /mnt/e/downloads/governator/bin/gov eval harness /mnt/e/downloads/governator/harness_eval
 /mnt/e/downloads/governator/bin/gov eval scorecard
+/mnt/e/downloads/governator/bin/gov protect status
+/mnt/e/downloads/governator/bin/gov snap create manual
+/mnt/e/downloads/governator/bin/gov hook pre-tool-use --shadow /absolute/path/to/harness_gate.py
+/mnt/e/downloads/governator/bin/gov parity report
 ```
 
 The Claude adapter uses the installed subscription-authenticated `claude` CLI and never embeds an API key. `GOV_CLAUDE_BIN` exists for deterministic adapter tests. State defaults to `$HOME/.governator`; `GOV_HOME` may redirect it for tests. Prompt lookup defaults to the repository-relative `prompts/` registry; set `GOV_PROMPTS` to its absolute path when invoking `gov` from another directory.
 
-Protected paths are read from `/home/lam/.governed-harness/state/protected_paths.txt`. Set `GOV_PROTECTED_PATHS` only for an alternate test manifest.
+Protected paths default to `$HOME/.governed-harness/state/protected_paths.txt`. Set `GOV_PROTECTED_PATHS` only for an alternate test manifest.
 
 Running a real job can invoke a paid model and must be explicitly user-triggered. The test suite uses a fake Claude executable and performs no model calls.

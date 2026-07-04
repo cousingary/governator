@@ -1,22 +1,27 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"time"
 
 	"github.com/cousingary/governator/internal/contracts"
 	"github.com/cousingary/governator/internal/doctor"
 	"github.com/cousingary/governator/internal/observability"
 	"github.com/cousingary/governator/internal/policy"
+	"github.com/cousingary/governator/internal/protect"
+	"github.com/cousingary/governator/internal/protectedpaths"
 	govruntime "github.com/cousingary/governator/internal/runtime"
+	"github.com/cousingary/governator/internal/snapshots"
 )
 
-const version = "0.6.0-phase5"
+const version = "0.7.0-phase6"
 
 func main() { os.Exit(run(os.Args[1:])) }
 
@@ -227,6 +232,12 @@ func run(args []string) int {
 			return 0
 		}
 		return bad("usage: gov eval harness <case-dir> | gov eval scorecard")
+	case "protect":
+		return protectCmd(args[1:])
+	case "snap":
+		return snapCmd(args[1:])
+	case "parity":
+		return parityCmd(args[1:])
 	case "hook":
 		return hookCmd(args[1:])
 	case "doctor":
@@ -302,19 +313,129 @@ func bad(s string) int { fmt.Fprintln(os.Stderr, s); return 2 }
 //
 // F5 fail-closed: any stdin parse failure or gate error routes through the
 // degraded denylist so the session never loses its irreversibility guards.
+func protectCmd(args []string) int {
+	if len(args) == 1 && args[0] == "status" {
+		entries, err := protect.Status()
+		if err != nil {
+			return bad("protect: " + err.Error())
+		}
+		fmt.Printf("Protected-paths status (%s)\n", protectedpaths.Manifest())
+		for _, entry := range entries {
+			fmt.Printf("%-12s %s (%d files)\n", entry.State, entry.Path, entry.Files)
+		}
+		return 0
+	}
+	if len(args) == 1 && args[0] == "apply" {
+		result, err := protect.Apply(true, nil)
+		if err != nil {
+			return bad("protect: " + err.Error())
+		}
+		fmt.Printf("Locked %d files across %d path(s).\n", result.Files, result.Roots)
+		return 0
+	}
+	if len(args) == 2 && args[0] == "release" {
+		result, err := protect.Apply(false, []string{args[1]})
+		if err != nil {
+			return bad("protect: " + err.Error())
+		}
+		fmt.Printf("Released %d files across %d path(s).\n", result.Files, result.Roots)
+		return 0
+	}
+	return bad("usage: gov protect status|apply|release <path>")
+}
+
+func snapCmd(args []string) int {
+	if len(args) >= 1 && args[0] == "create" && len(args) <= 2 {
+		label := ""
+		if len(args) == 2 {
+			label = args[1]
+		}
+		manifest, err := snapshots.Create(label)
+		if err != nil {
+			return bad("snap: " + err.Error())
+		}
+		total := 0
+		for _, root := range manifest.Roots {
+			total += root.Files
+		}
+		fmt.Printf("Snapshot %s: %d files across %d root(s).\n", manifest.ID, total, len(manifest.Roots))
+		return 0
+	}
+	if len(args) == 1 && args[0] == "list" {
+		list, err := snapshots.List()
+		if err != nil {
+			return bad("snap: " + err.Error())
+		}
+		for _, manifest := range list {
+			fmt.Printf("%s\t%s\t%d roots\n", manifest.ID, manifest.Label, len(manifest.Roots))
+		}
+		return 0
+	}
+	if len(args) == 2 && args[0] == "diff" {
+		changes, err := snapshots.Diff(args[1])
+		if err != nil {
+			return bad("snap: " + err.Error())
+		}
+		for _, change := range changes {
+			fmt.Printf("%s  %s\n", change.Kind, change.Path)
+		}
+		return 0
+	}
+	if len(args) >= 2 && args[0] == "restore" {
+		dryRun := len(args) == 3 && args[2] == "--dry-run"
+		if len(args) > 3 || (len(args) == 3 && !dryRun) {
+			return bad("usage: gov snap restore <id> [--dry-run]")
+		}
+		count, err := snapshots.Restore(args[1], dryRun)
+		if err != nil {
+			return bad("snap: " + err.Error())
+		}
+		if dryRun {
+			fmt.Printf("DRY-RUN: would restore %d file(s); nothing written.\n", count)
+		} else {
+			fmt.Printf("Restored %d file(s).\n", count)
+		}
+		return 0
+	}
+	return bad("usage: gov snap create [label]|list|diff <id>|restore <id> [--dry-run]")
+}
+
+func parityCmd(args []string) int {
+	if len(args) != 1 || args[0] != "report" {
+		return bad("usage: gov parity report")
+	}
+	report, err := observability.ParitySummary(govruntime.Home())
+	if err != nil {
+		return bad("parity: " + err.Error())
+	}
+	fmt.Printf("events=%d matches=%d mismatches=%d unavailable=%d coverage_days=%.2f\n", report.Total, report.Matches, report.Mismatches, report.Unavailable, report.CoverageDays)
+	for _, event := range report.Events {
+		fmt.Printf("%s\tmatch=%t\tpy_unavailable=%t\tgo=%q\tpython=%q\tpayload=%s\n", event.PayloadHash, event.Match, event.PythonUnavailable, event.GoDecision, event.PythonDecision, event.Payload)
+	}
+	return 0
+}
+
 func hookCmd(args []string) int {
-	if len(args) < 1 {
-		return bad("usage: gov hook pre-tool-use [--run <id>]")
+	if len(args) < 1 || args[0] != "pre-tool-use" {
+		return bad("usage: gov hook pre-tool-use [--run <id>] [--shadow <python-gate>]")
 	}
-	sub := args[0]
-	if sub != "pre-tool-use" {
-		return bad("usage: gov hook pre-tool-use [--run <id>]")
-	}
-	var runID string
+	var runID, shadow string
 	for i := 1; i < len(args); i++ {
-		if args[i] == "--run" && i+1 < len(args) {
+		switch args[i] {
+		case "--run":
+			if i+1 >= len(args) {
+				return bad("--run requires an id")
+			}
 			runID = args[i+1]
 			i++
+		case "--shadow":
+			if i+1 >= len(args) {
+				return bad("--shadow requires a path")
+			}
+			shadow = args[i+1]
+			i++
+		default:
+			return bad("usage: gov hook pre-tool-use [--run <id>] [--shadow <python-gate>]")
 		}
 	}
 	data, err := io.ReadAll(os.Stdin)
@@ -323,7 +444,6 @@ func hookCmd(args []string) int {
 	}
 	var in govruntime.GateInput
 	if err := json.Unmarshal(data, &in); err != nil {
-		// Unparseable payload — no tool/command to evaluate (matches Python).
 		return emitAllow()
 	}
 	if in.ToolInput == nil {
@@ -331,8 +451,6 @@ func hookCmd(args []string) int {
 	}
 	decision := govruntime.GateDecide(in)
 	if runID != "" {
-		// Traceability hook: audit the decision (not just the input) so the
-		// interactive plane shares the scripted plane's audit trail (F6).
 		recordHookDecision(runID, in, decision)
 	}
 	if decision.Allow && in.ToolName == "Bash" {
@@ -340,7 +458,29 @@ func hookCmd(args []string) int {
 			govruntime.PreflightSnapshotIfDelete(cmd)
 		}
 	}
-	return govruntime.EmitHookJSON(decision)
+	if shadow == "" {
+		return govruntime.EmitHookJSON(decision)
+	}
+
+	goOutput := govruntime.HookPayload(decision)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "python3", shadow)
+	cmd.Stdin = bytes.NewReader(data)
+	var pythonOutput bytes.Buffer
+	cmd.Stdout = &pythonOutput
+	err = cmd.Run()
+	event := observability.ParityEvent{Payload: string(data), GoDecision: string(goOutput), PythonDecision: pythonOutput.String()}
+	if err != nil {
+		event.PythonUnavailable = true
+		event.Match = false
+		_ = observability.RecordParity(govruntime.Home(), event)
+		return govruntime.EmitHookJSON(decision)
+	}
+	event.Match = bytes.Equal(goOutput, pythonOutput.Bytes())
+	_ = observability.RecordParity(govruntime.Home(), event)
+	_, _ = os.Stdout.Write(pythonOutput.Bytes())
+	return 0
 }
 
 func emitAllow() int {
@@ -410,7 +550,10 @@ Usage:
   gov repair-packet <run_id>
   gov eval harness <case-dir>
   gov eval scorecard
-  gov hook pre-tool-use [--run <id>]
+  gov protect status|apply|release <path>
+  gov snap create [label]|list|diff <id>|restore <id> [--dry-run]
+  gov hook pre-tool-use [--run <id>] [--shadow <python-gate>]
+  gov parity report
   gov doctor
   gov version`)
 }

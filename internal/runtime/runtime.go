@@ -26,6 +26,7 @@ import (
 	"github.com/cousingary/governator/internal/observability"
 	"github.com/cousingary/governator/internal/policy"
 	"github.com/cousingary/governator/internal/prompts"
+	"github.com/cousingary/governator/internal/protectedpaths"
 )
 
 type RunRecord struct {
@@ -208,33 +209,19 @@ func fingerprint(root string) (snapshot, error) {
 }
 
 func protectedFingerprint() (snapshot, error) {
-	manifest := os.Getenv("GOV_PROTECTED_PATHS")
-	if manifest == "" {
-		manifest = "/home/lam/.governed-harness/state/protected_paths.txt"
-	}
-	data, err := os.ReadFile(manifest)
-	if os.IsNotExist(err) {
-		return snapshot{}, nil
-	}
+	patterns, err := protectedpaths.Patterns()
 	if err != nil {
 		return nil, err
 	}
 	out := snapshot{}
-	for _, line := range strings.Split(string(data), "\n") {
-		line = strings.TrimSpace(strings.SplitN(line, "#", 2)[0])
-		if line == "" {
-			continue
-		}
-		matches, _ := filepath.Glob(line)
+	for _, pattern := range patterns {
+		matches := protectedpaths.Resolve(pattern)
 		if len(matches) == 0 {
-			matches = []string{line}
+			out[protectedpaths.Expand(pattern)] = stamp{Hash: "MISSING"}
+			continue
 		}
 		for _, p := range matches {
 			info, statErr := os.Lstat(p)
-			if os.IsNotExist(statErr) {
-				out[p] = stamp{Hash: "MISSING"}
-				continue
-			}
 			if statErr != nil {
 				return nil, statErr
 			}

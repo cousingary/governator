@@ -10,6 +10,8 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+
+	"github.com/cousingary/governator/internal/protectedpaths"
 )
 
 type Status string
@@ -98,11 +100,7 @@ func checkPython() Check {
 
 func checkProtectedManifest() Check {
 	check := Check{Name: "protected paths", Required: true}
-	manifest, err := protectedManifestPath()
-	if err != nil {
-		check.Status, check.Detail = StatusFail, err.Error()
-		return check
-	}
+	manifest := protectedpaths.Manifest()
 	file, err := os.Open(manifest)
 	if err != nil {
 		check.Status, check.Detail = StatusFail, fmt.Sprintf("%s: %v", manifest, err)
@@ -232,20 +230,6 @@ func checkBackendFlags(name, defaultBin string, helpArgs, requiredFlags []string
 	check.Status = StatusOK
 	check.Detail = fmt.Sprintf("%s present with required flags (%s)", bin, strings.Join(requiredFlags, ", "))
 	return check
-}
-
-func protectedManifestPath() (string, error) {
-	if explicit := strings.TrimSpace(os.Getenv("GOV_PROTECTED_PATHS")); explicit != "" {
-		return filepath.Clean(explicit), nil
-	}
-	if state := strings.TrimSpace(os.Getenv("CLAUDE_HARNESS_STATE")); state != "" {
-		return filepath.Join(state, "protected_paths.txt"), nil
-	}
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return "", fmt.Errorf("resolve home directory: %w", err)
-	}
-	return filepath.Join(home, ".governed-harness", "state", "protected_paths.txt"), nil
 }
 
 func governorHome() (string, error) {
