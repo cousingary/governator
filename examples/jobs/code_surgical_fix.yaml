@@ -14,7 +14,9 @@ forbidden:
   paths: ["agents/**", ".git/**"]
   commands: ["rm -rf", "git push"]
   behaviors: [refactor, reformat, scope_expansion]
-budget: {max_minutes: 10, max_commands: 20, max_files_changed: 1, max_deleted: 0}
+budget: {max_minutes: 10, max_commands: 20, max_files_changed: 1, max_lines_changed: 200, max_new_files: 0, max_deleted: 0}
+preflight:
+  intended_writes: ["internal/contracts/schema.go"]
 success:
   required_files: ["internal/contracts/schema.go"]
   validators: ["go test ./internal/contracts"]

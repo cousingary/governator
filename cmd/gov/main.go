@@ -2,16 +2,18 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
 
 	"github.com/cousingary/governator/internal/contracts"
 	"github.com/cousingary/governator/internal/doctor"
+	"github.com/cousingary/governator/internal/policy"
 	govruntime "github.com/cousingary/governator/internal/runtime"
 )
 
-const version = "0.2.0-phase1"
+const version = "0.3.0-phase2"
 
 func main() { os.Exit(run(os.Args[1:])) }
 
@@ -30,6 +32,30 @@ func run(args []string) int {
 			return contractError(args[1], err)
 		}
 		fmt.Printf("VALID %s (job_id=%s mode=%s agent=%s)\n", args[1], c.JobID, c.Mode, c.Agent)
+		return 0
+	case "preflight":
+		if len(args) != 2 {
+			return bad("usage: gov preflight <job.yaml>")
+		}
+		c, err := contracts.ParseFile(args[1])
+		if err != nil {
+			return contractError(args[1], err)
+		}
+		report, err := policy.Preflight(*c)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "preflight:", err)
+			return 1
+		}
+		output, err := json.MarshalIndent(report, "", "  ")
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "preflight:", err)
+			return 1
+		}
+		fmt.Println(string(output))
+		if err := policy.Enforce(report, *c); err != nil {
+			fmt.Fprintln(os.Stderr, "preflight:", err)
+			return 1
+		}
 		return 0
 	case "run":
 		if len(args) != 2 && len(args) != 4 {
@@ -163,6 +189,7 @@ func usage() {
 
 Usage:
   gov validate <job.yaml>
+  gov preflight <job.yaml>
   gov run <job.yaml> [--agent <name>]
   gov diff [last|run_id]
   gov rollback <run_id>

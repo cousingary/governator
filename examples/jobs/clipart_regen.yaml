@@ -14,7 +14,10 @@ forbidden:
   paths: ["done/**", "*.psd"]
   commands: ["rm -rf", "git push"]
   behaviors: [refactor, reformat, rename_files, scope_expansion]
-budget: {max_minutes: 20, max_commands: 60, max_files_changed: 30, max_deleted: 0}
+budget: {max_minutes: 20, max_commands: 60, max_files_changed: 30, max_lines_changed: 5000, max_new_files: 30, max_deleted: 0}
+preflight:
+  intended_writes: ["output/clipart/**"]
+  scout_completed: true
 success:
   required_files: ["output/clipart/*.png"]
   validators:

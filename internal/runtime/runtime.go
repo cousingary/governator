@@ -1,6 +1,7 @@
 package runtime
 
 import (
+	"bufio"
 	"context"
 	"crypto/sha1"
 	"crypto/sha256"
@@ -24,6 +25,7 @@ import (
 
 	"github.com/cousingary/governator/internal/agents"
 	"github.com/cousingary/governator/internal/contracts"
+	"github.com/cousingary/governator/internal/policy"
 )
 
 type RunRecord struct {
@@ -447,6 +449,9 @@ func auditTranscript(path string, c contracts.Contract) []string {
 		violations = append(violations, "max_commands exceeded")
 	}
 	for _, command := range commands {
+		if class := policy.ClassifyShellCommand(command, false); class != nil {
+			violations = append(violations, fmt.Sprintf("destructive command classified as %s %s: %s", class.Verb, class.Resource, command))
+		}
 		allowed := false
 		for _, pattern := range c.Allowed.Execute {
 			if commandMatches(pattern, command) {
@@ -464,7 +469,78 @@ func auditTranscript(path string, c contracts.Contract) []string {
 			}
 		}
 	}
+	lower := strings.ToLower(string(data))
+	for _, phrase := range []string{"while i'm here", "while i’m here", "i'll also refactor", "i’ll also refactor", "inspect the broader project"} {
+		if strings.Contains(lower, phrase) {
+			violations = append(violations, "scope-expansion tripwire: "+phrase)
+		}
+	}
 	return violations
+}
+
+type diffMetrics struct {
+	Lines    int
+	NewFiles int
+}
+
+func countLines(path string) int {
+	f, err := os.Open(path)
+	if err != nil {
+		return 0
+	}
+	defer f.Close()
+	scanner := bufio.NewScanner(f)
+	count := 0
+	for scanner.Scan() {
+		count++
+	}
+	return count
+}
+
+func parseNumstat(output string) int {
+	total := 0
+	for _, line := range strings.Split(strings.TrimSpace(output), "\n") {
+		parts := strings.SplitN(line, "\t", 3)
+		if len(parts) < 2 {
+			continue
+		}
+		added, aerr := strconv.Atoi(parts[0])
+		deleted, derr := strconv.Atoi(parts[1])
+		if aerr == nil {
+			total += added
+		}
+		if derr == nil {
+			total += deleted
+		}
+	}
+	return total
+}
+
+func measureDiff(root, work string, git bool, before snapshot, changed, deleted []string) diffMetrics {
+	metrics := diffMetrics{}
+	if git {
+		_, output, _ := shell(context.Background(), work, "git diff --numstat HEAD")
+		metrics.Lines = parseNumstat(output)
+	}
+	for _, name := range changed {
+		if _, existed := before[name]; existed {
+			if !git {
+				oldPath := filepath.Join(root, filepath.FromSlash(name))
+				newPath := filepath.Join(work, filepath.FromSlash(name))
+				_, output, _ := shell(context.Background(), work, "git diff --no-index --numstat -- "+shQuote(oldPath)+" "+shQuote(newPath))
+				metrics.Lines += parseNumstat(output)
+			}
+			continue
+		}
+		metrics.NewFiles++
+		metrics.Lines += countLines(filepath.Join(work, filepath.FromSlash(name)))
+	}
+	if !git {
+		for _, name := range deleted {
+			metrics.Lines += countLines(filepath.Join(root, filepath.FromSlash(name)))
+		}
+	}
+	return metrics
 }
 
 func redact(path string) error {
@@ -482,6 +558,13 @@ func redact(path string) error {
 func (r *Runner) Run(ctx context.Context, c contracts.Contract) (RunRecord, error) {
 	root, err := filepath.Abs(c.Workspace.Root)
 	if err != nil {
+		return RunRecord{}, err
+	}
+	preflight, err := policy.Preflight(c)
+	if err != nil {
+		return RunRecord{}, err
+	}
+	if err := policy.Enforce(preflight, c); err != nil {
 		return RunRecord{}, err
 	}
 	release, err := lock(root, r.Home)
@@ -517,6 +600,14 @@ func (r *Runner) Run(ctx context.Context, c contracts.Contract) (RunRecord, erro
 	if err != nil {
 		return RunRecord{}, err
 	}
+	canaryName := ".governator-canary"
+	canaryPath := filepath.Join(work, canaryName)
+	if _, statErr := os.Lstat(canaryPath); !os.IsNotExist(statErr) {
+		return RunRecord{}, fmt.Errorf("reserved canary path already exists: %s", canaryName)
+	}
+	if err := os.WriteFile(canaryPath, []byte(id+"\n"), 0400); err != nil {
+		return RunRecord{}, fmt.Errorf("create canary: %w", err)
+	}
 	transcript := filepath.Join(r.Home, "transcripts", id+".jsonl")
 	rec := RunRecord{ID: id, JobID: c.JobID, Status: "RUNNING", Root: root, Worktree: work, Branch: branch, Transcript: transcript, Created: time.Now().UTC().Format(time.RFC3339Nano)}
 	if err = insertRun(db, rec, hash, head); err != nil {
@@ -538,6 +629,7 @@ func (r *Runner) Run(ctx context.Context, c contracts.Contract) (RunRecord, erro
 	if err != nil {
 		return rec, err
 	}
+	prompt += "\nController canary: " + canaryName + " must remain byte-for-byte unchanged. Touching it quarantines the run.\n"
 	agent, err := agents.New(c.Agent)
 	if err != nil {
 		return rec, err
@@ -549,6 +641,13 @@ func (r *Runner) Run(ctx context.Context, c contracts.Contract) (RunRecord, erro
 	liveAfter, lerr := fingerprint(root)
 	protectedAfter, perr := protectedFingerprint()
 	violations := append([]string{}, transcriptViolations...)
+	if before, ok := workBefore[canaryName]; !ok || workAfter[canaryName] != before {
+		violations = append(violations, "canary mutation: "+canaryName)
+	}
+	_ = os.Chmod(canaryPath, 0600)
+	_ = os.Remove(canaryPath)
+	delete(workBefore, canaryName)
+	delete(workAfter, canaryName)
 	if aerr != nil {
 		violations = append(violations, "agent: "+aerr.Error())
 	}
@@ -580,12 +679,22 @@ func (r *Runner) Run(ctx context.Context, c contracts.Contract) (RunRecord, erro
 		if matchesAny(c.Forbidden.Paths, p) {
 			violations = append(violations, "forbidden path: "+p)
 		}
+		if !policy.MatchesAny(c.Preflight.IntendedWrites, p) && p != "RESULT.json" {
+			violations = append(violations, "write outside intended_writes: "+p)
+		}
 	}
 	if len(changed)+len(deleted) > c.Budget.MaxFilesChanged {
 		violations = append(violations, "max_files_changed exceeded")
 	}
 	if len(deleted) > c.Budget.MaxDeleted {
 		violations = append(violations, "max_deleted exceeded")
+	}
+	metrics := measureDiff(root, work, git, workBefore, changed, deleted)
+	if metrics.Lines > c.Budget.MaxLinesChanged {
+		violations = append(violations, fmt.Sprintf("max_lines_changed exceeded: %d > %d", metrics.Lines, c.Budget.MaxLinesChanged))
+	}
+	if metrics.NewFiles > c.Budget.MaxNewFiles {
+		violations = append(violations, fmt.Sprintf("max_new_files exceeded: %d > %d", metrics.NewFiles, c.Budget.MaxNewFiles))
 	}
 	for _, p := range c.Success.RequiredFiles {
 		found := false

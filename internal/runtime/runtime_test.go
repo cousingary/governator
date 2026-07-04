@@ -38,6 +38,10 @@ printf 'ok\n' > output/result.txt
 printf '{"status":"ok","summary":"fake","files":["output/result.txt"],"commands":[]}\n' > RESULT.json
 printf '{"type":"result","secret":"sk-abcdefghijklmnopqrstuvwxyz"}\n'
 if [ "$FAKE_COMMAND" = 1 ]; then printf '{"type":"tool_use","name":"Bash","input":{"command":"rm -rf /tmp/x"}}\n'; fi
+if [ "$FAKE_TRIPWIRE" = 1 ]; then printf '{"type":"assistant","text":"I should inspect the broader project."}\n'; fi
+if [ "$FAKE_CANARY" = 1 ]; then chmod 600 .governator-canary; printf 'mutated\n' > .governator-canary; fi
+if [ "$FAKE_BIG" = 1 ]; then printf '1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n' > output/result.txt; fi
+if [ "$FAKE_SCOPE" = 1 ]; then printf 'drift\n' > output/extra.txt; fi
 if [ "$FAKE_LEAK" = 1 ]; then printf 'leak\n' > "$FAKE_LIVE_ROOT/leak.txt"; fi
 `
 	if err := os.WriteFile(bin, []byte(s), 0755); err != nil {
@@ -52,7 +56,8 @@ func contract(root string) contracts.Contract {
 		Workspace:   contracts.Workspace{Root: root, Worktree: "auto"},
 		Allowed:     contracts.Permissions{Read: []string{"**"}, Write: []string{"output/**"}, Execute: []string{"test"}},
 		Forbidden:   contracts.Forbidden{Paths: []string{".git/**"}, Commands: []string{"rm -rf"}, Behaviors: []string{"network"}},
-		Budget:      contracts.Budget{MaxMinutes: 1, MaxCommands: 5, MaxFilesChanged: 5, MaxDeleted: 0},
+		Budget:      contracts.Budget{MaxMinutes: 1, MaxCommands: 5, MaxFilesChanged: 5, MaxLinesChanged: 20, MaxNewFiles: 2, MaxDeleted: 0},
+		Preflight:   contracts.Preflight{IntendedWrites: []string{"output/**"}},
 		Success:     contracts.Success{RequiredFiles: []string{"output/result.txt"}, Validators: []string{"test -f output/result.txt"}},
 		OnViolation: "quarantine",
 	}
@@ -181,6 +186,91 @@ func TestForbiddenCommandTranscriptIsQuarantined(t *testing.T) {
 		t.Fatal(err)
 	}
 	if r.Status != "QUARANTINED" || !strings.Contains(r.Message, "forbidden command") {
+		t.Fatalf("%s: %s", r.Status, r.Message)
+	}
+}
+
+func TestCanaryMutationIsQuarantined(t *testing.T) {
+	root, bin := fixture(t)
+	t.Setenv("GOV_HOME", t.TempDir())
+	t.Setenv("GOV_CLAUDE_BIN", bin)
+	t.Setenv("FAKE_CANARY", "1")
+	r, err := New().Run(context.Background(), contract(root))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r.Status != "QUARANTINED" || !strings.Contains(r.Message, "canary mutation") {
+		t.Fatalf("%s: %s", r.Status, r.Message)
+	}
+	if _, err := os.Stat(filepath.Join(root, "output", "result.txt")); !os.IsNotExist(err) {
+		t.Fatalf("quarantined work merged: %v", err)
+	}
+}
+
+func TestScopeExpansionTripwireIsQuarantined(t *testing.T) {
+	root, bin := fixture(t)
+	t.Setenv("GOV_HOME", t.TempDir())
+	t.Setenv("GOV_CLAUDE_BIN", bin)
+	t.Setenv("FAKE_TRIPWIRE", "1")
+	r, err := New().Run(context.Background(), contract(root))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r.Status != "QUARANTINED" || !strings.Contains(r.Message, "scope-expansion tripwire") {
+		t.Fatalf("%s: %s", r.Status, r.Message)
+	}
+}
+
+func TestDiffLineBudgetOverflowIsQuarantined(t *testing.T) {
+	root, bin := fixture(t)
+	t.Setenv("GOV_HOME", t.TempDir())
+	t.Setenv("GOV_CLAUDE_BIN", bin)
+	t.Setenv("FAKE_BIG", "1")
+	c := contract(root)
+	c.Budget.MaxLinesChanged = 5
+	r, err := New().Run(context.Background(), c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r.Status != "QUARANTINED" || !strings.Contains(r.Message, "max_lines_changed exceeded") {
+		t.Fatalf("%s: %s", r.Status, r.Message)
+	}
+	if _, err := os.Stat(filepath.Join(root, "output", "result.txt")); !os.IsNotExist(err) {
+		t.Fatalf("budget overflow merged: %v", err)
+	}
+}
+
+func TestNewFileBudgetOverflowIsQuarantined(t *testing.T) {
+	root, bin := fixture(t)
+	t.Setenv("GOV_HOME", t.TempDir())
+	t.Setenv("GOV_CLAUDE_BIN", bin)
+	c := contract(root)
+	c.Budget.MaxNewFiles = 1
+	r, err := New().Run(context.Background(), c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r.Status != "QUARANTINED" || !strings.Contains(r.Message, "max_new_files exceeded") {
+		t.Fatalf("%s: %s", r.Status, r.Message)
+	}
+	if _, err := os.Stat(filepath.Join(root, "output", "result.txt")); !os.IsNotExist(err) {
+		t.Fatalf("new-file budget overflow merged: %v", err)
+	}
+}
+
+func TestWriteOutsideIntendedScopeIsQuarantined(t *testing.T) {
+	root, bin := fixture(t)
+	t.Setenv("GOV_HOME", t.TempDir())
+	t.Setenv("GOV_CLAUDE_BIN", bin)
+	t.Setenv("FAKE_SCOPE", "1")
+	c := contract(root)
+	c.Preflight.IntendedWrites = []string{"output/result.txt"}
+	c.Budget.MaxNewFiles = 3
+	r, err := New().Run(context.Background(), c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r.Status != "QUARANTINED" || !strings.Contains(r.Message, "write outside intended_writes") {
 		t.Fatalf("%s: %s", r.Status, r.Message)
 	}
 }

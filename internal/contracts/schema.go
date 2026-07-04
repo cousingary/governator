@@ -37,6 +37,7 @@ type Contract struct {
 	Allowed     Permissions `yaml:"allowed" json:"allowed"`
 	Forbidden   Forbidden   `yaml:"forbidden" json:"forbidden"`
 	Budget      Budget      `yaml:"budget" json:"budget"`
+	Preflight   Preflight   `yaml:"preflight" json:"preflight"`
 	Success     Success     `yaml:"success" json:"success"`
 	OnViolation string      `yaml:"on_violation" json:"on_violation"`
 }
@@ -62,8 +63,16 @@ type Budget struct {
 	MaxMinutes      int `yaml:"max_minutes" json:"max_minutes"`
 	MaxCommands     int `yaml:"max_commands" json:"max_commands"`
 	MaxFilesChanged int `yaml:"max_files_changed" json:"max_files_changed"`
+	MaxLinesChanged int `yaml:"max_lines_changed" json:"max_lines_changed"`
+	MaxNewFiles     int `yaml:"max_new_files" json:"max_new_files"`
 	MaxDeleted      int `yaml:"max_deleted" json:"max_deleted"`
 	MaxTokens       int `yaml:"max_tokens,omitempty" json:"max_tokens,omitempty"`
+}
+
+type Preflight struct {
+	IntendedWrites  []string `yaml:"intended_writes" json:"intended_writes"`
+	ScoutCompleted  bool     `yaml:"scout_completed,omitempty" json:"scout_completed,omitempty"`
+	ApproveHighRisk bool     `yaml:"approve_high_risk,omitempty" json:"approve_high_risk,omitempty"`
 }
 
 type Success struct {
@@ -137,6 +146,13 @@ func (c Contract) Validate() error {
 
 	validatePathPatterns("allowed.read", c.Allowed.Read, add)
 	validatePathPatterns("allowed.write", c.Allowed.Write, add)
+	if readOnly && len(c.Preflight.IntendedWrites) != 0 {
+		add("preflight.intended_writes", "must be empty in a read-only mode")
+	}
+	if !readOnly && len(c.Preflight.IntendedWrites) == 0 {
+		add("preflight.intended_writes", "must declare at least one planned write for a write-capable mode")
+	}
+	validatePathPatterns("preflight.intended_writes", c.Preflight.IntendedWrites, add)
 	validatePathPatterns("forbidden.paths", c.Forbidden.Paths, add)
 	validateNonBlank("allowed.execute", c.Allowed.Execute, add)
 	validateNonBlank("forbidden.commands", c.Forbidden.Commands, add)
@@ -150,6 +166,14 @@ func (c Contract) Validate() error {
 	}
 	if c.Budget.MaxFilesChanged <= 0 {
 		add("budget.max_files_changed", "must be greater than zero")
+	}
+	if c.Budget.MaxLinesChanged <= 0 {
+		add("budget.max_lines_changed", "must be greater than zero")
+	}
+	if c.Budget.MaxNewFiles < 0 {
+		add("budget.max_new_files", "must be zero or greater")
+	} else if c.Budget.MaxNewFiles > c.Budget.MaxFilesChanged {
+		add("budget.max_new_files", "must not exceed budget.max_files_changed")
 	}
 	if c.Budget.MaxDeleted < 0 {
 		add("budget.max_deleted", "must be zero or greater")
