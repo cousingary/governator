@@ -14,10 +14,15 @@ import (
 
 func captureHook(t *testing.T, script string) string {
 	t.Helper()
+	return captureHookWith(t, script, `{"tool_name":"Read","tool_input":{}}`)
+}
+
+func captureHookWith(t *testing.T, script, payload string) string {
+	t.Helper()
 	oldIn, oldOut := os.Stdin, os.Stdout
 	inR, inW, _ := os.Pipe()
 	outR, outW, _ := os.Pipe()
-	_, _ = inW.WriteString(`{"tool_name":"Read","tool_input":{}}`)
+	_, _ = inW.WriteString(payload)
 	_ = inW.Close()
 	os.Stdin, os.Stdout = inR, outW
 	code := run([]string{"hook", "pre-tool-use", "--shadow", script})
@@ -105,6 +110,13 @@ func TestShadowParityMatchMismatchUnavailable(t *testing.T) {
 	allow := write("allow.py", "import sys\nsys.stdin.read()\n")
 	deny := write("deny.py", "import sys\nsys.stdin.read()\nsys.stdout.write('DENY')\n")
 	crash := write("crash.py", "raise SystemExit(1)\n")
+	// A legacy gate that denies with DIFFERENT reason wording than the Go gate.
+	// Parity compares the decision, not the prose — both deny ⇒ match (the raw
+	// byte comparison this replaced counted every deny as a mismatch, making
+	// the zero-mismatch cutover criterion unreachable).
+	wordedDeny := write("worded_deny.py", "import sys\nsys.stdin.read()\n"+
+		`sys.stdout.write('{"hookSpecificOutput": {"hookEventName": "PreToolUse", `+
+		`"permissionDecision": "deny", "permissionDecisionReason": "HARNESS AUTHORITY - nope"}}')`+"\n")
 
 	if got := captureHook(t, allow); got != "" {
 		t.Fatalf("allow output=%q", got)
@@ -115,12 +127,16 @@ func TestShadowParityMatchMismatchUnavailable(t *testing.T) {
 	if got := captureHook(t, crash); got != "" {
 		t.Fatalf("fallback output=%q", got)
 	}
+	denyPayload := `{"tool_name":"Bash","tool_input":{"command":"rm -rf /tmp/example"},"cwd":"/tmp"}`
+	if got := captureHookWith(t, wordedDeny, denyPayload); !strings.Contains(got, "HARNESS AUTHORITY") {
+		t.Fatalf("legacy deny must stay authoritative, got %q", got)
+	}
 
 	report, err := observability.ParitySummary(home)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if report.Total != 3 || report.Matches != 1 || report.Mismatches != 1 || report.Unavailable != 1 {
+	if report.Total != 4 || report.Matches != 2 || report.Mismatches != 1 || report.Unavailable != 1 {
 		t.Fatalf("report=%+v", report)
 	}
 }

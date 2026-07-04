@@ -529,10 +529,33 @@ func hookCmd(args []string) int {
 		_ = observability.RecordParity(govruntime.Home(), event)
 		return govruntime.EmitHookJSON(decision)
 	}
-	event.Match = bytes.Equal(goOutput, pythonOutput.Bytes())
+	event.Match = shadowVerdict(goOutput) == shadowVerdict(pythonOutput.Bytes())
 	_ = observability.RecordParity(govruntime.Home(), event)
 	_, _ = os.Stdout.Write(pythonOutput.Bytes())
 	return 0
+}
+
+// shadowVerdict reduces a gate's raw hook output to the decision it carries so
+// parity compares WHAT was decided, not how the reason is worded — the two
+// planes phrase deny reasons differently by design ("GOVERNATOR GATE" vs
+// "HARNESS AUTHORITY"), and byte-level comparison counted every deny as a
+// mismatch, making the zero-mismatch cutover criterion unreachable. Empty
+// output is the allow convention on both planes; unparseable non-empty output
+// is returned verbatim so genuinely alien output still registers as a mismatch.
+func shadowVerdict(out []byte) string {
+	trimmed := bytes.TrimSpace(out)
+	if len(trimmed) == 0 {
+		return "allow"
+	}
+	var parsed struct {
+		HookSpecificOutput struct {
+			PermissionDecision string `json:"permissionDecision"`
+		} `json:"hookSpecificOutput"`
+	}
+	if err := json.Unmarshal(trimmed, &parsed); err == nil && parsed.HookSpecificOutput.PermissionDecision != "" {
+		return parsed.HookSpecificOutput.PermissionDecision
+	}
+	return string(trimmed)
 }
 
 func emitAllow() int {
