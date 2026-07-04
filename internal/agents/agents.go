@@ -15,6 +15,7 @@ type Request struct {
 	Workdir    string
 	Transcript string
 	Timeout    time.Duration
+	Spec       BackendSpec
 }
 
 type Result struct {
@@ -27,46 +28,43 @@ type Agent interface {
 	Run(context.Context, Request) (Result, error)
 }
 
-func New(name string) (Agent, error) {
-	switch name {
-	case "claude-code", "claude":
-		return Claude{}, nil
-	default:
-		return nil, fmt.Errorf("unsupported agent %q", name)
-	}
+// runCLIRequest is the shared subprocess contract every adapter fills in.
+// Adapters differ only in bin path and how they project the spec into flags;
+// the process-group / timeout / transcript plumbing is identical, so it lives
+// here once.
+type runCLIRequest struct {
+	bin        string
+	workdir    string
+	transcript string
+	timeout    time.Duration
+	// prompt is appended as the final positional argument — all three backends
+	// (claude, codex exec, glm) take the prompt last. Required: an empty prompt
+	// is a caller bug (the backend would block on stdin), so runCLI rejects it.
+	prompt     string
+	extraFlags []string
 }
 
-type Claude struct{}
-
-func (Claude) Name() string { return "claude-code" }
-
-func (Claude) Run(parent context.Context, req Request) (Result, error) {
-	bin := os.Getenv("GOV_CLAUDE_BIN")
-	if bin == "" {
-		bin = "claude"
+func runCLI(parent context.Context, r runCLIRequest) (Result, error) {
+	if r.prompt == "" {
+		return Result{}, fmt.Errorf("runCLI: empty prompt for %s (backend would block on stdin)", r.bin)
 	}
-	if err := os.MkdirAll(filepath.Dir(req.Transcript), 0700); err != nil {
+	if err := os.MkdirAll(filepath.Dir(r.transcript), 0700); err != nil {
 		return Result{}, err
 	}
-	out, err := os.OpenFile(req.Transcript, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600)
+	out, err := os.OpenFile(r.transcript, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600)
 	if err != nil {
 		return Result{}, err
 	}
 	defer out.Close()
-	ctx, cancel := context.WithTimeout(parent, req.Timeout)
+	ctx, cancel := context.WithTimeout(parent, r.timeout)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, bin,
-		"-p", "--output-format", "stream-json", "--verbose",
-		"--no-session-persistence", "--safe-mode",
-		"--permission-mode", "acceptEdits",
-		"--add-dir", req.Workdir,
-		req.Prompt,
-	)
-	cmd.Dir = req.Workdir
+	args := append([]string{}, r.extraFlags...)
+	args = append(args, r.prompt)
+	cmd := exec.CommandContext(ctx, r.bin, args...)
+	cmd.Dir = r.workdir
 	cmd.Stdout, cmd.Stderr = out, out
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	err = cmd.Start()
-	if err != nil {
+	if err = cmd.Start(); err != nil {
 		return Result{}, err
 	}
 	done := make(chan error, 1)
@@ -74,7 +72,9 @@ func (Claude) Run(parent context.Context, req Request) (Result, error) {
 	select {
 	case err = <-done:
 	case <-ctx.Done():
-		_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+		if cmd.Process != nil {
+			_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+		}
 		<-done
 		return Result{ExitCode: -1, TimedOut: true}, ctx.Err()
 	}
@@ -87,4 +87,50 @@ func (Claude) Run(parent context.Context, req Request) (Result, error) {
 		}
 	}
 	return Result{ExitCode: code}, nil
+}
+
+func New(name string) (Agent, error) {
+	switch name {
+	case "claude-code", "claude":
+		return Claude{}, nil
+	case "codex":
+		return Codex{}, nil
+	case "glm":
+		return GLM{}, nil
+	default:
+		return nil, fmt.Errorf("unsupported agent %q", name)
+	}
+}
+
+type Claude struct{}
+
+func (Claude) Name() string { return "claude-code" }
+
+// project translates the abstract spec into Claude Code native flags.
+// --safe-mode + --permission-mode acceptEdits already confines writes to
+// --add-dir worktrees; read-only modes tighten to --permission-mode plan.
+func (Claude) project(spec BackendSpec) []string {
+	flags := []string{
+		"-p", "--output-format", "stream-json", "--verbose",
+		"--no-session-persistence", "--safe-mode",
+	}
+	switch spec.Sandbox {
+	case SandboxReadOnly:
+		flags = append(flags, "--permission-mode", "plan")
+	default:
+		flags = append(flags, "--permission-mode", "acceptEdits")
+	}
+	flags = append(flags, "--add-dir", spec.Workdir)
+	return flags
+}
+
+func (Claude) Run(parent context.Context, req Request) (Result, error) {
+	bin := os.Getenv("GOV_CLAUDE_BIN")
+	if bin == "" {
+		bin = "claude"
+	}
+	return runCLI(parent, runCLIRequest{
+		bin: bin, workdir: req.Workdir, transcript: req.Transcript,
+		timeout: req.Timeout, prompt: req.Prompt, extraFlags: Claude{}.project(req.Spec),
+	})
 }

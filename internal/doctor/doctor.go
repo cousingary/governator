@@ -35,6 +35,13 @@ func Run() []Check {
 		checkLedgerDirectory(),
 		checkLandlock(),
 		checkDrvfs(),
+		// Phase 5: backend CLI flag-drift probes. Each adapter depends on a
+		// small set of native flags that the backend can rename under us; the
+		// probe runs the backend with --help/version and asserts the flags
+		// still appear. Non-required (WARN) — a box need not run all backends.
+		checkBackendFlags("claude", "claude", []string{}, []string{"--output-format", "--add-dir", "--permission-mode"}),
+		checkBackendFlags("codex", "codex", []string{}, []string{"exec", "--sandbox", "--ask-for-approval", "-C"}),
+		checkBackendFlags("glm", "glm", []string{}, []string{"--output-format", "--add-dir", "--permission-mode"}),
 	}
 }
 
@@ -188,6 +195,42 @@ func checkDrvfs() Check {
 		return check
 	}
 	check.Status, check.Detail = StatusOK, fmt.Sprintf("%s on %s", fsType, mountpoint)
+	return check
+}
+
+// checkBackendFlags probes a coding-agent backend's --help output to assert the
+// native flags the adapter depends on still exist (plan risk: "Backend CLI flag
+// drift"). The env override lets tests point at a fake binary. Non-required:
+// missing backend = WARN (the box need not run all three), but a present backend
+// MISSING a depended-on flag = FAIL (the adapter would mis-govern silently).
+func checkBackendFlags(name, defaultBin string, helpArgs, requiredFlags []string) Check {
+	check := Check{Name: "backend:" + name, Required: false}
+	bin := strings.TrimSpace(os.Getenv("GOV_" + strings.ToUpper(name) + "_BIN"))
+	if bin == "" {
+		bin = defaultBin
+	}
+	path, err := exec.LookPath(bin)
+	if err != nil {
+		check.Status, check.Detail = StatusWarn, name+" not found in PATH (adapter unavailable)"
+		return check
+	}
+	args := append([]string{}, helpArgs...)
+	args = append(args, "--help")
+	output, _ := exec.Command(path, args...).CombinedOutput()
+	body := string(output)
+	var missing []string
+	for _, flag := range requiredFlags {
+		if !strings.Contains(body, flag) {
+			missing = append(missing, flag)
+		}
+	}
+	if len(missing) > 0 {
+		check.Status = StatusFail
+		check.Detail = fmt.Sprintf("%s present but missing flag(s): %s (adapter must be updated)", bin, strings.Join(missing, ", "))
+		return check
+	}
+	check.Status = StatusOK
+	check.Detail = fmt.Sprintf("%s present with required flags (%s)", bin, strings.Join(requiredFlags, ", "))
 	return check
 }
 

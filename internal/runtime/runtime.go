@@ -678,7 +678,11 @@ func (r *Runner) Run(ctx context.Context, c contracts.Contract) (RunRecord, erro
 	if err != nil {
 		return rec, err
 	}
-	ar, aerr := agent.Run(ctx, agents.Request{Prompt: prompt, Workdir: work, Transcript: transcript, Timeout: time.Duration(c.Budget.MaxMinutes) * time.Minute})
+	ar, aerr := agent.Run(ctx, agents.Request{
+		Prompt: prompt, Workdir: work, Transcript: transcript,
+		Timeout: time.Duration(c.Budget.MaxMinutes) * time.Minute,
+		Spec:    agents.SpecFromContract(c, work),
+	})
 	_ = redact(transcript)
 	audit := auditTranscript(transcript, c)
 	rec.CostUSD = audit.CostUSD

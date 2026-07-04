@@ -50,7 +50,7 @@ func TestOpenMigratesLegacyLedger(t *testing.T) {
 			t.Errorf("missing migrated column %s", name)
 		}
 	}
-	for _, table := range []string{"runs", "jobs", "agents", "agent_profiles", "files_touched", "commands_run", "validators", "violations", "repair_packets", "eval_runs"} {
+	for _, table := range []string{"runs", "jobs", "agents", "agent_profiles", "files_touched", "commands_run", "validators", "violations", "repair_packets", "eval_runs", "hook_events"} {
 		var count int
 		if err := migrated.QueryRow("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?", table).Scan(&count); err != nil {
 			t.Fatal(err)

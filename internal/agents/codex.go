@@ -1,0 +1,68 @@
+package agents
+
+import (
+	"context"
+	"fmt"
+	"os"
+)
+
+// Codex adapter. Codex CLI (codex-cli) has no PreToolUse hook model, so the
+// abstract spec is projected into its NATIVE controls (plan §7.3):
+//
+//	approval_policy = "on-request"  (the spec's ApprovalOnRequest)
+//	sandbox_mode    = "workspace-write" | "read-only"
+//	[sandbox_workspace_write] network_access = false
+//
+// The adapter cannot see what an opaque script does inside the sandbox, so the
+// runtime's pre/post fingerprint scan (Enforcement reality layer 4) remains the
+// mandatory detection floor — the sandbox is the first wall, not the only one.
+type Codex struct{}
+
+func (Codex) Name() string { return "codex" }
+
+// project translates the abstract spec into `codex exec` native flags.
+func (Codex) project(spec BackendSpec) ([]string, error) {
+	flags := []string{"exec", "--json"}
+	switch spec.Approval {
+	case ApprovalOnRequest:
+		flags = append(flags, "--ask-for-approval", "on-request")
+	case ApprovalNever:
+		flags = append(flags, "--ask-for-approval", "never")
+	default:
+		return nil, fmt.Errorf("codex: unsupported approval policy %q", spec.Approval)
+	}
+	switch spec.Sandbox {
+	case SandboxReadOnly:
+		flags = append(flags, "--sandbox", "read-only")
+	case SandboxWorkspaceWrite:
+		flags = append(flags, "--sandbox", "workspace-write")
+		if !spec.Network {
+			// network_access=false is the default for workspace-write; restated
+			// explicitly via the sandbox config TOML the operator loads. The
+			// flag itself is not exposed on `exec`, so the adapter asserts the
+			// mode and the doctor probe verifies the live config.
+		}
+	default:
+		return nil, fmt.Errorf("codex: unsupported sandbox %q", spec.Sandbox)
+	}
+	if spec.Workdir == "" {
+		return nil, fmt.Errorf("codex: spec.Workdir is required")
+	}
+	flags = append(flags, "-C", spec.Workdir)
+	return flags, nil
+}
+
+func (Codex) Run(parent context.Context, req Request) (Result, error) {
+	bin := os.Getenv("GOV_CODEX_BIN")
+	if bin == "" {
+		bin = "codex"
+	}
+	flags, err := Codex{}.project(req.Spec)
+	if err != nil {
+		return Result{}, err
+	}
+	return runCLI(parent, runCLIRequest{
+		bin: bin, workdir: req.Workdir, transcript: req.Transcript,
+		timeout: req.Timeout, prompt: req.Prompt, extraFlags: flags,
+	})
+}

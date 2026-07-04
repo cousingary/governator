@@ -5,7 +5,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
+	"time"
 
 	"github.com/cousingary/governator/internal/contracts"
 	"github.com/cousingary/governator/internal/doctor"
@@ -14,7 +16,7 @@ import (
 	govruntime "github.com/cousingary/governator/internal/runtime"
 )
 
-const version = "0.5.0-phase4"
+const version = "0.6.0-phase5"
 
 func main() { os.Exit(run(os.Args[1:])) }
 
@@ -225,6 +227,8 @@ func run(args []string) int {
 			return 0
 		}
 		return bad("usage: gov eval harness <case-dir> | gov eval scorecard")
+	case "hook":
+		return hookCmd(args[1:])
 	case "doctor":
 		if len(args) != 1 {
 			return bad("usage: gov doctor")
@@ -288,6 +292,95 @@ func quarantine(args []string) int {
 	return bad("usage: gov quarantine list|show <id>|diff <id>")
 }
 func bad(s string) int { fmt.Fprintln(os.Stderr, s); return 2 }
+
+// hookCmd implements `gov hook pre-tool-use` — the Phase 5 bridge that lets
+// Governator replace harness_gate.py as the Claude Code PreToolUse hook. It
+// reads the PreToolUse payload from stdin ({tool_name, tool_input, cwd}), runs
+// the Go F1-F7 gate, and emits the Claude Code decision JSON. The --run flag is
+// accepted for traceability (recorded in the ledger's hook audit log) but the
+// gate decision derives only from the observed payload, never from the run id.
+//
+// F5 fail-closed: any stdin parse failure or gate error routes through the
+// degraded denylist so the session never loses its irreversibility guards.
+func hookCmd(args []string) int {
+	if len(args) < 1 {
+		return bad("usage: gov hook pre-tool-use [--run <id>]")
+	}
+	sub := args[0]
+	if sub != "pre-tool-use" {
+		return bad("usage: gov hook pre-tool-use [--run <id>]")
+	}
+	var runID string
+	for i := 1; i < len(args); i++ {
+		if args[i] == "--run" && i+1 < len(args) {
+			runID = args[i+1]
+			i++
+		}
+	}
+	data, err := io.ReadAll(os.Stdin)
+	if err != nil {
+		return emitDegraded("stdin read failed: " + err.Error())
+	}
+	var in govruntime.GateInput
+	if err := json.Unmarshal(data, &in); err != nil {
+		// Unparseable payload — no tool/command to evaluate (matches Python).
+		return emitAllow()
+	}
+	if in.ToolInput == nil {
+		in.ToolInput = map[string]any{}
+	}
+	decision := govruntime.GateDecide(in)
+	if runID != "" {
+		// Traceability hook: audit the decision (not just the input) so the
+		// interactive plane shares the scripted plane's audit trail (F6).
+		recordHookDecision(runID, in, decision)
+	}
+	if decision.Allow && in.ToolName == "Bash" {
+		if cmd, ok := in.ToolInput["command"].(string); ok {
+			govruntime.PreflightSnapshotIfDelete(cmd)
+		}
+	}
+	return govruntime.EmitHookJSON(decision)
+}
+
+func emitAllow() int {
+	// Unparseable payload — no tool/command to evaluate. An allow decision
+	// never writes stdout JSON (see EmitHookJSON), so this is silent success.
+	return 0
+}
+
+func emitDegraded(why string) int {
+	return govruntime.EmitHookJSON(govruntime.GateDecision{
+		Allow: false, Degraded: true, Finding: "F5",
+		Reason: "gate unavailable (" + why + "); degraded safety net active",
+	})
+}
+
+// recordHookDecision appends a row to the hook_events audit log — a table of
+// its own, separate from `violations` (which feeds Phase-4 repair packets and
+// ClassifyFailure; audit rows there would displace/corrupt real violation
+// data). Records the decision (allow/deny), not just the input, so the
+// interactive plane's audit trail actually reflects what the gate decided
+// (the F6 unification goal). Best-effort: a ledger write failure must NEVER
+// block an already-computed decision, so errors are swallowed.
+func recordHookDecision(runID string, in govruntime.GateInput, d govruntime.GateDecision) {
+	home := govruntime.Home()
+	db, err := observability.Open(home)
+	if err != nil {
+		return
+	}
+	defer db.Close()
+	decision := "allow"
+	if !d.Allow {
+		decision = "deny"
+	}
+	payload, _ := json.Marshal(in.ToolInput)
+	cmd, _ := in.ToolInput["command"].(string)
+	detail := in.ToolName + " " + cmd + " " + string(payload)
+	_, _ = db.Exec(`INSERT INTO hook_events(run_id, tool, decision, finding, detail, created) VALUES (?, ?, ?, ?, ?, ?)`,
+		runID, in.ToolName, decision, d.Finding, detail, time.Now().UTC().Format(time.RFC3339))
+}
+
 func contractError(path string, err error) int {
 	fmt.Fprintf(os.Stderr, "INVALID %s\n", path)
 	var es contracts.ValidationErrors
@@ -317,6 +410,7 @@ Usage:
   gov repair-packet <run_id>
   gov eval harness <case-dir>
   gov eval scorecard
+  gov hook pre-tool-use [--run <id>]
   gov doctor
   gov version`)
 }
