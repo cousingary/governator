@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/cousingary/governator/internal/contracts"
+	"github.com/cousingary/governator/internal/observability"
 )
 
 func git(t *testing.T, dir string, args ...string) {
@@ -35,8 +36,9 @@ func fixture(t *testing.T) (string, string) {
 	s := `#!/bin/sh
 mkdir -p output
 printf 'ok\n' > output/result.txt
-printf '{"status":"ok","summary":"fake","files":["output/result.txt"],"commands":[]}\n' > RESULT.json
-printf '{"type":"result","secret":"sk-abcdefghijklmnopqrstuvwxyz"}\n'
+printf '{"status":"complete","files_changed":["output/result.txt"],"commands_run":0,"validation":{"self_checked":true},"violations":[],"blockers":[],"next_recommended_action":"none"}\n' > RESULT.json
+printf '{"type":"result","secret":"sk-abcdefghijklmnopqrstuvwxyz","total_cost_usd":0.25}\n'
+if [ "$FAKE_ALLOWED_COMMAND" = 1 ]; then printf '{"type":"tool_use","name":"Bash","input":{"command":"test"}}\n'; fi
 if [ "$FAKE_COMMAND" = 1 ]; then printf '{"type":"tool_use","name":"Bash","input":{"command":"rm -rf /tmp/x"}}\n'; fi
 if [ "$FAKE_TRIPWIRE" = 1 ]; then printf '{"type":"assistant","text":"I should inspect the broader project."}\n'; fi
 if [ "$FAKE_CANARY" = 1 ]; then chmod 600 .governator-canary; printf 'mutated\n' > .governator-canary; fi
@@ -68,12 +70,47 @@ func TestApprovedReplayRedactionAndRollback(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("GOV_HOME", home)
 	t.Setenv("GOV_CLAUDE_BIN", bin)
+	t.Setenv("FAKE_ALLOWED_COMMAND", "1")
 	r, err := New().Run(context.Background(), contract(root))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if r.Status != "APPROVED" {
 		t.Fatalf("%s: %s", r.Status, r.Message)
+	}
+	if !r.ValidOutput || r.CostUSD != 0.25 {
+		t.Fatalf("unexpected output metrics: valid=%v cost=%v", r.ValidOutput, r.CostUSD)
+	}
+	if r.SelfReview == nil || r.SelfReview.Status != "complete" {
+		t.Fatalf("structured self-review missing: %#v", r.SelfReview)
+	}
+	scores, err := observability.ScoreAgents(home, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(scores) != 1 || scores[0].Runs != 1 || scores[0].ValidOutputs != 1 || scores[0].CostPerValidUSD != 0.25 {
+		t.Fatalf("unexpected score: %#v", scores)
+	}
+	cost, err := observability.CostPerValidOutput(home)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cost.Runs != 1 || cost.ValidOutputs != 1 || cost.CostPerValidUSD != 0.25 {
+		t.Fatalf("unexpected cost summary: %#v", cost)
+	}
+	db, err := observability.Open(home)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	for table, want := range map[string]int{"jobs": 1, "agents": 1, "files_touched": 2, "commands_run": 1} {
+		var got int
+		if err := db.QueryRow("SELECT COUNT(*) FROM " + table).Scan(&got); err != nil {
+			t.Fatal(err)
+		}
+		if got != want {
+			t.Fatalf("%s count: got %d want %d", table, got, want)
+		}
 	}
 	if _, err := os.Stat(filepath.Join(root, "output", "result.txt")); err != nil {
 		t.Fatal(err)
@@ -178,7 +215,8 @@ func TestNonGitRecallRollback(t *testing.T) {
 
 func TestForbiddenCommandTranscriptIsQuarantined(t *testing.T) {
 	root, bin := fixture(t)
-	t.Setenv("GOV_HOME", t.TempDir())
+	home := t.TempDir()
+	t.Setenv("GOV_HOME", home)
 	t.Setenv("GOV_CLAUDE_BIN", bin)
 	t.Setenv("FAKE_COMMAND", "1")
 	r, err := New().Run(context.Background(), contract(root))
@@ -187,6 +225,16 @@ func TestForbiddenCommandTranscriptIsQuarantined(t *testing.T) {
 	}
 	if r.Status != "QUARANTINED" || !strings.Contains(r.Message, "forbidden command") {
 		t.Fatalf("%s: %s", r.Status, r.Message)
+	}
+	if r.FailureTaxonomy != "DESTRUCTIVE_COMMAND" {
+		t.Fatalf("unexpected taxonomy: %s", r.FailureTaxonomy)
+	}
+	failures, err := observability.Failures(home, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(failures) != 1 || failures[0].Taxonomy != "DESTRUCTIVE_COMMAND" {
+		t.Fatalf("unexpected failures: %#v", failures)
 	}
 }
 

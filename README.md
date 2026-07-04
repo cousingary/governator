@@ -2,7 +2,7 @@
 
 Governator is a contract-first runtime for replaceable coding-agent backends. The model proposes; deterministic validators and the merge gate decide; the SQLite ledger remembers.
 
-## Implemented through Phase 2
+## Implemented through Phase 3
 
 Phase 1 provides the complete user-triggered `gov run` spine:
 
@@ -26,6 +26,15 @@ Phase 2 hardens policy before and during execution:
 - controller canaries and scope-expansion transcript tripwires;
 - quarantine without merge when any Phase 2 contract is violated.
 
+Phase 3 adds ledger intelligence without invoking any model:
+
+- normalized job, agent, profile, file, command, validator, violation, and repair-packet tables;
+- per-run cost, valid-output, structured RESULT.json self-review, and failure taxonomy facts;
+- legacy-ledger schema migration and idempotent replay of the new run fields;
+- agent scoring by job type, classified failure reporting, and cost-per-valid-output reporting.
+
+The Phase 3 implementation is complete. Its operational acceptance gate remains open until at least 10 explicitly user-triggered real runs provide a representative scoring sample.
+
 The existing Python governed harness remains untouched and is still the control plane for Codex sessions. Governator does not replace it.
 
 ## Canonical commands
@@ -42,6 +51,9 @@ go build -trimpath -o /mnt/e/downloads/governator/bin/gov ./cmd/gov
 /mnt/e/downloads/governator/bin/gov diff last
 /mnt/e/downloads/governator/bin/gov quarantine list
 /mnt/e/downloads/governator/bin/gov rollback RUN_ID
+/mnt/e/downloads/governator/bin/gov score agents --job-type JOB_TYPE
+/mnt/e/downloads/governator/bin/gov failures
+/mnt/e/downloads/governator/bin/gov cost --per-valid-output
 ```
 
 The Claude adapter uses the installed subscription-authenticated `claude` CLI and never embeds an API key. `GOV_CLAUDE_BIN` exists for deterministic adapter tests. State defaults to `$HOME/.governator`; `GOV_HOME` may redirect it for tests.

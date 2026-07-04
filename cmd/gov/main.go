@@ -9,11 +9,12 @@ import (
 
 	"github.com/cousingary/governator/internal/contracts"
 	"github.com/cousingary/governator/internal/doctor"
+	"github.com/cousingary/governator/internal/observability"
 	"github.com/cousingary/governator/internal/policy"
 	govruntime "github.com/cousingary/governator/internal/runtime"
 )
 
-const version = "0.3.0-phase2"
+const version = "0.4.0-phase3"
 
 func main() { os.Exit(run(os.Args[1:])) }
 
@@ -109,6 +110,53 @@ func run(args []string) int {
 		return 0
 	case "quarantine":
 		return quarantine(args[1:])
+	case "score":
+		if len(args) != 4 || args[1] != "agents" || args[2] != "--job-type" {
+			return bad("usage: gov score agents --job-type <type>")
+		}
+		scores, err := observability.ScoreAgents(govruntime.Home(), args[3])
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "score:", err)
+			return 1
+		}
+		if len(scores) == 0 {
+			fmt.Printf("no scored runs for job_type=%s\n", args[3])
+			return 0
+		}
+		fmt.Println("agent\tjob_type\truns\tvalid\tfailures\tvalid_rate\tcost_per_valid_output")
+		for _, score := range scores {
+			fmt.Println(score.String())
+		}
+		return 0
+	case "failures":
+		if len(args) != 1 {
+			return bad("usage: gov failures")
+		}
+		failures, err := observability.Failures(govruntime.Home(), 50)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "failures:", err)
+			return 1
+		}
+		if len(failures) == 0 {
+			fmt.Println("no classified failures")
+			return 0
+		}
+		fmt.Println("run_id\tagent\tjob_type\ttaxonomy\tmessage")
+		for _, failure := range failures {
+			fmt.Println(failure.String())
+		}
+		return 0
+	case "cost":
+		if len(args) != 2 || args[1] != "--per-valid-output" {
+			return bad("usage: gov cost --per-valid-output")
+		}
+		summary, err := observability.CostPerValidOutput(govruntime.Home())
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "cost:", err)
+			return 1
+		}
+		fmt.Println(summary.String())
+		return 0
 	case "doctor":
 		if len(args) != 1 {
 			return bad("usage: gov doctor")
@@ -194,6 +242,9 @@ Usage:
   gov diff [last|run_id]
   gov rollback <run_id>
   gov quarantine list|show <id>|diff <id>
+  gov score agents --job-type <type>
+  gov failures
+  gov cost --per-valid-output
   gov doctor
   gov version`)
 }

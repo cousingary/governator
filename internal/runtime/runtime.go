@@ -21,26 +21,32 @@ import (
 	"syscall"
 	"time"
 
-	_ "modernc.org/sqlite"
-
 	"github.com/cousingary/governator/internal/agents"
 	"github.com/cousingary/governator/internal/contracts"
+	"github.com/cousingary/governator/internal/observability"
 	"github.com/cousingary/governator/internal/policy"
 )
 
 type RunRecord struct {
-	ID         string `json:"id"`
-	JobID      string `json:"job_id"`
-	Status     string `json:"status"`
-	Root       string `json:"root"`
-	Worktree   string `json:"worktree,omitempty"`
-	Branch     string `json:"branch,omitempty"`
-	Diff       string `json:"diff,omitempty"`
-	Transcript string `json:"transcript,omitempty"`
-	Message    string `json:"message"`
-	Commit     string `json:"commit,omitempty"`
-	Created    string `json:"created"`
-	Replayed   bool   `json:"replayed"`
+	ID              string                    `json:"id"`
+	JobID           string                    `json:"job_id"`
+	JobType         string                    `json:"job_type,omitempty"`
+	Agent           string                    `json:"agent,omitempty"`
+	Mode            string                    `json:"mode,omitempty"`
+	Status          string                    `json:"status"`
+	Root            string                    `json:"root"`
+	Worktree        string                    `json:"worktree,omitempty"`
+	Branch          string                    `json:"branch,omitempty"`
+	Diff            string                    `json:"diff,omitempty"`
+	Transcript      string                    `json:"transcript,omitempty"`
+	Message         string                    `json:"message"`
+	Commit          string                    `json:"commit,omitempty"`
+	Created         string                    `json:"created"`
+	Replayed        bool                      `json:"replayed"`
+	CostUSD         float64                   `json:"cost_usd"`
+	ValidOutput     bool                      `json:"valid_output"`
+	FailureTaxonomy string                    `json:"failure_taxonomy,omitempty"`
+	SelfReview      *contracts.ResultDocument `json:"self_review,omitempty"`
 }
 
 type Runner struct{ Home string }
@@ -56,30 +62,12 @@ func Home() string {
 func New() *Runner { return &Runner{Home: Home()} }
 
 func dbOpen(home string) (*sql.DB, error) {
-	if err := os.MkdirAll(home, 0700); err != nil {
-		return nil, err
-	}
-	db, err := sql.Open("sqlite", filepath.Join(home, "ledger.db"))
-	if err != nil {
-		return nil, err
-	}
-	_, err = db.Exec(`CREATE TABLE IF NOT EXISTS runs(
-id TEXT PRIMARY KEY, job_id TEXT, status TEXT, root TEXT, worktree TEXT, branch TEXT,
-contract_hash TEXT, base_head TEXT, approved_head TEXT, diff TEXT, transcript TEXT,
-message TEXT, commit_hash TEXT, created TEXT);
-CREATE INDEX IF NOT EXISTS runs_key ON runs(contract_hash, approved_head, status);
-CREATE TABLE IF NOT EXISTS validators(run_id TEXT, command TEXT, exit_code INTEGER, output TEXT);
-CREATE TABLE IF NOT EXISTS violations(run_id TEXT, kind TEXT, detail TEXT);`)
-	if err != nil {
-		db.Close()
-		return nil, err
-	}
-	return db, nil
+	return observability.Open(home)
 }
 
 func insertRun(db *sql.DB, r RunRecord, ch, head string) error {
-	_, err := db.Exec(`INSERT INTO runs(id,job_id,status,root,worktree,branch,contract_hash,base_head,diff,transcript,message,created)
-VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`, r.ID, r.JobID, r.Status, r.Root, r.Worktree, r.Branch, ch, head, r.Diff, r.Transcript, r.Message, r.Created)
+	_, err := db.Exec(`INSERT INTO runs(id,job_id,job_type,agent,mode,status,root,worktree,branch,contract_hash,base_head,diff,transcript,message,created)
+VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, r.ID, r.JobID, r.JobType, r.Agent, r.Mode, r.Status, r.Root, r.Worktree, r.Branch, ch, head, r.Diff, r.Transcript, r.Message, r.Created)
 	return err
 }
 
@@ -95,15 +83,14 @@ func Last(id string) (RunRecord, error) {
 		return RunRecord{}, err
 	}
 	defer db.Close()
-	q := `SELECT id,job_id,status,root,worktree,branch,diff,transcript,message,commit_hash,created FROM runs`
+	q := `SELECT id,job_id,COALESCE(job_type,''),COALESCE(agent,''),COALESCE(mode,''),status,root,worktree,branch,diff,transcript,message,commit_hash,created,cost_usd,valid_output,failure_taxonomy,result_json FROM runs`
 	var row *sql.Row
 	if id == "" || id == "last" {
 		row = db.QueryRow(q + ` ORDER BY created DESC LIMIT 1`)
 	} else {
 		row = db.QueryRow(q+` WHERE id=?`, id)
 	}
-	var r RunRecord
-	err = row.Scan(&r.ID, &r.JobID, &r.Status, &r.Root, &r.Worktree, &r.Branch, &r.Diff, &r.Transcript, &r.Message, &r.Commit, &r.Created)
+	r, err := scanRun(row)
 	return r, err
 }
 
@@ -113,20 +100,37 @@ func Quarantines() ([]RunRecord, error) {
 		return nil, err
 	}
 	defer db.Close()
-	rows, err := db.Query(`SELECT id,job_id,status,root,worktree,branch,diff,transcript,message,commit_hash,created FROM runs WHERE status='QUARANTINED' ORDER BY created DESC`)
+	rows, err := db.Query(`SELECT id,job_id,COALESCE(job_type,''),COALESCE(agent,''),COALESCE(mode,''),status,root,worktree,branch,diff,transcript,message,commit_hash,created,cost_usd,valid_output,failure_taxonomy,result_json FROM runs WHERE status='QUARANTINED' ORDER BY created DESC`)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 	var out []RunRecord
 	for rows.Next() {
-		var r RunRecord
-		if err := rows.Scan(&r.ID, &r.JobID, &r.Status, &r.Root, &r.Worktree, &r.Branch, &r.Diff, &r.Transcript, &r.Message, &r.Commit, &r.Created); err != nil {
+		r, err := scanRun(rows)
+		if err != nil {
 			return nil, err
 		}
 		out = append(out, r)
 	}
 	return out, rows.Err()
+}
+
+type rowScanner interface {
+	Scan(...any) error
+}
+
+func scanRun(row rowScanner) (RunRecord, error) {
+	var r RunRecord
+	var resultJSON string
+	err := row.Scan(&r.ID, &r.JobID, &r.JobType, &r.Agent, &r.Mode, &r.Status, &r.Root, &r.Worktree, &r.Branch, &r.Diff, &r.Transcript, &r.Message, &r.Commit, &r.Created, &r.CostUSD, &r.ValidOutput, &r.FailureTaxonomy, &resultJSON)
+	if err == nil && resultJSON != "" {
+		var review contracts.ResultDocument
+		if json.Unmarshal([]byte(resultJSON), &review) == nil {
+			r.SelfReview = &review
+		}
+	}
+	return r, err
 }
 
 func lock(root, home string) (func(), error) {
@@ -411,12 +415,18 @@ func commandMatches(pattern, command string) bool {
 	return ok
 }
 
-func auditTranscript(path string, c contracts.Contract) []string {
+type transcriptAudit struct {
+	Violations []string
+	Commands   []string
+	CostUSD    float64
+}
+
+func auditTranscript(path string, c contracts.Contract) transcriptAudit {
 	data, err := os.ReadFile(path)
 	if err != nil {
-		return []string{"transcript audit: " + err.Error()}
+		return transcriptAudit{Violations: []string{"transcript audit: " + err.Error()}}
 	}
-	var commands []string
+	audit := transcriptAudit{}
 	var walk func(any)
 	walk = func(v any) {
 		switch x := v.(type) {
@@ -430,7 +440,12 @@ func auditTranscript(path string, c contracts.Contract) []string {
 				input, _ := x["input"].(map[string]any)
 				command, _ := input["command"].(string)
 				if name == "Bash" && command != "" {
-					commands = append(commands, command)
+					audit.Commands = append(audit.Commands, command)
+				}
+			}
+			for _, key := range []string{"total_cost_usd", "cost_usd"} {
+				if cost, ok := x[key].(float64); ok && cost > audit.CostUSD {
+					audit.CostUSD = cost
 				}
 			}
 			for _, item := range x {
@@ -444,13 +459,12 @@ func auditTranscript(path string, c contracts.Contract) []string {
 			walk(v)
 		}
 	}
-	var violations []string
-	if len(commands) > c.Budget.MaxCommands {
-		violations = append(violations, "max_commands exceeded")
+	if len(audit.Commands) > c.Budget.MaxCommands {
+		audit.Violations = append(audit.Violations, "max_commands exceeded")
 	}
-	for _, command := range commands {
+	for _, command := range audit.Commands {
 		if class := policy.ClassifyShellCommand(command, false); class != nil {
-			violations = append(violations, fmt.Sprintf("destructive command classified as %s %s: %s", class.Verb, class.Resource, command))
+			audit.Violations = append(audit.Violations, fmt.Sprintf("destructive command classified as %s %s: %s", class.Verb, class.Resource, command))
 		}
 		allowed := false
 		for _, pattern := range c.Allowed.Execute {
@@ -460,11 +474,11 @@ func auditTranscript(path string, c contracts.Contract) []string {
 			}
 		}
 		if !allowed {
-			violations = append(violations, "command outside allowlist: "+command)
+			audit.Violations = append(audit.Violations, "command outside allowlist: "+command)
 		}
 		for _, forbidden := range c.Forbidden.Commands {
 			if strings.Contains(command, forbidden) {
-				violations = append(violations, "forbidden command: "+command)
+				audit.Violations = append(audit.Violations, "forbidden command: "+command)
 				break
 			}
 		}
@@ -472,10 +486,50 @@ func auditTranscript(path string, c contracts.Contract) []string {
 	lower := strings.ToLower(string(data))
 	for _, phrase := range []string{"while i'm here", "while i’m here", "i'll also refactor", "i’ll also refactor", "inspect the broader project"} {
 		if strings.Contains(lower, phrase) {
-			violations = append(violations, "scope-expansion tripwire: "+phrase)
+			audit.Violations = append(audit.Violations, "scope-expansion tripwire: "+phrase)
 		}
 	}
-	return violations
+	return audit
+}
+
+func readSelfReview(work string) (*contracts.ResultDocument, string) {
+	data, err := os.ReadFile(filepath.Join(work, "RESULT.json"))
+	if err != nil {
+		return nil, ""
+	}
+	var review contracts.ResultDocument
+	if json.Unmarshal(data, &review) != nil {
+		return nil, ""
+	}
+	normalized, err := json.Marshal(review)
+	if err != nil {
+		return nil, ""
+	}
+	return &review, string(normalized)
+}
+
+func classifyFailure(violations []string) string {
+	lower := strings.ToLower(strings.Join(violations, "\n"))
+	switch {
+	case strings.Contains(lower, "scope-expansion tripwire"):
+		return "UNAUTHORIZED_REFACTOR"
+	case strings.Contains(lower, "out-of-worktree mutation"), strings.Contains(lower, "write outside"):
+		return "SCOPE_DRIFT"
+	case strings.Contains(lower, "canary mutation"), strings.Contains(lower, "protected path"), strings.Contains(lower, "forbidden path"):
+		return "OVERWRITE_RISK"
+	case strings.Contains(lower, "max_commands"):
+		return "REPEATED_COMMAND_LOOP"
+	case strings.Contains(lower, "validator failed"), strings.Contains(lower, "required file missing"):
+		return "VALIDATION_FAILED"
+	case strings.Contains(lower, "destructive command"), strings.Contains(lower, "forbidden command"):
+		return "DESTRUCTIVE_COMMAND"
+	case strings.Contains(lower, "max_"):
+		return "BUDGET_EXCEEDED"
+	case strings.Contains(lower, "agent"):
+		return "AGENT_FAILURE"
+	default:
+		return "POLICY_VIOLATION"
+	}
 }
 
 type diffMetrics struct {
@@ -609,8 +663,11 @@ func (r *Runner) Run(ctx context.Context, c contracts.Contract) (RunRecord, erro
 		return RunRecord{}, fmt.Errorf("create canary: %w", err)
 	}
 	transcript := filepath.Join(r.Home, "transcripts", id+".jsonl")
-	rec := RunRecord{ID: id, JobID: c.JobID, Status: "RUNNING", Root: root, Worktree: work, Branch: branch, Transcript: transcript, Created: time.Now().UTC().Format(time.RFC3339Nano)}
+	rec := RunRecord{ID: id, JobID: c.JobID, JobType: c.JobType, Agent: c.Agent, Mode: string(c.Mode), Status: "RUNNING", Root: root, Worktree: work, Branch: branch, Transcript: transcript, Created: time.Now().UTC().Format(time.RFC3339Nano)}
 	if err = insertRun(db, rec, hash, head); err != nil {
+		return rec, err
+	}
+	if err = observability.RecordIdentity(db, c.JobID, c.JobType, c.Agent, rec.Created); err != nil {
 		return rec, err
 	}
 	liveBefore, err := fingerprint(root)
@@ -636,11 +693,14 @@ func (r *Runner) Run(ctx context.Context, c contracts.Contract) (RunRecord, erro
 	}
 	ar, aerr := agent.Run(ctx, agents.Request{Prompt: prompt, Workdir: work, Transcript: transcript, Timeout: time.Duration(c.Budget.MaxMinutes) * time.Minute})
 	_ = redact(transcript)
-	transcriptViolations := auditTranscript(transcript, c)
+	audit := auditTranscript(transcript, c)
+	rec.CostUSD = audit.CostUSD
 	workAfter, werr := fingerprint(work)
 	liveAfter, lerr := fingerprint(root)
 	protectedAfter, perr := protectedFingerprint()
-	violations := append([]string{}, transcriptViolations...)
+	violations := append([]string{}, audit.Violations...)
+	var selfReviewJSON string
+	rec.SelfReview, selfReviewJSON = readSelfReview(work)
 	if before, ok := workBefore[canaryName]; !ok || workAfter[canaryName] != before {
 		violations = append(violations, "canary mutation: "+canaryName)
 	}
@@ -765,15 +825,33 @@ func (r *Runner) Run(ctx context.Context, c contracts.Contract) (RunRecord, erro
 			}
 		}
 	}
+	files := make([]observability.FileFact, 0, len(changed)+len(deleted))
+	for _, path := range changed {
+		changeType := "new"
+		if _, existed := workBefore[path]; existed {
+			changeType = "modified"
+		}
+		files = append(files, observability.FileFact{Path: path, ChangeType: changeType})
+	}
+	for _, path := range deleted {
+		files = append(files, observability.FileFact{Path: path, ChangeType: "deleted"})
+	}
+	commands := make([]observability.CommandFact, 0, len(audit.Commands))
+	for _, command := range audit.Commands {
+		classification := "execute shell"
+		if class := policy.ClassifyShellCommand(command, false); class != nil {
+			classification = class.Verb + " " + class.Resource
+		}
+		commands = append(commands, observability.CommandFact{Command: command, Classification: classification})
+	}
 	if len(violations) == 0 {
 		rec.Status = "APPROVED"
 		rec.Message = "merge gate passed"
+		rec.ValidOutput = true
 	} else {
 		rec.Status = "QUARANTINED"
 		rec.Message = strings.Join(violations, "; ")
-		for _, v := range violations {
-			_, _ = db.Exec(`INSERT INTO violations(run_id,kind,detail) VALUES(?,?,?)`, id, "merge_gate", v)
-		}
+		rec.FailureTaxonomy = classifyFailure(violations)
 		if git {
 			_, _, _ = shell(ctx, work, "git add -A")
 			_, _, _ = shell(ctx, work, "git commit --allow-empty -m "+shQuote("Quarantined Governator run "+id))
@@ -784,6 +862,21 @@ func (r *Runner) Run(ctx context.Context, c contracts.Contract) (RunRecord, erro
 		approved, _ = gitHead(root)
 	}
 	if err := updateRun(db, rec, approved); err != nil {
+		return rec, err
+	}
+	if err := observability.RecordCompletion(db, observability.Completion{
+		RunID:           rec.ID,
+		Agent:           rec.Agent,
+		JobType:         rec.JobType,
+		Status:          rec.Status,
+		CostUSD:         rec.CostUSD,
+		ValidOutput:     rec.ValidOutput,
+		FailureTaxonomy: rec.FailureTaxonomy,
+		SelfReviewJSON:  selfReviewJSON,
+		Files:           files,
+		Commands:        commands,
+		Violations:      violations,
+	}); err != nil {
 		return rec, err
 	}
 	if git {
