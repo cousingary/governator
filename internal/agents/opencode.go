@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+
+	"github.com/cousingary/governator/internal/config"
 )
 
 // OpenCode has no read-only CLI flag. For read-only contracts this adapter
@@ -73,10 +75,7 @@ func withScopedConfig(workdir string, enabled bool) (func(), error) {
 }
 
 func (OpenCode) Run(parent context.Context, req Request) (Result, error) {
-	bin := os.Getenv("GOV_OPENCODE_BIN")
-	if bin == "" {
-		bin = "opencode"
-	}
+	bin := config.BackendBin("opencode")
 	flags, err := OpenCode{}.project(req.Spec)
 	if err != nil {
 		return Result{}, err

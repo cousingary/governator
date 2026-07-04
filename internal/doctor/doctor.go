@@ -12,6 +12,7 @@ import (
 	"strings"
 
 	"github.com/cousingary/governator/internal/agents"
+	"github.com/cousingary/governator/internal/config"
 	"github.com/cousingary/governator/internal/protectedpaths"
 )
 
@@ -32,6 +33,7 @@ type Check struct {
 
 func Run() []Check {
 	checks := []Check{
+		checkConfig(),
 		checkGit(),
 		checkPython(),
 		checkProtectedManifest(),
@@ -213,9 +215,18 @@ func checkDrvfs() Check {
 // drift"). The env override lets tests point at a fake binary. Non-required:
 // missing backend = WARN (the box need not run all three), but a present backend
 // MISSING a depended-on flag = FAIL (the adapter would mis-govern silently).
+func backendHelpArgs(helpArgs []string) []string {
+	args := append([]string(nil), helpArgs...)
+	return append(args, "--help")
+}
+
 func checkBackendFlags(name, defaultBin string, helpArgs, requiredFlags []string) Check {
 	check := Check{Name: "backend:" + name, Required: false}
-	bin := strings.TrimSpace(os.Getenv("GOV_" + strings.ToUpper(name) + "_BIN"))
+	configName := name
+	if name == "claude" {
+		configName = "claude-code"
+	}
+	bin := config.BackendBin(configName)
 	if bin == "" {
 		bin = defaultBin
 	}
@@ -224,8 +235,7 @@ func checkBackendFlags(name, defaultBin string, helpArgs, requiredFlags []string
 		check.Status, check.Detail = StatusWarn, name+" not found in PATH (adapter unavailable)"
 		return check
 	}
-	args := append([]string{}, helpArgs...)
-	args = append(args, "--help")
+	args := backendHelpArgs(helpArgs)
 	output, _ := exec.Command(path, args...).CombinedOutput()
 	body := string(output)
 	var missing []string
@@ -245,14 +255,22 @@ func checkBackendFlags(name, defaultBin string, helpArgs, requiredFlags []string
 }
 
 func governorHome() (string, error) {
-	if explicit := strings.TrimSpace(os.Getenv("GOVERNATOR_HOME")); explicit != "" {
-		return filepath.Clean(explicit), nil
-	}
-	home, err := os.UserHomeDir()
+	cfg, err := config.Load()
 	if err != nil {
-		return "", fmt.Errorf("resolve home directory: %w", err)
+		return "", err
 	}
-	return filepath.Join(home, ".governator"), nil
+	return cfg.LedgerDir, nil
+}
+
+func checkConfig() Check {
+	check := Check{Name: "configuration", Required: true}
+	_, err := config.Load()
+	if err != nil {
+		check.Status, check.Detail = StatusFail, err.Error()
+		return check
+	}
+	check.Status, check.Detail = StatusOK, config.Path()
+	return check
 }
 
 func parseVersion(value, prefix string) ([3]int, bool) {

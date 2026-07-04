@@ -8,6 +8,8 @@ import (
 	"path/filepath"
 	"syscall"
 	"time"
+
+	"github.com/cousingary/governator/internal/config"
 )
 
 type Request struct {
@@ -138,10 +140,7 @@ func (Claude) project(spec BackendSpec) []string {
 }
 
 func (Claude) Run(parent context.Context, req Request) (Result, error) {
-	bin := os.Getenv("GOV_CLAUDE_BIN")
-	if bin == "" {
-		bin = "claude"
-	}
+	bin := config.BackendBin("claude-code")
 	return runCLI(parent, runCLIRequest{
 		bin: bin, workdir: req.Workdir, transcript: req.Transcript,
 		timeout: req.Timeout, prompt: req.Prompt, extraFlags: Claude{}.project(req.Spec),

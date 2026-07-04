@@ -11,6 +11,8 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/cousingary/governator/internal/config"
 )
 
 var excluded = map[string]bool{
@@ -40,34 +42,19 @@ type Change struct {
 	Path string
 }
 
-func StoreDir() string {
-	if dir := strings.TrimSpace(os.Getenv("GOV_SNAPSHOT_DIR")); dir != "" {
-		return filepath.Clean(dir)
-	}
-	if dir := strings.TrimSpace(os.Getenv("HARNESS_SNAPSHOT_DIR")); dir != "" {
-		return filepath.Clean(dir)
-	}
-	home, _ := os.UserHomeDir()
-	return filepath.Join(home, ".governator", "snapshots")
-}
+func StoreDir() string { return config.Current().SnapshotDir }
 
 func rootsFile() string {
-	if file := strings.TrimSpace(os.Getenv("GOV_SNAPSHOT_ROOTS_FILE")); file != "" {
+	if file := config.Env("GOV_SNAPSHOT_ROOTS_FILE"); file != "" {
 		return filepath.Clean(file)
 	}
-	home, _ := os.UserHomeDir()
-	return filepath.Join(home, ".governed-harness", "recall_roots.txt")
+	return filepath.Join(config.HomeDir(), ".governed-harness", "recall_roots.txt")
 }
 
 func Roots() ([]string, error) {
-	if value := strings.TrimSpace(os.Getenv("GOV_SNAPSHOT_ROOTS")); value != "" {
-		var roots []string
-		for _, item := range strings.Split(value, string(os.PathListSeparator)) {
-			if item = strings.TrimSpace(item); item != "" {
-				roots = append(roots, filepath.Clean(item))
-			}
-		}
-		return roots, nil
+	configured := config.Current().SnapshotRoots
+	if configured != nil {
+		return append([]string(nil), configured...), nil
 	}
 	data, err := os.ReadFile(rootsFile())
 	if os.IsNotExist(err) {
@@ -83,8 +70,7 @@ func Roots() ([]string, error) {
 			continue
 		}
 		if strings.HasPrefix(line, "~/") {
-			home, _ := os.UserHomeDir()
-			line = filepath.Join(home, line[2:])
+			line = filepath.Join(config.HomeDir(), line[2:])
 		}
 		if _, err := os.Stat(line); err == nil {
 			roots = append(roots, filepath.Clean(line))

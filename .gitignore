@@ -1,4 +1,6 @@
 /bin/
+/PROGRESS.md
 *.db
 *.db-shm
 *.db-wal
+.env*

@@ -4,19 +4,12 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/cousingary/governator/internal/config"
 )
 
-// Manifest returns the single protected-path manifest shared by every plane.
-func Manifest() string {
-	if p := strings.TrimSpace(os.Getenv("GOV_PROTECTED_PATHS")); p != "" {
-		return filepath.Clean(p)
-	}
-	if state := strings.TrimSpace(os.Getenv("CLAUDE_HARNESS_STATE")); state != "" {
-		return filepath.Join(state, "protected_paths.txt")
-	}
-	home, _ := os.UserHomeDir()
-	return filepath.Join(home, ".governed-harness", "state", "protected_paths.txt")
-}
+// Manifest returns the protected-path manifest selected by configuration.
+func Manifest() string { return config.Current().ProtectedManifest }
 
 func Expand(path string) string {
 	if path == "~" {

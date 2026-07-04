@@ -10,7 +10,7 @@ job_type: batch_image
 agent: claude
 mode: batch_worker
 workspace:
-  root: /mnt/e/downloads/emmaNader
+  root: /workspace/design-repository
   worktree: auto
 allowed:
   read: ["designs/**", "mockups/**"]
@@ -50,7 +50,7 @@ func TestRejectsMalformedContractsWithFieldErrors(t *testing.T) {
 	}{
 		{"missing job id", strings.Replace(validContract, "job_id: clipart-regen-2026-07-03\n", "", 1), "job_id"},
 		{"invalid mode", strings.Replace(validContract, "mode: batch_worker", "mode: improviser", 1), "mode"},
-		{"relative workspace", strings.Replace(validContract, "root: /mnt/e/downloads/emmaNader", "root: relative/project", 1), "workspace.root"},
+		{"relative workspace", strings.Replace(validContract, "root: /workspace/design-repository", "root: relative/project", 1), "workspace.root"},
 		{"write mode without worktree", strings.Replace(validContract, "worktree: auto", "worktree: none", 1), "workspace.worktree"},
 		{"path escape", strings.Replace(validContract, "output/clipart/**", "../outside/**", 1), "allowed.write[0]"},
 		{"zero budget", strings.Replace(validContract, "max_minutes: 20", "max_minutes: 0", 1), "budget.max_minutes"},
@@ -85,4 +85,22 @@ func TestRejectsMultipleDocuments(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "multiple YAML documents") {
 		t.Fatalf("expected multiple-document error, got %v", err)
 	}
+}
+
+func FuzzContractParser(f *testing.F) {
+	for _, seed := range [][]byte{
+		[]byte(validContract),
+		{},
+		[]byte("job_id: fuzz\n"),
+		[]byte("---\n{}\n---\n{}\n"),
+		[]byte("job_id: fuzz\nsurprise: true\n"),
+	} {
+		f.Add(seed)
+	}
+	f.Fuzz(func(t *testing.T, data []byte) {
+		if len(data) > 64*1024 {
+			t.Skip()
+		}
+		_, _ = Parse(data)
+	})
 }

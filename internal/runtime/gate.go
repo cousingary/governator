@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/cousingary/governator/internal/config"
 	"github.com/cousingary/governator/internal/policy"
 	"github.com/cousingary/governator/internal/protectedpaths"
 	"github.com/cousingary/governator/internal/snapshots"
@@ -127,7 +128,7 @@ func protectedReasonForPath(path string) string {
 	if err != nil {
 		return ""
 	}
-	unlock := strings.TrimSpace(os.Getenv("HARNESS_UNLOCK"))
+	unlock := strings.TrimSpace(config.Env("HARNESS_UNLOCK"))
 	for _, pattern := range loadProtectedPatterns() {
 		if matchProtected(absolute, pattern) {
 			if unlock != "" && (unlock == "all" || strings.Contains(absolute, unlock)) {
@@ -204,7 +205,7 @@ func bashProtectedReason(cmd, cwd string) string {
 	if len(patterns) == 0 {
 		return ""
 	}
-	unlock := strings.TrimSpace(os.Getenv("HARNESS_UNLOCK"))
+	unlock := strings.TrimSpace(config.Env("HARNESS_UNLOCK"))
 	cwdResolved := cwd
 	if cwdResolved == "" {
 		cwdResolved, _ = os.Getwd()
@@ -453,7 +454,7 @@ func PreflightSnapshotIfDelete(cmd string) {
 	if snapshotThrottled(snapshotStoreDir()) {
 		return
 	}
-	if script := strings.TrimSpace(os.Getenv("GOV_RECALL_SCRIPT")); script != "" {
+	if script := strings.TrimSpace(config.Env("GOV_RECALL_SCRIPT")); script != "" {
 		script = expandPath(script)
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()

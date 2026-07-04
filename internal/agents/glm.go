@@ -3,7 +3,7 @@ package agents
 import (
 	"context"
 	"fmt"
-	"os"
+	"github.com/cousingary/governator/internal/config"
 )
 
 // GLM adapter. The GLM coding CLI (glm-cli) follows the same headless pattern
@@ -44,10 +44,7 @@ func (GLM) project(spec BackendSpec) ([]string, error) {
 }
 
 func (GLM) Run(parent context.Context, req Request) (Result, error) {
-	bin := os.Getenv("GOV_GLM_BIN")
-	if bin == "" {
-		bin = "glm"
-	}
+	bin := config.BackendBin("glm")
 	flags, err := GLM{}.project(req.Spec)
 	if err != nil {
 		return Result{}, err

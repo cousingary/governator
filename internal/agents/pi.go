@@ -3,7 +3,7 @@ package agents
 import (
 	"context"
 	"fmt"
-	"os"
+	"github.com/cousingary/governator/internal/config"
 )
 
 // Pi can remove mutating tools entirely for read-only runs.
@@ -34,10 +34,7 @@ func (Pi) project(spec BackendSpec) ([]string, error) {
 }
 
 func (Pi) Run(parent context.Context, req Request) (Result, error) {
-	bin := os.Getenv("GOV_PI_BIN")
-	if bin == "" {
-		bin = "pi"
-	}
+	bin := config.BackendBin("pi")
 	flags, err := Pi{}.project(req.Spec)
 	if err != nil {
 		return Result{}, err

@@ -105,3 +105,22 @@ func TestHighRiskRequiresScoutOrApproval(t *testing.T) {
 		t.Fatalf("scouted HIGH risk rejected: %v", err)
 	}
 }
+
+func FuzzClassifyShellCommand(f *testing.F) {
+	for _, seed := range []string{
+		"go test ./...",
+		"echo ok && rm -rf dist",
+		"git push --force origin main",
+		"psql -c 'DROP TABLE users'",
+		"find . -exec rm {} +",
+	} {
+		f.Add(seed, false)
+		f.Add(seed, true)
+	}
+	f.Fuzz(func(t *testing.T, command string, highDangerOnly bool) {
+		if len(command) > 16*1024 {
+			t.Skip()
+		}
+		_ = ClassifyShellCommand(command, highDangerOnly)
+	})
+}

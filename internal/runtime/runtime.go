@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"github.com/cousingary/governator/internal/agents"
+	"github.com/cousingary/governator/internal/config"
 	"github.com/cousingary/governator/internal/contracts"
 	"github.com/cousingary/governator/internal/observability"
 	"github.com/cousingary/governator/internal/policy"
@@ -81,13 +82,7 @@ func envelopeJSON(spec agents.BackendSpec, capability agents.Capability) string 
 
 type Runner struct{ Home string }
 
-func Home() string {
-	if p := os.Getenv("GOV_HOME"); p != "" {
-		return p
-	}
-	h, _ := os.UserHomeDir()
-	return filepath.Join(h, ".governator")
-}
+func Home() string { return config.Current().LedgerDir }
 
 func New() *Runner { return &Runner{Home: Home()} }
 
@@ -710,7 +705,7 @@ func (r *Runner) Run(ctx context.Context, c contracts.Contract) (RunRecord, erro
 		return RunRecord{}, fmt.Errorf("create canary: %w", err)
 	}
 	transcript := filepath.Join(r.Home, "transcripts", id+".jsonl")
-	promptRoot := os.Getenv("GOV_PROMPTS")
+	promptRoot := config.Env("GOV_PROMPTS")
 	if promptRoot == "" {
 		promptRoot = "prompts"
 	}

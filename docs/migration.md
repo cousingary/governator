@@ -1,60 +1,58 @@
 # Migrating to Governator
 
-The existing gate remains authoritative during shadowing. Do not remove it until at least 200 real hook events over at least seven days produce zero mismatches in `gov parity report`.
+Keep the existing gate authoritative while Governator runs in shadow. Do not remove the legacy hook until at least 200 real events over at least seven days produce zero mismatches in `gov parity report`.
 
-## 1. Shadow phase
+## 1. Initialize
 
-Install the following Claude Code `PreToolUse` hook, replacing paths with absolute paths for your installation:
-
-```json
-{
-  "hooks": {
-    "PreToolUse": [{
-      "matcher": "*",
-      "hooks": [{
-        "type": "command",
-        "command": "/absolute/path/to/gov hook pre-tool-use --shadow /absolute/path/to/harness_gate.py"
-      }]
-    }]
-  }
-}
+```sh
+gov init
+gov doctor
 ```
 
-The Python hook's stdout is authoritative. Governator records the Go decision, Python decision, payload hash, payload, match status, and Python availability in `parity_events`.
+Move protected-path entries into `$HOME/.governator/protected-paths.txt`, configure snapshot roots in `$HOME/.governator/config.yaml`, and run `gov protect apply`. Keep normal backups throughout migration.
 
-Run `gov parity report` regularly. A Python error or two-second timeout is recorded as unavailable and the Go decision is emitted as the safety fallback.
+## 2. Shadow the interactive gate
 
-## 2. Cutover
+Install the Claude Code `PreToolUse` shadow command from `integrations/claude-code/settings-snippet.json`, replacing placeholders with absolute executable paths:
 
-After the criterion holds, switch to the direct hook:
-
-```json
-{
-  "hooks": {
-    "PreToolUse": [{
-      "matcher": "*",
-      "hooks": [{
-        "type": "command",
-        "command": "/absolute/path/to/gov hook pre-tool-use"
-      }]
-    }]
-  }
-}
+```text
+/absolute/path/to/gov hook pre-tool-use --shadow /absolute/path/to/legacy_gate.py
 ```
 
-Keep the Python files installed but disarmed. Replace snapshot automation with `gov snap create scheduled`. Configure snapshot roots in `$HOME/.governed-harness/recall_roots.txt` during transition, or with `GOV_SNAPSHOT_ROOTS`; set `GOV_SNAPSHOT_DIR` when the neutral `$HOME/.governator/snapshots` default is unsuitable.
+The legacy hook's stdout remains authoritative. Governator records its own decision, the legacy decision, payload hash, match state, and availability. Review `gov parity report` until the cutover threshold is met.
 
-Use `gov protect apply`, `gov protect status`, and `gov protect release <path>` for filesystem locks. All gate, runtime, doctor, and protection commands read the same protected-path manifest.
+For Pi, load `integrations/pi/gov-gate.ts` interactively. For OpenCode, install the scoped permission configuration first; its example plugin can deny permission-ask events but cannot veto actions already configured as allow. Codex has no interactive hook surface.
 
-## 3. Rollback
+## 3. Cut over
 
-Restore the shadow or Python-only command in the same settings file. No database migration or Python file restoration is required.
+Replace the shadow hook with:
+
+```text
+/absolute/path/to/gov hook pre-tool-use
+```
+
+Keep legacy files installed but disarmed for rollback. Replace legacy protection and snapshot automation with `gov protect ...` and `gov snap ...`. Begin new automated agent work through reviewed job contracts and `gov run`.
+
+## 4. Roll back
+
+Restore the legacy hook command and stop launching new Governator jobs. Existing SQLite evidence and snapshots need not be deleted. If required, restore files with `gov snap restore ID --dry-run` followed by an operator-approved restore.
 
 ## Deliberate divergences
 
-| Area | Governator behavior | Legacy behavior | Reason |
+| Area | Governator behavior | Legacy Python plane | Reason |
 |---|---|---|---|
-| Classified destructive commands | Interactive Go gate denies every classified delete, main push, and database drop | Python may permit a verb/resource explicitly granted by its authority manifest | Governator's interactive plane is intentionally stricter |
-| Snapshot default store | `$HOME/.governator/snapshots` | A machine-specific drive path | Publishable neutral default; override with `GOV_SNAPSHOT_DIR` |
-| Snapshot implementation | Native Go by default; `GOV_RECALL_SCRIPT` preserves transitional Python override | Python subprocess | Removes the runtime dependency while retaining rollback |
-| Protected lock verbs | `apply` and explicit `release <path>` | `lock` and `unlock` | Clear operator-facing terminology; file and directory modes remain compatible |
+| Classified destructive commands | Interactive gate denies every classified delete, main push, and database drop | Authority entries could permit some destructive verb/resource pairs | Interactive safety is intentionally stricter |
+| Execution isolation | Contract jobs run in disposable Git worktrees through a backend capability envelope | General actions ran directly through a Python wrapper | Separate proposal from approval and merge |
+| Universal write check | Pre/post repository fingerprints run for every backend | Protection depended primarily on hook classification and manifests | Detect writes missed by backend or lexical controls |
+| Snapshot default store | `$HOME/.governator/snapshots` | Machine-specific storage path | Publishable neutral default |
+| Snapshot implementation | Native Go; `GOV_RECALL_SCRIPT` remains a transition override | Python subprocess | Remove the runtime dependency while preserving rollback |
+| Protected-path location | `$HOME/.governator/protected-paths.txt` after `gov init` | Harness-specific state directory | One neutral, configurable location |
+| Protected lock verbs | `apply` and explicit `release PATH` | `lock` and `unlock` | Make the affected path explicit |
+| Configuration | One strict YAML loader with environment overrides | Settings were distributed across environment and harness files | One precedence model and publishable defaults |
+| Backend policy | Native guarantees and compensations are recorded per run | Claude-focused hook plane | Support five replaceable backends without overstating enforcement |
+| OpenCode read-only | Scoped permission config plus fingerprint detection | No equivalent backend | OpenCode has no native read-only flag |
+| Pi read-only | Mutating tools are removed from the tool surface | No equivalent backend | Use Pi's strongest native control |
+| Cost gaps | Store zero with `cost_unavailable` note | Missing data could appear as zero | Avoid claiming an unknown call was free |
+| Interactive integration | Claude dialect plus neutral `gov gate check` | Claude-specific hook payload | Reuse one decision core across harnesses |
+| Evidence | Run, hook, parity, eval, routing, and repair data share one SQLite schema | Multiple logs and ledgers | Make audit and routing evidence queryable |
+| Failure handling | Contract violations quarantine, halt, or rollback according to the contract | Wrapper circuit breaker governed arbitrary action retries | Governator governs bounded jobs, not every shell action on a workstation |

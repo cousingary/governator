@@ -1,113 +1,104 @@
 # Governator
 
-Governator is a contract-first runtime for replaceable coding-agent backends. The model proposes; deterministic validators and the merge gate decide; the SQLite ledger remembers.
+Governator is a contract-first runtime for replaceable coding-agent backends. It turns file scope, command authority, budgets, and success criteria into deterministic checks around an isolated agent run. Models can propose changes, but only validators and the merge gate can approve them.
 
-## Implemented through Phase 6
+> *The model proposes. The governor disposes. The validator decides. The ledger remembers.*
 
-Phase 1 provides the complete user-triggered `gov run` spine:
+## Quickstart
 
-- strict sovereign job contracts and mode-aware prompt compilation;
-- isolated Git worktrees, with copy-on-write non-Git workspaces;
-- a generic agent ABI and headless Claude Code adapter;
-- process-group timeouts and transcript capture with secret redaction;
-- command-policy transcript auditing and out-of-process validators;
-- pre/post fingerprints of the live root and protected-path manifest;
-- diff scope, forbidden-path, deletion, and file-count merge gates;
-- SQLite run, validator, and violation records;
-- squash merge commits with `Gov-Run` trailers;
-- quarantine inspection, idempotent approved replay, and Git/non-Git rollback.
-
-Phase 2 hardens policy before and during execution:
-
-- explicit intended-write declarations and preflight reports;
-- LOW/MED/HIGH/BLOCKED blast-radius estimates, with scout or approval required for HIGH;
-- the ported destructive-command classifier;
-- file, changed-line, new-file, and zero-deletion budgets;
-- controller canaries and scope-expansion transcript tripwires;
-- quarantine without merge when any Phase 2 contract is violated.
-
-Phase 3 adds ledger intelligence without invoking any model:
-
-- normalized job, agent, profile, file, command, validator, violation, and repair-packet tables;
-- per-run cost, valid-output, structured RESULT.json self-review, and failure taxonomy facts;
-- legacy-ledger schema migration and idempotent replay of the new run fields;
-- agent scoring by job type, classified failure reporting, and cost-per-valid-output reporting.
-
-The Phase 3 implementation is complete. Its operational acceptance gate remains open until at least 10 explicitly user-triggered real runs provide a representative scoring sample.
-
-Phase 4 adds deterministic routing, repair, evaluation, and prompt provenance:
-
-- negative-capability routing from observed failure rates;
-- compact repair packets derived from structured ledger facts rather than transcripts;
-- a one-command `harness_eval` suite with agent-by-mode scorecards stored in SQLite;
-- versioned prompt resolution tied to run outcomes, plus a checksum mutation test.
-
-Phase 5 adds replaceable Claude Code, Codex, and GLM backends plus the F1–F7 `PreToolUse` gate.
-
-Phase 6 completes the native harness-replacement surface:
-
-- shared protected-path resolution and verified `gov protect` filesystem locks;
-- compatible hardlink snapshots with create, list, diff, dry-run, and restore commands;
-- native pre-delete snapshots with a transitional Python override;
-- Python-authoritative shadow parity events and `gov parity report`;
-- an operator migration and rollback runbook in `docs/migration.md`.
-
-The existing Python governed harness remains untouched and authoritative until the documented shadow-parity criterion is met; cutover is an operator action.
-
-## Canonical commands
-
-```bash
-PATH=/home/lam/.local/go1.26.4/bin:$PATH
-cd /mnt/e/downloads/governator
-go test -v ./...
-go build -trimpath -o /mnt/e/downloads/governator/bin/gov ./cmd/gov
-/mnt/e/downloads/governator/bin/gov validate /mnt/e/downloads/governator/examples/jobs/clipart_regen.yaml
-/mnt/e/downloads/governator/bin/gov preflight /mnt/e/downloads/governator/examples/jobs/code_surgical_fix.yaml
-/mnt/e/downloads/governator/bin/gov doctor
-/mnt/e/downloads/governator/bin/gov run /absolute/path/to/job.yaml
-/mnt/e/downloads/governator/bin/gov diff last
-/mnt/e/downloads/governator/bin/gov quarantine list
-/mnt/e/downloads/governator/bin/gov rollback RUN_ID
-/mnt/e/downloads/governator/bin/gov score agents --job-type JOB_TYPE
-/mnt/e/downloads/governator/bin/gov failures
-/mnt/e/downloads/governator/bin/gov cost --per-valid-output
-/mnt/e/downloads/governator/bin/gov route --job-type JOB_TYPE
-/mnt/e/downloads/governator/bin/gov repair-packet RUN_ID
-/mnt/e/downloads/governator/bin/gov eval harness /mnt/e/downloads/governator/harness_eval
-/mnt/e/downloads/governator/bin/gov eval scorecard
-/mnt/e/downloads/governator/bin/gov protect status
-/mnt/e/downloads/governator/bin/gov snap create manual
-/mnt/e/downloads/governator/bin/gov hook pre-tool-use --shadow /absolute/path/to/harness_gate.py
-/mnt/e/downloads/governator/bin/gov parity report
-```
-
-The Claude adapter uses the installed subscription-authenticated `claude` CLI and never embeds an API key. `GOV_CLAUDE_BIN` exists for deterministic adapter tests. State defaults to `$HOME/.governator`; `GOV_HOME` may redirect it for tests. Prompt lookup defaults to the repository-relative `prompts/` registry; set `GOV_PROMPTS` to its absolute path when invoking `gov` from another directory.
-
-Protected paths default to `$HOME/.governed-harness/state/protected_paths.txt`. Set `GOV_PROTECTED_PATHS` only for an alternate test manifest.
-
-Running a real job can invoke a paid model and must be explicitly user-triggered. The test suite uses a fake Claude executable and performs no model calls.
-
-
-## Multi-harness capability model
-
-Governator supports Claude Code, Codex, GLM, OpenCode, and Pi through one
-backend specification. Run `gov doctor` to see live CLI probes and each adapter's
-native sandbox, read-only, approval, network, and transcript capabilities.
-
-Every run records an envelope showing guarantees enforced natively and those
-compensated by Governator. Pre/post fingerprints of the disposable worktree,
-live workspace, and protected paths are always applied: they are the universal
-floor, not a fallback that disappears when a backend advertises a sandbox.
-OpenCode read-only mode is a scoped permission configuration; Pi read-only mode
-natively removes bash/edit/write from its tool surface.
-
-Interactive clients can call the neutral gate:
+Requires Go 1.26 or newer and Git 2.30 or newer.
 
 ```sh
-printf '%s' '{"tool":"bash","command":"git status","cwd":"/workspace"}' | gov gate check
+go install github.com/cousingary/governator/cmd/gov@latest
+gov init
+gov validate "$HOME/.governator/jobs/example.yaml"
+gov doctor
 ```
 
-See `integrations/` for Claude Code, Pi, OpenCode, and Codex examples.
-Transcript cost fields are parsed per backend. When the format has no monetary
-cost, the run records `cost_unavailable` rather than reporting a silently
-incorrect zero.
+`gov init` is safe to run repeatedly: it creates a commented configuration, a valid example contract, and an empty protected-path manifest without overwriting existing files. Edit the generated contract's absolute workspace path and validator before a real `gov run`; running an agent may consume a paid subscription or API quota.
+
+For a source checkout:
+
+```sh
+go test ./...
+go build -trimpath -o bin/gov ./cmd/gov
+bin/gov validate examples/jobs/code_surgical_fix.yaml
+```
+
+## Architecture
+
+```text
+job.yaml -> strict parser -> preflight policy -> disposable Git worktree
+                                                  |
+                                           backend adapter
+                                      (Claude/Codex/GLM/
+                                         OpenCode/Pi)
+                                                  |
+          protected paths <- F1-F7 gate <- tool calls/transcript
+                                                  |
+             fingerprint diff -> budgets -> deterministic validators
+                                                  |
+                              approve + merge OR quarantine/rollback
+                                                  |
+                                         SQLite WAL ledger
+```
+
+Every backend implements one abstract execution specification. Native controls are used when available; missing guarantees are compensated by the runtime and recorded in each run's enforcement envelope.
+
+## Backend capabilities
+
+| Backend | Sandbox | Read-only | Approval policy | Network control | Transcript |
+|---|---:|---:|---:|---:|---|
+| Claude Code | native | native | native | compensated | `claude-stream-json` |
+| Codex | native | native | native | native | `codex-json` |
+| GLM | compensated | compensated | native | compensated | `glm-stream-json` |
+| OpenCode | compensated | config projection | native | compensated | `opencode-json` |
+| Pi | compensated | native tool reduction | compensated | compensated | `pi-json` |
+
+Run `gov doctor` to probe installed backend flags and print the live matrix. See [backend details](docs/backends.md) for exact projections and limitations.
+
+## Threat model
+
+Governator governs **cooperative coding agents**. A native sandbox is containment; a pre/post fingerprint scan is detection and remains the universal floor for every backend. Config and prompt restrictions are weaker than kernel enforcement, and transcript audit can only inspect events a backend emits.
+
+Governator does not stop a malicious human, a compromised process with equivalent shell access, or an agent that escapes the operating-system boundary. Protected files still need normal host permissions, backups, credential isolation, and least-privilege execution. Never treat an approved run as proof that arbitrary third-party code is safe.
+
+## Configuration
+
+Configuration defaults to `$HOME/.governator/config.yaml`; `GOV_CONFIG` selects another file. Environment values take precedence over the file, which takes precedence over neutral built-ins. Supported settings cover the protected manifest, snapshots, ledger directory, backend binaries, default agent, and default time limit. Existing runtime overrides such as `GOV_HOME`, `GOV_PROTECTED_PATHS`, `GOV_SNAPSHOT_DIR`, `GOV_SNAPSHOT_ROOTS`, and `GOV_<BACKEND>_BIN` remain supported.
+
+## Commands
+
+```text
+gov init
+gov validate <job.yaml>
+gov preflight <job.yaml>
+gov run <job.yaml> [--agent <name>]
+gov diff [last|run_id]
+gov rollback <run_id>
+gov quarantine list|show <id>|diff <id>
+gov hook pre-tool-use [--run <id>] [--shadow <python-gate>]
+gov gate check
+gov parity report
+gov protect status|apply|release <path>
+gov snap create [label]|list|diff <id>|restore <id> [--dry-run]
+gov score agents --job-type <type>
+gov route --job-type <type>
+gov failures
+gov repair-packet <run_id>
+gov eval harness <case-dir>
+gov doctor
+gov version
+```
+
+## Documentation
+
+- [Contracts and `RESULT.json`](docs/contracts.md)
+- [F1-F7 gate and hook integration](docs/gate.md)
+- [Backend projections](docs/backends.md)
+- [Migration and deliberate divergences](docs/migration.md)
+- [Ledger, routing, evaluation, and repair packets](docs/ledger.md)
+- [Publishing checklist](docs/publishing.md)
+- [Security policy](SECURITY.md) and [contributing guide](CONTRIBUTING.md)
+
+Governator is licensed under the [MIT License](LICENSE).

@@ -4,7 +4,7 @@ job_type: batch_image
 agent: claude
 mode: batch_worker
 workspace:
-  root: /mnt/e/downloads/emmaNader
+  root: /absolute/path/to/design-repository
   worktree: auto
 allowed:
   read: ["designs/**", "mockups/**"]

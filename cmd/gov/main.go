@@ -9,9 +9,11 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"time"
 
+	"github.com/cousingary/governator/internal/config"
 	"github.com/cousingary/governator/internal/contracts"
 	"github.com/cousingary/governator/internal/doctor"
 	"github.com/cousingary/governator/internal/observability"
@@ -22,7 +24,7 @@ import (
 	"github.com/cousingary/governator/internal/snapshots"
 )
 
-const version = "0.8.0-phase7"
+var version = "1.0.0-rc1"
 
 func main() { os.Exit(run(os.Args[1:])) }
 
@@ -32,6 +34,8 @@ func run(args []string) int {
 		return 2
 	}
 	switch args[0] {
+	case "init":
+		return initCmd(args[1:])
 	case "validate":
 		if len(args) != 2 {
 			return bad("usage: gov validate <job.yaml>")
@@ -272,6 +276,29 @@ func run(args []string) int {
 	default:
 		return bad(fmt.Sprintf("unknown command %q", args[0]))
 	}
+}
+
+func initCmd(args []string) int {
+	if len(args) != 0 {
+		return bad("usage: gov init")
+	}
+	cwd, err := os.Getwd()
+	if err != nil {
+		return bad("init: " + err.Error())
+	}
+	results, err := config.Scaffold(cwd)
+	if err != nil {
+		return bad("init: " + err.Error())
+	}
+	for _, result := range results {
+		action := "WRITE"
+		if result.Skipped {
+			action = "SKIP"
+		}
+		fmt.Printf("%s %s\n", action, result.Path)
+	}
+	fmt.Printf("Next: gov validate %s\n", filepath.Join(config.HomeDir(), ".governator", "jobs", "example.yaml"))
+	return 0
 }
 
 func quarantine(args []string) int {
@@ -562,6 +589,7 @@ func usage() {
 	fmt.Println(`Governator - contract-first runtime for replaceable coding agents
 
 Usage:
+  gov init
   gov validate <job.yaml>
   gov preflight <job.yaml>
   gov run <job.yaml> [--agent <name>]

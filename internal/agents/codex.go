@@ -3,7 +3,7 @@ package agents
 import (
 	"context"
 	"fmt"
-	"os"
+	"github.com/cousingary/governator/internal/config"
 )
 
 // Codex adapter. Codex CLI (codex-cli) has no PreToolUse hook model, so the
@@ -61,10 +61,7 @@ func (Codex) project(spec BackendSpec) ([]string, error) {
 }
 
 func (Codex) Run(parent context.Context, req Request) (Result, error) {
-	bin := os.Getenv("GOV_CODEX_BIN")
-	if bin == "" {
-		bin = "codex"
-	}
+	bin := config.BackendBin("codex")
 	flags, err := Codex{}.project(req.Spec)
 	if err != nil {
 		return Result{}, err

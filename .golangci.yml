@@ -1,0 +1,15 @@
+run:
+  timeout: 5m
+
+linters:
+  disable-all: true
+  enable:
+    - govet
+    - staticcheck
+    - errcheck
+    - ineffassign
+    - misspell
+
+issues:
+  exclude-dirs:
+    - bin

@@ -4,7 +4,7 @@ job_type: code_change
 agent: claude-code
 mode: surgeon
 workspace:
-  root: /mnt/e/downloads/governator
+  root: /absolute/path/to/governator
   worktree: auto
 allowed:
   read: ["internal/contracts/**", "go.mod", "go.sum"]

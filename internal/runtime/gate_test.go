@@ -218,3 +218,27 @@ func TestPreflightSnapshotIfDelete(t *testing.T) {
 		t.Fatal("snapshot must not fire for an already-blocked high-danger delete")
 	}
 }
+
+func FuzzBashProtectedReason(f *testing.F) {
+	root := f.TempDir()
+	manifest := filepath.Join(f.TempDir(), "protected-paths.txt")
+	if err := os.WriteFile(manifest, []byte(root+"/\n"), 0o600); err != nil {
+		f.Fatal(err)
+	}
+	f.Setenv("GOV_PROTECTED_PATHS", manifest)
+	f.Setenv("HARNESS_UNLOCK", "")
+	for _, seed := range []string{
+		"cat " + root + "/safe.txt",
+		"rm -rf " + root,
+		"echo changed > " + root + "/file",
+		"go test ./...",
+	} {
+		f.Add(seed, root)
+	}
+	f.Fuzz(func(t *testing.T, command, cwd string) {
+		if len(command) > 16*1024 || len(cwd) > 4*1024 {
+			t.Skip()
+		}
+		_ = bashProtectedReason(command, cwd)
+	})
+}
