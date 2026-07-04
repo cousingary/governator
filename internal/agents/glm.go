@@ -16,6 +16,13 @@ type GLM struct{}
 
 func (GLM) Name() string { return "glm" }
 
+func (GLM) Capabilities() Capability {
+	return Capability{
+		NativeApprovalPolicy: true,
+		TranscriptFormat:     TranscriptGLM,
+	}
+}
+
 // project translates the abstract spec into glm-cli native flags.
 func (GLM) project(spec BackendSpec) ([]string, error) {
 	flags := []string{"-p", "--output-format", "stream-json", "--verbose"}

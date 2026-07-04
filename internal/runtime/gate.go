@@ -34,6 +34,40 @@ type GateInput struct {
 	CWD       string         `json:"cwd,omitempty"`
 }
 
+type NeutralGateInput struct {
+	Tool    string `json:"tool"`
+	Command string `json:"command,omitempty"`
+	Path    string `json:"path,omitempty"`
+	CWD     string `json:"cwd,omitempty"`
+}
+
+// NeutralGateDecide translates a harness-neutral tool call into the shared
+// F1-F7 decision core.
+func NeutralGateDecide(in NeutralGateInput) GateDecision {
+	tool := strings.ToLower(strings.TrimSpace(in.Tool))
+	name := in.Tool
+	switch tool {
+	case "bash", "shell", "execute", "command":
+		name = "Bash"
+	case "write":
+		name = "Write"
+	case "edit":
+		name = "Edit"
+	case "multiedit", "multi_edit":
+		name = "MultiEdit"
+	case "notebookedit", "notebook_edit":
+		name = "NotebookEdit"
+	}
+	input := map[string]any{}
+	if in.Command != "" {
+		input["command"] = in.Command
+	}
+	if in.Path != "" {
+		input["file_path"] = in.Path
+	}
+	return GateDecide(GateInput{ToolName: name, ToolInput: input, CWD: in.CWD})
+}
+
 // fileMutatingTools are the tools F2 gates against the protected-paths manifest.
 var fileMutatingTools = map[string]bool{
 	"Write": true, "Edit": true, "MultiEdit": true, "NotebookEdit": true,

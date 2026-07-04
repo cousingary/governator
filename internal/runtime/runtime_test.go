@@ -96,6 +96,9 @@ func TestApprovedReplayRedactionAndRollback(t *testing.T) {
 	if r.PromptVersion != "v007" {
 		t.Fatalf("prompt version=%s", r.PromptVersion)
 	}
+	if !strings.Contains(r.Envelope, "pre_post_fingerprint") || !strings.Contains(r.Envelope, "native") {
+		t.Fatalf("missing governance envelope: %s", r.Envelope)
+	}
 	scores, err := observability.ScoreAgents(home, "test")
 	if err != nil {
 		t.Fatal(err)

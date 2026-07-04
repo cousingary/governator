@@ -86,3 +86,28 @@ The Claude adapter uses the installed subscription-authenticated `claude` CLI an
 Protected paths default to `$HOME/.governed-harness/state/protected_paths.txt`. Set `GOV_PROTECTED_PATHS` only for an alternate test manifest.
 
 Running a real job can invoke a paid model and must be explicitly user-triggered. The test suite uses a fake Claude executable and performs no model calls.
+
+
+## Multi-harness capability model
+
+Governator supports Claude Code, Codex, GLM, OpenCode, and Pi through one
+backend specification. Run `gov doctor` to see live CLI probes and each adapter's
+native sandbox, read-only, approval, network, and transcript capabilities.
+
+Every run records an envelope showing guarantees enforced natively and those
+compensated by Governator. Pre/post fingerprints of the disposable worktree,
+live workspace, and protected paths are always applied: they are the universal
+floor, not a fallback that disappears when a backend advertises a sandbox.
+OpenCode read-only mode is a scoped permission configuration; Pi read-only mode
+natively removes bash/edit/write from its tool surface.
+
+Interactive clients can call the neutral gate:
+
+```sh
+printf '%s' '{"tool":"bash","command":"git status","cwd":"/workspace"}' | gov gate check
+```
+
+See `integrations/` for Claude Code, Pi, OpenCode, and Codex examples.
+Transcript cost fields are parsed per backend. When the format has no monetary
+cost, the run records `cost_unavailable` rather than reporting a silently
+incorrect zero.

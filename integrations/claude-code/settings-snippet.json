@@ -1,0 +1,30 @@
+{
+  "direct": {
+    "hooks": {
+      "PreToolUse": [
+        {
+          "hooks": [
+            {
+              "type": "command",
+              "command": "gov hook pre-tool-use"
+            }
+          ]
+        }
+      ]
+    }
+  },
+  "shadow": {
+    "hooks": {
+      "PreToolUse": [
+        {
+          "hooks": [
+            {
+              "type": "command",
+              "command": "gov hook pre-tool-use --shadow /absolute/path/to/harness_gate.py"
+            }
+          ]
+        }
+      ]
+    }
+  }
+}

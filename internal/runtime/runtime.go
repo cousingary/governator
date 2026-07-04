@@ -50,6 +50,33 @@ type RunRecord struct {
 	FailureTaxonomy string                    `json:"failure_taxonomy,omitempty"`
 	SelfReview      *contracts.ResultDocument `json:"self_review,omitempty"`
 	PromptVersion   string                    `json:"prompt_version,omitempty"`
+	Envelope        string                    `json:"envelope,omitempty"`
+	Notes           string                    `json:"notes,omitempty"`
+}
+
+func envelopeJSON(spec agents.BackendSpec, capability agents.Capability) string {
+	native := []string{}
+	compensated := []string{"pre_post_fingerprint"}
+	add := func(name string, isNative bool) {
+		if isNative {
+			native = append(native, name)
+		} else {
+			compensated = append(compensated, name)
+		}
+	}
+	add("filesystem_sandbox", capability.NativeSandbox)
+	if spec.Sandbox == agents.SandboxReadOnly {
+		add("read_only", capability.NativeReadOnly)
+	}
+	add("approval_policy", capability.NativeApprovalPolicy)
+	if !spec.Network {
+		add("network_control", capability.NetworkControl)
+	}
+	payload, _ := json.Marshal(map[string]any{
+		"native": native, "compensated": compensated,
+		"transcript_format": capability.TranscriptFormat,
+	})
+	return string(payload)
 }
 
 type Runner struct{ Home string }
@@ -69,8 +96,8 @@ func dbOpen(home string) (*sql.DB, error) {
 }
 
 func insertRun(db *sql.DB, r RunRecord, ch, head string) error {
-	_, err := db.Exec(`INSERT INTO runs(id,job_id,job_type,agent,mode,status,root,worktree,branch,contract_hash,base_head,diff,transcript,message,created,prompt_version)
-VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, r.ID, r.JobID, r.JobType, r.Agent, r.Mode, r.Status, r.Root, r.Worktree, r.Branch, ch, head, r.Diff, r.Transcript, r.Message, r.Created, r.PromptVersion)
+	_, err := db.Exec(`INSERT INTO runs(id,job_id,job_type,agent,mode,status,root,worktree,branch,contract_hash,base_head,diff,transcript,message,created,prompt_version,envelope_json,notes)
+VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, r.ID, r.JobID, r.JobType, r.Agent, r.Mode, r.Status, r.Root, r.Worktree, r.Branch, ch, head, r.Diff, r.Transcript, r.Message, r.Created, r.PromptVersion, r.Envelope, r.Notes)
 	return err
 }
 
@@ -86,7 +113,7 @@ func Last(id string) (RunRecord, error) {
 		return RunRecord{}, err
 	}
 	defer db.Close()
-	q := `SELECT id,job_id,COALESCE(job_type,''),COALESCE(agent,''),COALESCE(mode,''),status,root,worktree,branch,diff,transcript,message,commit_hash,created,cost_usd,valid_output,failure_taxonomy,result_json,COALESCE(prompt_version,'') FROM runs`
+	q := `SELECT id,job_id,COALESCE(job_type,''),COALESCE(agent,''),COALESCE(mode,''),status,root,worktree,branch,diff,transcript,message,commit_hash,created,cost_usd,valid_output,failure_taxonomy,result_json,COALESCE(prompt_version,''),COALESCE(envelope_json,''),COALESCE(notes,'') FROM runs`
 	var row *sql.Row
 	if id == "" || id == "last" {
 		row = db.QueryRow(q + ` ORDER BY created DESC LIMIT 1`)
@@ -103,7 +130,7 @@ func Quarantines() ([]RunRecord, error) {
 		return nil, err
 	}
 	defer db.Close()
-	rows, err := db.Query(`SELECT id,job_id,COALESCE(job_type,''),COALESCE(agent,''),COALESCE(mode,''),status,root,worktree,branch,diff,transcript,message,commit_hash,created,cost_usd,valid_output,failure_taxonomy,result_json,COALESCE(prompt_version,'') FROM runs WHERE status='QUARANTINED' ORDER BY created DESC`)
+	rows, err := db.Query(`SELECT id,job_id,COALESCE(job_type,''),COALESCE(agent,''),COALESCE(mode,''),status,root,worktree,branch,diff,transcript,message,commit_hash,created,cost_usd,valid_output,failure_taxonomy,result_json,COALESCE(prompt_version,''),COALESCE(envelope_json,''),COALESCE(notes,'') FROM runs WHERE status='QUARANTINED' ORDER BY created DESC`)
 	if err != nil {
 		return nil, err
 	}
@@ -126,7 +153,7 @@ type rowScanner interface {
 func scanRun(row rowScanner) (RunRecord, error) {
 	var r RunRecord
 	var resultJSON string
-	err := row.Scan(&r.ID, &r.JobID, &r.JobType, &r.Agent, &r.Mode, &r.Status, &r.Root, &r.Worktree, &r.Branch, &r.Diff, &r.Transcript, &r.Message, &r.Commit, &r.Created, &r.CostUSD, &r.ValidOutput, &r.FailureTaxonomy, &resultJSON, &r.PromptVersion)
+	err := row.Scan(&r.ID, &r.JobID, &r.JobType, &r.Agent, &r.Mode, &r.Status, &r.Root, &r.Worktree, &r.Branch, &r.Diff, &r.Transcript, &r.Message, &r.Commit, &r.Created, &r.CostUSD, &r.ValidOutput, &r.FailureTaxonomy, &resultJSON, &r.PromptVersion, &r.Envelope, &r.Notes)
 	if err == nil && resultJSON != "" {
 		var review contracts.ResultDocument
 		if json.Unmarshal([]byte(resultJSON), &review) == nil {
@@ -405,17 +432,71 @@ func commandMatches(pattern, command string) bool {
 }
 
 type transcriptAudit struct {
-	Violations []string
-	Commands   []string
-	CostUSD    float64
+	Violations      []string
+	Commands        []string
+	CostUSD         float64
+	CostAvailable   bool
+	CostUnavailable bool
 }
 
-func auditTranscript(path string, c contracts.Contract) transcriptAudit {
+func transcriptCommand(format string, value map[string]any) string {
+	getCommand := func(container any) string {
+		input, _ := container.(map[string]any)
+		command, _ := input["command"].(string)
+		return command
+	}
+	typeName, _ := value["type"].(string)
+	switch format {
+	case agents.TranscriptClaude, agents.TranscriptGLM:
+		name, _ := value["name"].(string)
+		if typeName == "tool_use" && strings.EqualFold(name, "bash") {
+			return getCommand(value["input"])
+		}
+	case agents.TranscriptCodex:
+		if typeName == "command_execution" {
+			command, _ := value["command"].(string)
+			return command
+		}
+	case agents.TranscriptOpenCode:
+		tool, _ := value["tool"].(string)
+		name, _ := value["name"].(string)
+		if strings.EqualFold(tool, "bash") || strings.EqualFold(name, "bash") {
+			if command := getCommand(value["input"]); command != "" {
+				return command
+			}
+			if state, ok := value["state"].(map[string]any); ok {
+				return getCommand(state["input"])
+			}
+		}
+	case agents.TranscriptPi:
+		tool, _ := value["toolName"].(string)
+		if tool == "" {
+			tool, _ = value["tool_name"].(string)
+		}
+		if strings.EqualFold(tool, "bash") {
+			if command := getCommand(value["args"]); command != "" {
+				return command
+			}
+			return getCommand(value["input"])
+		}
+	}
+	return ""
+}
+
+func auditTranscript(path, format string, c contracts.Contract) transcriptAudit {
 	data, err := os.ReadFile(path)
 	if err != nil {
-		return transcriptAudit{Violations: []string{"transcript audit: " + err.Error()}}
+		return transcriptAudit{Violations: []string{"transcript audit: " + err.Error()}, CostUnavailable: true}
 	}
 	audit := transcriptAudit{}
+	known := map[string]bool{
+		agents.TranscriptClaude: true, agents.TranscriptCodex: true,
+		agents.TranscriptGLM: true, agents.TranscriptOpenCode: true,
+		agents.TranscriptPi: true,
+	}
+	if !known[format] {
+		audit.CostUnavailable = true
+	}
 	var walk func(any)
 	walk = func(v any) {
 		switch x := v.(type) {
@@ -424,17 +505,15 @@ func auditTranscript(path string, c contracts.Contract) transcriptAudit {
 				walk(item)
 			}
 		case map[string]any:
-			if x["type"] == "tool_use" {
-				name, _ := x["name"].(string)
-				input, _ := x["input"].(map[string]any)
-				command, _ := input["command"].(string)
-				if name == "Bash" && command != "" {
-					audit.Commands = append(audit.Commands, command)
-				}
+			if command := transcriptCommand(format, x); command != "" {
+				audit.Commands = append(audit.Commands, command)
 			}
 			for _, key := range []string{"total_cost_usd", "cost_usd"} {
-				if cost, ok := x[key].(float64); ok && cost > audit.CostUSD {
-					audit.CostUSD = cost
+				if cost, ok := x[key].(float64); ok {
+					audit.CostAvailable = true
+					if cost > audit.CostUSD {
+						audit.CostUSD = cost
+					}
 				}
 			}
 			for _, item := range x {
@@ -447,6 +526,9 @@ func auditTranscript(path string, c contracts.Contract) transcriptAudit {
 		if json.Unmarshal([]byte(line), &v) == nil {
 			walk(v)
 		}
+	}
+	if !audit.CostAvailable {
+		audit.CostUnavailable = true
 	}
 	if len(audit.Commands) > c.Budget.MaxCommands {
 		audit.Violations = append(audit.Violations, "max_commands exceeded")
@@ -636,7 +718,12 @@ func (r *Runner) Run(ctx context.Context, c contracts.Contract) (RunRecord, erro
 	if err != nil {
 		return RunRecord{}, err
 	}
-	rec := RunRecord{ID: id, JobID: c.JobID, JobType: c.JobType, Agent: c.Agent, Mode: string(c.Mode), Status: "RUNNING", Root: root, Worktree: work, Branch: branch, Transcript: transcript, Created: time.Now().UTC().Format(time.RFC3339Nano), PromptVersion: promptVersion.ID}
+	agent, err := agents.New(c.Agent)
+	if err != nil {
+		return RunRecord{}, err
+	}
+	spec := agents.SpecFromContract(c, work)
+	rec := RunRecord{ID: id, JobID: c.JobID, JobType: c.JobType, Agent: c.Agent, Mode: string(c.Mode), Status: "RUNNING", Root: root, Worktree: work, Branch: branch, Transcript: transcript, Created: time.Now().UTC().Format(time.RFC3339Nano), PromptVersion: promptVersion.ID, Envelope: envelopeJSON(spec, agent.Capabilities())}
 	if err = insertRun(db, rec, hash, head); err != nil {
 		return rec, err
 	}
@@ -661,18 +748,17 @@ func (r *Runner) Run(ctx context.Context, c contracts.Contract) (RunRecord, erro
 	}
 	prompt += "\nController canary: " + canaryName + " must remain byte-for-byte unchanged. Touching it quarantines the run.\n"
 	prompt += prompts.Annotation(promptVersion)
-	agent, err := agents.New(c.Agent)
-	if err != nil {
-		return rec, err
-	}
 	ar, aerr := agent.Run(ctx, agents.Request{
 		Prompt: prompt, Workdir: work, Transcript: transcript,
 		Timeout: time.Duration(c.Budget.MaxMinutes) * time.Minute,
-		Spec:    agents.SpecFromContract(c, work),
+		Spec:    spec,
 	})
 	_ = redact(transcript)
-	audit := auditTranscript(transcript, c)
+	audit := auditTranscript(transcript, agent.Capabilities().TranscriptFormat, c)
 	rec.CostUSD = audit.CostUSD
+	if audit.CostUnavailable {
+		rec.Notes = "cost_unavailable"
+	}
 	workAfter, werr := fingerprint(work)
 	liveAfter, lerr := fingerprint(root)
 	protectedAfter, perr := protectedFingerprint()
@@ -851,6 +937,7 @@ func (r *Runner) Run(ctx context.Context, c contracts.Contract) (RunRecord, erro
 		ValidOutput:     rec.ValidOutput,
 		FailureTaxonomy: rec.FailureTaxonomy,
 		SelfReviewJSON:  selfReviewJSON,
+		Notes:           rec.Notes,
 		Files:           files,
 		Commands:        commands,
 		Violations:      violations,

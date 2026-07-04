@@ -20,6 +20,14 @@ type Codex struct{}
 
 func (Codex) Name() string { return "codex" }
 
+func (Codex) Capabilities() Capability {
+	return Capability{
+		NativeSandbox: true, NativeReadOnly: true,
+		NativeApprovalPolicy: true, NetworkControl: true,
+		TranscriptFormat: TranscriptCodex,
+	}
+}
+
 // project translates the abstract spec into `codex exec` native flags.
 func (Codex) project(spec BackendSpec) ([]string, error) {
 	flags := []string{"exec", "--json"}

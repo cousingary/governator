@@ -45,7 +45,7 @@ func TestOpenMigratesLegacyLedger(t *testing.T) {
 	if err := rows.Close(); err != nil {
 		t.Fatal(err)
 	}
-	for _, name := range []string{"job_type", "agent", "mode", "cost_usd", "valid_output", "failure_taxonomy", "result_json", "prompt_version"} {
+	for _, name := range []string{"job_type", "agent", "mode", "cost_usd", "valid_output", "failure_taxonomy", "result_json", "prompt_version", "envelope_json", "notes"} {
 		if !columns[name] {
 			t.Errorf("missing migrated column %s", name)
 		}

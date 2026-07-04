@@ -25,6 +25,7 @@ type Result struct {
 
 type Agent interface {
 	Name() string
+	Capabilities() Capability
 	Run(context.Context, Request) (Result, error)
 }
 
@@ -97,6 +98,10 @@ func New(name string) (Agent, error) {
 		return Codex{}, nil
 	case "glm":
 		return GLM{}, nil
+	case "opencode":
+		return OpenCode{}, nil
+	case "pi":
+		return Pi{}, nil
 	default:
 		return nil, fmt.Errorf("unsupported agent %q", name)
 	}
@@ -105,6 +110,14 @@ func New(name string) (Agent, error) {
 type Claude struct{}
 
 func (Claude) Name() string { return "claude-code" }
+
+func (Claude) Capabilities() Capability {
+	return Capability{
+		NativeSandbox: true, NativeReadOnly: true,
+		NativeApprovalPolicy: true, NetworkControl: false,
+		TranscriptFormat: TranscriptClaude,
+	}
+}
 
 // project translates the abstract spec into Claude Code native flags.
 // --safe-mode + --permission-mode acceptEdits already confines writes to

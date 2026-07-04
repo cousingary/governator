@@ -1,12 +1,15 @@
 package main
 
 import (
+	"encoding/json"
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/cousingary/governator/internal/observability"
+	govruntime "github.com/cousingary/governator/internal/runtime"
 )
 
 func captureHook(t *testing.T, script string) string {
@@ -25,6 +28,67 @@ func captureHook(t *testing.T, script string) string {
 		t.Fatalf("hook exit=%d", code)
 	}
 	return string(data)
+}
+
+func captureRunInput(t *testing.T, args []string, input string) (int, string) {
+	t.Helper()
+	oldIn, oldOut := os.Stdin, os.Stdout
+	inR, inW, _ := os.Pipe()
+	outR, outW, _ := os.Pipe()
+	_, _ = inW.WriteString(input)
+	_ = inW.Close()
+	os.Stdin, os.Stdout = inR, outW
+	code := run(args)
+	_ = outW.Close()
+	os.Stdin, os.Stdout = oldIn, oldOut
+	data, _ := io.ReadAll(outR)
+	return code, string(data)
+}
+
+func TestGateCheckDialectRoundTrip(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		input string
+		allow bool
+	}{
+		{"allow", `{"tool":"bash","command":"git status","cwd":"/tmp"}`, true},
+		{"deny", `{"tool":"bash","command":"rm -rf /tmp/example","cwd":"/tmp"}`, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			code, output := captureRunInput(t, []string{"gate", "check"}, tc.input)
+			if code != 0 {
+				t.Fatalf("exit=%d", code)
+			}
+			var decision struct {
+				Allow   bool   `json:"allow"`
+				Reason  string `json:"reason"`
+				Finding string `json:"finding"`
+			}
+			if err := json.Unmarshal([]byte(output), &decision); err != nil {
+				t.Fatalf("output=%q: %v", output, err)
+			}
+			if decision.Allow != tc.allow || decision.Finding == "" {
+				t.Fatalf("decision=%+v", decision)
+			}
+			if !tc.allow && !strings.Contains(decision.Reason, "forbidden") {
+				t.Fatalf("deny reason=%q", decision.Reason)
+			}
+		})
+	}
+	code, output := captureRunInput(t, []string{"gate", "check"}, "{")
+	if code != 0 || output != "" {
+		t.Fatalf("malformed: exit=%d output=%q", code, output)
+	}
+
+	neutral := govruntime.NeutralGateDecide(govruntime.NeutralGateInput{
+		Tool: "bash", Command: "rm -rf /tmp/example", CWD: "/tmp",
+	})
+	hook := govruntime.GateDecide(govruntime.GateInput{
+		ToolName: "Bash", ToolInput: map[string]any{"command": "rm -rf /tmp/example"}, CWD: "/tmp",
+	})
+	if neutral.Allow != hook.Allow || neutral.Finding != hook.Finding || neutral.Reason != hook.Reason {
+		t.Fatalf("dialects diverged: neutral=%+v hook=%+v", neutral, hook)
+	}
 }
 
 func TestShadowParityMatchMismatchUnavailable(t *testing.T) {

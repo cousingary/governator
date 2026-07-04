@@ -51,10 +51,10 @@ func TestSpecFromContract(t *testing.T) {
 	}
 }
 
-// TestNewRegistersAllBackends verifies all three adapters resolve from the
+// TestNewRegistersAllBackends verifies all five adapters resolve from the
 // contract's agent name (Phase 5: "Add Codex + GLM adapters").
 func TestNewRegistersAllBackends(t *testing.T) {
-	for _, name := range []string{"claude", "claude-code", "codex", "glm"} {
+	for _, name := range []string{"claude", "claude-code", "codex", "glm", "opencode", "pi"} {
 		a, err := New(name)
 		if err != nil {
 			t.Fatalf("New(%q): %v", name, err)
@@ -137,6 +137,28 @@ func TestGLMProjectsSpec(t *testing.T) {
 	}
 }
 
+func TestOpenCodeAndPiProjectReadOnly(t *testing.T) {
+	spec := BackendSpec{Approval: ApprovalNever, Sandbox: SandboxReadOnly, Workdir: "/w"}
+	openFlags, err := OpenCode{}.project(spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"run", "--pure", "--format", "json", "--dir", "/w"} {
+		if !contains(openFlags, want) {
+			t.Fatalf("opencode flags missing %q: %v", want, openFlags)
+		}
+	}
+	piFlags, err := Pi{}.project(spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"--print", "--mode", "json", "--no-session", "--no-extensions", "--no-skills", "--tools", "read,grep,find,ls"} {
+		if !contains(piFlags, want) {
+			t.Fatalf("pi flags missing %q: %v", want, piFlags)
+		}
+	}
+}
+
 // TestAdaptersRunFakeBackend drives every adapter end-to-end against a fake
 // backend binary, asserting the projected flags AND the prompt actually reach
 // the backend argv and the transcript is captured. This is the adapter
@@ -148,23 +170,23 @@ func TestAdaptersRunFakeBackend(t *testing.T) {
 		name      string
 		envVar    string
 		agent     Agent
+		sandbox   SandboxMode
 		wantFlags []string
 	}{
-		{"claude", "GOV_CLAUDE_BIN", Claude{}, []string{"acceptEdits", "--add-dir"}},
-		{"codex", "GOV_CODEX_BIN", Codex{}, []string{"workspace-write", "on-request"}},
-		{"glm", "GOV_GLM_BIN", GLM{}, []string{"acceptEdits", "--add-dir"}},
+		{"claude", "GOV_CLAUDE_BIN", Claude{}, SandboxWorkspaceWrite, []string{"acceptEdits", "--add-dir"}},
+		{"codex", "GOV_CODEX_BIN", Codex{}, SandboxWorkspaceWrite, []string{"workspace-write", "on-request"}},
+		{"glm", "GOV_GLM_BIN", GLM{}, SandboxWorkspaceWrite, []string{"acceptEdits", "--add-dir"}},
+		{"opencode", "GOV_OPENCODE_BIN", OpenCode{}, SandboxReadOnly, []string{"--pure", "--format", "--dir", `"edit": "deny"`}},
+		{"pi", "GOV_PI_BIN", Pi{}, SandboxReadOnly, []string{"--no-session", "--no-extensions", "--no-skills", "read,grep,find,ls"}},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			fakeBin := filepath.Join(t.TempDir(), "fake-"+tc.name)
-			// Echo args to stdout, not a side file: runCLI wires cmd.Stdout to
-			// the transcript file, so this is the only way the flags land where
-			// the assertions below look for them. LAST_ARG isolates the final
-			// positional so the prompt-position assertion is exact.
 			script := `#!/bin/sh
 printf '%s\n' "$@"
 for a in "$@"; do last="$a"; done
 printf 'LAST_ARG=%s\n' "$last"
+if [ -f opencode.json ]; then cat opencode.json; fi
 printf '{"type":"result","total_cost_usd":0.1}\n'
 `
 			if err := os.WriteFile(fakeBin, []byte(script), 0755); err != nil {
@@ -172,11 +194,12 @@ printf '{"type":"result","total_cost_usd":0.1}\n'
 			}
 			t.Setenv(tc.envVar, fakeBin)
 			transcript := filepath.Join(t.TempDir(), "out.jsonl")
-			// cmd.Dir must exist: with SysProcAttr{Setpgid:true} set, a missing
-			// Dir makes the child's chdir failure surface as a misleading
-			// "fork/exec <bin>: no such file or directory" instead of naming chdir.
 			workdir := t.TempDir()
-			spec := BackendSpec{Approval: ApprovalOnRequest, Sandbox: SandboxWorkspaceWrite, Workdir: workdir}
+			approval := ApprovalOnRequest
+			if tc.sandbox == SandboxReadOnly {
+				approval = ApprovalNever
+			}
+			spec := BackendSpec{Approval: approval, Sandbox: tc.sandbox, Workdir: workdir}
 			res, err := tc.agent.Run(context.Background(), Request{
 				Prompt: "do the thing", Workdir: workdir, Transcript: transcript,
 				Timeout: 5 * time.Second, Spec: spec,
@@ -192,13 +215,17 @@ printf '{"type":"result","total_cost_usd":0.1}\n'
 				t.Fatal(err)
 			}
 			body := string(data)
-			// The prompt must reach the backend as the final positional arg.
 			if !strings.Contains(body, "LAST_ARG=do the thing") {
 				t.Fatalf("prompt not passed as final positional: %s", body)
 			}
 			for _, want := range tc.wantFlags {
 				if !strings.Contains(body, want) {
-					t.Fatalf("spec not projected to native flags (missing %q): %s", want, body)
+					t.Fatalf("spec not projected (missing %q): %s", want, body)
+				}
+			}
+			if tc.name == "opencode" {
+				if _, err := os.Stat(filepath.Join(workdir, "opencode.json")); !os.IsNotExist(err) {
+					t.Fatalf("scoped config was not removed: %v", err)
 				}
 			}
 		})

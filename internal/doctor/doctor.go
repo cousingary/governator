@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/cousingary/governator/internal/agents"
 	"github.com/cousingary/governator/internal/protectedpaths"
 )
 
@@ -30,7 +31,7 @@ type Check struct {
 }
 
 func Run() []Check {
-	return []Check{
+	checks := []Check{
 		checkGit(),
 		checkPython(),
 		checkProtectedManifest(),
@@ -44,7 +45,18 @@ func Run() []Check {
 		checkBackendFlags("claude", "claude", []string{}, []string{"--output-format", "--add-dir", "--permission-mode"}),
 		checkBackendFlags("codex", "codex", []string{}, []string{"exec", "--sandbox", "--ask-for-approval", "-C"}),
 		checkBackendFlags("glm", "glm", []string{}, []string{"--output-format", "--add-dir", "--permission-mode"}),
+		checkBackendFlags("opencode", "opencode", []string{"run"}, []string{"--format", "--dir", "--pure"}),
+		checkBackendFlags("pi", "pi", []string{}, []string{"--print", "--mode", "--tools", "--no-session", "--no-extensions", "--no-skills"}),
 	}
+	for _, row := range agents.CapabilityMatrix() {
+		checks = append(checks, Check{
+			Name: "capability:" + row.Name, Status: StatusOK, Required: false,
+			Detail: fmt.Sprintf("sandbox=%t read-only=%t approval=%t network=%t transcript=%s",
+				row.NativeSandbox, row.NativeReadOnly, row.NativeApprovalPolicy,
+				row.NetworkControl, row.TranscriptFormat),
+		})
+	}
+	return checks
 }
 
 func Passed(checks []Check) bool {

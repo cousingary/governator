@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"strings"
 	"time"
 
 	"github.com/cousingary/governator/internal/contracts"
@@ -21,7 +22,7 @@ import (
 	"github.com/cousingary/governator/internal/snapshots"
 )
 
-const version = "0.7.0-phase6"
+const version = "0.8.0-phase7"
 
 func main() { os.Exit(run(os.Args[1:])) }
 
@@ -240,6 +241,8 @@ func run(args []string) int {
 		return parityCmd(args[1:])
 	case "hook":
 		return hookCmd(args[1:])
+	case "gate":
+		return gateCmd(args[1:])
 	case "doctor":
 		if len(args) != 1 {
 			return bad("usage: gov doctor")
@@ -415,6 +418,28 @@ func parityCmd(args []string) int {
 	return 0
 }
 
+func gateCmd(args []string) int {
+	if len(args) != 1 || args[0] != "check" {
+		return bad("usage: gov gate check")
+	}
+	data, err := io.ReadAll(os.Stdin)
+	if err != nil {
+		return 0
+	}
+	var input govruntime.NeutralGateInput
+	if json.Unmarshal(data, &input) != nil || strings.TrimSpace(input.Tool) == "" {
+		return 0
+	}
+	decision := govruntime.NeutralGateDecide(input)
+	output := struct {
+		Allow   bool   `json:"allow"`
+		Reason  string `json:"reason"`
+		Finding string `json:"finding"`
+	}{decision.Allow, decision.Reason, decision.Finding}
+	_ = json.NewEncoder(os.Stdout).Encode(output)
+	return 0
+}
+
 func hookCmd(args []string) int {
 	if len(args) < 1 || args[0] != "pre-tool-use" {
 		return bad("usage: gov hook pre-tool-use [--run <id>] [--shadow <python-gate>]")
@@ -553,6 +578,7 @@ Usage:
   gov protect status|apply|release <path>
   gov snap create [label]|list|diff <id>|restore <id> [--dry-run]
   gov hook pre-tool-use [--run <id>] [--shadow <python-gate>]
+  gov gate check
   gov parity report
   gov doctor
   gov version`)

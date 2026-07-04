@@ -1,0 +1,8 @@
+{
+  "name": "governator-opencode-gate",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@opencode-ai/plugin": "*"
+  }
+}
