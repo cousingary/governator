@@ -245,6 +245,55 @@ func TestNonGitRecallRollback(t *testing.T) {
 	}
 }
 
+// Regression test: mergeCopyChanged's MkdirAll/copyFile error used to be
+// declared inside the `if err := ...; err == nil` statement that read it, so
+// the error was discarded the moment that if-block ended and the outer
+// `if err != nil` check below it was inspecting an unrelated, already-nil
+// outer `err` — merge copy failures were silently approved. Force a real
+// failure (a plain file sitting where the destination directory needs to
+// be) and confirm it's now returned as a "merge copy" violation.
+func TestMergeCopyChangedReportsFailureInsteadOfSwallowingIt(t *testing.T) {
+	work := t.TempDir()
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(work, "output"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(work, "output", "result.txt"), []byte("ok\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "output"), []byte("blocker\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	violations := mergeCopyChanged(work, root, []string{"output/result.txt"})
+	if len(violations) != 1 || !strings.Contains(violations[0], "merge copy") {
+		t.Fatalf("expected one merge copy violation, got %v", violations)
+	}
+}
+
+func TestMergeCopyChangedCopiesCleanlyWhenUnobstructed(t *testing.T) {
+	work := t.TempDir()
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(work, "output"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(work, "output", "result.txt"), []byte("ok\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	violations := mergeCopyChanged(work, root, []string{"output/result.txt"})
+	if len(violations) != 0 {
+		t.Fatalf("expected no violations, got %v", violations)
+	}
+	got, err := os.ReadFile(filepath.Join(root, "output", "result.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "ok\n" {
+		t.Fatalf("merged content = %q", got)
+	}
+}
+
 func TestForbiddenCommandTranscriptIsQuarantined(t *testing.T) {
 	root, bin := fixture(t)
 	home := t.TempDir()

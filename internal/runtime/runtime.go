@@ -913,16 +913,7 @@ func (r *Runner) Run(ctx context.Context, c contracts.Contract) (RunRecord, erro
 			if err := captureRecall(r.Home, id, root, append(append([]string{}, changed...), deleted...)); err != nil {
 				violations = append(violations, "recall snapshot: "+err.Error())
 			}
-			for _, p := range changed {
-				src := filepath.Join(work, filepath.FromSlash(p))
-				dst := filepath.Join(root, filepath.FromSlash(p))
-				if err := os.MkdirAll(filepath.Dir(dst), 0755); err == nil {
-					err = copyFile(src, dst)
-				}
-				if err != nil {
-					violations = append(violations, "merge copy: "+err.Error())
-				}
-			}
+			violations = append(violations, mergeCopyChanged(work, root, changed)...)
 			for _, p := range deleted {
 				if err := os.Remove(filepath.Join(root, filepath.FromSlash(p))); err != nil && !os.IsNotExist(err) {
 					violations = append(violations, "merge delete: "+err.Error())
@@ -1055,6 +1046,25 @@ func restoreRecall(home, id, root string) error {
 		}
 	}
 	return nil
+}
+
+// mergeCopyChanged copies every changed path from the disposable worktree
+// back into the live (non-git) root and returns one "merge copy: ..."
+// violation per path that failed, instead of dropping the failure.
+func mergeCopyChanged(work, root string, changed []string) []string {
+	var violations []string
+	for _, p := range changed {
+		src := filepath.Join(work, filepath.FromSlash(p))
+		dst := filepath.Join(root, filepath.FromSlash(p))
+		copyErr := os.MkdirAll(filepath.Dir(dst), 0755)
+		if copyErr == nil {
+			copyErr = copyFile(src, dst)
+		}
+		if copyErr != nil {
+			violations = append(violations, "merge copy: "+copyErr.Error())
+		}
+	}
+	return violations
 }
 
 func copyFile(src, dst string) error {
