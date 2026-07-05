@@ -38,6 +38,29 @@ type CostSummary struct {
 	CostPerValidUSD float64 `json:"cost_per_valid_output_usd"`
 }
 
+type TokenUsage struct {
+	InputTokens         int64 `json:"input_tokens"`
+	OutputTokens        int64 `json:"output_tokens"`
+	CachedInputTokens   int64 `json:"cached_input_tokens"`
+	CacheCreationTokens int64 `json:"cache_creation_tokens"`
+	ReasoningTokens     int64 `json:"reasoning_tokens"`
+	TotalTokens         int64 `json:"total_tokens"`
+	Available           bool  `json:"available"`
+}
+
+type UsageReport struct {
+	RunID           string `json:"run_id,omitempty"`
+	Runs            int    `json:"runs"`
+	MeasuredRuns    int    `json:"measured_runs"`
+	InputTokens     int64  `json:"input_tokens"`
+	OutputTokens    int64  `json:"output_tokens"`
+	CachedTokens    int64  `json:"cached_tokens"`
+	ReasoningTokens int64  `json:"reasoning_tokens"`
+	TotalTokens     int64  `json:"total_tokens"`
+	ToolCalls       int    `json:"tool_calls"`
+	TranscriptBytes int64  `json:"transcript_bytes"`
+}
+
 type FileFact struct {
 	Path       string
 	ChangeType string
@@ -61,6 +84,9 @@ type Completion struct {
 	Files           []FileFact
 	Commands        []CommandFact
 	Violations      []string
+	Usage           TokenUsage
+	ToolCalls       int
+	TranscriptBytes int64
 }
 
 func Open(home string) (*sql.DB, error) {
@@ -74,7 +100,8 @@ func Open(home string) (*sql.DB, error) {
 	schema := `CREATE TABLE IF NOT EXISTS runs(
 id TEXT PRIMARY KEY, job_id TEXT, job_type TEXT, agent TEXT, mode TEXT, status TEXT, root TEXT, worktree TEXT, branch TEXT,
 contract_hash TEXT, base_head TEXT, approved_head TEXT, diff TEXT, transcript TEXT, message TEXT, commit_hash TEXT, created TEXT,
-cost_usd REAL NOT NULL DEFAULT 0, valid_output INTEGER NOT NULL DEFAULT 0, failure_taxonomy TEXT NOT NULL DEFAULT '', result_json TEXT NOT NULL DEFAULT '', prompt_version TEXT NOT NULL DEFAULT '', envelope_json TEXT NOT NULL DEFAULT '', notes TEXT NOT NULL DEFAULT '');
+cost_usd REAL NOT NULL DEFAULT 0, valid_output INTEGER NOT NULL DEFAULT 0, failure_taxonomy TEXT NOT NULL DEFAULT '', result_json TEXT NOT NULL DEFAULT '', prompt_version TEXT NOT NULL DEFAULT '', envelope_json TEXT NOT NULL DEFAULT '', notes TEXT NOT NULL DEFAULT '',
+input_tokens INTEGER NOT NULL DEFAULT 0, output_tokens INTEGER NOT NULL DEFAULT 0, cached_input_tokens INTEGER NOT NULL DEFAULT 0, cache_creation_tokens INTEGER NOT NULL DEFAULT 0, reasoning_tokens INTEGER NOT NULL DEFAULT 0, total_tokens INTEGER NOT NULL DEFAULT 0, usage_available INTEGER NOT NULL DEFAULT 0, tool_calls INTEGER NOT NULL DEFAULT 0, transcript_bytes INTEGER NOT NULL DEFAULT 0);
 CREATE TABLE IF NOT EXISTS jobs(job_id TEXT PRIMARY KEY, job_type TEXT, last_run_at TEXT);
 CREATE TABLE IF NOT EXISTS agents(name TEXT PRIMARY KEY, first_run_at TEXT, last_run_at TEXT);
 CREATE TABLE IF NOT EXISTS agent_profiles(agent TEXT, job_type TEXT, runs INTEGER NOT NULL DEFAULT 0, valid_outputs INTEGER NOT NULL DEFAULT 0, failures INTEGER NOT NULL DEFAULT 0, total_cost_usd REAL NOT NULL DEFAULT 0, PRIMARY KEY(agent,job_type));
@@ -94,6 +121,9 @@ CREATE TABLE IF NOT EXISTS parity_events(id INTEGER PRIMARY KEY AUTOINCREMENT, p
 		"job_type TEXT", "agent TEXT", "mode TEXT", "cost_usd REAL NOT NULL DEFAULT 0",
 		"valid_output INTEGER NOT NULL DEFAULT 0", "failure_taxonomy TEXT NOT NULL DEFAULT ''", "result_json TEXT NOT NULL DEFAULT ''",
 		"prompt_version TEXT NOT NULL DEFAULT ''", "envelope_json TEXT NOT NULL DEFAULT ''", "notes TEXT NOT NULL DEFAULT ''",
+		"input_tokens INTEGER NOT NULL DEFAULT 0", "output_tokens INTEGER NOT NULL DEFAULT 0", "cached_input_tokens INTEGER NOT NULL DEFAULT 0",
+		"cache_creation_tokens INTEGER NOT NULL DEFAULT 0", "reasoning_tokens INTEGER NOT NULL DEFAULT 0", "total_tokens INTEGER NOT NULL DEFAULT 0",
+		"usage_available INTEGER NOT NULL DEFAULT 0", "tool_calls INTEGER NOT NULL DEFAULT 0", "transcript_bytes INTEGER NOT NULL DEFAULT 0",
 	} {
 		if _, alterErr := db.Exec("ALTER TABLE runs ADD COLUMN " + column); alterErr != nil && !strings.Contains(strings.ToLower(alterErr.Error()), "duplicate column") {
 			db.Close()
@@ -124,7 +154,10 @@ func RecordCompletion(db *sql.DB, c Completion) error {
 		return err
 	}
 	defer tx.Rollback()
-	if _, err = tx.Exec(`UPDATE runs SET cost_usd=?,valid_output=?,failure_taxonomy=?,result_json=?,notes=? WHERE id=?`, c.CostUSD, c.ValidOutput, c.FailureTaxonomy, c.SelfReviewJSON, c.Notes, c.RunID); err != nil {
+	if _, err = tx.Exec(`UPDATE runs SET cost_usd=?,valid_output=?,failure_taxonomy=?,result_json=?,notes=?,input_tokens=?,output_tokens=?,cached_input_tokens=?,cache_creation_tokens=?,reasoning_tokens=?,total_tokens=?,usage_available=?,tool_calls=?,transcript_bytes=? WHERE id=?`,
+		c.CostUSD, c.ValidOutput, c.FailureTaxonomy, c.SelfReviewJSON, c.Notes, c.Usage.InputTokens, c.Usage.OutputTokens,
+		c.Usage.CachedInputTokens, c.Usage.CacheCreationTokens, c.Usage.ReasoningTokens, c.Usage.TotalTokens,
+		boolInt(c.Usage.Available), c.ToolCalls, c.TranscriptBytes, c.RunID); err != nil {
 		return err
 	}
 	for _, table := range []string{"files_touched", "commands_run", "violations"} {
@@ -221,6 +254,27 @@ func CostPerValidOutput(home string) (CostSummary, error) {
 		s.CostPerValidUSD = s.TotalCostUSD / float64(s.ValidOutputs)
 	}
 	return s, err
+}
+
+func UsageSummaryFor(home, runID string) (UsageReport, error) {
+	db, err := Open(home)
+	if err != nil {
+		return UsageReport{}, err
+	}
+	defer db.Close()
+	report := UsageReport{RunID: runID}
+	query := `SELECT COUNT(*),COALESCE(SUM(usage_available),0),COALESCE(SUM(input_tokens),0),COALESCE(SUM(output_tokens),0),COALESCE(SUM(cached_input_tokens+cache_creation_tokens),0),COALESCE(SUM(reasoning_tokens),0),COALESCE(SUM(total_tokens),0),COALESCE(SUM(tool_calls),0),COALESCE(SUM(transcript_bytes),0) FROM runs WHERE status<>'RUNNING'`
+	args := []any{}
+	if runID != "" {
+		query += ` AND id=?`
+		args = append(args, runID)
+	}
+	err = db.QueryRow(query, args...).Scan(&report.Runs, &report.MeasuredRuns, &report.InputTokens, &report.OutputTokens, &report.CachedTokens, &report.ReasoningTokens, &report.TotalTokens, &report.ToolCalls, &report.TranscriptBytes)
+	return report, err
+}
+
+func (u UsageReport) String() string {
+	return fmt.Sprintf("runs=%d measured=%d tokens=%d input=%d output=%d cached=%d reasoning=%d tool_calls=%d transcript_bytes=%d", u.Runs, u.MeasuredRuns, u.TotalTokens, u.InputTokens, u.OutputTokens, u.CachedTokens, u.ReasoningTokens, u.ToolCalls, u.TranscriptBytes)
 }
 
 func boolInt(value bool) int {

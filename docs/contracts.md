@@ -25,7 +25,7 @@ A job contract is strict YAML: unknown fields, multiple documents, malformed pat
 | `budget.max_lines_changed` | Positive added-plus-deleted line limit. |
 | `budget.max_new_files` | Nonnegative new-file limit, not above changed files. |
 | `budget.max_deleted` | Nonnegative deleted-file limit. |
-| `budget.max_tokens` | Optional nonnegative token ceiling when the backend reports usage. |
+| `budget.max_tokens` | Optional nonnegative token ceiling. Exceeding reported usage quarantines the run; unavailable usage is recorded without guessing. |
 | `preflight.intended_writes` | Declared write patterns; required in write modes and empty in read-only modes. |
 | `preflight.scout_completed` | Records that reconnaissance preceded a high-risk write. |
 | `preflight.approve_high_risk` | Explicit operator approval for policy-classified high-risk work. |

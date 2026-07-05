@@ -48,6 +48,9 @@ type RunRecord struct {
 	Created         string                    `json:"created"`
 	Replayed        bool                      `json:"replayed"`
 	CostUSD         float64                   `json:"cost_usd"`
+	Usage           observability.TokenUsage  `json:"usage"`
+	ToolCalls       int                       `json:"tool_calls"`
+	TranscriptBytes int64                     `json:"transcript_bytes"`
 	ValidOutput     bool                      `json:"valid_output"`
 	FailureTaxonomy string                    `json:"failure_taxonomy,omitempty"`
 	SelfReview      *contracts.ResultDocument `json:"self_review,omitempty"`
@@ -109,7 +112,7 @@ func Last(id string) (RunRecord, error) {
 		return RunRecord{}, err
 	}
 	defer db.Close()
-	q := `SELECT id,job_id,COALESCE(job_type,''),COALESCE(agent,''),COALESCE(mode,''),status,root,worktree,branch,diff,transcript,message,commit_hash,created,cost_usd,valid_output,failure_taxonomy,result_json,COALESCE(prompt_version,''),COALESCE(envelope_json,''),COALESCE(notes,'') FROM runs`
+	q := `SELECT id,job_id,COALESCE(job_type,''),COALESCE(agent,''),COALESCE(mode,''),status,root,worktree,branch,diff,transcript,message,commit_hash,created,cost_usd,valid_output,failure_taxonomy,result_json,COALESCE(prompt_version,''),COALESCE(envelope_json,''),COALESCE(notes,''),input_tokens,output_tokens,cached_input_tokens,cache_creation_tokens,reasoning_tokens,total_tokens,usage_available,tool_calls,transcript_bytes FROM runs`
 	var row *sql.Row
 	if id == "" || id == "last" {
 		row = db.QueryRow(q + ` ORDER BY created DESC LIMIT 1`)
@@ -126,7 +129,7 @@ func Quarantines() ([]RunRecord, error) {
 		return nil, err
 	}
 	defer db.Close()
-	rows, err := db.Query(`SELECT id,job_id,COALESCE(job_type,''),COALESCE(agent,''),COALESCE(mode,''),status,root,worktree,branch,diff,transcript,message,commit_hash,created,cost_usd,valid_output,failure_taxonomy,result_json,COALESCE(prompt_version,''),COALESCE(envelope_json,''),COALESCE(notes,'') FROM runs WHERE status='QUARANTINED' ORDER BY created DESC`)
+	rows, err := db.Query(`SELECT id,job_id,COALESCE(job_type,''),COALESCE(agent,''),COALESCE(mode,''),status,root,worktree,branch,diff,transcript,message,commit_hash,created,cost_usd,valid_output,failure_taxonomy,result_json,COALESCE(prompt_version,''),COALESCE(envelope_json,''),COALESCE(notes,''),input_tokens,output_tokens,cached_input_tokens,cache_creation_tokens,reasoning_tokens,total_tokens,usage_available,tool_calls,transcript_bytes FROM runs WHERE status='QUARANTINED' ORDER BY created DESC`)
 	if err != nil {
 		return nil, err
 	}
@@ -149,7 +152,7 @@ type rowScanner interface {
 func scanRun(row rowScanner) (RunRecord, error) {
 	var r RunRecord
 	var resultJSON string
-	err := row.Scan(&r.ID, &r.JobID, &r.JobType, &r.Agent, &r.Mode, &r.Status, &r.Root, &r.Worktree, &r.Branch, &r.Diff, &r.Transcript, &r.Message, &r.Commit, &r.Created, &r.CostUSD, &r.ValidOutput, &r.FailureTaxonomy, &resultJSON, &r.PromptVersion, &r.Envelope, &r.Notes)
+	err := row.Scan(&r.ID, &r.JobID, &r.JobType, &r.Agent, &r.Mode, &r.Status, &r.Root, &r.Worktree, &r.Branch, &r.Diff, &r.Transcript, &r.Message, &r.Commit, &r.Created, &r.CostUSD, &r.ValidOutput, &r.FailureTaxonomy, &resultJSON, &r.PromptVersion, &r.Envelope, &r.Notes, &r.Usage.InputTokens, &r.Usage.OutputTokens, &r.Usage.CachedInputTokens, &r.Usage.CacheCreationTokens, &r.Usage.ReasoningTokens, &r.Usage.TotalTokens, &r.Usage.Available, &r.ToolCalls, &r.TranscriptBytes)
 	if err == nil && resultJSON != "" {
 		var review contracts.ResultDocument
 		if json.Unmarshal([]byte(resultJSON), &review) == nil {
@@ -433,6 +436,9 @@ type transcriptAudit struct {
 	CostUSD         float64
 	CostAvailable   bool
 	CostUnavailable bool
+	Usage           observability.TokenUsage
+	ToolCalls       int
+	TranscriptBytes int64
 }
 
 func transcriptCommand(format string, value map[string]any) string {
@@ -484,7 +490,8 @@ func auditTranscript(path, format string, c contracts.Contract) transcriptAudit 
 	if err != nil {
 		return transcriptAudit{Violations: []string{"transcript audit: " + err.Error()}, CostUnavailable: true}
 	}
-	audit := transcriptAudit{}
+	audit := transcriptAudit{TranscriptBytes: int64(len(data))}
+	usage := newUsageAccumulator()
 	known := map[string]bool{
 		agents.TranscriptClaude: true, agents.TranscriptCodex: true,
 		agents.TranscriptGLM: true, agents.TranscriptOpenCode: true,
@@ -520,11 +527,16 @@ func auditTranscript(path, format string, c contracts.Contract) transcriptAudit 
 	for _, line := range strings.Split(string(data), "\n") {
 		var v any
 		if json.Unmarshal([]byte(line), &v) == nil {
+			usage.walk(format, v)
 			walk(v)
 		}
 	}
+	audit.Usage, audit.ToolCalls = usage.result()
 	if !audit.CostAvailable {
 		audit.CostUnavailable = true
+	}
+	if c.Budget.MaxTokens > 0 && audit.Usage.Available && audit.Usage.TotalTokens > int64(c.Budget.MaxTokens) {
+		audit.Violations = append(audit.Violations, fmt.Sprintf("max_tokens exceeded: %d > %d", audit.Usage.TotalTokens, c.Budget.MaxTokens))
 	}
 	if len(audit.Commands) > c.Budget.MaxCommands {
 		audit.Violations = append(audit.Violations, "max_commands exceeded")
@@ -558,6 +570,13 @@ func auditTranscript(path, format string, c contracts.Contract) transcriptAudit 
 		}
 	}
 	return audit
+}
+
+func appendNote(notes, note string) string {
+	if notes == "" {
+		return note
+	}
+	return notes + "," + note
 }
 
 func readSelfReview(work string) (*contracts.ResultDocument, string) {
@@ -758,8 +777,14 @@ func (r *Runner) Run(ctx context.Context, c contracts.Contract) (RunRecord, erro
 	_ = redact(transcript)
 	audit := auditTranscript(transcript, agent.Capabilities().TranscriptFormat, c)
 	rec.CostUSD = audit.CostUSD
+	rec.Usage = audit.Usage
+	rec.ToolCalls = audit.ToolCalls
+	rec.TranscriptBytes = audit.TranscriptBytes
 	if audit.CostUnavailable {
-		rec.Notes = "cost_unavailable"
+		rec.Notes = appendNote(rec.Notes, "cost_unavailable")
+	}
+	if !audit.Usage.Available {
+		rec.Notes = appendNote(rec.Notes, "usage_unavailable")
 	}
 	workAfter, werr := fingerprint(work)
 	liveAfter, lerr := fingerprint(root)
@@ -943,6 +968,9 @@ func (r *Runner) Run(ctx context.Context, c contracts.Contract) (RunRecord, erro
 		Files:           files,
 		Commands:        commands,
 		Violations:      violations,
+		Usage:           rec.Usage,
+		ToolCalls:       rec.ToolCalls,
+		TranscriptBytes: rec.TranscriptBytes,
 	}); err != nil {
 		return rec, err
 	}

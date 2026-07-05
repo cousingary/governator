@@ -87,6 +87,8 @@ gov snap create [label]|list|diff <id>|restore <id> [--dry-run]
 gov score agents --job-type <type>
 gov route --job-type <type>
 gov failures
+gov cost --per-valid-output
+gov usage summary|<run_id>
 gov repair-packet <run_id>
 gov eval harness <case-dir>
 gov doctor

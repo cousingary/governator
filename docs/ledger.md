@@ -6,7 +6,7 @@ Governator stores an SQLite WAL database in `ledger_dir` (default `$HOME/.govern
 
 | Table | Evidence |
 |---|---|
-| `runs` | Contract identity, worktree, status, diff, transcript, cost, result, prompt version, enforcement envelope, and notes. |
+| `runs` | Contract identity, worktree, status, diff, transcript, cost, token usage, tool calls, transcript bytes, result, prompt version, enforcement envelope, and notes. |
 | `jobs` | Last-seen timestamp and job type. |
 | `agents` | First and last observed run per backend. |
 | `agent_profiles` | Runs, valid outputs, failures, and total cost by agent and job type. |
@@ -26,6 +26,8 @@ gov diff last
 gov quarantine list
 gov failures
 gov cost --per-valid-output
+gov usage summary
+gov usage RUN_ID
 gov score agents --job-type code_change
 gov route --job-type code_change
 gov repair-packet RUN_ID
@@ -43,6 +45,8 @@ Scoring reports valid-output rate and cost per valid output. Routing orders agen
 
 `harness_eval/` contains deterministic, failure-shaped fixtures that exercise governance without calling a model. `gov eval harness harness_eval` records case outcomes, and `gov eval scorecard` summarizes pass rate and cost by agent and mode.
 
-## Cost caveat
+## Usage and cost caveats
+
+`gov usage summary` aggregates measured tokens, cache activity, tool calls, and transcript bytes; `gov usage RUN_ID` reports one run. Token totals are parsed from Claude, Codex, GLM, OpenCode, and Pi transcript shapes. Runs without reported usage store zero plus `usage_unavailable`; zero must not be interpreted as measured usage.
 
 Cost is parsed from backend transcript formats when exposed. Unsupported or cost-free formats store `0` plus the run note `cost_unavailable`; consumers must distinguish that state from a reported zero-dollar call.

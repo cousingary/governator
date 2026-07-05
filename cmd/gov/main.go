@@ -169,6 +169,25 @@ func run(args []string) int {
 		}
 		fmt.Println(summary.String())
 		return 0
+	case "usage":
+		if len(args) != 2 {
+			return bad("usage: gov usage summary|<run_id>")
+		}
+		runID := args[1]
+		if runID == "summary" {
+			runID = ""
+		}
+		report, err := observability.UsageSummaryFor(govruntime.Home(), runID)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "usage:", err)
+			return 1
+		}
+		if runID != "" && report.Runs == 0 {
+			fmt.Fprintln(os.Stderr, "usage: run not found:", runID)
+			return 1
+		}
+		fmt.Println(report.String())
+		return 0
 	case "route":
 		if len(args) != 3 || args[1] != "--job-type" {
 			return bad("usage: gov route --job-type <type>")
@@ -622,6 +641,7 @@ Usage:
   gov score agents --job-type <type>
   gov failures
   gov cost --per-valid-output
+  gov usage summary|<run_id>
   gov route --job-type <type>
   gov repair-packet <run_id>
   gov eval harness <case-dir>

@@ -45,7 +45,7 @@ func TestOpenMigratesLegacyLedger(t *testing.T) {
 	if err := rows.Close(); err != nil {
 		t.Fatal(err)
 	}
-	for _, name := range []string{"job_type", "agent", "mode", "cost_usd", "valid_output", "failure_taxonomy", "result_json", "prompt_version", "envelope_json", "notes"} {
+	for _, name := range []string{"job_type", "agent", "mode", "cost_usd", "valid_output", "failure_taxonomy", "result_json", "prompt_version", "envelope_json", "notes", "input_tokens", "output_tokens", "cached_input_tokens", "cache_creation_tokens", "reasoning_tokens", "total_tokens", "usage_available", "tool_calls", "transcript_bytes"} {
 		if !columns[name] {
 			t.Errorf("missing migrated column %s", name)
 		}
@@ -58,5 +58,28 @@ func TestOpenMigratesLegacyLedger(t *testing.T) {
 		if count != 1 {
 			t.Errorf("missing table %s", table)
 		}
+	}
+}
+
+func TestUsageSummaryFor(t *testing.T) {
+	home := t.TempDir()
+	db, err := Open(home)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = db.Exec(`INSERT INTO runs(id,status,input_tokens,output_tokens,cached_input_tokens,cache_creation_tokens,reasoning_tokens,total_tokens,usage_available,tool_calls,transcript_bytes) VALUES('run-1','APPROVED',100,20,70,5,4,129,1,3,2048)`)
+	if err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	report, err := UsageSummaryFor(home, "run-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.Runs != 1 || report.MeasuredRuns != 1 || report.TotalTokens != 129 || report.CachedTokens != 75 || report.ToolCalls != 3 || report.TranscriptBytes != 2048 {
+		t.Fatalf("unexpected usage report: %+v", report)
 	}
 }
