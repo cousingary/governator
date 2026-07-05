@@ -1,6 +1,7 @@
 package contextgraph
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"strings"
@@ -61,5 +62,78 @@ exit 1
 	}
 	if !stats.Initialized || stats.FileCount != 51 || stats.NodeCount != 689 || stats.EdgeCount != 1579 {
 		t.Fatalf("stats=%+v", stats)
+	}
+}
+
+func TestPrepareBuildsFingerprintAndQueries(t *testing.T) {
+	bin := filepath.Join(t.TempDir(), "codegraph")
+	script := `#!/bin/sh
+for arg in "$@"; do project="$arg"; done
+case "$1" in
+  version)
+    echo 'codegraph 0.24.0'
+    ;;
+  init|sync)
+    mkdir -p "$project/.codegraph"
+    printf 'deterministic graph db' > "$project/.codegraph/codegraph.db"
+    ;;
+  status)
+    if [ -f "$project/.codegraph/codegraph.db" ]; then
+      printf '{"initialized":true,"projectPath":"%s","indexPath":"%s/.codegraph","fileCount":51,"nodeCount":689,"edgeCount":1579,"dbSizeBytes":22}\n' "$project" "$project"
+    else
+      printf '{"initialized":false}\n'
+    fi
+    ;;
+  query)
+    printf '[{"name":"RunRecord","kind":"struct"}]\n'
+    ;;
+  *) exit 1 ;;
+esac
+`
+	if err := os.WriteFile(bin, []byte(script), 0755); err != nil {
+		t.Fatal(err)
+	}
+	graphEnv(t, "required", bin)
+	project := t.TempDir()
+
+	snapshot, err := Prepare(context.Background(), project)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !snapshot.Available || !snapshot.Refreshed || len(snapshot.Fingerprint) != 64 {
+		t.Fatalf("snapshot=%+v", snapshot)
+	}
+	if snapshot.FileCount != 51 || snapshot.NodeCount != 689 || snapshot.EdgeCount != 1579 {
+		t.Fatalf("snapshot stats=%+v", snapshot)
+	}
+	if snapshot.IndexPath != filepath.Join(project, ".codegraph", "codegraph.db") {
+		t.Fatalf("index path=%q", snapshot.IndexPath)
+	}
+	output, err := Query(context.Background(), snapshot, "RunRecord", 5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(output), "RunRecord") {
+		t.Fatalf("query output=%s", output)
+	}
+	patterns := CommandPatterns(snapshot)
+	annotation := PromptAnnotation(snapshot)
+	if len(patterns) != 4 || !strings.Contains(annotation, snapshot.Fingerprint) || !strings.Contains(annotation, "Before broad grep") {
+		t.Fatalf("patterns=%v annotation=%q", patterns, annotation)
+	}
+}
+
+func TestPrepareAutoDegradesOnProviderFailure(t *testing.T) {
+	bin := filepath.Join(t.TempDir(), "codegraph")
+	if err := os.WriteFile(bin, []byte("#!/bin/sh\nif [ \"$1\" = version ]; then echo 'codegraph broken'; exit 0; fi\necho build-failed >&2\nexit 2\n"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	graphEnv(t, "auto", bin)
+	snapshot, err := Prepare(context.Background(), t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snapshot.Available || !strings.Contains(snapshot.Warning, "build-failed") {
+		t.Fatalf("snapshot=%+v", snapshot)
 	}
 }

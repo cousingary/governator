@@ -71,6 +71,8 @@ RTK (Rust Token Killer) integration defaults to `rtk.mode: auto`: when an `rtk` 
 
 Structural context defaults to `graph.mode: auto` with the `codegraph` provider. When the binary is available, `gov doctor` reports its version and the current repository's index statistics; otherwise auto mode remains an optional warning. Use `graph.mode: required` to make a missing provider a hard preflight failure, or `off` to disable graph integration. `GOV_GRAPH_MODE`, `GOV_GRAPH_PROVIDER`, and `GOV_GRAPH_BIN` override the YAML settings. The first supported adapter is [CodeGraph-Rust](https://github.com/sunerpy/codegraph-rust), selected after a compatibility spike confirmed Go type, method, and relationship indexing.
 
+For each governed run, the controller builds or refreshes the graph inside the disposable worktree before baseline fingerprints, injects bounded read-only query forms into the runtime prompt, and excludes the controller-owned `.codegraph` index from source commits. The ledger records provider version, SHA-256 index fingerprint, file/node/edge counts, and database size. Operators can inspect or explicitly manage an index with `gov graph status [path]`, `gov graph refresh [path]`, and `gov graph query <search> [--path <path>] [--limit <n>]`.
+
 ## Commands
 
 ```text
@@ -86,6 +88,8 @@ gov gate check
 gov parity report
 gov protect status|apply|release <path>
 gov snap create [label]|list|diff <id>|restore <id> [--dry-run]
+gov graph status|refresh [path]
+gov graph query <search> [--path <path>] [--limit <n>]
 gov score agents --job-type <type>
 gov route --job-type <type>
 gov failures

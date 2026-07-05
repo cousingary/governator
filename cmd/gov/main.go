@@ -10,10 +10,12 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/cousingary/governator/internal/config"
+	"github.com/cousingary/governator/internal/contextgraph"
 	"github.com/cousingary/governator/internal/contracts"
 	"github.com/cousingary/governator/internal/doctor"
 	"github.com/cousingary/governator/internal/observability"
@@ -260,6 +262,8 @@ func run(args []string) int {
 		return protectCmd(args[1:])
 	case "snap":
 		return snapCmd(args[1:])
+	case "graph":
+		return graphCmd(args[1:])
 	case "parity":
 		return parityCmd(args[1:])
 	case "hook":
@@ -351,6 +355,82 @@ func quarantine(args []string) int {
 	}
 	return bad("usage: gov quarantine list|show <id>|diff <id>")
 }
+func graphCmd(args []string) int {
+	if len(args) == 0 {
+		return bad("usage: gov graph status|refresh [path] | gov graph query <search> [--path <path>] [--limit <n>]")
+	}
+	cwd, err := os.Getwd()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "graph:", err)
+		return 1
+	}
+	printSnapshot := func(snapshot contextgraph.Snapshot) int {
+		output, marshalErr := json.MarshalIndent(snapshot, "", "  ")
+		if marshalErr != nil {
+			fmt.Fprintln(os.Stderr, "graph:", marshalErr)
+			return 1
+		}
+		fmt.Println(string(output))
+		return 0
+	}
+	switch args[0] {
+	case "status", "refresh":
+		if len(args) > 2 {
+			return bad("usage: gov graph " + args[0] + " [path]")
+		}
+		project := cwd
+		if len(args) == 2 {
+			project = args[1]
+		}
+		var snapshot contextgraph.Snapshot
+		if args[0] == "status" {
+			snapshot, err = contextgraph.Current(project)
+		} else {
+			snapshot, err = contextgraph.Prepare(context.Background(), project)
+		}
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "graph:", err)
+			return 1
+		}
+		return printSnapshot(snapshot)
+	case "query":
+		if len(args) < 2 {
+			return bad("usage: gov graph query <search> [--path <path>] [--limit <n>]")
+		}
+		search, project, limit := args[1], cwd, 5
+		for i := 2; i < len(args); i += 2 {
+			if i+1 >= len(args) {
+				return bad("usage: gov graph query <search> [--path <path>] [--limit <n>]")
+			}
+			switch args[i] {
+			case "--path":
+				project = args[i+1]
+			case "--limit":
+				limit, err = strconv.Atoi(args[i+1])
+				if err != nil {
+					return bad("graph: --limit must be an integer")
+				}
+			default:
+				return bad("graph: unknown option " + args[i])
+			}
+		}
+		snapshot, prepareErr := contextgraph.Prepare(context.Background(), project)
+		if prepareErr != nil {
+			fmt.Fprintln(os.Stderr, "graph:", prepareErr)
+			return 1
+		}
+		output, queryErr := contextgraph.Query(context.Background(), snapshot, search, limit)
+		if queryErr != nil {
+			fmt.Fprintln(os.Stderr, "graph:", queryErr)
+			return 1
+		}
+		fmt.Print(string(output))
+		return 0
+	default:
+		return bad("usage: gov graph status|refresh [path] | gov graph query <search> [--path <path>] [--limit <n>]")
+	}
+}
+
 func bad(s string) int { fmt.Fprintln(os.Stderr, s); return 2 }
 
 // hookCmd implements `gov hook pre-tool-use` — the Phase 5 bridge that lets
@@ -648,6 +728,8 @@ Usage:
   gov eval scorecard
   gov protect status|apply|release <path>
   gov snap create [label]|list|diff <id>|restore <id> [--dry-run]
+  gov graph status|refresh [path]
+  gov graph query <search> [--path <path>] [--limit <n>]
   gov hook pre-tool-use [--run <id>] [--shadow <python-gate>]
   gov gate check
   gov parity report

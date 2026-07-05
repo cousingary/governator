@@ -6,7 +6,7 @@ Governator stores an SQLite WAL database in `ledger_dir` (default `$HOME/.govern
 
 | Table | Evidence |
 |---|---|
-| `runs` | Contract identity, worktree, status, diff, transcript, cost, token usage, tool calls, transcript bytes, result, prompt version, enforcement envelope, and notes. |
+| `runs` | Contract identity, worktree, status, diff, transcript, cost, token usage, tool calls, transcript bytes, graph provider/version/fingerprint/stats, result, prompt version, enforcement envelope, and notes. |
 | `jobs` | Last-seen timestamp and job type. |
 | `agents` | First and last observed run per backend. |
 | `agent_profiles` | Runs, valid outputs, failures, and total cost by agent and job type. |
@@ -28,6 +28,8 @@ gov failures
 gov cost --per-valid-output
 gov usage summary
 gov usage RUN_ID
+gov graph status
+gov graph query SYMBOL --limit 5
 gov score agents --job-type code_change
 gov route --job-type code_change
 gov repair-packet RUN_ID
@@ -44,6 +46,10 @@ Scoring reports valid-output rate and cost per valid output. Routing orders agen
 ## Evaluation
 
 `harness_eval/` contains deterministic, failure-shaped fixtures that exercise governance without calling a model. `gov eval harness harness_eval` records case outcomes, and `gov eval scorecard` summarizes pass rate and cost by agent and mode.
+
+## Structural context evidence
+
+When graph integration is active, every run records the CodeGraph provider version, SHA-256 database fingerprint, file/node/edge counts, and database size. Runtime indexes live only in the disposable worktree and are not merged into source. The fingerprint identifies the exact context database presented to the agent; it is evidence, not a substitute for source verification.
 
 ## Usage and cost caveats
 

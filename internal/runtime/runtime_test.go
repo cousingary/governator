@@ -35,6 +35,8 @@ func fixture(t *testing.T) (string, string) {
 	git(t, root, "commit", "-m", "seed")
 	bin := filepath.Join(t.TempDir(), "fake-claude")
 	s := `#!/bin/sh
+for arg in "$@"; do last="$arg"; done
+if [ -n "$FAKE_PROMPT_FILE" ]; then printf '%s' "$last" > "$FAKE_PROMPT_FILE"; fi
 mkdir -p output
 printf 'ok\n' > output/result.txt
 printf '{"status":"complete","files_changed":["output/result.txt"],"commands_run":0,"validation":{"self_checked":true},"violations":[],"blockers":[],"next_recommended_action":"none"}\n' > RESULT.json
@@ -350,5 +352,71 @@ func TestWriteOutsideIntendedScopeIsQuarantined(t *testing.T) {
 	}
 	if r.Status != "QUARANTINED" || !strings.Contains(r.Message, "write outside intended_writes") {
 		t.Fatalf("%s: %s", r.Status, r.Message)
+	}
+}
+
+func TestRunBuildsDisposableGraphAndRecordsFingerprint(t *testing.T) {
+	root, agentBin := fixture(t)
+	home := t.TempDir()
+	graphBin := filepath.Join(t.TempDir(), "codegraph")
+	graphScript := `#!/bin/sh
+for arg in "$@"; do project="$arg"; done
+case "$1" in
+  version) echo 'codegraph 0.24.0' ;;
+  init|sync)
+    mkdir -p "$project/.codegraph"
+    printf 'runtime graph database' > "$project/.codegraph/codegraph.db"
+    ;;
+  status)
+    printf '{"initialized":true,"projectPath":"%s","indexPath":"%s/.codegraph/codegraph.db","fileCount":7,"nodeCount":31,"edgeCount":44,"dbSizeBytes":22}\n' "$project" "$project"
+    ;;
+  query) printf '[]\n' ;;
+  *) exit 1 ;;
+esac
+`
+	if err := os.WriteFile(graphBin, []byte(graphScript), 0755); err != nil {
+		t.Fatal(err)
+	}
+	promptFile := filepath.Join(t.TempDir(), "prompt.txt")
+	t.Setenv("GOV_HOME", home)
+	t.Setenv("GOV_CLAUDE_BIN", agentBin)
+	t.Setenv("GOV_GRAPH_MODE", "required")
+	t.Setenv("GOV_GRAPH_PROVIDER", "codegraph")
+	t.Setenv("GOV_GRAPH_BIN", graphBin)
+	t.Setenv("FAKE_PROMPT_FILE", promptFile)
+
+	record, err := New().Run(context.Background(), contract(root))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if record.Status != "APPROVED" || !record.Graph.Available || len(record.Graph.Fingerprint) != 64 {
+		t.Fatalf("record=%+v", record)
+	}
+	if record.Graph.Version != "codegraph 0.24.0" || record.Graph.FileCount != 7 || record.Graph.NodeCount != 31 || record.Graph.EdgeCount != 44 {
+		t.Fatalf("graph=%+v", record.Graph)
+	}
+	prompt, err := os.ReadFile(promptFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(prompt), "Before broad grep") || !strings.Contains(string(prompt), record.Graph.Fingerprint) {
+		t.Fatalf("graph annotation missing from prompt")
+	}
+	loaded, err := Last(record.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.Graph.Fingerprint != record.Graph.Fingerprint || loaded.Graph.Provider != "codegraph" {
+		t.Fatalf("ledger graph=%+v", loaded.Graph)
+	}
+	tracked, err := exec.Command("git", "-C", root, "ls-files", ".codegraph").Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(tracked) != 0 {
+		t.Fatalf("controller graph was committed: %s", tracked)
+	}
+	if _, err := os.Stat(filepath.Join(root, ".codegraph")); !os.IsNotExist(err) {
+		t.Fatalf("graph escaped disposable worktree: %v", err)
 	}
 }
