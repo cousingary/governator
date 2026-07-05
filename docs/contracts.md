@@ -31,6 +31,8 @@ A job contract is strict YAML: unknown fields, multiple documents, malformed pat
 | `preflight.approve_high_risk` | Explicit operator approval for policy-classified high-risk work. |
 | `success.required_files` | Files that must exist after a write-capable run. |
 | `success.validators` | Nonempty deterministic shell validators, run outside the model. |
+| `output.style` | Optional. `terse` or `normal`. Omit the field for the existing unrestricted prompt. |
+| `output.max_final_words` | Optional, `terse` only. 20-1000; defaults to 120 when omitted. |
 | `on_violation` | `quarantine`, `halt`, or `rollback`. |
 
 All path patterns are repository-relative and may not escape with `..`. Read-only modes are `scout`, `verifier`, and `architect`.
@@ -77,3 +79,13 @@ Write-capable agents are instructed to create `RESULT.json` in the worktree:
 ```
 
 The document is advisory. Governator independently computes the diff, command count, budgets, forbidden-path checks, required files, and validator results before approving a merge.
+
+## Output policy
+
+```yaml
+output:
+  style: terse
+  max_final_words: 80
+```
+
+Setting `output.style: terse` appends prompt guidance capping the agent's final response at `max_final_words` (default 120). The guidance suppresses task restatement, routine progress narration, and generic advice; it never permits omitting evidence or `RESULT.json`. Leave `output` unset for the unrestricted prompt. `max_final_words` is invalid under `style: normal`.

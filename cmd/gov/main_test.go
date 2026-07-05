@@ -140,3 +140,32 @@ func TestShadowParityMatchMismatchUnavailable(t *testing.T) {
 		t.Fatalf("report=%+v", report)
 	}
 }
+
+func TestHandoffCommandReturnsCompactRunEvidence(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("GOV_HOME", home)
+	t.Setenv("GOV_CONFIG", "")
+	db, err := observability.Open(home)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = db.Exec(`INSERT INTO runs(id,job_id,job_type,agent,mode,status,root,worktree,branch,diff,transcript,message,commit_hash,created,total_tokens,usage_available,graph_provider,graph_fingerprint,graph_files,graph_nodes,graph_edges) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		"run-handoff", "job-handoff", "code_change", "codex", "surgeon", "APPROVED", "/tmp/project", "", "",
+		"diff --git a/a.go b/a.go\n", strings.Repeat("bulk", 1000), "verified", "",
+		"2026-07-05T00:00:00Z", 120, 1, "codegraph", strings.Repeat("a", 64), 1, 2, 3)
+	_ = db.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	code, output := captureRunInput(t, []string{"handoff", "run-handoff"}, "")
+	if code != 0 {
+		t.Fatalf("exit=%d output=%s", code, output)
+	}
+	var handoff govruntime.Handoff
+	if err := json.Unmarshal([]byte(output), &handoff); err != nil {
+		t.Fatalf("output=%q: %v", output, err)
+	}
+	if handoff.RunID != "run-handoff" || handoff.Usage.TotalTokens != 120 || handoff.Graph.NodeCount != 2 || strings.Contains(output, "bulkbulk") {
+		t.Fatalf("handoff=%+v output=%s", handoff, output)
+	}
+}

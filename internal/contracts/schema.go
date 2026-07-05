@@ -28,18 +28,19 @@ var validModes = map[Mode]bool{
 var jobIDPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]*$`)
 
 type Contract struct {
-	Task        string      `yaml:"task,omitempty" json:"task,omitempty"`
-	JobID       string      `yaml:"job_id" json:"job_id"`
-	JobType     string      `yaml:"job_type" json:"job_type"`
-	Agent       string      `yaml:"agent" json:"agent"`
-	Mode        Mode        `yaml:"mode" json:"mode"`
-	Workspace   Workspace   `yaml:"workspace" json:"workspace"`
-	Allowed     Permissions `yaml:"allowed" json:"allowed"`
-	Forbidden   Forbidden   `yaml:"forbidden" json:"forbidden"`
-	Budget      Budget      `yaml:"budget" json:"budget"`
-	Preflight   Preflight   `yaml:"preflight" json:"preflight"`
-	Success     Success     `yaml:"success" json:"success"`
-	OnViolation string      `yaml:"on_violation" json:"on_violation"`
+	Task        string        `yaml:"task,omitempty" json:"task,omitempty"`
+	JobID       string        `yaml:"job_id" json:"job_id"`
+	JobType     string        `yaml:"job_type" json:"job_type"`
+	Agent       string        `yaml:"agent" json:"agent"`
+	Mode        Mode          `yaml:"mode" json:"mode"`
+	Workspace   Workspace     `yaml:"workspace" json:"workspace"`
+	Allowed     Permissions   `yaml:"allowed" json:"allowed"`
+	Forbidden   Forbidden     `yaml:"forbidden" json:"forbidden"`
+	Budget      Budget        `yaml:"budget" json:"budget"`
+	Preflight   Preflight     `yaml:"preflight" json:"preflight"`
+	Success     Success       `yaml:"success" json:"success"`
+	Output      *OutputPolicy `yaml:"output,omitempty" json:"output,omitempty"`
+	OnViolation string        `yaml:"on_violation" json:"on_violation"`
 }
 
 type Workspace struct {
@@ -78,6 +79,18 @@ type Preflight struct {
 type Success struct {
 	RequiredFiles []string `yaml:"required_files" json:"required_files"`
 	Validators    []string `yaml:"validators" json:"validators"`
+}
+
+type OutputPolicy struct {
+	Style         string `yaml:"style" json:"style"`
+	MaxFinalWords int    `yaml:"max_final_words,omitempty" json:"max_final_words,omitempty"`
+}
+
+func (p OutputPolicy) EffectiveMaxFinalWords() int {
+	if p.MaxFinalWords > 0 {
+		return p.MaxFinalWords
+	}
+	return 120
 }
 
 type ValidationError struct {
@@ -190,6 +203,21 @@ func (c Contract) Validate() error {
 		add("success.validators", "must contain at least one deterministic validator command")
 	}
 	validateNonBlank("success.validators", c.Success.Validators, add)
+
+	if c.Output != nil {
+		switch c.Output.Style {
+		case "terse":
+			if c.Output.MaxFinalWords != 0 && (c.Output.MaxFinalWords < 20 || c.Output.MaxFinalWords > 1000) {
+				add("output.max_final_words", "must be between 20 and 1000 when set")
+			}
+		case "normal":
+			if c.Output.MaxFinalWords != 0 {
+				add("output.max_final_words", "is only valid when output.style is 'terse'")
+			}
+		default:
+			add("output.style", "must be 'terse' or 'normal'")
+		}
+	}
 
 	switch c.OnViolation {
 	case "quarantine", "halt", "rollback":

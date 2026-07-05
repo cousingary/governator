@@ -22,6 +22,7 @@ Governator stores an SQLite WAL database in `ledger_dir` (default `$HOME/.govern
 ## Operations
 
 ```sh
+gov handoff last
 gov diff last
 gov quarantine list
 gov failures
@@ -38,6 +39,10 @@ gov eval scorecard
 ```
 
 Scoring reports valid-output rate and cost per valid output. Routing orders agents using recorded failure evidence for the requested job type; it does not invent a recommendation when no evidence exists.
+
+## Handoffs
+
+`gov handoff [last|run_id]` emits a bounded JSON summary of one run from ledger evidence: run identity and status, files changed, blockers, next recommended action, token usage, graph fingerprint/stats, and prompt version. It excludes the transcript and diff bodies entirely, falling back to file paths parsed from the diff header when `RESULT.json` reported no file list. Use it to brief the next session or agent without paying for the full transcript context.
 
 ## Repair packets
 

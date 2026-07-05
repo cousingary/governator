@@ -113,5 +113,8 @@ preflight:
 success:
   required_files: []
   validators: ["go test ./..."]
+output:
+  style: terse
+  max_final_words: 80
 on_violation: halt
 `

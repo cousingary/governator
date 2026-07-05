@@ -42,7 +42,7 @@ func CompilePrompt(c Contract, worktree string) (string, error) {
 		ModeRepair:      "diagnose and repair only the stated failure",
 		ModeArchitect:   "analyze architecture and report without modifying files",
 	}[c.Mode]
-	return fmt.Sprintf(`You are an execution agent inside Governator.
+	prompt := fmt.Sprintf(`You are an execution agent inside Governator.
 Mode: %s - %s.
 Task: %s
 The only writable project root is %s.
@@ -53,5 +53,11 @@ RESULT.json is advisory; the controller independently verifies every claim.
 
 CONTRACT:
 %s
-`, c.Mode, role, strings.TrimSpace(c.Task), worktree, b), nil
+`, c.Mode, role, strings.TrimSpace(c.Task), worktree, b)
+	if c.Output != nil && c.Output.Style == "terse" {
+		prompt += fmt.Sprintf(`
+Output discipline: terse. Keep the final response under %d words. Do not restate the task, narrate routine progress, or add generic advice. Report only actions, verification, blockers, and the final status. Never omit evidence or RESULT.json to save words.
+`, c.Output.EffectiveMaxFinalWords())
+	}
+	return prompt, nil
 }

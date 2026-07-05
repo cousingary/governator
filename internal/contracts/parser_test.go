@@ -104,3 +104,18 @@ func FuzzContractParser(f *testing.F) {
 		_, _ = Parse(data)
 	})
 }
+
+func TestParseOutputPolicy(t *testing.T) {
+	withOutput := strings.Replace(validContract, "on_violation: quarantine", "output: {style: terse, max_final_words: 80}\non_violation: quarantine", 1)
+	contract, err := Parse([]byte(withOutput))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if contract.Output == nil || contract.Output.Style != "terse" || contract.Output.EffectiveMaxFinalWords() != 80 {
+		t.Fatalf("output=%+v", contract.Output)
+	}
+	invalid := strings.Replace(withOutput, "max_final_words: 80", "max_final_words: 10", 1)
+	if _, err := Parse([]byte(invalid)); err == nil || !strings.Contains(err.Error(), "output.max_final_words") {
+		t.Fatalf("error=%v", err)
+	}
+}

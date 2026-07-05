@@ -32,3 +32,20 @@ func TestContractHashIsStable(t *testing.T) {
 		t.Fatalf("unstable hash %q %q", a, b)
 	}
 }
+
+func TestCompilePromptTerseOutputPolicy(t *testing.T) {
+	c := Contract{
+		Task:   "repair one defect",
+		Mode:   ModeSurgeon,
+		Output: &OutputPolicy{Style: "terse", MaxFinalWords: 80},
+	}
+	prompt, err := CompilePrompt(c, "/tmp/worktree")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"Output discipline: terse", "under 80 words", "Never omit evidence"} {
+		if !strings.Contains(prompt, want) {
+			t.Fatalf("prompt missing %q", want)
+		}
+	}
+}

@@ -80,6 +80,7 @@ gov init
 gov validate <job.yaml>
 gov preflight <job.yaml>
 gov run <job.yaml> [--agent <name>]
+gov handoff [last|run_id]
 gov diff [last|run_id]
 gov rollback <run_id>
 gov quarantine list|show <id>|diff <id>

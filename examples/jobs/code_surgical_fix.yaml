@@ -20,4 +20,7 @@ preflight:
 success:
   required_files: ["internal/contracts/schema.go"]
   validators: ["go test ./internal/contracts"]
+output:
+  style: terse
+  max_final_words: 80
 on_violation: quarantine

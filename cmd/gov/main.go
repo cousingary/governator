@@ -96,6 +96,26 @@ func run(args []string) int {
 			return 1
 		}
 		return 0
+	case "handoff":
+		if len(args) > 2 {
+			return bad("usage: gov handoff [last|run_id]")
+		}
+		id := "last"
+		if len(args) == 2 {
+			id = args[1]
+		}
+		handoff, err := govruntime.HandoffFor(id)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "handoff:", err)
+			return 1
+		}
+		output, err := json.MarshalIndent(handoff, "", "  ")
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "handoff:", err)
+			return 1
+		}
+		fmt.Println(string(output))
+		return 0
 	case "diff":
 		if len(args) > 2 {
 			return bad("usage: gov diff [last|run_id]")
@@ -715,6 +735,7 @@ Usage:
   gov validate <job.yaml>
   gov preflight <job.yaml>
   gov run <job.yaml> [--agent <name>]
+  gov handoff [last|run_id]
   gov diff [last|run_id]
   gov rollback <run_id>
   gov quarantine list|show <id>|diff <id>
