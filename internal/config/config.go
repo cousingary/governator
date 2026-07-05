@@ -20,6 +20,12 @@ type RTK struct {
 	Bin  string `yaml:"bin"`
 }
 
+type Graph struct {
+	Mode     string `yaml:"mode"`
+	Provider string `yaml:"provider"`
+	Bin      string `yaml:"bin"`
+}
+
 type Defaults struct {
 	Agent      string `yaml:"agent"`
 	MaxMinutes int    `yaml:"max_minutes"`
@@ -32,6 +38,7 @@ type Config struct {
 	LedgerDir         string             `yaml:"ledger_dir"`
 	Backends          map[string]Backend `yaml:"backends"`
 	RTK               RTK                `yaml:"rtk"`
+	Graph             Graph              `yaml:"graph"`
 	Defaults          Defaults           `yaml:"defaults"`
 }
 
@@ -65,6 +72,7 @@ func BuiltIn() Config {
 			"opencode": {Bin: "opencode"}, "pi": {Bin: "pi"},
 		},
 		RTK:      RTK{Mode: "auto", Bin: "rtk"},
+		Graph:    Graph{Mode: "auto", Provider: "codegraph", Bin: "codegraph"},
 		Defaults: Defaults{Agent: "claude-code", MaxMinutes: 30},
 	}
 }
@@ -89,6 +97,12 @@ func Load() (Config, error) {
 	clean(&cfg)
 	if cfg.RTK.Mode != "auto" && cfg.RTK.Mode != "off" && cfg.RTK.Mode != "required" {
 		return Config{}, fmt.Errorf("invalid rtk.mode %q (want auto, off, or required)", cfg.RTK.Mode)
+	}
+	if cfg.Graph.Mode != "auto" && cfg.Graph.Mode != "off" && cfg.Graph.Mode != "required" {
+		return Config{}, fmt.Errorf("invalid graph.mode %q (want auto, off, or required)", cfg.Graph.Mode)
+	}
+	if cfg.Graph.Provider != "codegraph" {
+		return Config{}, fmt.Errorf("invalid graph.provider %q (want codegraph)", cfg.Graph.Provider)
 	}
 	return cfg, nil
 }
@@ -126,6 +140,15 @@ func merge(dst *Config, src Config) {
 	}
 	if src.RTK.Bin != "" {
 		dst.RTK.Bin = src.RTK.Bin
+	}
+	if src.Graph.Mode != "" {
+		dst.Graph.Mode = src.Graph.Mode
+	}
+	if src.Graph.Provider != "" {
+		dst.Graph.Provider = src.Graph.Provider
+	}
+	if src.Graph.Bin != "" {
+		dst.Graph.Bin = src.Graph.Bin
 	}
 	if src.Defaults.Agent != "" {
 		dst.Defaults.Agent = src.Defaults.Agent
@@ -166,6 +189,15 @@ func applyEnv(cfg *Config) {
 	if value := Env("GOV_RTK_BIN"); value != "" {
 		cfg.RTK.Bin = value
 	}
+	if value := Env("GOV_GRAPH_MODE"); value != "" {
+		cfg.Graph.Mode = value
+	}
+	if value := Env("GOV_GRAPH_PROVIDER"); value != "" {
+		cfg.Graph.Provider = value
+	}
+	if value := Env("GOV_GRAPH_BIN"); value != "" {
+		cfg.Graph.Bin = value
+	}
 	if value := Env("GOV_DEFAULT_AGENT"); value != "" {
 		cfg.Defaults.Agent = value
 	}
@@ -198,6 +230,9 @@ func splitPathList(value string) []string {
 func clean(cfg *Config) {
 	cfg.RTK.Mode = strings.ToLower(strings.TrimSpace(cfg.RTK.Mode))
 	cfg.RTK.Bin = strings.TrimSpace(cfg.RTK.Bin)
+	cfg.Graph.Mode = strings.ToLower(strings.TrimSpace(cfg.Graph.Mode))
+	cfg.Graph.Provider = strings.ToLower(strings.TrimSpace(cfg.Graph.Provider))
+	cfg.Graph.Bin = strings.TrimSpace(cfg.Graph.Bin)
 	cfg.ProtectedManifest = expand(cfg.ProtectedManifest)
 	cfg.SnapshotDir = expand(cfg.SnapshotDir)
 	cfg.LedgerDir = expand(cfg.LedgerDir)

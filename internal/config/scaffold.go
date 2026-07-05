@@ -76,6 +76,10 @@ backends:
 rtk:
   mode: auto # auto, off, or required
   bin: rtk
+graph:
+  mode: auto # auto, off, or required
+  provider: codegraph
+  bin: codegraph
 defaults:
   agent: claude-code
   max_minutes: 30

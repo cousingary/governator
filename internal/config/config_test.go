@@ -14,6 +14,7 @@ func cleanEnv(t *testing.T) {
 		"CLAUDE_HARNESS_STATE", "GOV_SNAPSHOT_DIR", "HARNESS_SNAPSHOT_DIR",
 		"GOV_SNAPSHOT_ROOTS", "GOV_LEDGER_DIR", "GOV_HOME", "GOVERNATOR_HOME",
 		"GOV_CODEX_BIN", "GOV_RTK_MODE", "GOV_RTK_BIN",
+		"GOV_GRAPH_MODE", "GOV_GRAPH_PROVIDER", "GOV_GRAPH_BIN",
 		"GOV_DEFAULT_AGENT", "GOV_DEFAULT_MAX_MINUTES",
 	} {
 		t.Setenv(name, "")
@@ -33,6 +34,7 @@ ledger_dir: /ledger/file
 backends:
   codex: {bin: codex-file}
 rtk: {mode: off, bin: rtk-file}
+graph: {mode: auto, provider: codegraph, bin: codegraph-file}
 defaults: {agent: codex, max_minutes: 12}
 `), 0644); err != nil {
 		t.Fatal(err)
@@ -41,6 +43,8 @@ defaults: {agent: codex, max_minutes: 12}
 	t.Setenv("GOV_CODEX_BIN", "codex-env")
 	t.Setenv("GOV_RTK_MODE", "required")
 	t.Setenv("GOV_RTK_BIN", "rtk-env")
+	t.Setenv("GOV_GRAPH_MODE", "required")
+	t.Setenv("GOV_GRAPH_BIN", "codegraph-env")
 	cfg, err := Load()
 	if err != nil {
 		t.Fatal(err)
@@ -54,6 +58,9 @@ defaults: {agent: codex, max_minutes: 12}
 	if cfg.RTK.Mode != "required" || cfg.RTK.Bin != "rtk-env" {
 		t.Fatalf("rtk config=%+v", cfg.RTK)
 	}
+	if cfg.Graph.Mode != "required" || cfg.Graph.Provider != "codegraph" || cfg.Graph.Bin != "codegraph-env" {
+		t.Fatalf("graph config=%+v", cfg.Graph)
+	}
 }
 
 func TestLoadRejectsInvalidRTKMode(t *testing.T) {
@@ -64,6 +71,18 @@ func TestLoadRejectsInvalidRTKMode(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "invalid rtk.mode") {
+		t.Fatalf("error=%v", err)
+	}
+}
+
+func TestLoadRejectsInvalidGraphMode(t *testing.T) {
+	cleanEnv(t)
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	t.Setenv("GOV_CONFIG", path)
+	if err := os.WriteFile(path, []byte("graph: {mode: always}\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "invalid graph.mode") {
 		t.Fatalf("error=%v", err)
 	}
 }

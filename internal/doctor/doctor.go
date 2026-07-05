@@ -13,6 +13,7 @@ import (
 
 	"github.com/cousingary/governator/internal/agents"
 	"github.com/cousingary/governator/internal/config"
+	"github.com/cousingary/governator/internal/contextgraph"
 	"github.com/cousingary/governator/internal/protectedpaths"
 	"github.com/cousingary/governator/internal/tokenoptimizer"
 )
@@ -38,6 +39,7 @@ func Run() []Check {
 		checkGit(),
 		checkPython(),
 		checkRTK(),
+		checkContextGraph(),
 		checkProtectedManifest(),
 		checkLedgerDirectory(),
 		checkLandlock(),
@@ -139,6 +141,45 @@ func checkRTK() Check {
 		return check
 	}
 	check.Status, check.Detail = StatusOK, strings.TrimSpace(string(output))
+	return check
+}
+
+func checkContextGraph() Check {
+	status, err := contextgraph.Resolve()
+	check := Check{Name: "context graph", Required: status.Mode == "required"}
+	if err != nil {
+		check.Status, check.Detail = StatusFail, err.Error()
+		return check
+	}
+	if status.Mode == "off" {
+		check.Status, check.Detail = StatusOK, "disabled by configuration"
+		return check
+	}
+	if !status.Enabled {
+		check.Status, check.Detail = StatusWarn, fmt.Sprintf("%s (%s) not found in PATH; structural context inactive", status.Provider, status.Bin)
+		return check
+	}
+	version, err := contextgraph.Version(status)
+	if err != nil {
+		check.Status = StatusWarn
+		if check.Required {
+			check.Status = StatusFail
+		}
+		check.Detail = err.Error()
+		return check
+	}
+	cwd, err := os.Getwd()
+	if err != nil {
+		check.Status, check.Detail = StatusWarn, fmt.Sprintf("%s; cannot inspect current directory: %v", version, err)
+		return check
+	}
+	stats, err := contextgraph.Inspect(status, cwd)
+	if err != nil || !stats.Initialized {
+		check.Status, check.Detail = StatusOK, version+"; current directory not indexed"
+		return check
+	}
+	check.Status = StatusOK
+	check.Detail = fmt.Sprintf("%s; files=%d nodes=%d edges=%d db_bytes=%d index=%s", version, stats.FileCount, stats.NodeCount, stats.EdgeCount, stats.DBSizeBytes, stats.IndexPath)
 	return check
 }
 
