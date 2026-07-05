@@ -25,6 +25,12 @@ func TestClassifyShellCommandParity(t *testing.T) {
 		{"rm one.txt", true, ""},
 		{"rm -i one.txt", false, ""},
 		{"go test ./...", false, ""},
+		{"rtk rm -rf dist", true, "delete"},
+		{"rtk -u git push origin main", true, "push"},
+		{"rtk proxy psql -c 'DROP TABLE users'", true, "drop"},
+		{"echo ok && rtk rm -rf dist", true, "delete"},
+		{"sudo rtk proxy rm -rf dist", true, "delete"},
+		{"FOO=1 nohup sudo rtk proxy rm -rf dist", true, "delete"},
 	}
 	for _, test := range tests {
 		t.Run(test.command, func(t *testing.T) {

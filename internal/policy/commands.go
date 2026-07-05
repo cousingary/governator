@@ -12,6 +12,7 @@ type CommandClass struct {
 
 var (
 	chainRE       = regexp.MustCompile(`&&|\|\||;|\||\n`)
+	rtkPrefixRE   = regexp.MustCompile(`(?i)(^|(?:&&|\|\||;|\||\n)\s*)(?:[^\s]*/)?rtk(?:\s+(?:-u|--ultra-compact|-v|-vv|-vvv))*\s+(?:proxy\s+)?`)
 	wrapperRE     = regexp.MustCompile(`^(?:sudo|nohup|time|env)\s+`)
 	assignmentRE  = regexp.MustCompile(`^(?:\w+=\S+\s+)+`)
 	deleteRE      = regexp.MustCompile(`^(rm|rmdir|unlink|shred)\b`)
@@ -27,16 +28,31 @@ var (
 	dropRE        = regexp.MustCompile(`\b(drop\s+(table|database|schema|index|view)|truncate\s+table)\b`)
 )
 
+// NormalizeShellCommand removes RTK's transparent output-filter prefix before
+// governance evaluates command intent. The original command still executes and
+// is retained in transcripts; only policy matching uses the normalized form.
+func NormalizeShellCommand(command string) string {
+	return rtkPrefixRE.ReplaceAllString(command, "$1")
+}
+
 // ClassifyShellCommand ports the live Python harness classifier. In full mode,
 // every delete is classified; highDangerOnly permits routine single-file cleanup.
 func ClassifyShellCommand(command string, highDangerOnly bool) *CommandClass {
+	command = NormalizeShellCommand(command)
 	for _, segment := range chainRE.Split(command, -1) {
 		s := strings.TrimSpace(segment)
 		if s == "" {
 			continue
 		}
-		s = wrapperRE.ReplaceAllString(s, "")
-		s = assignmentRE.ReplaceAllString(s, "")
+		for {
+			before := s
+			s = wrapperRE.ReplaceAllString(s, "")
+			s = assignmentRE.ReplaceAllString(s, "")
+			s = NormalizeShellCommand(s)
+			if s == before {
+				break
+			}
+		}
 		low := strings.ToLower(s)
 
 		if match := deleteRE.FindStringSubmatch(low); match != nil && !interactiveRM.MatchString(low) {

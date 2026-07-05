@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/cousingary/governator/internal/agents"
 	"github.com/cousingary/governator/internal/contracts"
 	"github.com/cousingary/governator/internal/observability"
 )
@@ -156,6 +157,20 @@ func TestApprovedReplayRedactionAndRollback(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(root, "output", "result.txt")); !os.IsNotExist(err) {
 		t.Fatalf("rollback left output: %v", err)
+	}
+}
+
+func TestAuditAllowsRTKWrappedCommand(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "transcript.jsonl")
+	data := []byte(`{"type":"tool_use","name":"Bash","input":{"command":"rtk test"}}` + "\n")
+	if err := os.WriteFile(path, data, 0600); err != nil {
+		t.Fatal(err)
+	}
+	audit := auditTranscript(path, agents.TranscriptClaude, contract(t.TempDir()))
+	for _, violation := range audit.Violations {
+		if strings.Contains(violation, "outside allowlist") {
+			t.Fatalf("RTK-wrapped command rejected: %v", audit.Violations)
+		}
 	}
 }
 

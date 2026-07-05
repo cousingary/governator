@@ -14,6 +14,7 @@ import (
 	"github.com/cousingary/governator/internal/agents"
 	"github.com/cousingary/governator/internal/config"
 	"github.com/cousingary/governator/internal/protectedpaths"
+	"github.com/cousingary/governator/internal/tokenoptimizer"
 )
 
 type Status string
@@ -36,6 +37,7 @@ func Run() []Check {
 		checkConfig(),
 		checkGit(),
 		checkPython(),
+		checkRTK(),
 		checkProtectedManifest(),
 		checkLedgerDirectory(),
 		checkLandlock(),
@@ -106,6 +108,34 @@ func checkPython() Check {
 	output, err := exec.Command(path, "--version").CombinedOutput()
 	if err != nil {
 		check.Status, check.Detail = StatusFail, err.Error()
+		return check
+	}
+	check.Status, check.Detail = StatusOK, strings.TrimSpace(string(output))
+	return check
+}
+
+func checkRTK() Check {
+	status, err := tokenoptimizer.Resolve()
+	check := Check{Name: "rtk token optimizer", Required: status.Mode == "required"}
+	if err != nil {
+		check.Status, check.Detail = StatusFail, err.Error()
+		return check
+	}
+	if status.Mode == "off" {
+		check.Status, check.Detail = StatusOK, "disabled by configuration"
+		return check
+	}
+	if !status.Enabled {
+		check.Status, check.Detail = StatusWarn, status.Bin+" not found in PATH; token optimization inactive"
+		return check
+	}
+	output, versionErr := exec.Command(status.Path, "--version").CombinedOutput()
+	if versionErr != nil {
+		check.Status = StatusWarn
+		if check.Required {
+			check.Status = StatusFail
+		}
+		check.Detail = fmt.Sprintf("%s found but --version failed: %v", status.Path, versionErr)
 		return check
 	}
 	check.Status, check.Detail = StatusOK, strings.TrimSpace(string(output))

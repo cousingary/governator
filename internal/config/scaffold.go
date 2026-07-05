@@ -73,6 +73,9 @@ backends:
     bin: opencode
   pi:
     bin: pi
+rtk:
+  mode: auto # auto, off, or required
+  bin: rtk
 defaults:
   agent: claude-code
   max_minutes: 30

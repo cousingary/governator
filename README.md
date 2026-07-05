@@ -67,6 +67,8 @@ Governator does not stop a malicious human, a compromised process with equivalen
 
 Configuration defaults to `$HOME/.governator/config.yaml`; `GOV_CONFIG` selects another file. Environment values take precedence over the file, which takes precedence over neutral built-ins. Supported settings cover the protected manifest, snapshots, ledger directory, backend binaries, default agent, and default time limit. Existing runtime overrides such as `GOV_HOME`, `GOV_PROTECTED_PATHS`, `GOV_SNAPSHOT_DIR`, `GOV_SNAPSHOT_ROOTS`, and `GOV_<BACKEND>_BIN` remain supported.
 
+RTK (Rust Token Killer) integration defaults to `rtk.mode: auto`: when an `rtk` binary is on `PATH`, Governator adds token-saving command guidance to the backend prompt and normalizes RTK-wrapped commands before all command-policy checks. Use `off` to disable it or `required` to fail before an agent run when RTK is unavailable. `GOV_RTK_MODE` and `GOV_RTK_BIN` override those settings; `gov doctor` reports whether optimization is active. Install RTK from the [official project](https://github.com/rtk-ai/rtk).
+
 ## Commands
 
 ```text

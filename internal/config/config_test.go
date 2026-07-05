@@ -13,7 +13,8 @@ func cleanEnv(t *testing.T) {
 		"GOV_CONFIG", "GOV_PROTECTED_PATHS", "GOV_PROTECTED_MANIFEST",
 		"CLAUDE_HARNESS_STATE", "GOV_SNAPSHOT_DIR", "HARNESS_SNAPSHOT_DIR",
 		"GOV_SNAPSHOT_ROOTS", "GOV_LEDGER_DIR", "GOV_HOME", "GOVERNATOR_HOME",
-		"GOV_CODEX_BIN", "GOV_DEFAULT_AGENT", "GOV_DEFAULT_MAX_MINUTES",
+		"GOV_CODEX_BIN", "GOV_RTK_MODE", "GOV_RTK_BIN",
+		"GOV_DEFAULT_AGENT", "GOV_DEFAULT_MAX_MINUTES",
 	} {
 		t.Setenv(name, "")
 	}
@@ -31,12 +32,15 @@ snapshot_roots: [/root/file]
 ledger_dir: /ledger/file
 backends:
   codex: {bin: codex-file}
+rtk: {mode: off, bin: rtk-file}
 defaults: {agent: codex, max_minutes: 12}
 `), 0644); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("GOV_PROTECTED_PATHS", "/from/env")
 	t.Setenv("GOV_CODEX_BIN", "codex-env")
+	t.Setenv("GOV_RTK_MODE", "required")
+	t.Setenv("GOV_RTK_BIN", "rtk-env")
 	cfg, err := Load()
 	if err != nil {
 		t.Fatal(err)
@@ -46,6 +50,21 @@ defaults: {agent: codex, max_minutes: 12}
 	}
 	if cfg.Backends["codex"].Bin != "codex-env" || cfg.Defaults.Agent != "codex" || cfg.Defaults.MaxMinutes != 12 {
 		t.Fatalf("config=%+v", cfg)
+	}
+	if cfg.RTK.Mode != "required" || cfg.RTK.Bin != "rtk-env" {
+		t.Fatalf("rtk config=%+v", cfg.RTK)
+	}
+}
+
+func TestLoadRejectsInvalidRTKMode(t *testing.T) {
+	cleanEnv(t)
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	t.Setenv("GOV_CONFIG", path)
+	if err := os.WriteFile(path, []byte("rtk: {mode: always}\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "invalid rtk.mode") {
+		t.Fatalf("error=%v", err)
 	}
 }
 

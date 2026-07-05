@@ -28,6 +28,7 @@ import (
 	"github.com/cousingary/governator/internal/policy"
 	"github.com/cousingary/governator/internal/prompts"
 	"github.com/cousingary/governator/internal/protectedpaths"
+	"github.com/cousingary/governator/internal/tokenoptimizer"
 )
 
 type RunRecord struct {
@@ -529,12 +530,13 @@ func auditTranscript(path, format string, c contracts.Contract) transcriptAudit 
 		audit.Violations = append(audit.Violations, "max_commands exceeded")
 	}
 	for _, command := range audit.Commands {
-		if class := policy.ClassifyShellCommand(command, false); class != nil {
+		normalized := policy.NormalizeShellCommand(command)
+		if class := policy.ClassifyShellCommand(normalized, false); class != nil {
 			audit.Violations = append(audit.Violations, fmt.Sprintf("destructive command classified as %s %s: %s", class.Verb, class.Resource, command))
 		}
 		allowed := false
 		for _, pattern := range c.Allowed.Execute {
-			if commandMatches(pattern, command) {
+			if commandMatches(pattern, normalized) || commandMatches(pattern, command) {
 				allowed = true
 				break
 			}
@@ -543,7 +545,7 @@ func auditTranscript(path, format string, c contracts.Contract) transcriptAudit 
 			audit.Violations = append(audit.Violations, "command outside allowlist: "+command)
 		}
 		for _, forbidden := range c.Forbidden.Commands {
-			if strings.Contains(command, forbidden) {
+			if strings.Contains(normalized, forbidden) || strings.Contains(command, forbidden) {
 				audit.Violations = append(audit.Violations, "forbidden command: "+command)
 				break
 			}
@@ -656,6 +658,10 @@ func (r *Runner) Run(ctx context.Context, c contracts.Contract) (RunRecord, erro
 	if err != nil {
 		return RunRecord{}, err
 	}
+	rtkAnnotation, err := tokenoptimizer.PromptAnnotation()
+	if err != nil {
+		return RunRecord{}, err
+	}
 	preflight, err := policy.Preflight(c)
 	if err != nil {
 		return RunRecord{}, err
@@ -743,6 +749,7 @@ func (r *Runner) Run(ctx context.Context, c contracts.Contract) (RunRecord, erro
 	}
 	prompt += "\nController canary: " + canaryName + " must remain byte-for-byte unchanged. Touching it quarantines the run.\n"
 	prompt += prompts.Annotation(promptVersion)
+	prompt += rtkAnnotation
 	ar, aerr := agent.Run(ctx, agents.Request{
 		Prompt: prompt, Workdir: work, Transcript: transcript,
 		Timeout: time.Duration(c.Budget.MaxMinutes) * time.Minute,

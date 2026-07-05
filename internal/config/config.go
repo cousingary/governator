@@ -15,6 +15,11 @@ type Backend struct {
 	Bin string `yaml:"bin"`
 }
 
+type RTK struct {
+	Mode string `yaml:"mode"`
+	Bin  string `yaml:"bin"`
+}
+
 type Defaults struct {
 	Agent      string `yaml:"agent"`
 	MaxMinutes int    `yaml:"max_minutes"`
@@ -26,6 +31,7 @@ type Config struct {
 	SnapshotRoots     []string           `yaml:"snapshot_roots"`
 	LedgerDir         string             `yaml:"ledger_dir"`
 	Backends          map[string]Backend `yaml:"backends"`
+	RTK               RTK                `yaml:"rtk"`
 	Defaults          Defaults           `yaml:"defaults"`
 }
 
@@ -58,6 +64,7 @@ func BuiltIn() Config {
 			"codex": {Bin: "codex"}, "glm": {Bin: "glm"},
 			"opencode": {Bin: "opencode"}, "pi": {Bin: "pi"},
 		},
+		RTK:      RTK{Mode: "auto", Bin: "rtk"},
 		Defaults: Defaults{Agent: "claude-code", MaxMinutes: 30},
 	}
 }
@@ -80,6 +87,9 @@ func Load() (Config, error) {
 	}
 	applyEnv(&cfg)
 	clean(&cfg)
+	if cfg.RTK.Mode != "auto" && cfg.RTK.Mode != "off" && cfg.RTK.Mode != "required" {
+		return Config{}, fmt.Errorf("invalid rtk.mode %q (want auto, off, or required)", cfg.RTK.Mode)
+	}
 	return cfg, nil
 }
 
@@ -110,6 +120,12 @@ func merge(dst *Config, src Config) {
 		if backend.Bin != "" {
 			dst.Backends[name] = backend
 		}
+	}
+	if src.RTK.Mode != "" {
+		dst.RTK.Mode = src.RTK.Mode
+	}
+	if src.RTK.Bin != "" {
+		dst.RTK.Bin = src.RTK.Bin
 	}
 	if src.Defaults.Agent != "" {
 		dst.Defaults.Agent = src.Defaults.Agent
@@ -144,6 +160,12 @@ func applyEnv(cfg *Config) {
 			cfg.Backends[name] = backend
 		}
 	}
+	if value := Env("GOV_RTK_MODE"); value != "" {
+		cfg.RTK.Mode = value
+	}
+	if value := Env("GOV_RTK_BIN"); value != "" {
+		cfg.RTK.Bin = value
+	}
 	if value := Env("GOV_DEFAULT_AGENT"); value != "" {
 		cfg.Defaults.Agent = value
 	}
@@ -174,6 +196,8 @@ func splitPathList(value string) []string {
 }
 
 func clean(cfg *Config) {
+	cfg.RTK.Mode = strings.ToLower(strings.TrimSpace(cfg.RTK.Mode))
+	cfg.RTK.Bin = strings.TrimSpace(cfg.RTK.Bin)
 	cfg.ProtectedManifest = expand(cfg.ProtectedManifest)
 	cfg.SnapshotDir = expand(cfg.SnapshotDir)
 	cfg.LedgerDir = expand(cfg.LedgerDir)

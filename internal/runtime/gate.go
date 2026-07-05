@@ -246,15 +246,17 @@ func bashProtectedReason(cmd, cwd string) string {
 	if hit == "" {
 		return ""
 	}
-	// normalized first token for the read-only allowance
-	s := wrapperRE.ReplaceAllString(strings.TrimSpace(cmd), "")
+	// normalized first token for the read-only allowance. RTK is an output
+	// filter, so policy sees the wrapped command's real verb.
+	normalized := policy.NormalizeShellCommand(cmd)
+	s := wrapperRE.ReplaceAllString(strings.TrimSpace(normalized), "")
 	s = assignmentRE.ReplaceAllString(s, "")
 	parts := strings.Fields(s)
 	first := ""
 	if len(parts) > 0 {
 		first = strings.ToLower(bashPathRE.ReplaceAllString(parts[0], ""))
 	}
-	if redirectHit == "" && cmdIsReadonly(first, strings.ToLower(cmd)) {
+	if redirectHit == "" && cmdIsReadonly(first, strings.ToLower(normalized)) {
 		return ""
 	}
 	ap := strings.SplitN(hit, "|", 2)[0]
