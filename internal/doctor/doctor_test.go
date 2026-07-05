@@ -5,6 +5,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/cousingary/governator/internal/observability"
 )
 
 func TestBackendHelpArgs(t *testing.T) {
@@ -92,6 +94,60 @@ func TestContextGraphCheckWarnsWhenAutoBinaryMissing(t *testing.T) {
 		t.Fatalf("check = %+v, want optional warning", check)
 	}
 	if !strings.Contains(check.Detail, "structural context inactive") {
+		t.Fatalf("unexpected detail: %s", check.Detail)
+	}
+}
+
+// TestGovernedRunsCheckWarnsWhenLedgerEmpty pins the doctor advisory added
+// 2026-07-06: a clean bill of health from the presence checks above must not
+// be read as proof RTK/graph are saving tokens, since neither is exercised
+// outside `gov run`'s backend-invocation path. A freshly opened ledger with
+// zero runs is exactly the state this repo was in before that date.
+func TestGovernedRunsCheckWarnsWhenLedgerEmpty(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("GOV_CONFIG", "")
+	t.Setenv("GOV_LEDGER_DIR", home)
+
+	db, err := observability.Open(home)
+	if err != nil {
+		t.Fatal(err)
+	}
+	db.Close()
+
+	check := checkGovernedRuns()
+	if check.Status != StatusWarn || check.Required {
+		t.Fatalf("check = %+v, want optional warning", check)
+	}
+	if !strings.Contains(check.Detail, "0 governed runs") {
+		t.Fatalf("unexpected detail: %s", check.Detail)
+	}
+}
+
+// TestGovernedRunsCheckReportsCountWhenPopulated asserts the OK branch once
+// the ledger holds at least one real run.
+func TestGovernedRunsCheckReportsCountWhenPopulated(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("GOV_CONFIG", "")
+	t.Setenv("GOV_LEDGER_DIR", home)
+
+	db, err := observability.Open(home)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = db.Exec(`INSERT INTO runs(id, job_id, status, created, total_tokens, usage_available) VALUES (?, ?, ?, ?, ?, ?)`,
+		"test-run-1", "test-job", "APPROVED", "2026-07-06T00:00:00Z", 1234, 1)
+	db.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	check := checkGovernedRuns()
+	if check.Status != StatusOK {
+		t.Fatalf("status = %s, want %s: %s", check.Status, StatusOK, check.Detail)
+	}
+	if !strings.Contains(check.Detail, "1 run(s)") || !strings.Contains(check.Detail, "1234 total tokens") {
 		t.Fatalf("unexpected detail: %s", check.Detail)
 	}
 }

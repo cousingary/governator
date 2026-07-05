@@ -76,8 +76,8 @@ func TestClaudeProjectsSpec(t *testing.T) {
 	if !contains(flags, "--permission-mode") || !contains(flags, "acceptEdits") {
 		t.Fatalf("write spec should map to acceptEdits: %v", flags)
 	}
-	if !contains(flags, "--add-dir") || !contains(flags, "/w") {
-		t.Fatalf("workdir must be added: %v", flags)
+	if !contains(flags, "--add-dir=/w") {
+		t.Fatalf("workdir must be added as a single bound value: %v", flags)
 	}
 	read := BackendSpec{Approval: ApprovalNever, Sandbox: SandboxReadOnly, Workdir: "/w"}
 	flags = Claude{}.project(read)

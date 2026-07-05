@@ -634,7 +634,12 @@ func hookCmd(args []string) int {
 	}
 
 	goOutput := govruntime.HookPayload(decision)
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	// 35s comfortably exceeds harness_gate.py's own 30s pre-delete snapshot
+	// ceiling (_preflight_snapshot) plus interpreter startup: a real local
+	// delete on a slow drvfs mount measured at ~13s in practice, and 2s was
+	// marking those legitimate runs py_unavailable instead of letting the
+	// authoritative legacy decision land (governator ledger, 2026-07-06).
+	ctx, cancel := context.WithTimeout(context.Background(), 35*time.Second)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, "python3", shadow)
 	cmd.Stdin = bytes.NewReader(data)

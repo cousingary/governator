@@ -14,6 +14,7 @@ import (
 	"github.com/cousingary/governator/internal/agents"
 	"github.com/cousingary/governator/internal/config"
 	"github.com/cousingary/governator/internal/contextgraph"
+	"github.com/cousingary/governator/internal/observability"
 	"github.com/cousingary/governator/internal/protectedpaths"
 	"github.com/cousingary/governator/internal/tokenoptimizer"
 )
@@ -40,6 +41,7 @@ func Run() []Check {
 		checkPython(),
 		checkRTK(),
 		checkContextGraph(),
+		checkGovernedRuns(),
 		checkProtectedManifest(),
 		checkLedgerDirectory(),
 		checkLandlock(),
@@ -180,6 +182,35 @@ func checkContextGraph() Check {
 	}
 	check.Status = StatusOK
 	check.Detail = fmt.Sprintf("%s; files=%d nodes=%d edges=%d db_bytes=%d index=%s", version, stats.FileCount, stats.NodeCount, stats.EdgeCount, stats.DBSizeBytes, stats.IndexPath)
+	return check
+}
+
+// checkGovernedRuns guards against reading "doctor: OK" as proof that RTK and
+// the context graph are actually saving tokens. Both are only exercised by
+// `gov run`'s backend-invocation path (never the interactive PreToolUse hook),
+// so a healthy doctor report is compatible with zero real runs ever having
+// happened — as it was here until 2026-07-06. WARN, not FAIL: presence checks
+// above already cover installation health: this is a distinct claim
+// ("has it ever actually run") that a clean doctor pass does not establish.
+func checkGovernedRuns() Check {
+	check := Check{Name: "governed runs", Required: false}
+	home, err := governorHome()
+	if err != nil {
+		check.Status, check.Detail = StatusWarn, err.Error()
+		return check
+	}
+	report, err := observability.UsageSummaryFor(home, "")
+	if err != nil {
+		check.Status, check.Detail = StatusWarn, err.Error()
+		return check
+	}
+	if report.Runs == 0 {
+		check.Status, check.Detail = StatusWarn,
+			"0 governed runs recorded; RTK/graph token-saving effect is unverified until `gov run` executes at least one real job"
+		return check
+	}
+	check.Status = StatusOK
+	check.Detail = fmt.Sprintf("%d run(s), %d with measured usage, %d total tokens", report.Runs, report.MeasuredRuns, report.TotalTokens)
 	return check
 }
 

@@ -135,7 +135,10 @@ func (Claude) project(spec BackendSpec) []string {
 	default:
 		flags = append(flags, "--permission-mode", "acceptEdits")
 	}
-	flags = append(flags, "--add-dir", spec.Workdir)
+	// "=" form binds --add-dir to exactly this one value; two separate args
+	// would let the CLI's variadic parser greedily swallow the trailing
+	// prompt positional as an additional directory, leaving no prompt at all.
+	flags = append(flags, "--add-dir="+spec.Workdir)
 	return flags
 }
 

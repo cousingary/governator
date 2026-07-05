@@ -39,7 +39,10 @@ func (GLM) project(spec BackendSpec) ([]string, error) {
 	if spec.Workdir == "" {
 		return nil, fmt.Errorf("glm: spec.Workdir is required")
 	}
-	flags = append(flags, "--add-dir", spec.Workdir)
+	// "=" form binds --add-dir to exactly this one value; see the identical
+	// fix and rationale in agents.go's Claude.project (glm-cli is Claude-Code
+	// compatible and shares the same variadic-flag parsing).
+	flags = append(flags, "--add-dir="+spec.Workdir)
 	return flags, nil
 }
 
