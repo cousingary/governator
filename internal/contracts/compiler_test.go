@@ -49,3 +49,29 @@ func TestCompilePromptTerseOutputPolicy(t *testing.T) {
 		}
 	}
 }
+
+// TestCompilePromptNetworkAnnotationOnlyWhenForbidden asserts the prompt-level
+// network nudge fires only when the contract forbids network, and that it names
+// the concrete verbs a compensated backend (Claude/GLM/OpenCode/Pi) otherwise
+// learns the hard way from a post-hoc quarantine.
+func TestCompilePromptNetworkAnnotationOnlyWhenForbidden(t *testing.T) {
+	allowed := Contract{Task: "t", Mode: ModeSurgeon}
+	prompt, err := CompilePrompt(allowed, "/tmp/w")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(prompt, "Network discipline") {
+		t.Fatalf("network annotation leaked into a contract that does not forbid network")
+	}
+
+	forbidden := Contract{Task: "t", Mode: ModeSurgeon, Forbidden: Forbidden{Behaviors: []string{"network"}}}
+	prompt, err = CompilePrompt(forbidden, "/tmp/w")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"Network discipline", "curl", "npm/pnpm/yarn install", "pip install", "git push", "quarantines the run"} {
+		if !strings.Contains(prompt, want) {
+			t.Fatalf("network annotation missing %q", want)
+		}
+	}
+}

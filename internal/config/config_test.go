@@ -118,6 +118,15 @@ func TestScaffoldIsIdempotent(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	example, err := os.ReadFile(filepath.Join(home, ".governator", "jobs", "example.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"worktree: auto", "on_violation: quarantine"} {
+		if !strings.Contains(string(example), want) {
+			t.Fatalf("example contract missing %q", want)
+		}
+	}
 	results, err = Scaffold(t.TempDir())
 	if err != nil {
 		t.Fatal(err)

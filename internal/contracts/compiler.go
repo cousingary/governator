@@ -59,5 +59,25 @@ CONTRACT:
 Output discipline: terse. Keep the final response under %d words. Do not restate the task, narrate routine progress, or add generic advice. Report only actions, verification, blockers, and the final status. Never omit evidence or RESULT.json to save words.
 `, c.Output.EffectiveMaxFinalWords())
 	}
+	prompt += networkAnnotation(c)
 	return prompt, nil
+}
+
+// networkAnnotation is the prompt-level compensation for backends that declare
+// NetworkControl=false (Claude, GLM, OpenCode, Pi). The runtime's fingerprint
+// scan is the authoritative network floor, but a model that interprets
+// "behaviors: [network]" as a vague hint will still happily run curl/wget/npm
+// install mid-task. Naming the concrete verbs the controller will flag makes
+// the contract's network prohibition behavior the agent actually has, not just
+// one it will be retroactively quarantined for. No-op (and omitted from the
+// prompt entirely) when the contract does not forbid network.
+func networkAnnotation(c Contract) string {
+	for _, behavior := range c.Forbidden.Behaviors {
+		if behavior == "network" {
+			return `
+Network discipline: this contract forbids network access. Do not run network-bound commands — including but not limited to curl, wget, git fetch, git pull, git push, git clone, npm/pnpm/yarn install, pip install, uv sync, cargo add/fetch, go get, apt/apk/dnf, brew, docker pull, ssh, scp, rsync over a remote host, or any tool that contacts a registry, API, or remote host. The controller independently audits your transcript; a network command quarantines the run even if the rest of the work is correct.
+`
+		}
+	}
+	return ""
 }

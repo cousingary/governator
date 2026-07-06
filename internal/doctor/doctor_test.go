@@ -49,6 +49,24 @@ func TestBackendFlagDriftFails(t *testing.T) {
 	}
 }
 
+func TestCodexFlagDriftChecksRootAndExecSurfaces(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("GOV_CONFIG", "")
+	fake := filepath.Join(t.TempDir(), "codex")
+	script := "#!/bin/sh\nif [ \"$1\" = exec ]; then\n  echo '--sandbox -C --json'\nelse\n  echo '--ask-for-approval'\nfi\n"
+	if err := os.WriteFile(fake, []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("GOV_CODEX_BIN", fake)
+	check := checkCodexFlags()
+	if check.Status != StatusFail {
+		t.Fatalf("status = %s, want %s: %s", check.Status, StatusFail, check.Detail)
+	}
+	if !strings.Contains(check.Detail, "exec:--ephemeral") {
+		t.Fatalf("missing subcommand drift detail: %s", check.Detail)
+	}
+}
+
 func TestContextGraphCheckReportsStats(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	t.Setenv("GOV_CONFIG", "")

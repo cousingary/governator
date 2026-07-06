@@ -25,7 +25,14 @@ func (GLM) Capabilities() Capability {
 
 // project translates the abstract spec into glm-cli native flags.
 func (GLM) project(spec BackendSpec) ([]string, error) {
-	flags := []string{"-p", "--output-format", "stream-json", "--verbose"}
+	// Mirror Claude Code's headless surface: prompt-mode, stream-json,
+	// verbose, no leftover session state, and safe-mode's additional tool
+	// guards. glm-cli is Claude-Code compatible (see agents.go Claude.project
+	// and the shared variadic --add-dir fix below), so the same isolation
+	// flags apply. If a future glm-cli drops either flag, doctor's
+	// backend flag-drift probe is the right place to surface it.
+	flags := []string{"-p", "--output-format", "stream-json", "--verbose",
+		"--no-session-persistence", "--safe-mode"}
 	switch spec.Sandbox {
 	case SandboxReadOnly:
 		// No native read-only sandbox; rely on prompt-mode + the runtime's

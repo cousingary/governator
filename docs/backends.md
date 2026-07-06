@@ -12,7 +12,7 @@ All adapters receive the same abstract spec: work directory, sandbox mode, appro
 
 ## Codex
 
-- Command shape: `codex exec --json --ask-for-approval POLICY --sandbox MODE -C WORKTREE PROMPT`.
+- Command shape: `codex --ask-for-approval POLICY -c sandbox_workspace_write.network_access=false exec --json --ephemeral --sandbox MODE -C WORKTREE PROMPT`.
 - Native `read-only` and `workspace-write` sandboxes.
 - Native approval and workspace-write network configuration.
 - Codex exposes no PreToolUse hook, so Governator relies on sandboxing, transcript audit, and the fingerprint floor.
@@ -20,8 +20,9 @@ All adapters receive the same abstract spec: work directory, sandbox mode, appro
 
 ## GLM
 
-- Command shape follows the headless Claude-compatible surface with stream JSON.
-- Read-only projects `--permission-mode plan`; write mode projects `acceptEdits` and `--add-dir`.
+- Command shape follows the headless Claude-compatible surface: `glm -p --output-format stream-json --verbose --no-session-persistence --safe-mode --permission-mode MODE --add-dir=WORKTREE PROMPT`.
+- Write mode: `--permission-mode acceptEdits`; read-only mode: `--permission-mode plan`.
+- `--no-session-persistence` keeps contract runs hermetic (no leftover session state between governed runs); `--safe-mode` enables Claude Code's additional tool guards. Both rely on glm-cli's Claude-Code-compatible flag surface; doctor's backend flag-drift probe is the tripwire if a future glm-cli drops one.
 - Approval is native, but sandbox, read-only, and network guarantees are compensated.
 - Override: `GOV_GLM_BIN` or `backends.glm.bin`.
 

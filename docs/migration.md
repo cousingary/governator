@@ -55,4 +55,4 @@ Restore the legacy hook command and stop launching new Governator jobs. Existing
 | Cost gaps | Store zero with `cost_unavailable` note | Missing data could appear as zero | Avoid claiming an unknown call was free |
 | Interactive integration | Claude dialect plus neutral `gov gate check` | Claude-specific hook payload | Reuse one decision core across harnesses |
 | Evidence | Run, hook, parity, eval, routing, and repair data share one SQLite schema | Multiple logs and ledgers | Make audit and routing evidence queryable |
-| Failure handling | Contract violations quarantine, halt, or rollback according to the contract | Wrapper circuit breaker governed arbitrary action retries | Governator governs bounded jobs, not every shell action on a workstation |
+| Failure handling | Contract violations quarantine the run; unsupported actions fail contract validation | Wrapper circuit breaker governed arbitrary action retries | Governator governs bounded jobs, not every shell action on a workstation |

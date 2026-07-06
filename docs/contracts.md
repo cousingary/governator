@@ -12,7 +12,7 @@ A job contract is strict YAML: unknown fields, multiple documents, malformed pat
 | `agent` | `claude-code`, `codex`, `glm`, `opencode`, or `pi`. |
 | `mode` | `scout`, `surgeon`, `batch_worker`, `verifier`, `repair`, or `architect`. |
 | `workspace.root` | Absolute path to the source Git repository. |
-| `workspace.worktree` | `auto`, or `none` for read-only modes. |
+| `workspace.worktree` | `auto`; every run uses a disposable Git worktree. |
 | `allowed.read` | Nonempty repository-relative path patterns the agent may inspect. |
 | `allowed.write` | Repository-relative write patterns; empty for read-only modes. |
 | `allowed.execute` | Shell-command patterns allowed by preflight and transcript audit. |
@@ -33,9 +33,9 @@ A job contract is strict YAML: unknown fields, multiple documents, malformed pat
 | `success.validators` | Nonempty deterministic shell validators, run outside the model. |
 | `output.style` | Optional. `terse` or `normal`. Omit the field for the existing unrestricted prompt. |
 | `output.max_final_words` | Optional, `terse` only. 20-1000; defaults to 120 when omitted. |
-| `on_violation` | `quarantine`, `halt`, or `rollback`. |
+| `on_violation` | `quarantine`; unsupported actions are rejected during validation. |
 
-All path patterns are repository-relative and may not escape with `..`. Read-only modes are `scout`, `verifier`, and `architect`.
+All path patterns are repository-relative and may not escape with `..`. Read-only modes are `scout`, `verifier`, and `architect`. Governator rejects direct-root execution and unimplemented violation actions rather than accepting policy it cannot enforce.
 
 ## Minimal read-only example
 
@@ -45,7 +45,7 @@ job_id: verify
 job_type: verification
 agent: codex
 mode: verifier
-workspace: {root: /absolute/path/to/repository, worktree: none}
+workspace: {root: /absolute/path/to/repository, worktree: auto}
 allowed:
   read: ["**"]
   write: []
@@ -59,7 +59,7 @@ preflight: {intended_writes: []}
 success:
   required_files: []
   validators: ["go test ./..."]
-on_violation: halt
+on_violation: quarantine
 ```
 
 ## `RESULT.json`

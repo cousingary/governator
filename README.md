@@ -50,7 +50,7 @@ Every backend implements one abstract execution specification. Native controls a
 | Backend | Sandbox | Read-only | Approval policy | Network control | Transcript |
 |---|---:|---:|---:|---:|---|
 | Claude Code | native | native | native | compensated | `claude-stream-json` |
-| Codex | native | native | native | native | `codex-json` |
+| Codex | native | native | native | native (explicitly disabled by default) | `codex-json` |
 | GLM | compensated | compensated | native | compensated | `glm-stream-json` |
 | OpenCode | compensated | config projection | native | compensated | `opencode-json` |
 | Pi | compensated | native tool reduction | compensated | compensated | `pi-json` |

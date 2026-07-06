@@ -2,11 +2,16 @@ package runtime
 
 import (
 	"context"
+	"crypto/sha1"
+	"encoding/hex"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/cousingary/governator/internal/agents"
 	"github.com/cousingary/governator/internal/contracts"
@@ -66,6 +71,100 @@ func contract(root string) contracts.Contract {
 		Success:     contracts.Success{RequiredFiles: []string{"output/result.txt"}, Validators: []string{"test -f output/result.txt"}},
 		OnViolation: "quarantine",
 	}
+}
+
+// Regression: the old lock() trusted a live PID unconditionally. If the holder
+// died and the OS recycled its PID, the workspace became permanently
+// un-runnable. isLiveLock now cross-checks the /proc start ticks (Linux) or
+// the lock age (portable fallback), so a lock claiming a PID that was recycled
+// is reclaimable.
+func TestLockReclaimsRecycledPID(t *testing.T) {
+	home := t.TempDir()
+	root := t.TempDir()
+	dir := filepath.Join(home, "locks")
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	sum := sha1.Sum([]byte(root))
+	lockPath := filepath.Join(dir, hex.EncodeToString(sum[:])+".lock")
+
+	// Simulate a recycled PID: write the current PID with a bogus start ticks
+	// field. The real holder would match; a recycled PID will not.
+	pid := os.Getpid()
+	stale := fmt.Sprintf("%d %d BOGUS-TICKS", pid, time.Now().UTC().UnixNano())
+	if err := os.WriteFile(lockPath, []byte(stale), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if isLiveLock(lockPath) {
+		t.Fatal("lock with mismatched start ticks should be reclaimable (recycled PID)")
+	}
+	release, err := lock(root, home)
+	if err != nil {
+		t.Fatalf("could not reclaim recycled-PID lock: %v", err)
+	}
+	release()
+
+	// A genuinely live lock (matching start ticks) must still block.
+	ticks := processStartTicks(pid)
+	if ticks == "" {
+		t.Skip("non-Linux or /proc unavailable; start-tick precision not testable here")
+	}
+	live := fmt.Sprintf("%d %d %s", pid, time.Now().UTC().UnixNano(), ticks)
+	if err := os.WriteFile(lockPath, []byte(live), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if !isLiveLock(lockPath) {
+		t.Fatal("lock with matching start ticks should be live")
+	}
+	if _, err := lock(root, home); err == nil {
+		t.Fatal("acquired a lock that is genuinely held by a live PID")
+	}
+}
+
+// TestProcessStartTicksReadsRealStarttime pins processStartTicks to stat
+// field 22 (starttime). A prior off-by-one read field 21 (itrealvalue, always
+// 0 since Linux 2.6.17), so every process reported the same "0" — recycled-PID
+// detection compared 0==0 and never fired, and the non-empty ticks field also
+// kept the timestamp staleness fallback from ever running.
+func TestProcessStartTicksReadsRealStarttime(t *testing.T) {
+	ticks := processStartTicks(os.Getpid())
+	if ticks == "" {
+		t.Skip("non-Linux or /proc unavailable")
+	}
+	n, err := strconv.ParseUint(ticks, 10, 64)
+	if err != nil {
+		t.Fatalf("start ticks %q is not an unsigned integer: %v", ticks, err)
+	}
+	// This test process started long after boot; a genuine starttime is a
+	// large positive tick count. Zero means a wrong field was read.
+	if n == 0 {
+		t.Fatal("start ticks is 0: wrong /proc stat field (itrealvalue instead of starttime)")
+	}
+}
+
+func TestLockReclaimsStaleTimestampFallback(t *testing.T) {
+	home := t.TempDir()
+	root := t.TempDir()
+	dir := filepath.Join(home, "locks")
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	sum := sha1.Sum([]byte(root))
+	lockPath := filepath.Join(dir, hex.EncodeToString(sum[:])+".lock")
+	// Lock created well past the staleness threshold, held by the current PID
+	// with no start_ticks (the portable fallback path).
+	age := time.Now().UTC().Add(-3 * lockStaleThreshold).UnixNano()
+	if err := os.WriteFile(lockPath, []byte(fmt.Sprintf("%d %d", os.Getpid(), age)), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if isLiveLock(lockPath) {
+		t.Fatal("stale timestamp lock should be reclaimable")
+	}
+	release, err := lock(root, home)
+	if err != nil {
+		t.Fatalf("could not reclaim stale lock: %v", err)
+	}
+	release()
 }
 
 func TestApprovedReplayRedactionAndRollback(t *testing.T) {

@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -94,8 +95,12 @@ func TestCodexProjectsSpec(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	wantPrefix := []string{"--ask-for-approval", "on-request", "-c", "sandbox_workspace_write.network_access=false", "exec", "--json", "--ephemeral"}
+	if len(flags) < len(wantPrefix) || !slices.Equal(flags[:len(wantPrefix)], wantPrefix) {
+		t.Fatalf("codex root flags must precede exec: got %v, want prefix %v", flags, wantPrefix)
+	}
 	joined := strings.Join(flags, " ")
-	for _, want := range []string{"exec", "--json", "--ask-for-approval", "on-request", "--sandbox", "workspace-write", "-C", "/w"} {
+	for _, want := range []string{"exec", "--json", "--ephemeral", "--ask-for-approval", "on-request", "--sandbox", "workspace-write", "-C", "/w"} {
 		if !strings.Contains(joined, want) {
 			t.Fatalf("codex flags missing %q: %v", want, flags)
 		}
@@ -117,7 +122,8 @@ func TestCodexProjectsSpec(t *testing.T) {
 }
 
 // TestGLMProjectsSpec asserts the generic adapter projects the spec into its
-// native flag surface.
+// native flag surface, including the Claude-Code-compatible isolation flags
+// (--no-session-persistence, --safe-mode) that keep GLM runs hermetic.
 func TestGLMProjectsSpec(t *testing.T) {
 	spec := BackendSpec{Sandbox: SandboxWorkspaceWrite, Workdir: "/w"}
 	flags, err := GLM{}.project(spec)
@@ -125,7 +131,7 @@ func TestGLMProjectsSpec(t *testing.T) {
 		t.Fatal(err)
 	}
 	joined := strings.Join(flags, " ")
-	for _, want := range []string{"stream-json", "acceptEdits", "--add-dir", "/w"} {
+	for _, want := range []string{"stream-json", "acceptEdits", "--add-dir", "/w", "--safe-mode", "--no-session-persistence"} {
 		if !strings.Contains(joined, want) {
 			t.Fatalf("glm flags missing %q: %v", want, flags)
 		}
@@ -175,7 +181,7 @@ func TestAdaptersRunFakeBackend(t *testing.T) {
 	}{
 		{"claude", "GOV_CLAUDE_BIN", Claude{}, SandboxWorkspaceWrite, []string{"acceptEdits", "--add-dir"}},
 		{"codex", "GOV_CODEX_BIN", Codex{}, SandboxWorkspaceWrite, []string{"workspace-write", "on-request"}},
-		{"glm", "GOV_GLM_BIN", GLM{}, SandboxWorkspaceWrite, []string{"acceptEdits", "--add-dir"}},
+		{"glm", "GOV_GLM_BIN", GLM{}, SandboxWorkspaceWrite, []string{"acceptEdits", "--add-dir", "--safe-mode", "--no-session-persistence"}},
 		{"opencode", "GOV_OPENCODE_BIN", OpenCode{}, SandboxReadOnly, []string{"--pure", "--format", "--dir", `"edit": "deny"`}},
 		{"pi", "GOV_PI_BIN", Pi{}, SandboxReadOnly, []string{"--no-session", "--no-extensions", "--no-skills", "read,grep,find,ls"}},
 	}

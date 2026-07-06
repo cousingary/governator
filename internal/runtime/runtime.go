@@ -167,6 +167,40 @@ func scanRun(row rowScanner) (RunRecord, error) {
 	return r, err
 }
 
+// lockStaleThreshold bounds how long a live-PID lock is trusted before the
+// controller reclaims it. Governed runs are capped by budget.max_minutes (and
+// release the lock on return), so a lock held far beyond any plausible run
+// length is far more likely a recycled PID than a genuinely in-flight job. 2h
+// comfortably exceeds the largest realistic max_minutes while still catching
+// day-old orphan locks within the same session.
+const lockStaleThreshold = 2 * time.Hour
+
+// processStartTicks returns the kernel start time of pid on Linux, or "" off
+// Linux / on any read failure. Two PIDs that happen to share a number across
+// recycling will have different start times, so this distinguishes "same
+// process, lock is real" from "PID reused, lock is phantom" without the
+// coarser staleness heuristic. Field 22 of /proc/<pid>/stat is starttime in
+// clock ticks since boot.
+func processStartTicks(pid int) string {
+	data, err := os.ReadFile("/proc/" + strconv.Itoa(pid) + "/stat")
+	if err != nil {
+		return ""
+	}
+	rparen := strings.LastIndexByte(string(data), ')')
+	if rparen < 0 {
+		return ""
+	}
+	// Fields after ')' start at stat field 3 (state), so starttime (field 22)
+	// sits at index 19. Off-by-one here previously read field 21 (itrealvalue,
+	// always 0 since Linux 2.6.17), which made every process report the same
+	// tick value and silently disabled recycled-PID detection.
+	fields := strings.Fields(string(data)[rparen+1:])
+	if len(fields) < 20 {
+		return ""
+	}
+	return fields[19]
+}
+
 func lock(root, home string) (func(), error) {
 	sum := sha1.Sum([]byte(root))
 	dir := filepath.Join(home, "locks")
@@ -175,20 +209,65 @@ func lock(root, home string) (func(), error) {
 	}
 	p := filepath.Join(dir, hex.EncodeToString(sum[:])+".lock")
 	for tries := 0; tries < 2; tries++ {
+		pid := os.Getpid()
+		created := time.Now().UTC().UnixNano()
+		// Format: "<pid> <created_unix_nano> <start_ticks>". start_ticks is
+		// empty off Linux; on Linux it lets us reject a recycled PID precisely
+		// rather than relying on lockStaleThreshold alone. The first two
+		// fields stay parseable even for a hand-written or old lock that only
+		// contained a pid.
+		body := fmt.Sprintf("%d %d %s", pid, created, processStartTicks(pid))
 		f, err := os.OpenFile(p, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
 		if err == nil {
-			fmt.Fprint(f, os.Getpid())
+			fmt.Fprint(f, body)
 			f.Close()
 			return func() { _ = os.Remove(p) }, nil
 		}
-		b, _ := os.ReadFile(p)
-		pid, _ := strconv.Atoi(strings.TrimSpace(string(b)))
-		if pid > 0 && syscall.Kill(pid, 0) == nil {
-			return nil, fmt.Errorf("workspace locked by pid %d", pid)
+		if !isLiveLock(p) {
+			_ = os.Remove(p)
+			continue
 		}
-		_ = os.Remove(p)
+		return nil, fmt.Errorf("workspace locked by an in-flight governator run (lock %s)", p)
 	}
 	return nil, errors.New("cannot acquire workspace lock")
+}
+
+// isLiveLock reports whether an existing lock file points at a genuinely
+// in-flight governator process. A lock is considered live only when:
+//   - the holder PID exists (syscall.Kill(pid, 0) succeeds), AND
+//   - on Linux, its /proc start ticks still match what the lock recorded, OR
+//   - off Linux / when start ticks are unavailable, the lock was created
+//     within lockStaleThreshold (a coarse but portable recycle guard).
+//
+// Any parse failure, dead PID, tick mismatch, or stale timestamp means the
+// lock is reclaimable.
+func isLiveLock(p string) bool {
+	b, err := os.ReadFile(p)
+	if err != nil {
+		return false
+	}
+	parts := strings.Fields(strings.TrimSpace(string(b)))
+	if len(parts) == 0 {
+		return false
+	}
+	pid, err := strconv.Atoi(parts[0])
+	if err != nil || pid <= 0 {
+		return false
+	}
+	if syscall.Kill(pid, 0) != nil {
+		return false
+	}
+	if len(parts) >= 3 && parts[2] != "" {
+		return parts[2] == processStartTicks(pid)
+	}
+	if len(parts) >= 2 {
+		if created, err := strconv.ParseInt(parts[1], 10, 64); err == nil {
+			return time.Unix(0, created).Add(lockStaleThreshold).After(time.Now())
+		}
+	}
+	// Old-format lock containing only a pid, held by a live process: trust it
+	// (preserves prior behaviour for locks written before this change).
+	return true
 }
 
 type stamp struct {
@@ -529,12 +608,18 @@ func auditTranscript(path, format string, c contracts.Contract) transcriptAudit 
 			}
 		}
 	}
-	for _, line := range strings.Split(string(data), "\n") {
-		var v any
-		if json.Unmarshal([]byte(line), &v) == nil {
-			usage.walk(format, v)
-			walk(v)
+	for lineNumber, line := range strings.Split(string(data), "\n") {
+		if strings.TrimSpace(line) == "" {
+			continue
 		}
+		var v any
+		if err := json.Unmarshal([]byte(line), &v); err != nil {
+			audit.Violations = append(audit.Violations,
+				fmt.Sprintf("transcript audit: malformed JSON on line %d", lineNumber+1))
+			continue
+		}
+		usage.walk(format, v)
+		walk(v)
 	}
 	audit.Usage, audit.ToolCalls = usage.result()
 	if !audit.CostAvailable {
@@ -814,9 +899,20 @@ func (r *Runner) Run(ctx context.Context, c contracts.Contract) (RunRecord, erro
 	delete(workBefore, canaryName)
 	delete(workAfter, canaryName)
 	if aerr != nil {
-		violations = append(violations, "agent: "+aerr.Error())
-	}
-	if ar.ExitCode != 0 {
+		// A timeout produces BOTH a non-nil error (context.DeadlineExceeded)
+		// and ExitCode -1 with TimedOut=true. Reporting all three inflates the
+		// violation list and double-counts the same event in failure taxonomy.
+		// Collapse to a single unambiguous "agent timeout" when the timer
+		// fired; every other error path keeps its existing message.
+		if ar.TimedOut {
+			violations = append(violations, "agent timeout: exceeded budget.max_minutes")
+		} else {
+			violations = append(violations, "agent: "+aerr.Error())
+			if ar.ExitCode != 0 {
+				violations = append(violations, fmt.Sprintf("agent exit code %d", ar.ExitCode))
+			}
+		}
+	} else if ar.ExitCode != 0 {
 		violations = append(violations, fmt.Sprintf("agent exit code %d", ar.ExitCode))
 	}
 	if werr != nil {

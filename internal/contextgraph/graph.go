@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -76,22 +77,22 @@ func Resolve() (Status, error) {
 	return status, nil
 }
 
-func Version(status Status) (string, error) {
+func Version(ctx context.Context, status Status) (string, error) {
 	if !status.Enabled {
 		return "", fmt.Errorf("graph provider is not enabled")
 	}
-	output, err := exec.Command(status.Path, "version").CombinedOutput()
+	output, err := exec.CommandContext(ctx, status.Path, "version").CombinedOutput()
 	if err != nil {
 		return "", fmt.Errorf("%s version: %w: %s", status.Provider, err, strings.TrimSpace(string(output)))
 	}
 	return strings.TrimSpace(string(output)), nil
 }
 
-func Inspect(status Status, project string) (Stats, error) {
+func Inspect(ctx context.Context, status Status, project string) (Stats, error) {
 	if !status.Enabled {
 		return Stats{}, fmt.Errorf("graph provider is not enabled")
 	}
-	output, err := exec.Command(status.Path, "status", "--json", project).CombinedOutput()
+	output, err := exec.CommandContext(ctx, status.Path, "status", "--json", project).CombinedOutput()
 	if err != nil {
 		return Stats{}, fmt.Errorf("%s status: %w: %s", status.Provider, err, strings.TrimSpace(string(output)))
 	}
@@ -116,11 +117,12 @@ func Current(project string) (Snapshot, error) {
 		return snapshot, err
 	}
 	snapshot.ProjectPath = project
-	snapshot.Version, err = Version(status)
+	ctx := context.Background()
+	snapshot.Version, err = Version(ctx, status)
 	if err != nil {
 		return snapshot, err
 	}
-	stats, err := Inspect(status, project)
+	stats, err := Inspect(ctx, status, project)
 	if err != nil || !stats.Initialized {
 		return snapshot, nil
 	}
@@ -141,7 +143,7 @@ func Prepare(ctx context.Context, project string) (Snapshot, error) {
 		return prepareFailure(snapshot, status.Mode, err)
 	}
 	snapshot.ProjectPath = project
-	snapshot.Version, err = Version(status)
+	snapshot.Version, err = Version(ctx, status)
 	if err != nil {
 		return prepareFailure(snapshot, status.Mode, err)
 	}
@@ -158,7 +160,7 @@ func Prepare(ctx context.Context, project string) (Snapshot, error) {
 		err = fmt.Errorf("%s %s: %w: %s", status.Provider, args[0], runErr, strings.TrimSpace(string(output)))
 		return prepareFailure(snapshot, status.Mode, err)
 	}
-	stats, err := Inspect(status, project)
+	stats, err := Inspect(ctx, status, project)
 	if err != nil {
 		return prepareFailure(snapshot, status.Mode, err)
 	}
@@ -210,12 +212,19 @@ func snapshotFromStats(snapshot Snapshot, stats Stats) (Snapshot, error) {
 }
 
 func hashFile(path string) (string, error) {
-	data, err := os.ReadFile(path)
+	f, err := os.Open(path)
 	if err != nil {
 		return "", err
 	}
-	sum := sha256.Sum256(data)
-	return hex.EncodeToString(sum[:]), nil
+	defer f.Close()
+	h := sha256.New()
+	// Stream instead of os.ReadFile: a codegraph index can be hundreds of MB,
+	// and slurping it whole caused avoidable memory spikes on large repos.
+	if _, err := io.Copy(h, f); err != nil {
+		return "", err
+	}
+	sum := h.Sum(nil)
+	return hex.EncodeToString(sum), nil
 }
 
 func Query(ctx context.Context, snapshot Snapshot, search string, limit int) ([]byte, error) {

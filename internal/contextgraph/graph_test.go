@@ -52,11 +52,11 @@ exit 1
 	if err != nil {
 		t.Fatal(err)
 	}
-	version, err := Version(status)
+	version, err := Version(context.Background(), status)
 	if err != nil || version != "codegraph 0.24.0" {
 		t.Fatalf("version=%q err=%v", version, err)
 	}
-	stats, err := Inspect(status, t.TempDir())
+	stats, err := Inspect(context.Background(), status, t.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}

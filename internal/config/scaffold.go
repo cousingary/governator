@@ -92,7 +92,7 @@ agent: claude-code
 mode: verifier
 workspace:
   root: %q
-  worktree: none
+  worktree: auto
 allowed:
   read: ["**"]
   write: []
@@ -116,5 +116,5 @@ success:
 output:
   style: terse
   max_final_words: 80
-on_violation: halt
+on_violation: quarantine
 `

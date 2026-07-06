@@ -3,6 +3,7 @@ package doctor
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"fmt"
 	"os"
 	"os/exec"
@@ -51,7 +52,7 @@ func Run() []Check {
 		// probe runs the backend with --help/version and asserts the flags
 		// still appear. Non-required (WARN) — a box need not run all backends.
 		checkBackendFlags("claude", "claude", []string{}, []string{"--output-format", "--add-dir", "--permission-mode"}),
-		checkBackendFlags("codex", "codex", []string{}, []string{"exec", "--sandbox", "--ask-for-approval", "-C"}),
+		checkCodexFlags(),
 		checkBackendFlags("glm", "glm", []string{}, []string{"--output-format", "--add-dir", "--permission-mode"}),
 		checkBackendFlags("opencode", "opencode", []string{"run"}, []string{"--format", "--dir", "--pure"}),
 		checkBackendFlags("pi", "pi", []string{}, []string{"--print", "--mode", "--tools", "--no-session", "--no-extensions", "--no-skills"}),
@@ -161,7 +162,7 @@ func checkContextGraph() Check {
 		check.Status, check.Detail = StatusWarn, fmt.Sprintf("%s (%s) not found in PATH; structural context inactive", status.Provider, status.Bin)
 		return check
 	}
-	version, err := contextgraph.Version(status)
+	version, err := contextgraph.Version(context.Background(), status)
 	if err != nil {
 		check.Status = StatusWarn
 		if check.Required {
@@ -175,7 +176,7 @@ func checkContextGraph() Check {
 		check.Status, check.Detail = StatusWarn, fmt.Sprintf("%s; cannot inspect current directory: %v", version, err)
 		return check
 	}
-	stats, err := contextgraph.Inspect(status, cwd)
+	stats, err := contextgraph.Inspect(context.Background(), status, cwd)
 	if err != nil || !stats.Initialized {
 		check.Status, check.Detail = StatusOK, version+"; current directory not indexed"
 		return check
@@ -320,6 +321,38 @@ func checkDrvfs() Check {
 func backendHelpArgs(helpArgs []string) []string {
 	args := append([]string(nil), helpArgs...)
 	return append(args, "--help")
+}
+
+func checkCodexFlags() Check {
+	check := Check{Name: "backend:codex", Required: false}
+	bin := config.BackendBin("codex")
+	if bin == "" {
+		bin = "codex"
+	}
+	path, err := exec.LookPath(bin)
+	if err != nil {
+		check.Status, check.Detail = StatusWarn, "codex not found in PATH (adapter unavailable)"
+		return check
+	}
+	rootOutput, _ := exec.Command(path, "--help").CombinedOutput()
+	execOutput, _ := exec.Command(path, "exec", "--help").CombinedOutput()
+	var missing []string
+	if !bytes.Contains(rootOutput, []byte("--ask-for-approval")) {
+		missing = append(missing, "root:--ask-for-approval")
+	}
+	for _, flag := range []string{"--sandbox", "-C", "--json", "--ephemeral"} {
+		if !bytes.Contains(execOutput, []byte(flag)) {
+			missing = append(missing, "exec:"+flag)
+		}
+	}
+	if len(missing) > 0 {
+		check.Status = StatusFail
+		check.Detail = fmt.Sprintf("%s present but missing flag(s): %s (adapter must be updated)", bin, strings.Join(missing, ", "))
+		return check
+	}
+	check.Status = StatusOK
+	check.Detail = bin + " present with root approval and exec sandbox/transcript flags"
+	return check
 }
 
 func checkBackendFlags(name, defaultBin string, helpArgs, requiredFlags []string) Check {

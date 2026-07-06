@@ -114,7 +114,11 @@ func same(a, b string) bool {
 	if err != nil {
 		return false
 	}
-	return left.Size() == right.Size() && left.ModTime().Unix() == right.ModTime().Unix()
+	// Sub-second precision is required: two writes to the same file inside one
+	// second that keep the same size would compare as identical under whole-
+	// second mtime, causing Diff to miss the change and snapshotRoot to
+	// hardlink stale content into the new snapshot.
+	return left.Size() == right.Size() && left.ModTime().UnixNano() == right.ModTime().UnixNano()
 }
 
 func copyFile(src, dst string) error {
@@ -250,19 +254,25 @@ func find(id string) (Manifest, string, error) {
 	if err != nil {
 		return Manifest{}, "", err
 	}
-	var matches []Manifest
+	// An exact ID match is unambiguous even when a longer ID shares it as a
+	// prefix (e.g. "20260101-120000" vs "20260101-120000-1"): short-circuit so
+	// the exact match wins instead of reporting ambiguity.
+	var prefixMatches []Manifest
 	for _, manifest := range list {
-		if manifest.ID == id || strings.HasPrefix(manifest.ID, id) {
-			matches = append(matches, manifest)
+		if manifest.ID == id {
+			return manifest, filepath.Join(StoreDir(), manifest.ID), nil
+		}
+		if strings.HasPrefix(manifest.ID, id) {
+			prefixMatches = append(prefixMatches, manifest)
 		}
 	}
-	if len(matches) == 0 {
+	if len(prefixMatches) == 0 {
 		return Manifest{}, "", fmt.Errorf("snapshot %q not found", id)
 	}
-	if len(matches) > 1 {
+	if len(prefixMatches) > 1 {
 		return Manifest{}, "", fmt.Errorf("snapshot prefix %q is ambiguous", id)
 	}
-	return matches[0], filepath.Join(StoreDir(), matches[0].ID), nil
+	return prefixMatches[0], filepath.Join(StoreDir(), prefixMatches[0].ID), nil
 }
 
 func Diff(id string) ([]Change, error) {

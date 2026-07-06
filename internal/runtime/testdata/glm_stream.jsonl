@@ -1,0 +1,10 @@
+{"type":"system","session_id":"glm-session-abc","subtype":"init"}
+{"type":"assistant","id":"msg-1","message":{"usage":{"input_tokens":1250,"output_tokens":48,"cache_creation_input_tokens":0,"cache_read_input_tokens":0},"content":[{"type":"text","text":"Reading the contract."}]}}
+{"type":"assistant","id":"msg-2","message":{"content":[{"type":"tool_use","id":"tu-1","name":"Read","input":{"file_path":"output/result.txt"}}]}}
+{"type":"user","id":"user-1","message":{"content":[{"type":"tool_result","tool_use_id":"tu-1","content":"seed"}]}}
+{"type":"assistant","id":"msg-3","message":{"usage":{"input_tokens":1310,"output_tokens":72,"reasoning_tokens":15},"content":[{"type":"tool_use","id":"tu-2","name":"Bash","input":{"command":"test -f output/result.txt"}}]}}
+{"type":"user","id":"user-2","message":{"content":[{"type":"tool_result","tool_use_id":"tu-2","content":"0"}]}}
+{"type":"assistant","id":"msg-4","message":{"content":[{"type":"tool_use","id":"tu-3","name":"Write","input":{"file_path":"output/result.txt","content":"ok\n"}}]}}
+{"type":"user","id":"user-3","message":{"content":[{"type":"tool_result","tool_use_id":"tu-3","content":"wrote"}]}}
+{"type":"assistant","id":"msg-5","message":{"usage":{"input_tokens":1422,"output_tokens":30},"content":[{"type":"text","text":"done"}]}}
+{"type":"result","subtype":"success","cost_usd":0.1375,"duration_ms":1840,"result":"wrote output/result.txt","total_cost_usd":0.1375,"usage":{"input_tokens":3982,"output_tokens":150,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"reasoning_tokens":15}}

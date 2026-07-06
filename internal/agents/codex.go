@@ -30,7 +30,8 @@ func (Codex) Capabilities() Capability {
 
 // project translates the abstract spec into `codex exec` native flags.
 func (Codex) project(spec BackendSpec) ([]string, error) {
-	flags := []string{"exec", "--json"}
+	// Root-level flags must precede the exec subcommand.
+	flags := []string{}
 	switch spec.Approval {
 	case ApprovalOnRequest:
 		flags = append(flags, "--ask-for-approval", "on-request")
@@ -39,17 +40,16 @@ func (Codex) project(spec BackendSpec) ([]string, error) {
 	default:
 		return nil, fmt.Errorf("codex: unsupported approval policy %q", spec.Approval)
 	}
+	if !spec.Network {
+		flags = append(flags, "-c", "sandbox_workspace_write.network_access=false")
+	}
+	// Governator owns the durable transcript; avoid duplicate Codex sessions.
+	flags = append(flags, "exec", "--json", "--ephemeral")
 	switch spec.Sandbox {
 	case SandboxReadOnly:
 		flags = append(flags, "--sandbox", "read-only")
 	case SandboxWorkspaceWrite:
 		flags = append(flags, "--sandbox", "workspace-write")
-		if !spec.Network {
-			// network_access=false is the default for workspace-write; restated
-			// explicitly via the sandbox config TOML the operator loads. The
-			// flag itself is not exposed on `exec`, so the adapter asserts the
-			// mode and the doctor probe verifies the live config.
-		}
 	default:
 		return nil, fmt.Errorf("codex: unsupported sandbox %q", spec.Sandbox)
 	}

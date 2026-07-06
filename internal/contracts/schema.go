@@ -139,14 +139,13 @@ func (c Contract) Validate() error {
 	} else if !filepath.IsAbs(c.Workspace.Root) {
 		add("workspace.root", "must be an absolute path")
 	}
-	if c.Workspace.Worktree != "auto" && c.Workspace.Worktree != "none" {
-		add("workspace.worktree", "must be 'auto' or 'none'")
+	// Every backend runs in a disposable workspace. Accepting "none" would
+	// promise direct-root execution that the runtime intentionally never does.
+	if c.Workspace.Worktree != "auto" {
+		add("workspace.worktree", "must be 'auto'; direct-root execution is unsupported")
 	}
 
 	readOnly := c.Mode == ModeScout || c.Mode == ModeVerifier || c.Mode == ModeArchitect
-	if c.Workspace.Worktree == "none" && !readOnly {
-		add("workspace.worktree", "'none' is allowed only for read-only modes")
-	}
 	if len(c.Allowed.Read) == 0 {
 		add("allowed.read", "must contain at least one path pattern")
 	}
@@ -219,10 +218,11 @@ func (c Contract) Validate() error {
 		}
 	}
 
-	switch c.OnViolation {
-	case "quarantine", "halt", "rollback":
-	default:
-		add("on_violation", "must be one of quarantine, halt, rollback")
+	// Quarantine is the implemented fail-closed action. Halt and rollback were
+	// previously accepted but ignored; rollback also cannot restore arbitrary
+	// live-root mutations from fingerprints alone.
+	if c.OnViolation != "quarantine" {
+		add("on_violation", "must be 'quarantine'; halt and rollback are unsupported")
 	}
 
 	if len(errs) > 0 {
