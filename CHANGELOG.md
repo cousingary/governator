@@ -4,6 +4,10 @@ All notable changes to Governator are documented here.
 
 ## [Unreleased]
 
+### Added
+
+- Minimalism prompt optimizer: a YAGNI-first ruleset adapted from ponytail (github.com/DietrichGebert/ponytail, MIT) is injected into every governed prompt (`minimalism.mode`: `off`/`lite`/`full`/`ultra`, default `full`), aimed at smaller diffs and lower per-run cost, with no external binary required. `gov doctor` reports the active mode.
+
 ### Fixed
 
 - Workspace lock: read the correct `/proc/<pid>/stat` field for process start time (field 22, index 19 after the comm parenthesis). The prior off-by-one read `itrealvalue` (always 0), which silently disabled recycled-PID detection and kept the staleness fallback from ever running on Linux. Regression test pins the field.

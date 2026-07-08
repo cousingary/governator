@@ -15,6 +15,7 @@ import (
 	"github.com/cousingary/governator/internal/agents"
 	"github.com/cousingary/governator/internal/config"
 	"github.com/cousingary/governator/internal/contextgraph"
+	"github.com/cousingary/governator/internal/minimalism"
 	"github.com/cousingary/governator/internal/observability"
 	"github.com/cousingary/governator/internal/protectedpaths"
 	"github.com/cousingary/governator/internal/tokenoptimizer"
@@ -42,6 +43,7 @@ func Run() []Check {
 		checkPython(),
 		checkRTK(),
 		checkContextGraph(),
+		checkMinimalism(),
 		checkGovernedRuns(),
 		checkProtectedManifest(),
 		checkLedgerDirectory(),
@@ -183,6 +185,22 @@ func checkContextGraph() Check {
 	}
 	check.Status = StatusOK
 	check.Detail = fmt.Sprintf("%s; files=%d nodes=%d edges=%d db_bytes=%d index=%s", version, stats.FileCount, stats.NodeCount, stats.EdgeCount, stats.DBSizeBytes, stats.IndexPath)
+	return check
+}
+
+func checkMinimalism() Check {
+	status, err := minimalism.Resolve()
+	check := Check{Name: "minimalism ruleset"}
+	if err != nil {
+		check.Status, check.Detail = StatusFail, err.Error()
+		return check
+	}
+	if !status.Enabled {
+		check.Status, check.Detail = StatusOK, "disabled by configuration"
+		return check
+	}
+	check.Status = StatusOK
+	check.Detail = fmt.Sprintf("mode=%s (ponytail-derived ruleset injected into prompts)", status.Mode)
 	return check
 }
 

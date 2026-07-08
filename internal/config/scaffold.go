@@ -80,6 +80,8 @@ graph:
   mode: auto # auto, off, or required
   provider: codegraph
   bin: codegraph
+minimalism:
+  mode: full # off, lite, full, or ultra
 defaults:
   agent: claude-code
   max_minutes: 30

@@ -25,6 +25,7 @@ import (
 	"github.com/cousingary/governator/internal/config"
 	"github.com/cousingary/governator/internal/contextgraph"
 	"github.com/cousingary/governator/internal/contracts"
+	"github.com/cousingary/governator/internal/minimalism"
 	"github.com/cousingary/governator/internal/observability"
 	"github.com/cousingary/governator/internal/policy"
 	"github.com/cousingary/governator/internal/prompts"
@@ -771,6 +772,10 @@ func (r *Runner) Run(ctx context.Context, c contracts.Contract) (RunRecord, erro
 	if err != nil {
 		return RunRecord{}, err
 	}
+	minimalismAnnotation, err := minimalism.PromptAnnotation()
+	if err != nil {
+		return RunRecord{}, err
+	}
 	preflight, err := policy.Preflight(c)
 	if err != nil {
 		return RunRecord{}, err
@@ -868,6 +873,7 @@ func (r *Runner) Run(ctx context.Context, c contracts.Contract) (RunRecord, erro
 	prompt += prompts.Annotation(promptVersion)
 	prompt += rtkAnnotation
 	prompt += contextgraph.PromptAnnotation(graphSnapshot)
+	prompt += minimalismAnnotation
 	ar, aerr := agent.Run(ctx, agents.Request{
 		Prompt: prompt, Workdir: work, Transcript: transcript,
 		Timeout: time.Duration(c.Budget.MaxMinutes) * time.Minute,

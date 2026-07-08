@@ -15,6 +15,7 @@ func cleanEnv(t *testing.T) {
 		"GOV_SNAPSHOT_ROOTS", "GOV_LEDGER_DIR", "GOV_HOME", "GOVERNATOR_HOME",
 		"GOV_CODEX_BIN", "GOV_RTK_MODE", "GOV_RTK_BIN",
 		"GOV_GRAPH_MODE", "GOV_GRAPH_PROVIDER", "GOV_GRAPH_BIN",
+		"GOV_MINIMALISM_MODE",
 		"GOV_DEFAULT_AGENT", "GOV_DEFAULT_MAX_MINUTES",
 	} {
 		t.Setenv(name, "")
@@ -35,6 +36,7 @@ backends:
   codex: {bin: codex-file}
 rtk: {mode: off, bin: rtk-file}
 graph: {mode: auto, provider: codegraph, bin: codegraph-file}
+minimalism: {mode: lite}
 defaults: {agent: codex, max_minutes: 12}
 `), 0644); err != nil {
 		t.Fatal(err)
@@ -45,6 +47,7 @@ defaults: {agent: codex, max_minutes: 12}
 	t.Setenv("GOV_RTK_BIN", "rtk-env")
 	t.Setenv("GOV_GRAPH_MODE", "required")
 	t.Setenv("GOV_GRAPH_BIN", "codegraph-env")
+	t.Setenv("GOV_MINIMALISM_MODE", "ultra")
 	cfg, err := Load()
 	if err != nil {
 		t.Fatal(err)
@@ -60,6 +63,9 @@ defaults: {agent: codex, max_minutes: 12}
 	}
 	if cfg.Graph.Mode != "required" || cfg.Graph.Provider != "codegraph" || cfg.Graph.Bin != "codegraph-env" {
 		t.Fatalf("graph config=%+v", cfg.Graph)
+	}
+	if cfg.Minimalism.Mode != "ultra" {
+		t.Fatalf("minimalism config=%+v", cfg.Minimalism)
 	}
 }
 
@@ -83,6 +89,18 @@ func TestLoadRejectsInvalidGraphMode(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "invalid graph.mode") {
+		t.Fatalf("error=%v", err)
+	}
+}
+
+func TestLoadRejectsInvalidMinimalismMode(t *testing.T) {
+	cleanEnv(t)
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	t.Setenv("GOV_CONFIG", path)
+	if err := os.WriteFile(path, []byte("minimalism: {mode: extreme}\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "invalid minimalism.mode") {
 		t.Fatalf("error=%v", err)
 	}
 }

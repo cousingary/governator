@@ -116,6 +116,34 @@ func TestContextGraphCheckWarnsWhenAutoBinaryMissing(t *testing.T) {
 	}
 }
 
+func TestMinimalismCheckReportsMode(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("GOV_CONFIG", "")
+	t.Setenv("GOV_MINIMALISM_MODE", "lite")
+
+	check := checkMinimalism()
+	if check.Status != StatusOK {
+		t.Fatalf("check = %+v, want OK", check)
+	}
+	if !strings.Contains(check.Detail, "mode=lite") {
+		t.Fatalf("unexpected detail: %s", check.Detail)
+	}
+}
+
+func TestMinimalismCheckOffIsOK(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("GOV_CONFIG", "")
+	t.Setenv("GOV_MINIMALISM_MODE", "off")
+
+	check := checkMinimalism()
+	if check.Status != StatusOK {
+		t.Fatalf("check = %+v, want OK", check)
+	}
+	if !strings.Contains(check.Detail, "disabled by configuration") {
+		t.Fatalf("unexpected detail: %s", check.Detail)
+	}
+}
+
 // TestGovernedRunsCheckWarnsWhenLedgerEmpty pins the doctor advisory added
 // 2026-07-06: a clean bill of health from the presence checks above must not
 // be read as proof RTK/graph are saving tokens, since neither is exercised

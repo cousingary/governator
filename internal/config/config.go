@@ -26,6 +26,10 @@ type Graph struct {
 	Bin      string `yaml:"bin"`
 }
 
+type Minimalism struct {
+	Mode string `yaml:"mode"`
+}
+
 type Defaults struct {
 	Agent      string `yaml:"agent"`
 	MaxMinutes int    `yaml:"max_minutes"`
@@ -39,6 +43,7 @@ type Config struct {
 	Backends          map[string]Backend `yaml:"backends"`
 	RTK               RTK                `yaml:"rtk"`
 	Graph             Graph              `yaml:"graph"`
+	Minimalism        Minimalism         `yaml:"minimalism"`
 	Defaults          Defaults           `yaml:"defaults"`
 }
 
@@ -71,9 +76,10 @@ func BuiltIn() Config {
 			"codex": {Bin: "codex"}, "glm": {Bin: "glm"},
 			"opencode": {Bin: "opencode"}, "pi": {Bin: "pi"},
 		},
-		RTK:      RTK{Mode: "auto", Bin: "rtk"},
-		Graph:    Graph{Mode: "auto", Provider: "codegraph", Bin: "codegraph"},
-		Defaults: Defaults{Agent: "claude-code", MaxMinutes: 30},
+		RTK:        RTK{Mode: "auto", Bin: "rtk"},
+		Graph:      Graph{Mode: "auto", Provider: "codegraph", Bin: "codegraph"},
+		Minimalism: Minimalism{Mode: "full"},
+		Defaults:   Defaults{Agent: "claude-code", MaxMinutes: 30},
 	}
 }
 
@@ -103,6 +109,9 @@ func Load() (Config, error) {
 	}
 	if cfg.Graph.Provider != "codegraph" {
 		return Config{}, fmt.Errorf("invalid graph.provider %q (want codegraph)", cfg.Graph.Provider)
+	}
+	if cfg.Minimalism.Mode != "off" && cfg.Minimalism.Mode != "lite" && cfg.Minimalism.Mode != "full" && cfg.Minimalism.Mode != "ultra" {
+		return Config{}, fmt.Errorf("invalid minimalism.mode %q (want off, lite, full, or ultra)", cfg.Minimalism.Mode)
 	}
 	return cfg, nil
 }
@@ -149,6 +158,9 @@ func merge(dst *Config, src Config) {
 	}
 	if src.Graph.Bin != "" {
 		dst.Graph.Bin = src.Graph.Bin
+	}
+	if src.Minimalism.Mode != "" {
+		dst.Minimalism.Mode = src.Minimalism.Mode
 	}
 	if src.Defaults.Agent != "" {
 		dst.Defaults.Agent = src.Defaults.Agent
@@ -198,6 +210,9 @@ func applyEnv(cfg *Config) {
 	if value := Env("GOV_GRAPH_BIN"); value != "" {
 		cfg.Graph.Bin = value
 	}
+	if value := Env("GOV_MINIMALISM_MODE"); value != "" {
+		cfg.Minimalism.Mode = value
+	}
 	if value := Env("GOV_DEFAULT_AGENT"); value != "" {
 		cfg.Defaults.Agent = value
 	}
@@ -233,6 +248,7 @@ func clean(cfg *Config) {
 	cfg.Graph.Mode = strings.ToLower(strings.TrimSpace(cfg.Graph.Mode))
 	cfg.Graph.Provider = strings.ToLower(strings.TrimSpace(cfg.Graph.Provider))
 	cfg.Graph.Bin = strings.TrimSpace(cfg.Graph.Bin)
+	cfg.Minimalism.Mode = strings.ToLower(strings.TrimSpace(cfg.Minimalism.Mode))
 	cfg.ProtectedManifest = expand(cfg.ProtectedManifest)
 	cfg.SnapshotDir = expand(cfg.SnapshotDir)
 	cfg.LedgerDir = expand(cfg.LedgerDir)
