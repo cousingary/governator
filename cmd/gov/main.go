@@ -25,6 +25,7 @@ import (
 	govruntime "github.com/cousingary/governator/internal/runtime"
 	"github.com/cousingary/governator/internal/snapshots"
 	"github.com/cousingary/governator/internal/spend"
+	"gopkg.in/yaml.v3"
 )
 
 var version = "1.0.0-rc1"
@@ -99,6 +100,8 @@ func run(args []string) int {
 		return 0
 	case "batch":
 		return batchCmd(args[1:])
+	case "plan":
+		return planCmd(args[1:])
 	case "handoff":
 		if len(args) > 2 {
 			return bad("usage: gov handoff [last|run_id]")
@@ -427,11 +430,12 @@ func spendCmd(args []string) int {
 
 func batchCmd(args []string) int {
 	if len(args) < 1 || args[0] != "run" {
-		return bad("usage: gov batch run <job.yaml|dir|glob>... [--parallel N] [--halt-on-first-quarantine]")
+		return bad("usage: gov batch run <job.yaml|dir|glob>... [--parallel N] [--halt-on-first-quarantine] [--ordered]")
 	}
 	args = args[1:]
 
 	opts := govruntime.BatchOptions{}
+	ordered := false
 	var pathArgs []string
 	for i := 0; i < len(args); i++ {
 		switch args[i] {
@@ -447,12 +451,14 @@ func batchCmd(args []string) int {
 			i++
 		case "--halt-on-first-quarantine":
 			opts.HaltOnFirstQuarantine = true
+		case "--ordered":
+			ordered = true
 		default:
 			pathArgs = append(pathArgs, args[i])
 		}
 	}
 	if len(pathArgs) == 0 {
-		return bad("usage: gov batch run <job.yaml|dir|glob>... [--parallel N] [--halt-on-first-quarantine]")
+		return bad("usage: gov batch run <job.yaml|dir|glob>... [--parallel N] [--halt-on-first-quarantine] [--ordered]")
 	}
 
 	paths, err := resolveJobPaths(pathArgs)
@@ -481,7 +487,17 @@ func batchCmd(args []string) int {
 		return 2
 	}
 
-	summary, err := govruntime.New().RunBatch(context.Background(), jobs, opts)
+	var summary govruntime.BatchSummary
+	if ordered {
+		levels, lErr := contracts.TopologicalLevels(jobs)
+		if lErr != nil {
+			fmt.Fprintln(os.Stderr, "batch:", lErr)
+			return 2
+		}
+		summary, err = govruntime.New().RunBatchOrdered(context.Background(), levels, opts)
+	} else {
+		summary, err = govruntime.New().RunBatch(context.Background(), jobs, opts)
+	}
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "batch:", err)
 		return 1
@@ -507,6 +523,12 @@ func batchCmd(args []string) int {
 // *.yaml file directly inside, non-recursive), and shell-style globs (for
 // callers that quote the pattern so their shell doesn't expand it) into a
 // flat, order-preserving list of job contract paths.
+// planManifestName is the reserved filename for a gov plan's DAG manifest
+// (contracts.Plan, a list of jobs — not itself a single runnable Contract).
+// Directory/glob expansion below skips it so `gov batch run jobs/<slug>/`
+// naturally picks up only the exploded per-job files sitting beside it.
+const planManifestName = "PLAN.yaml"
+
 func resolveJobPaths(args []string) ([]string, error) {
 	var out []string
 	for _, a := range args {
@@ -516,7 +538,7 @@ func resolveJobPaths(args []string) ([]string, error) {
 			if err != nil {
 				return nil, fmt.Errorf("glob %s: %w", a, err)
 			}
-			out = append(out, matches...)
+			out = append(out, excludePlanManifest(matches)...)
 		default:
 			info, err := os.Stat(a)
 			if err != nil {
@@ -527,7 +549,7 @@ func resolveJobPaths(args []string) ([]string, error) {
 				if err != nil {
 					return nil, fmt.Errorf("glob %s: %w", a, err)
 				}
-				out = append(out, matches...)
+				out = append(out, excludePlanManifest(matches)...)
 			} else {
 				out = append(out, a)
 			}
@@ -535,6 +557,277 @@ func resolveJobPaths(args []string) ([]string, error) {
 	}
 	return out, nil
 }
+
+func excludePlanManifest(paths []string) []string {
+	out := make([]string, 0, len(paths))
+	for _, p := range paths {
+		if filepath.Base(p) == planManifestName {
+			continue
+		}
+		out = append(out, p)
+	}
+	return out
+}
+
+const planUsage = "usage: gov plan <intent.md> --out <dir> --envelope <pattern>... --max-total-tokens <n> [--backend <name>]\n" +
+	"       gov plan --show <dir>"
+
+func planCmd(args []string) int {
+	if len(args) == 0 {
+		return bad(planUsage)
+	}
+	if args[0] == "--show" {
+		if len(args) != 2 {
+			return bad(planUsage)
+		}
+		return planShow(args[1])
+	}
+	return planCreate(args)
+}
+
+// planCreate compiles and runs the planner job that turns an intent file
+// into a validated PLAN.yaml, then explodes each approved sub-contract into
+// its own runnable job file inside --out. Every structural check (schema,
+// envelope, budget, cycles) happens in contracts.ValidatePlan via the
+// compiled contract's PostRunValidate hook, which runs in-process before the
+// merge — so a malformed plan quarantines and nothing lands on disk, exactly
+// like any other governed job.
+func planCreate(args []string) int {
+	intentPath := args[0]
+	var outDir, backend string
+	var envelope []string
+	maxTotalTokens := 0
+	rest := args[1:]
+	for i := 0; i < len(rest); i++ {
+		switch rest[i] {
+		case "--out":
+			if i+1 >= len(rest) {
+				return bad(planUsage)
+			}
+			outDir = rest[i+1]
+			i++
+		case "--envelope":
+			if i+1 >= len(rest) {
+				return bad(planUsage)
+			}
+			envelope = append(envelope, rest[i+1])
+			i++
+		case "--max-total-tokens":
+			if i+1 >= len(rest) {
+				return bad(planUsage)
+			}
+			n, err := strconv.Atoi(rest[i+1])
+			if err != nil || n <= 0 {
+				return bad("gov plan: --max-total-tokens must be a positive integer")
+			}
+			maxTotalTokens = n
+			i++
+		case "--backend":
+			if i+1 >= len(rest) {
+				return bad(planUsage)
+			}
+			backend = rest[i+1]
+			i++
+		default:
+			return bad(planUsage)
+		}
+	}
+	if outDir == "" || len(envelope) == 0 || maxTotalTokens <= 0 {
+		return bad(planUsage)
+	}
+
+	intent, err := os.ReadFile(intentPath)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "plan:", err)
+		return 1
+	}
+	root, err := os.Getwd()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "plan:", err)
+		return 1
+	}
+
+	outRel := filepath.ToSlash(filepath.Clean(outDir))
+	if filepath.IsAbs(outRel) || outRel == ".." || strings.HasPrefix(outRel, "../") {
+		return bad("gov plan: --out must be a relative path inside the project root")
+	}
+	slug := filepath.Base(outRel)
+	planRel := outRel + "/" + planManifestName
+
+	if backend == "" {
+		if candidates, rErr := observability.RouteAgents(govruntime.Home(), "planning"); rErr == nil && len(candidates) > 0 {
+			backend = candidates[0].Agent
+		} else {
+			backend = config.Current().Defaults.Agent
+		}
+	}
+
+	c := contracts.Contract{
+		Task:    planTask(string(intent), root, envelope, planRel, maxTotalTokens),
+		JobID:   "plan-" + slug,
+		JobType: "planning",
+		Agent:   backend,
+		Mode:    contracts.ModePlanner,
+		Workspace: contracts.Workspace{
+			Root: root, Worktree: "auto",
+		},
+		Allowed: contracts.Permissions{
+			Read:  []string{"**"},
+			Write: []string{outRel + "/**"},
+		},
+		Forbidden: contracts.Forbidden{
+			Paths:     []string{".git/**"},
+			Commands:  []string{"rm -rf"},
+			Behaviors: []string{"network"},
+		},
+		Budget: contracts.Budget{
+			// MaxFilesChanged/MaxNewFiles allow 2: PLAN.yaml plus the
+			// backend's own RESULT.json, which lands in the worktree
+			// alongside it and counts toward these budgets too.
+			MaxMinutes: 15, MaxCommands: 10, MaxFilesChanged: 2,
+			MaxLinesChanged: 1500, MaxNewFiles: 2, MaxDeleted: 0,
+		},
+		Preflight: contracts.Preflight{IntendedWrites: []string{planRel}},
+		Success: contracts.Success{
+			RequiredFiles: []string{planRel},
+			Validators:    []string{"test -f " + planShQuote(planRel)},
+		},
+		OnViolation: "quarantine",
+	}
+	c.PostRunValidate = func(worktree string) error {
+		plan, perr := contracts.ParsePlanFile(filepath.Join(worktree, filepath.FromSlash(planRel)))
+		if perr != nil {
+			return perr
+		}
+		_, verr := contracts.ValidatePlan(plan.Jobs, root, envelope, maxTotalTokens)
+		return verr
+	}
+
+	rec, err := govruntime.New().RunWithAutoRepair(context.Background(), c)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "plan:", err)
+		return 1
+	}
+	if rec.Status != "APPROVED" {
+		fmt.Println(govruntime.MarshalRecord(rec))
+		return 1
+	}
+
+	plan, err := contracts.ParsePlanFile(filepath.Join(root, filepath.FromSlash(planRel)))
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "plan:", err)
+		return 1
+	}
+	levels, err := contracts.ValidatePlan(plan.Jobs, root, envelope, maxTotalTokens)
+	if err != nil {
+		// PostRunValidate already gated this before the merge, so this
+		// should be unreachable — surfaced defensively rather than exploding
+		// a manifest nothing has actually approved.
+		fmt.Fprintln(os.Stderr, "plan: approved manifest failed re-validation:", err)
+		return 1
+	}
+
+	written := 0
+	for _, job := range plan.Jobs {
+		data, mErr := yaml.Marshal(job)
+		if mErr != nil {
+			fmt.Fprintln(os.Stderr, "plan:", mErr)
+			return 1
+		}
+		path := filepath.Join(root, filepath.FromSlash(outRel), job.JobID+".yaml")
+		if wErr := os.WriteFile(path, data, 0644); wErr != nil {
+			fmt.Fprintln(os.Stderr, "plan:", wErr)
+			return 1
+		}
+		written++
+	}
+
+	fmt.Printf("run_id: %s\nbackend: %s\nplan: %s\n", rec.ID, backend, filepath.Join(root, filepath.FromSlash(planRel)))
+	printPlanTable(levels)
+	fmt.Printf("jobs=%d levels=%d written=%d\n", len(plan.Jobs), len(levels), written)
+	return 0
+}
+
+// planShow reads an already-written PLAN.yaml and renders its dependency
+// DAG plus a per-job budget/risk table. It performs no envelope or budget
+// re-validation (those aren't persisted in PLAN.yaml) — only cycle-safe
+// topological ordering, which is intrinsic to the manifest itself.
+func planShow(dir string) int {
+	planPath := filepath.Join(dir, planManifestName)
+	plan, err := contracts.ParsePlanFile(planPath)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "plan:", err)
+		return 1
+	}
+	levels, err := contracts.TopologicalLevels(plan.Jobs)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "plan:", err)
+		return 1
+	}
+	printPlanTable(levels)
+	total := 0
+	for _, job := range plan.Jobs {
+		total += job.Budget.MaxTokens
+	}
+	fmt.Printf("jobs=%d levels=%d total_max_tokens=%d\n", len(plan.Jobs), len(levels), total)
+	return 0
+}
+
+func printPlanTable(levels [][]contracts.Contract) {
+	fmt.Println("level\tjob_id\trisk_class\tbudget.max_tokens\tdepends_on")
+	for i, level := range levels {
+		for _, job := range level {
+			fmt.Printf("%d\t%s\t%s\t%d\t%s\n", i, job.JobID, job.RiskClass, job.Budget.MaxTokens, strings.Join(job.DependsOn, ","))
+		}
+	}
+}
+
+func planTask(intent, root string, envelope []string, planRel string, maxTotalTokens int) string {
+	return fmt.Sprintf(`Decompose the intent below into a governed execution plan.
+
+INTENT:
+%s
+
+Write exactly one file, %s, containing a YAML mapping with a single top-level
+key "jobs": an ordered list of governed sub-contracts. Every job in the list
+must be a complete, valid Governator contract (the same shape as a normal
+job.yaml: task, job_id, job_type, agent, mode, workspace, allowed, forbidden,
+budget, preflight, success, on_violation) PLUS two extra fields:
+  risk_class: low | medium | high
+  depends_on: [other_job_id, ...]   # omit or leave empty if none
+
+Hard requirements, checked deterministically after you finish:
+  - Every job's workspace.root must equal %q exactly.
+  - Every job's allowed.write / preflight.intended_writes patterns must stay
+    inside this declared envelope: %v — writing anywhere else fails the plan.
+  - Every job must set budget.max_tokens > 0, and the sum across all jobs
+    must not exceed %d.
+  - job_id must be unique across the plan.
+  - depends_on may only reference other job_id values in this same plan, and
+    must not form a cycle.
+  - on_violation must be "quarantine" for every job.
+
+Example single job entry (repeat this shape for each job in the list):
+  - task: "Add input validation to the signup handler"
+    job_id: signup-validation
+    job_type: code_change
+    agent: claude-code
+    mode: surgeon
+    workspace: {root: %q, worktree: auto}
+    allowed: {read: ["**"], write: ["internal/signup/**"], execute: ["go test ./internal/signup"]}
+    forbidden: {paths: [".git/**"], commands: ["rm -rf"], behaviors: [network]}
+    budget: {max_minutes: 10, max_commands: 20, max_files_changed: 3, max_lines_changed: 150, max_new_files: 1, max_deleted: 0, max_tokens: 20000}
+    preflight: {intended_writes: ["internal/signup/**"]}
+    success: {required_files: ["internal/signup/handler.go"], validators: ["go test ./internal/signup"]}
+    on_violation: quarantine
+    risk_class: low
+    depends_on: []
+
+Do not write anything outside %s. Do not run any commands beyond what you
+need to read the repository for context.`, strings.TrimSpace(intent), planRel, root, envelope, maxTotalTokens, root, planRel)
+}
+
+func planShQuote(s string) string { return "'" + strings.ReplaceAll(s, "'", "'\"'\"'") + "'" }
 
 func graphCmd(args []string) int {
 	if len(args) == 0 {
@@ -901,7 +1194,9 @@ Usage:
   gov validate <job.yaml>
   gov preflight <job.yaml>
   gov run <job.yaml> [--agent <name>]
-  gov batch run <job.yaml|dir|glob>... [--parallel N] [--halt-on-first-quarantine]
+  gov batch run <job.yaml|dir|glob>... [--parallel N] [--halt-on-first-quarantine] [--ordered]
+  gov plan <intent.md> --out <dir> --envelope <pattern>... --max-total-tokens <n> [--backend <name>]
+  gov plan --show <dir>
   gov handoff [last|run_id]
   gov diff [last|run_id]
   gov rollback <run_id>

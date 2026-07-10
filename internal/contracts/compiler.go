@@ -41,6 +41,7 @@ func CompilePrompt(c Contract, worktree string) (string, error) {
 		ModeVerifier:    "verify deterministically without modifying files",
 		ModeRepair:      "diagnose and repair only the stated failure",
 		ModeArchitect:   "analyze architecture and report without modifying files",
+		ModePlanner:     "decompose the intent into an ordered, validated plan of governed sub-contracts; write only the required PLAN.yaml manifest",
 	}[c.Mode]
 	prompt := fmt.Sprintf(`You are an execution agent inside Governator.
 Mode: %s - %s.

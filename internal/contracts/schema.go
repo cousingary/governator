@@ -18,11 +18,15 @@ const (
 	ModeVerifier    Mode = "verifier"
 	ModeRepair      Mode = "repair"
 	ModeArchitect   Mode = "architect"
+	// ModePlanner decomposes an intent into an ordered PLAN.yaml manifest of
+	// governed sub-contracts. It writes (unlike scout/verifier/architect) but
+	// only within the plan's own output directory — see `gov plan`.
+	ModePlanner Mode = "planner"
 )
 
 var validModes = map[Mode]bool{
 	ModeScout: true, ModeSurgeon: true, ModeBatchWorker: true,
-	ModeVerifier: true, ModeRepair: true, ModeArchitect: true,
+	ModeVerifier: true, ModeRepair: true, ModeArchitect: true, ModePlanner: true,
 }
 
 // ReadOnly reports whether m never writes to the workspace. Scout, verifier,
@@ -32,6 +36,8 @@ func (m Mode) ReadOnly() bool {
 }
 
 var jobIDPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]*$`)
+
+var riskClasses = map[string]bool{"low": true, "medium": true, "high": true}
 
 type Contract struct {
 	Task        string        `yaml:"task,omitempty" json:"task,omitempty"`
@@ -56,6 +62,27 @@ type Contract struct {
 	// it), and `json:"-"` keeps it out of ContractHash and the compiled
 	// prompt.
 	RepairLineage string `yaml:"-" json:"-"`
+
+	// DependsOn and RiskClass are plan-authoring metadata: a `gov plan`
+	// manifest's sub-contracts use them to declare execution order
+	// (`gov batch run --ordered`) and a coarse risk tier (`gov plan --show`).
+	// Both are optional and additive — absent on every job YAML predating
+	// `gov plan`, so existing contracts keep validating unchanged. DependsOn
+	// entries name other job_ids within the same plan; cross-referencing and
+	// cycle detection happen at the plan level (ValidatePlan), not here,
+	// since a single contract can't see its siblings.
+	DependsOn []string `yaml:"depends_on,omitempty" json:"depends_on,omitempty"`
+	RiskClass string   `yaml:"risk_class,omitempty" json:"risk_class,omitempty"`
+
+	// PostRunValidate, when set, runs in-process after Success.Validators
+	// pass but before the run merges to the live root — an extra pre-merge
+	// gate for checks too structured for a shell one-liner (e.g. `gov plan`'s
+	// PLAN.yaml post-gate). A non-nil error is added as a violation exactly
+	// like a failed validator, quarantining the run and skipping the merge.
+	// Set only by internal callers, never by job YAML: `yaml:"-"`/`json:"-"`
+	// keep it out of the strict decoder and ContractHash (a func value can't
+	// serialize, and letting YAML forge it would be a governance hole).
+	PostRunValidate func(worktree string) error `yaml:"-" json:"-"`
 }
 
 type Workspace struct {
@@ -175,7 +202,7 @@ func (c Contract) Validate() error {
 		add("agent", "is required")
 	}
 	if !validModes[c.Mode] {
-		add("mode", "must be one of scout, surgeon, batch_worker, verifier, repair, architect")
+		add("mode", "must be one of scout, surgeon, batch_worker, verifier, repair, architect, planner")
 	}
 	if strings.TrimSpace(c.Workspace.Root) == "" {
 		add("workspace.root", "is required")
@@ -263,6 +290,16 @@ func (c Contract) Validate() error {
 
 	if c.Repair != nil && c.Repair.MaxAttempts < 0 {
 		add("repair.max_attempts", "must be zero or greater (0 defaults to 1, values above 2 clamp to 2)")
+	}
+
+	if strings.TrimSpace(c.RiskClass) != "" && !riskClasses[c.RiskClass] {
+		add("risk_class", "must be one of low, medium, high when set")
+	}
+	validateNonBlank("depends_on", c.DependsOn, add)
+	for i, dep := range c.DependsOn {
+		if strings.TrimSpace(dep) != "" && !jobIDPattern.MatchString(dep) {
+			add(fmt.Sprintf("depends_on[%d]", i), "must look like a job_id (alphanumeric, '.', '_', '-')")
+		}
 	}
 
 	// Quarantine is the implemented fail-closed action. Halt and rollback were

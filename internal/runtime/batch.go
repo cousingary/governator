@@ -147,6 +147,42 @@ func (r *Runner) RunBatch(ctx context.Context, jobs []contracts.Contract, opts B
 	return summary, nil
 }
 
+// RunBatchOrdered runs a topologically-ordered set of dependency levels —
+// e.g. from contracts.TopologicalLevels(plan.Jobs) — serial across levels (a
+// level only starts once every job in the previous level has finished) and
+// parallel within a level via the same worker pool RunBatch already builds.
+// Each level is just a call to RunBatch, reusing it unmodified rather than
+// forking its logic, same as RunBatch itself reuses the single-run path.
+// Once any level quarantines under HaltOnFirstQuarantine, every job in every
+// later level is marked SKIPPED without ever launching. The returned
+// BatchSummary flattens every level's jobs in level order; each level still
+// gets its own `batches` ledger row via RunBatch.
+func (r *Runner) RunBatchOrdered(ctx context.Context, levels [][]contracts.Contract, opts BatchOptions) (BatchSummary, error) {
+	combined := BatchSummary{BatchID: fmt.Sprintf("ordered-batch-%d", time.Now().UTC().UnixNano())}
+	halted := false
+	for _, level := range levels {
+		if halted {
+			for _, job := range level {
+				combined.Jobs = append(combined.Jobs, BatchJobResult{
+					JobID: job.JobID, Status: "SKIPPED", Error: "batch halted after an earlier quarantine",
+				})
+			}
+			continue
+		}
+		summary, err := r.RunBatch(ctx, level, opts)
+		if err != nil {
+			return combined, err
+		}
+		combined.Jobs = append(combined.Jobs, summary.Jobs...)
+		combined.TotalCostUSD += summary.TotalCostUSD
+		combined.Quarantined += summary.Quarantined
+		if opts.HaltOnFirstQuarantine && summary.Quarantined > 0 {
+			halted = true
+		}
+	}
+	return combined, nil
+}
+
 // runBatchJob reserves a conservative cost estimate before launching job,
 // releases it after Run returns (settled against the real reported cost),
 // and never calls Run at all when the reservation is refused — the spend

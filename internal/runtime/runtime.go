@@ -1011,6 +1011,17 @@ func (r *Runner) Run(ctx context.Context, c contracts.Contract) (RunRecord, erro
 			violations = append(violations, fmt.Sprintf("validator failed (%d): %s", code, v))
 		}
 	}
+	// PostRunValidate is the in-process extension of the validator gate above
+	// for checks too structured for a shell one-liner (e.g. `gov plan`'s
+	// PLAN.yaml post-gate). It only runs once every shell validator has
+	// already passed, and — like them — strictly before the merge below, so
+	// a failure here blocks the merge exactly as a failed shell validator
+	// would.
+	if len(violations) == 0 && c.PostRunValidate != nil {
+		if err := c.PostRunValidate(work); err != nil {
+			violations = append(violations, "post-run validation failed: "+err.Error())
+		}
+	}
 	rec.Diff = workspaceDiff(root, work, git, changed, deleted)
 	if len(violations) == 0 {
 		if git {
