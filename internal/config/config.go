@@ -216,6 +216,15 @@ func applyEnv(cfg *Config) {
 	}
 	if value := firstEnv("GOV_LEDGER_DIR", "GOV_HOME", "GOVERNATOR_HOME"); value != "" {
 		cfg.LedgerDir = value
+		// Keep the still-default halt file next to the ledger it guards when
+		// the home is overridden: the spend cap reads the ledger under this
+		// home, so consulting ~/.governator/HALT from a GOV_HOME-isolated run
+		// (tests especially) would let a real operator halt bleed into every
+		// isolated environment. An explicit spend.halt_file in the config
+		// file, or GOV_SPEND_HALT_FILE (applied below), still wins.
+		if cfg.Spend.HaltFile == filepath.Join(HomeDir(), ".governator", "HALT") {
+			cfg.Spend.HaltFile = filepath.Join(value, "HALT")
+		}
 	}
 	for name, backend := range cfg.Backends {
 		envName := "GOV_" + strings.ToUpper(strings.ReplaceAll(name, "-", "_")) + "_BIN"

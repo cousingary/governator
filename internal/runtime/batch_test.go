@@ -184,3 +184,40 @@ func TestRunBatchHaltOnFirstQuarantineSkipsLaterJobs(t *testing.T) {
 		t.Fatalf("expected 1 quarantined job, got %d", summary.Quarantined)
 	}
 }
+
+func TestLineageCostSumsOriginalAndRepairAttempts(t *testing.T) {
+	home := t.TempDir()
+	db, err := dbOpen(home)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, row := range []struct {
+		id, repairOf string
+		cost         float64
+	}{
+		{"root-1", "", 0.5},
+		{"rep-1", "root-1", 0.3},
+		{"rep-2", "root-1", 0.2},
+		{"unrelated-1", "", 9.9},
+	} {
+		if _, err := db.Exec(`INSERT INTO runs(id, status, created, cost_usd, repair_of) VALUES(?,?,?,?,?)`,
+			row.id, "QUARANTINED", "2026-07-10T00:00:00Z", row.cost, row.repairOf); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	r := &Runner{Home: home}
+	// Final repair attempt carries the lineage: settle the WHOLE lineage's
+	// cost (original + both attempts), not just the final record's own.
+	got := r.lineageCostUSD(RunRecord{ID: "rep-2", RepairOf: "root-1", CostUSD: 0.2})
+	if got < 0.999 || got > 1.001 {
+		t.Fatalf("lineageCostUSD = %v, want 1.0 (0.5 + 0.3 + 0.2)", got)
+	}
+	// No lineage: the record's own cost passes through untouched.
+	if got := r.lineageCostUSD(RunRecord{ID: "unrelated-1", CostUSD: 9.9}); got != 9.9 {
+		t.Fatalf("lineageCostUSD without lineage = %v, want 9.9", got)
+	}
+}

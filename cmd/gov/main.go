@@ -494,6 +494,29 @@ func batchCmd(args []string) int {
 		return 2
 	}
 
+	// depends_on is only honored under --ordered, and TopologicalLevels
+	// silently drops references it can't resolve within the set — so a
+	// hand-picked subset would otherwise run a job WITHOUT its declared
+	// prerequisite. Fail closed on both instead.
+	ids := make(map[string]bool, len(jobs))
+	for _, j := range jobs {
+		ids[j.JobID] = true
+	}
+	hasDeps := false
+	for _, j := range jobs {
+		for _, dep := range j.DependsOn {
+			hasDeps = true
+			if !ids[dep] {
+				fmt.Fprintf(os.Stderr, "batch: job %s depends_on %q, which is not in this batch — include it or fix the contract\n", j.JobID, dep)
+				return 2
+			}
+		}
+	}
+	if hasDeps && !ordered {
+		fmt.Fprintln(os.Stderr, "batch: contracts declare depends_on; run with --ordered so dependencies execute first")
+		return 2
+	}
+
 	var summary govruntime.BatchSummary
 	if ordered {
 		levels, lErr := contracts.TopologicalLevels(jobs)

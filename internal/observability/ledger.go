@@ -230,11 +230,17 @@ func RecordCompletion(db *sql.DB, c Completion) error {
 			return err
 		}
 	}
-	failure := c.Status != "APPROVED"
-	if _, err = tx.Exec(`INSERT INTO agent_profiles(agent,job_type,runs,valid_outputs,failures,total_cost_usd) VALUES(?,?,?,?,?,?)
+	// A SPEND_CAP refusal never launched the backend, so booking it as an
+	// agent run/failure would corrupt the valid-output rates gov score/route
+	// rank agents by — a halted day would pile fake failures onto whatever
+	// agent the refused jobs happened to name.
+	if c.FailureTaxonomy != "SPEND_CAP" {
+		failure := c.Status != "APPROVED"
+		if _, err = tx.Exec(`INSERT INTO agent_profiles(agent,job_type,runs,valid_outputs,failures,total_cost_usd) VALUES(?,?,?,?,?,?)
 ON CONFLICT(agent,job_type) DO UPDATE SET runs=runs+1,valid_outputs=valid_outputs+excluded.valid_outputs,failures=failures+excluded.failures,total_cost_usd=total_cost_usd+excluded.total_cost_usd`,
-		c.Agent, c.JobType, 1, boolInt(c.ValidOutput), boolInt(failure), c.CostUSD); err != nil {
-		return err
+			c.Agent, c.JobType, 1, boolInt(c.ValidOutput), boolInt(failure), c.CostUSD); err != nil {
+			return err
+		}
 	}
 	return tx.Commit()
 }

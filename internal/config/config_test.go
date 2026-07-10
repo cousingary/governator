@@ -256,3 +256,44 @@ func TestScaffoldIsIdempotent(t *testing.T) {
 		}
 	}
 }
+
+func TestLoadGovHomeMovesDefaultHaltFileNextToLedger(t *testing.T) {
+	cleanEnv(t)
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	govHome := t.TempDir()
+	t.Setenv("GOV_HOME", govHome)
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.LedgerDir != govHome {
+		t.Fatalf("ledger_dir=%s want=%s", cfg.LedgerDir, govHome)
+	}
+	// The spend cap reads the ledger under GOV_HOME; the still-default halt
+	// file must follow it, or a real operator halt in ~/.governator/HALT
+	// would bleed into every GOV_HOME-isolated run (tests especially).
+	want := filepath.Join(govHome, "HALT")
+	if cfg.Spend.HaltFile != want {
+		t.Fatalf("halt file=%s want=%s", cfg.Spend.HaltFile, want)
+	}
+}
+
+func TestLoadGovHomeDoesNotOverrideExplicitHaltFile(t *testing.T) {
+	cleanEnv(t)
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("GOV_HOME", t.TempDir())
+	path := filepath.Join(home, "custom.yaml")
+	t.Setenv("GOV_CONFIG", path)
+	if err := os.WriteFile(path, []byte("spend: {halt_file: /halt/explicit}\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Spend.HaltFile != "/halt/explicit" {
+		t.Fatalf("explicit halt_file must win over the GOV_HOME redirect, got %s", cfg.Spend.HaltFile)
+	}
+}

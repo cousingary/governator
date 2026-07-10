@@ -83,3 +83,52 @@ func TestUsageSummaryFor(t *testing.T) {
 		t.Fatalf("unexpected usage report: %+v", report)
 	}
 }
+
+func TestRecordCompletionSpendCapRefusalDoesNotTouchAgentProfiles(t *testing.T) {
+	home := t.TempDir()
+	db, err := Open(home)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	// A SPEND_CAP refusal never launched the backend: it must still record
+	// its violation row, but must not book a run/failure against the agent —
+	// that would corrupt the evidence gov score/route rank agents by.
+	if err := RecordCompletion(db, Completion{
+		RunID: "refused-1", Agent: "claude-code", JobType: "code_change",
+		Status: "QUARANTINED", FailureTaxonomy: "SPEND_CAP",
+		Violations: []string{"spend_cap: daily spend over cap"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var profiles int
+	if err := db.QueryRow("SELECT COUNT(*) FROM agent_profiles").Scan(&profiles); err != nil {
+		t.Fatal(err)
+	}
+	if profiles != 0 {
+		t.Fatalf("SPEND_CAP refusal must not create an agent_profiles row, got %d", profiles)
+	}
+	var violations int
+	if err := db.QueryRow("SELECT COUNT(*) FROM violations WHERE run_id='refused-1'").Scan(&violations); err != nil {
+		t.Fatal(err)
+	}
+	if violations != 1 {
+		t.Fatalf("SPEND_CAP refusal must still record its violation row, got %d", violations)
+	}
+
+	// A genuine quarantine still books against the agent as before.
+	if err := RecordCompletion(db, Completion{
+		RunID: "failed-1", Agent: "claude-code", JobType: "code_change",
+		Status: "QUARANTINED", FailureTaxonomy: "VALIDATOR_FAILED",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var runs, failures int
+	if err := db.QueryRow("SELECT runs, failures FROM agent_profiles WHERE agent='claude-code' AND job_type='code_change'").Scan(&runs, &failures); err != nil {
+		t.Fatal(err)
+	}
+	if runs != 1 || failures != 1 {
+		t.Fatalf("real quarantine must book exactly one run+failure, got runs=%d failures=%d", runs, failures)
+	}
+}

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path"
 	"sort"
 	"strings"
 
@@ -64,7 +65,8 @@ func ParsePlan(data []byte) (*Plan, error) {
 //     point a governed run at a different project)
 //   - every job declares a risk_class and a positive budget.max_tokens
 //   - the sum of budget.max_tokens does not exceed maxTotalTokens
-//   - every job's allowed.write patterns stay inside the declared envelope
+//   - every job's allowed.write and preflight.intended_writes patterns stay
+//     inside the declared envelope
 //   - every depends_on reference names another job_id in the same plan,
 //     with no self-reference and no cycle
 //
@@ -113,6 +115,11 @@ func ValidatePlan(jobs []Contract, root string, envelope []string, maxTotalToken
 		for _, w := range job.Allowed.Write {
 			if !envelopeCovers(envelope, w) {
 				add(field+".allowed.write", fmt.Sprintf("%q escapes the declared envelope %v", w, envelope))
+			}
+		}
+		for _, w := range job.Preflight.IntendedWrites {
+			if !envelopeCovers(envelope, w) {
+				add(field+".preflight.intended_writes", fmt.Sprintf("%q escapes the declared envelope %v", w, envelope))
 			}
 		}
 	}
@@ -225,6 +232,8 @@ func envelopeCovers(envelope []string, candidate string) bool {
 // candidate — no partial credit — so a sub-job can't smuggle a write pattern
 // outside the operator-declared blast radius past a lenient glob heuristic.
 func envelopePatternCovers(declared, candidate string) bool {
+	declared = normalizePattern(declared)
+	candidate = normalizePattern(candidate)
 	if declared == candidate {
 		return true
 	}
@@ -234,4 +243,14 @@ func envelopePatternCovers(declared, candidate string) bool {
 		return c == base || strings.HasPrefix(c, base+"/")
 	}
 	return false
+}
+
+// normalizePattern collapses "." and ".." segments (and backslashes) before
+// the envelope comparison. Contract.Validate only rejects patterns whose
+// CLEANED form escapes workspace.root, so without cleaning here too a
+// candidate like "src/../secrets/**" would pass validation (it stays inside
+// the root) AND prefix-match a declared "src/**" — smuggling a write target
+// outside the declared envelope while remaining inside the workspace.
+func normalizePattern(p string) string {
+	return path.Clean(strings.ReplaceAll(p, `\`, "/"))
 }

@@ -243,3 +243,37 @@ func TestBatchRunOrderedCLIRunsDependentJobAfterDependency(t *testing.T) {
 		t.Fatalf("expected the dependent job to run after its dependency: a=%s b=%s", createdA, createdB)
 	}
 }
+
+func TestBatchRunRefusesDependsOnWithoutOrdered(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("GOV_HOME", home)
+	t.Setenv("GOV_CONFIG", filepath.Join(t.TempDir(), "missing-config.yaml"))
+
+	jobsDir := t.TempDir()
+	orderedBatchJobFixture(t, jobsDir, "unordered-dep-a", nil)
+	orderedBatchJobFixture(t, jobsDir, "unordered-dep-b", []string{"unordered-dep-a"})
+
+	// Without --ordered, depends_on would be silently ignored and both jobs
+	// would run in parallel — the CLI must refuse instead.
+	code, _ := captureRunInput(t, []string{"batch", "run", jobsDir}, "")
+	if code != 2 {
+		t.Fatalf("expected exit 2 refusing depends_on without --ordered, got %d", code)
+	}
+}
+
+func TestBatchRunOrderedRefusesDanglingDependsOn(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("GOV_HOME", home)
+	t.Setenv("GOV_CONFIG", filepath.Join(t.TempDir(), "missing-config.yaml"))
+
+	jobsDir := t.TempDir()
+	orderedBatchJobFixture(t, jobsDir, "dangling-dep-b", []string{"dangling-dep-a"})
+
+	// TopologicalLevels silently drops references it can't resolve, so a
+	// subset batch would run the job WITHOUT its declared prerequisite — the
+	// CLI must fail closed before launching anything.
+	code, _ := captureRunInput(t, []string{"batch", "run", jobsDir, "--ordered"}, "")
+	if code != 2 {
+		t.Fatalf("expected exit 2 refusing a dangling depends_on, got %d", code)
+	}
+}

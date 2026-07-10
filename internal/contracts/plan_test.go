@@ -235,3 +235,48 @@ func TestParsePlanRejectsLiteralSecret(t *testing.T) {
 		t.Fatal("expected literal-secret detection to reject the plan")
 	}
 }
+
+func TestValidatePlanRejectsDotDotTraversalSmuggledPastEnvelopePrefix(t *testing.T) {
+	root := "/repo"
+	sneaky := planJob(root, "job-a")
+	// Cleans to "secrets/**": inside the workspace root (so Contract.Validate
+	// accepts it) but outside the declared internal/** envelope. The RAW
+	// string prefix-matches "internal/", so an uncleaned comparison passes it.
+	sneaky.Allowed.Write = []string{"internal/../secrets/**"}
+	sneaky.Preflight.IntendedWrites = []string{"internal/**"}
+
+	_, err := ValidatePlan([]Contract{sneaky}, root, []string{"internal/**"}, 25000)
+	if err == nil {
+		t.Fatal("expected a dot-dot traversal write pattern to be rejected by the envelope check")
+	}
+	if !strings.Contains(err.Error(), "escapes the declared envelope") {
+		t.Fatalf("expected an envelope-escape error, got %v", err)
+	}
+}
+
+func TestValidatePlanRejectsIntendedWritesOutsideEnvelope(t *testing.T) {
+	root := "/repo"
+	job := planJob(root, "job-a")
+	job.Allowed.Write = []string{"internal/**"}
+	job.Preflight.IntendedWrites = []string{"secrets/x.txt"}
+
+	_, err := ValidatePlan([]Contract{job}, root, []string{"internal/**"}, 25000)
+	if err == nil {
+		t.Fatal("expected an out-of-envelope preflight.intended_writes to be rejected")
+	}
+	if !strings.Contains(err.Error(), "preflight.intended_writes") {
+		t.Fatalf("expected the error to be attributed to preflight.intended_writes, got %v", err)
+	}
+}
+
+func TestEnvelopePatternCoversNormalizesDotSegments(t *testing.T) {
+	if !envelopePatternCovers("internal/**", "./internal/x/**") {
+		t.Fatal("a ./-prefixed candidate inside the envelope must be covered")
+	}
+	if envelopePatternCovers("internal/**", "internal/../secrets/**") {
+		t.Fatal("a dot-dot traversal out of the envelope must not be covered")
+	}
+	if envelopePatternCovers("internal/**", "internal/x/../../secrets/**") {
+		t.Fatal("a nested dot-dot traversal out of the envelope must not be covered")
+	}
+}

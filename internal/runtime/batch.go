@@ -199,13 +199,38 @@ func (r *Runner) runBatchJob(ctx context.Context, job contracts.Contract, accoun
 		accountant.Settle(estimate, 0)
 		return BatchJobResult{JobID: job.JobID, Status: "ERROR", Error: err.Error()}
 	}
-	accountant.Settle(estimate, rec.CostUSD)
+	cost := r.lineageCostUSD(rec)
+	accountant.Settle(estimate, cost)
 
 	if opts.HaltOnFirstQuarantine && rec.Status == "QUARANTINED" {
 		atomic.StoreInt32(halted, 1)
 	}
 	return BatchJobResult{
 		JobID: job.JobID, RunID: rec.ID, Status: rec.Status, Taxonomy: rec.FailureTaxonomy,
-		CostUSD: rec.CostUSD, Worktree: rec.Worktree,
+		CostUSD: cost, Worktree: rec.Worktree,
 	}
+}
+
+// lineageCostUSD is what a batch job actually cost: RunWithAutoRepair
+// returns only the FINAL attempt's record, so settling rec.CostUSD alone
+// would drop the quarantined original's (and any intermediate attempt's)
+// spend from the accountant and the batch summary exactly when auto-repair
+// has made the job most expensive. When a lineage exists, sum every run in
+// it from the ledger; on any read failure fall back to the final record's
+// own cost rather than failing the job over accounting.
+func (r *Runner) lineageCostUSD(rec RunRecord) float64 {
+	if rec.RepairOf == "" {
+		return rec.CostUSD
+	}
+	db, err := dbOpen(r.Home)
+	if err != nil {
+		return rec.CostUSD
+	}
+	defer db.Close()
+	var total float64
+	if err := db.QueryRow(`SELECT COALESCE(SUM(cost_usd),0) FROM runs WHERE id=? OR repair_of=?`,
+		rec.RepairOf, rec.RepairOf).Scan(&total); err != nil {
+		return rec.CostUSD
+	}
+	return total
 }
