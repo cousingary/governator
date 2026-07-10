@@ -107,6 +107,35 @@ func FuzzContractParser(f *testing.F) {
 	})
 }
 
+func TestParseWithoutRepairBlockLeavesRepairNil(t *testing.T) {
+	contract, err := Parse([]byte(validContract))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if contract.Repair != nil {
+		t.Fatalf("expected nil Repair for a contract with no repair block, got %+v", contract.Repair)
+	}
+}
+
+func TestParseRepairBlock(t *testing.T) {
+	withRepair := strings.Replace(validContract, "on_violation: quarantine", "repair: {auto: true, max_attempts: 2, backend: codex}\non_violation: quarantine", 1)
+	contract, err := Parse([]byte(withRepair))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if contract.Repair == nil || !contract.Repair.Auto || contract.Repair.MaxAttempts != 2 || contract.Repair.Backend != "codex" {
+		t.Fatalf("repair=%+v", contract.Repair)
+	}
+}
+
+func TestParseRepairNegativeMaxAttemptsRejected(t *testing.T) {
+	withRepair := strings.Replace(validContract, "on_violation: quarantine", "repair: {auto: true, max_attempts: -1}\non_violation: quarantine", 1)
+	_, err := Parse([]byte(withRepair))
+	if err == nil || !strings.Contains(err.Error(), "repair.max_attempts") {
+		t.Fatalf("expected repair.max_attempts error, got %v", err)
+	}
+}
+
 func TestParseOutputPolicy(t *testing.T) {
 	withOutput := strings.Replace(validContract, "on_violation: quarantine", "output: {style: terse, max_final_words: 80}\non_violation: quarantine", 1)
 	contract, err := Parse([]byte(withOutput))

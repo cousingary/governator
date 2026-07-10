@@ -29,6 +29,7 @@ type Failure struct {
 	Taxonomy string `json:"taxonomy"`
 	Message  string `json:"message"`
 	Created  string `json:"created"`
+	RepairOf string `json:"repair_of,omitempty"`
 }
 
 type CostSummary struct {
@@ -102,7 +103,8 @@ id TEXT PRIMARY KEY, job_id TEXT, job_type TEXT, agent TEXT, mode TEXT, status T
 contract_hash TEXT, base_head TEXT, approved_head TEXT, diff TEXT, transcript TEXT, message TEXT, commit_hash TEXT, created TEXT,
 cost_usd REAL NOT NULL DEFAULT 0, valid_output INTEGER NOT NULL DEFAULT 0, failure_taxonomy TEXT NOT NULL DEFAULT '', result_json TEXT NOT NULL DEFAULT '', prompt_version TEXT NOT NULL DEFAULT '', envelope_json TEXT NOT NULL DEFAULT '', notes TEXT NOT NULL DEFAULT '',
 input_tokens INTEGER NOT NULL DEFAULT 0, output_tokens INTEGER NOT NULL DEFAULT 0, cached_input_tokens INTEGER NOT NULL DEFAULT 0, cache_creation_tokens INTEGER NOT NULL DEFAULT 0, reasoning_tokens INTEGER NOT NULL DEFAULT 0, total_tokens INTEGER NOT NULL DEFAULT 0, usage_available INTEGER NOT NULL DEFAULT 0, tool_calls INTEGER NOT NULL DEFAULT 0, transcript_bytes INTEGER NOT NULL DEFAULT 0,
-graph_provider TEXT NOT NULL DEFAULT '', graph_version TEXT NOT NULL DEFAULT '', graph_fingerprint TEXT NOT NULL DEFAULT '', graph_files INTEGER NOT NULL DEFAULT 0, graph_nodes INTEGER NOT NULL DEFAULT 0, graph_edges INTEGER NOT NULL DEFAULT 0, graph_db_bytes INTEGER NOT NULL DEFAULT 0);
+graph_provider TEXT NOT NULL DEFAULT '', graph_version TEXT NOT NULL DEFAULT '', graph_fingerprint TEXT NOT NULL DEFAULT '', graph_files INTEGER NOT NULL DEFAULT 0, graph_nodes INTEGER NOT NULL DEFAULT 0, graph_edges INTEGER NOT NULL DEFAULT 0, graph_db_bytes INTEGER NOT NULL DEFAULT 0,
+repair_of TEXT NOT NULL DEFAULT '');
 CREATE TABLE IF NOT EXISTS jobs(job_id TEXT PRIMARY KEY, job_type TEXT, last_run_at TEXT);
 CREATE TABLE IF NOT EXISTS agents(name TEXT PRIMARY KEY, first_run_at TEXT, last_run_at TEXT);
 CREATE TABLE IF NOT EXISTS agent_profiles(agent TEXT, job_type TEXT, runs INTEGER NOT NULL DEFAULT 0, valid_outputs INTEGER NOT NULL DEFAULT 0, failures INTEGER NOT NULL DEFAULT 0, total_cost_usd REAL NOT NULL DEFAULT 0, PRIMARY KEY(agent,job_type));
@@ -127,6 +129,7 @@ CREATE TABLE IF NOT EXISTS parity_events(id INTEGER PRIMARY KEY AUTOINCREMENT, p
 		"usage_available INTEGER NOT NULL DEFAULT 0", "tool_calls INTEGER NOT NULL DEFAULT 0", "transcript_bytes INTEGER NOT NULL DEFAULT 0",
 		"graph_provider TEXT NOT NULL DEFAULT ''", "graph_version TEXT NOT NULL DEFAULT ''", "graph_fingerprint TEXT NOT NULL DEFAULT ''",
 		"graph_files INTEGER NOT NULL DEFAULT 0", "graph_nodes INTEGER NOT NULL DEFAULT 0", "graph_edges INTEGER NOT NULL DEFAULT 0", "graph_db_bytes INTEGER NOT NULL DEFAULT 0",
+		"repair_of TEXT NOT NULL DEFAULT ''",
 	} {
 		if _, alterErr := db.Exec("ALTER TABLE runs ADD COLUMN " + column); alterErr != nil && !strings.Contains(strings.ToLower(alterErr.Error()), "duplicate column") {
 			db.Close()
@@ -135,6 +138,7 @@ CREATE TABLE IF NOT EXISTS parity_events(id INTEGER PRIMARY KEY AUTOINCREMENT, p
 	}
 	if _, err = db.Exec(`CREATE INDEX IF NOT EXISTS runs_key ON runs(contract_hash, approved_head, status);
 CREATE INDEX IF NOT EXISTS runs_failure ON runs(failure_taxonomy, created);
+CREATE INDEX IF NOT EXISTS runs_repair_of ON runs(repair_of);
 CREATE INDEX IF NOT EXISTS files_run ON files_touched(run_id);
 CREATE INDEX IF NOT EXISTS commands_run_id ON commands_run(run_id);`); err != nil {
 		db.Close()
@@ -229,7 +233,7 @@ func Failures(home string, limit int) ([]Failure, error) {
 		return nil, err
 	}
 	defer db.Close()
-	rows, err := db.Query(`SELECT id,job_id,COALESCE(agent,''),COALESCE(job_type,''),failure_taxonomy,message,created FROM runs WHERE failure_taxonomy<>'' ORDER BY created DESC LIMIT ?`, limit)
+	rows, err := db.Query(`SELECT id,job_id,COALESCE(agent,''),COALESCE(job_type,''),failure_taxonomy,message,created,COALESCE(repair_of,'') FROM runs WHERE failure_taxonomy<>'' ORDER BY created DESC LIMIT ?`, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -237,7 +241,7 @@ func Failures(home string, limit int) ([]Failure, error) {
 	var failures []Failure
 	for rows.Next() {
 		var f Failure
-		if err := rows.Scan(&f.RunID, &f.JobID, &f.Agent, &f.JobType, &f.Taxonomy, &f.Message, &f.Created); err != nil {
+		if err := rows.Scan(&f.RunID, &f.JobID, &f.Agent, &f.JobType, &f.Taxonomy, &f.Message, &f.Created, &f.RepairOf); err != nil {
 			return nil, err
 		}
 		failures = append(failures, f)
@@ -292,7 +296,11 @@ func (s AgentScore) String() string {
 }
 
 func (f Failure) String() string {
-	return fmt.Sprintf("%s\t%s\t%s\t%s\t%s", f.RunID, f.Agent, f.JobType, f.Taxonomy, f.Message)
+	repairOf := f.RepairOf
+	if repairOf == "" {
+		repairOf = "-"
+	}
+	return fmt.Sprintf("%s\t%s\t%s\t%s\t%s\t%s", f.RunID, f.Agent, f.JobType, f.Taxonomy, f.Message, repairOf)
 }
 
 func (s CostSummary) String() string {

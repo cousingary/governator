@@ -6,7 +6,7 @@ Governator stores an SQLite WAL database in `ledger_dir` (default `$HOME/.govern
 
 | Table | Evidence |
 |---|---|
-| `runs` | Contract identity, worktree, status, diff, transcript, cost, token usage, tool calls, transcript bytes, graph provider/version/fingerprint/stats, result, prompt version, enforcement envelope, and notes. |
+| `runs` | Contract identity, worktree, status, diff, transcript, cost, token usage, tool calls, transcript bytes, graph provider/version/fingerprint/stats, result, prompt version, enforcement envelope, notes, and repair lineage (`repair_of`). |
 | `jobs` | Last-seen timestamp and job type. |
 | `agents` | First and last observed run per backend. |
 | `agent_profiles` | Runs, valid outputs, failures, and total cost by agent and job type. |
@@ -51,6 +51,10 @@ Scoring reports valid-output rate and cost per valid output. Routing orders agen
 
 `gov repair-packet RUN_ID` gathers the original run identity, classified failure, diff, touched files, commands, validator outcomes, and violations into a bounded JSON packet. Use that packet as the input to a separate `repair` contract rather than asking an agent to rediscover an unbounded history.
 
+## Auto-triggered repair loop
+
+A contract that sets `repair.auto: true` opts into automatic repair: `gov run` (via `RunWithAutoRepair`) compiles a follow-up job from the quarantined run's repair packet — the same evidence `gov repair-packet` gathers — and runs it as a normal governed job, going through the same lock, spend check, gate, and validators as any other run. It stops as soon as an attempt is approved, is refused by the spend cap, or `repair.max_attempts` (default 1, hard-clamped to 2 regardless of YAML) is reached. Every run in a failure lineage — the original and every repair attempt, including a repair of a repair — records `runs.repair_of` as the lineage's original run id, so counting attempts-so-far is a flat query rather than a chain walk. `gov failures` prints a `repair_lineage` column from this data, and `gov handoff` reports `repair_attempted: n` for the lineage the queried run belongs to. Repair is skipped for read-only modes (`scout`, `verifier`, `architect`) and for a run that was itself refused purely by the spend cap.
+
 ## Evaluation
 
 `harness_eval/` contains deterministic, failure-shaped fixtures that exercise governance without calling a model. `gov eval harness harness_eval` records case outcomes, and `gov eval scorecard` summarizes pass rate and cost by agent and mode.
@@ -71,4 +75,4 @@ Cost is parsed from backend transcript formats when exposed. Unsupported or cost
 
 After a run completes, a post-run hook writes the halt file if that run pushed today's total to or past the cap, so the *next* run refuses; a live mid-run abort is out of scope. `gov spend` reports today's total, cap, remaining budget, run and unknown-cost-run counts, and halt status. `gov spend --halt` / `gov spend --resume` write or remove the halt file directly. Both `spend.daily_cap_usd` and `spend.halt_file` can be overridden per-invocation with `GOV_SPEND_DAILY_CAP_USD` and `GOV_SPEND_HALT_FILE`.
 
-This cap is enforced only at `gov run`; it does not yet cover `gov batch` or `gov repair --auto` (planned for later sessions).
+This cap is enforced at `gov run`, including every attempt the auto-triggered repair loop (`repair.auto`, see below) fires — each is a normal `Run` call and checks the cap independently. It does not yet cover `gov batch` (planned for a later session).

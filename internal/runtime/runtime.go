@@ -61,6 +61,7 @@ type RunRecord struct {
 	PromptVersion   string                    `json:"prompt_version,omitempty"`
 	Envelope        string                    `json:"envelope,omitempty"`
 	Notes           string                    `json:"notes,omitempty"`
+	RepairOf        string                    `json:"repair_of,omitempty"`
 }
 
 func envelopeJSON(spec agents.BackendSpec, capability agents.Capability) string {
@@ -99,8 +100,8 @@ func dbOpen(home string) (*sql.DB, error) {
 }
 
 func insertRun(db *sql.DB, r RunRecord, ch, head string) error {
-	_, err := db.Exec(`INSERT INTO runs(id,job_id,job_type,agent,mode,status,root,worktree,branch,contract_hash,base_head,diff,transcript,message,created,prompt_version,envelope_json,notes,graph_provider,graph_version,graph_fingerprint,graph_files,graph_nodes,graph_edges,graph_db_bytes)
-VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, r.ID, r.JobID, r.JobType, r.Agent, r.Mode, r.Status, r.Root, r.Worktree, r.Branch, ch, head, r.Diff, r.Transcript, r.Message, r.Created, r.PromptVersion, r.Envelope, r.Notes, r.Graph.Provider, r.Graph.Version, r.Graph.Fingerprint, r.Graph.FileCount, r.Graph.NodeCount, r.Graph.EdgeCount, r.Graph.DBSizeBytes)
+	_, err := db.Exec(`INSERT INTO runs(id,job_id,job_type,agent,mode,status,root,worktree,branch,contract_hash,base_head,diff,transcript,message,created,prompt_version,envelope_json,notes,graph_provider,graph_version,graph_fingerprint,graph_files,graph_nodes,graph_edges,graph_db_bytes,repair_of)
+VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, r.ID, r.JobID, r.JobType, r.Agent, r.Mode, r.Status, r.Root, r.Worktree, r.Branch, ch, head, r.Diff, r.Transcript, r.Message, r.Created, r.PromptVersion, r.Envelope, r.Notes, r.Graph.Provider, r.Graph.Version, r.Graph.Fingerprint, r.Graph.FileCount, r.Graph.NodeCount, r.Graph.EdgeCount, r.Graph.DBSizeBytes, r.RepairOf)
 	return err
 }
 
@@ -116,7 +117,7 @@ func Last(id string) (RunRecord, error) {
 		return RunRecord{}, err
 	}
 	defer db.Close()
-	q := `SELECT id,job_id,COALESCE(job_type,''),COALESCE(agent,''),COALESCE(mode,''),status,root,worktree,branch,diff,transcript,message,commit_hash,created,cost_usd,valid_output,failure_taxonomy,result_json,COALESCE(prompt_version,''),COALESCE(envelope_json,''),COALESCE(notes,''),input_tokens,output_tokens,cached_input_tokens,cache_creation_tokens,reasoning_tokens,total_tokens,usage_available,tool_calls,transcript_bytes,COALESCE(graph_provider,''),COALESCE(graph_version,''),COALESCE(graph_fingerprint,''),graph_files,graph_nodes,graph_edges,graph_db_bytes FROM runs`
+	q := `SELECT id,job_id,COALESCE(job_type,''),COALESCE(agent,''),COALESCE(mode,''),status,root,worktree,branch,diff,transcript,message,commit_hash,created,cost_usd,valid_output,failure_taxonomy,result_json,COALESCE(prompt_version,''),COALESCE(envelope_json,''),COALESCE(notes,''),input_tokens,output_tokens,cached_input_tokens,cache_creation_tokens,reasoning_tokens,total_tokens,usage_available,tool_calls,transcript_bytes,COALESCE(graph_provider,''),COALESCE(graph_version,''),COALESCE(graph_fingerprint,''),graph_files,graph_nodes,graph_edges,graph_db_bytes,COALESCE(repair_of,'') FROM runs`
 	var row *sql.Row
 	if id == "" || id == "last" {
 		row = db.QueryRow(q + ` ORDER BY created DESC LIMIT 1`)
@@ -133,7 +134,7 @@ func Quarantines() ([]RunRecord, error) {
 		return nil, err
 	}
 	defer db.Close()
-	rows, err := db.Query(`SELECT id,job_id,COALESCE(job_type,''),COALESCE(agent,''),COALESCE(mode,''),status,root,worktree,branch,diff,transcript,message,commit_hash,created,cost_usd,valid_output,failure_taxonomy,result_json,COALESCE(prompt_version,''),COALESCE(envelope_json,''),COALESCE(notes,''),input_tokens,output_tokens,cached_input_tokens,cache_creation_tokens,reasoning_tokens,total_tokens,usage_available,tool_calls,transcript_bytes,COALESCE(graph_provider,''),COALESCE(graph_version,''),COALESCE(graph_fingerprint,''),graph_files,graph_nodes,graph_edges,graph_db_bytes FROM runs WHERE status='QUARANTINED' ORDER BY created DESC`)
+	rows, err := db.Query(`SELECT id,job_id,COALESCE(job_type,''),COALESCE(agent,''),COALESCE(mode,''),status,root,worktree,branch,diff,transcript,message,commit_hash,created,cost_usd,valid_output,failure_taxonomy,result_json,COALESCE(prompt_version,''),COALESCE(envelope_json,''),COALESCE(notes,''),input_tokens,output_tokens,cached_input_tokens,cache_creation_tokens,reasoning_tokens,total_tokens,usage_available,tool_calls,transcript_bytes,COALESCE(graph_provider,''),COALESCE(graph_version,''),COALESCE(graph_fingerprint,''),graph_files,graph_nodes,graph_edges,graph_db_bytes,COALESCE(repair_of,'') FROM runs WHERE status='QUARANTINED' ORDER BY created DESC`)
 	if err != nil {
 		return nil, err
 	}
@@ -156,7 +157,7 @@ type rowScanner interface {
 func scanRun(row rowScanner) (RunRecord, error) {
 	var r RunRecord
 	var resultJSON string
-	err := row.Scan(&r.ID, &r.JobID, &r.JobType, &r.Agent, &r.Mode, &r.Status, &r.Root, &r.Worktree, &r.Branch, &r.Diff, &r.Transcript, &r.Message, &r.Commit, &r.Created, &r.CostUSD, &r.ValidOutput, &r.FailureTaxonomy, &resultJSON, &r.PromptVersion, &r.Envelope, &r.Notes, &r.Usage.InputTokens, &r.Usage.OutputTokens, &r.Usage.CachedInputTokens, &r.Usage.CacheCreationTokens, &r.Usage.ReasoningTokens, &r.Usage.TotalTokens, &r.Usage.Available, &r.ToolCalls, &r.TranscriptBytes, &r.Graph.Provider, &r.Graph.Version, &r.Graph.Fingerprint, &r.Graph.FileCount, &r.Graph.NodeCount, &r.Graph.EdgeCount, &r.Graph.DBSizeBytes)
+	err := row.Scan(&r.ID, &r.JobID, &r.JobType, &r.Agent, &r.Mode, &r.Status, &r.Root, &r.Worktree, &r.Branch, &r.Diff, &r.Transcript, &r.Message, &r.Commit, &r.Created, &r.CostUSD, &r.ValidOutput, &r.FailureTaxonomy, &resultJSON, &r.PromptVersion, &r.Envelope, &r.Notes, &r.Usage.InputTokens, &r.Usage.OutputTokens, &r.Usage.CachedInputTokens, &r.Usage.CacheCreationTokens, &r.Usage.ReasoningTokens, &r.Usage.TotalTokens, &r.Usage.Available, &r.ToolCalls, &r.TranscriptBytes, &r.Graph.Provider, &r.Graph.Version, &r.Graph.Fingerprint, &r.Graph.FileCount, &r.Graph.NodeCount, &r.Graph.EdgeCount, &r.Graph.DBSizeBytes, &r.RepairOf)
 	if err == nil {
 		r.Graph.Available = r.Graph.Fingerprint != ""
 	}
@@ -818,7 +819,7 @@ func (r *Runner) Run(ctx context.Context, c contracts.Contract) (RunRecord, erro
 		refused := RunRecord{
 			ID: refusedID, JobID: c.JobID, JobType: c.JobType, Agent: c.Agent, Mode: string(c.Mode),
 			Status: "QUARANTINED", Root: root, Created: time.Now().UTC().Format(time.RFC3339Nano),
-			Message: "SPEND_CAP: " + reason, FailureTaxonomy: "SPEND_CAP",
+			Message: "SPEND_CAP: " + reason, FailureTaxonomy: "SPEND_CAP", RepairOf: c.RepairLineage,
 		}
 		if err := insertRun(db, refused, hash, head); err != nil {
 			return refused, err
@@ -866,7 +867,7 @@ func (r *Runner) Run(ctx context.Context, c contracts.Contract) (RunRecord, erro
 		return RunRecord{}, err
 	}
 	spec := agents.SpecFromContract(c, work)
-	rec := RunRecord{ID: id, JobID: c.JobID, JobType: c.JobType, Agent: c.Agent, Mode: string(c.Mode), Status: "RUNNING", Root: root, Worktree: work, Branch: branch, Transcript: transcript, Created: time.Now().UTC().Format(time.RFC3339Nano), PromptVersion: promptVersion.ID, Envelope: envelopeJSON(spec, agent.Capabilities()), Graph: graphSnapshot}
+	rec := RunRecord{ID: id, JobID: c.JobID, JobType: c.JobType, Agent: c.Agent, Mode: string(c.Mode), Status: "RUNNING", Root: root, Worktree: work, Branch: branch, Transcript: transcript, Created: time.Now().UTC().Format(time.RFC3339Nano), PromptVersion: promptVersion.ID, Envelope: envelopeJSON(spec, agent.Capabilities()), Graph: graphSnapshot, RepairOf: c.RepairLineage}
 	if graphSnapshot.Warning != "" {
 		rec.Notes = appendNote(rec.Notes, "graph_warning: "+graphSnapshot.Warning)
 	}

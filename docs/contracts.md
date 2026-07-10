@@ -33,6 +33,9 @@ A job contract is strict YAML: unknown fields, multiple documents, malformed pat
 | `success.validators` | Nonempty deterministic shell validators, run outside the model. |
 | `output.style` | Optional. `terse` or `normal`. Omit the field for the existing unrestricted prompt. |
 | `output.max_final_words` | Optional, `terse` only. 20-1000; defaults to 120 when omitted. |
+| `repair.auto` | Optional, default `false`. When `true`, a quarantined run of this contract triggers the auto-repair loop (see `docs/ledger.md`). |
+| `repair.max_attempts` | Optional, nonnegative. Defaults to 1 when unset; hard-clamped to 2 regardless of what is requested. |
+| `repair.backend` | Optional. Overrides `agent` for compiled repair attempts only. |
 | `on_violation` | `quarantine`; unsupported actions are rejected during validation. |
 
 All path patterns are repository-relative and may not escape with `..`. Read-only modes are `scout`, `verifier`, and `architect`. Governator rejects direct-root execution and unimplemented violation actions rather than accepting policy it cannot enforce.

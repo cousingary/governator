@@ -43,6 +43,7 @@ type Handoff struct {
 	TranscriptBytes       int64                    `json:"transcript_bytes"`
 	Graph                 HandoffGraph             `json:"graph"`
 	PromptVersion         string                   `json:"prompt_version,omitempty"`
+	RepairAttempted       int                      `json:"repair_attempted"`
 }
 
 func HandoffFor(id string) (Handoff, error) {
@@ -50,7 +51,23 @@ func HandoffFor(id string) (Handoff, error) {
 	if err != nil {
 		return Handoff{}, err
 	}
-	return BuildHandoff(record), nil
+	handoff := BuildHandoff(record)
+	// repair_attempted counts auto-repair runs fired for this run's failure
+	// lineage so far. The lineage root is this run itself unless it is
+	// already a repair attempt, in which case RepairOf names the root. A
+	// ledger-read failure here is informational only — leave the count at
+	// its zero value rather than fail the whole handoff.
+	rootID := record.RepairOf
+	if rootID == "" {
+		rootID = record.ID
+	}
+	if db, dbErr := dbOpen(Home()); dbErr == nil {
+		if attempts, attErr := observability.RepairAttempts(db, rootID); attErr == nil {
+			handoff.RepairAttempted = attempts
+		}
+		db.Close()
+	}
+	return handoff, nil
 }
 
 func BuildHandoff(record RunRecord) Handoff {

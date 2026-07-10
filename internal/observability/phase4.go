@@ -1,6 +1,7 @@
 package observability
 
 import (
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -103,6 +104,20 @@ func GenerateRepairPacket(home, runID string) (RepairPacket, error) {
 	}
 	_, err = db.Exec("INSERT INTO repair_packets(run_id,taxonomy,packet_json,created) VALUES(?,?,?,?)", runID, packet.Taxonomy, string(data), time.Now().UTC().Format(time.RFC3339Nano))
 	return packet, err
+}
+
+// RepairAttempts counts repair runs already fired for a failure lineage.
+// rootID is the id of the original (non-repair) run that started the
+// lineage; every automatic repair attempt in that lineage — including a
+// repair of a repair — records repair_of=rootID, so this is a flat count
+// rather than a recursive walk. An empty rootID (no lineage yet) reports 0.
+func RepairAttempts(db *sql.DB, rootID string) (int, error) {
+	if rootID == "" {
+		return 0, nil
+	}
+	var n int
+	err := db.QueryRow(`SELECT COUNT(*) FROM runs WHERE repair_of=?`, rootID).Scan(&n)
+	return n, err
 }
 
 func ClassifyFailure(violations []string) string {

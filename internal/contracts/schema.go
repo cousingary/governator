@@ -25,6 +25,12 @@ var validModes = map[Mode]bool{
 	ModeVerifier: true, ModeRepair: true, ModeArchitect: true,
 }
 
+// ReadOnly reports whether m never writes to the workspace. Scout, verifier,
+// and architect jobs inspect and report only; every other mode may write.
+func (m Mode) ReadOnly() bool {
+	return m == ModeScout || m == ModeVerifier || m == ModeArchitect
+}
+
 var jobIDPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]*$`)
 
 type Contract struct {
@@ -40,7 +46,16 @@ type Contract struct {
 	Preflight   Preflight     `yaml:"preflight" json:"preflight"`
 	Success     Success       `yaml:"success" json:"success"`
 	Output      *OutputPolicy `yaml:"output,omitempty" json:"output,omitempty"`
+	Repair      *Repair       `yaml:"repair,omitempty" json:"repair,omitempty"`
 	OnViolation string        `yaml:"on_violation" json:"on_violation"`
+
+	// RepairLineage tags a contract compiled by the auto-repair loop with the
+	// id of the original run that started its failure lineage. It is set
+	// only by internal/runtime, never by job YAML: `yaml:"-"` keeps it out of
+	// the strict decoder (KnownFields would otherwise let an operator forge
+	// it), and `json:"-"` keeps it out of ContractHash and the compiled
+	// prompt.
+	RepairLineage string `yaml:"-" json:"-"`
 }
 
 type Workspace struct {
@@ -91,6 +106,34 @@ func (p OutputPolicy) EffectiveMaxFinalWords() int {
 		return p.MaxFinalWords
 	}
 	return 120
+}
+
+// Repair opts a contract into the auto-triggered repair loop: when a run
+// quarantines, the runtime compiles a follow-up job from the quarantine's
+// repair packet and runs it, bounded by EffectiveMaxAttempts. Absent (the
+// zero value via a nil pointer) leaves existing behavior unchanged.
+type Repair struct {
+	Auto        bool   `yaml:"auto,omitempty" json:"auto,omitempty"`
+	MaxAttempts int    `yaml:"max_attempts,omitempty" json:"max_attempts,omitempty"`
+	Backend     string `yaml:"backend,omitempty" json:"backend,omitempty"`
+}
+
+// EffectiveMaxAttempts returns r.MaxAttempts defaulted to 1 and hard-clamped
+// to 2 regardless of what YAML requested — the two-attempts rule encoded so
+// a misconfigured job cannot loop repair attempts indefinitely. A nil
+// receiver (repair block absent) reports 0: no attempts are ever permitted.
+func (r *Repair) EffectiveMaxAttempts() int {
+	if r == nil {
+		return 0
+	}
+	n := r.MaxAttempts
+	if n <= 0 {
+		n = 1
+	}
+	if n > 2 {
+		n = 2
+	}
+	return n
 }
 
 type ValidationError struct {
@@ -216,6 +259,10 @@ func (c Contract) Validate() error {
 		default:
 			add("output.style", "must be 'terse' or 'normal'")
 		}
+	}
+
+	if c.Repair != nil && c.Repair.MaxAttempts < 0 {
+		add("repair.max_attempts", "must be zero or greater (0 defaults to 1, values above 2 clamp to 2)")
 	}
 
 	// Quarantine is the implemented fail-closed action. Halt and rollback were

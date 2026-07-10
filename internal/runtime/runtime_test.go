@@ -53,6 +53,8 @@ if [ "$FAKE_CANARY" = 1 ]; then chmod 600 .governator-canary; printf 'mutated\n'
 if [ "$FAKE_BIG" = 1 ]; then printf '1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n' > output/result.txt; fi
 if [ "$FAKE_SCOPE" = 1 ]; then printf 'drift\n' > output/extra.txt; fi
 if [ "$FAKE_LEAK" = 1 ]; then printf 'leak\n' > "$FAKE_LIVE_ROOT/leak.txt"; fi
+if [ "$FAKE_ALWAYS_FAIL" = 1 ]; then rm -f output/result.txt; fi
+if [ -n "$FAKE_MARKER_FILE" ] && [ ! -f "$FAKE_MARKER_FILE" ]; then touch "$FAKE_MARKER_FILE"; rm -f output/result.txt; fi
 `
 	if err := os.WriteFile(bin, []byte(s), 0755); err != nil {
 		t.Fatal(err)

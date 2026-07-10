@@ -87,7 +87,7 @@ func run(args []string) int {
 			}
 			c.Agent = args[3]
 		}
-		rec, err := govruntime.New().Run(context.Background(), *c)
+		rec, err := govruntime.New().RunWithAutoRepair(context.Background(), *c)
 		if err != nil {
 			fmt.Fprintln(os.Stderr, "run:", err)
 			return 1
@@ -176,7 +176,7 @@ func run(args []string) int {
 			fmt.Println("no classified failures")
 			return 0
 		}
-		fmt.Println("run_id\tagent\tjob_type\ttaxonomy\tmessage")
+		fmt.Println("run_id\tagent\tjob_type\ttaxonomy\tmessage\trepair_lineage")
 		for _, failure := range failures {
 			fmt.Println(failure.String())
 		}

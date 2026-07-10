@@ -61,6 +61,37 @@ func TestNegativeRoutingAndRepairPacket(t *testing.T) {
 	}
 }
 
+func TestRepairAttemptsCountsFlatLineageNotChain(t *testing.T) {
+	home := t.TempDir()
+	db, err := Open(home)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	if n, err := RepairAttempts(db, ""); err != nil || n != 0 {
+		t.Fatalf("empty rootID: n=%d err=%v", n, err)
+	}
+	if n, err := RepairAttempts(db, "root-1"); err != nil || n != 0 {
+		t.Fatalf("no attempts yet: n=%d err=%v", n, err)
+	}
+	// A repair of a repair still records repair_of=root-1 (flat lineage, not
+	// a chain to its immediate parent), so counting is a single flat query.
+	for _, stmt := range []string{
+		"INSERT INTO runs(id,job_id,status,created,repair_of) VALUES('root-1','job-1','QUARANTINED','t0','')",
+		"INSERT INTO runs(id,job_id,status,created,repair_of) VALUES('repair-1','job-1','QUARANTINED','t1','root-1')",
+		"INSERT INTO runs(id,job_id,status,created,repair_of) VALUES('repair-2','job-1','APPROVED','t2','root-1')",
+		"INSERT INTO runs(id,job_id,status,created,repair_of) VALUES('unrelated','job-2','QUARANTINED','t3','')",
+	} {
+		if _, err := db.Exec(stmt); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if n, err := RepairAttempts(db, "root-1"); err != nil || n != 2 {
+		t.Fatalf("expected 2 attempts for root-1, got n=%d err=%v", n, err)
+	}
+}
+
 func TestEvalSuiteProducesScorecard(t *testing.T) {
 	home := t.TempDir()
 	dir := t.TempDir()
