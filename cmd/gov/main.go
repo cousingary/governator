@@ -24,6 +24,7 @@ import (
 	"github.com/cousingary/governator/internal/protectedpaths"
 	govruntime "github.com/cousingary/governator/internal/runtime"
 	"github.com/cousingary/governator/internal/snapshots"
+	"github.com/cousingary/governator/internal/spend"
 )
 
 var version = "1.0.0-rc1"
@@ -191,6 +192,8 @@ func run(args []string) int {
 		}
 		fmt.Println(summary.String())
 		return 0
+	case "spend":
+		return spendCmd(args[1:])
 	case "usage":
 		if len(args) != 2 {
 			return bad("usage: gov usage summary|<run_id>")
@@ -375,6 +378,51 @@ func quarantine(args []string) int {
 	}
 	return bad("usage: gov quarantine list|show <id>|diff <id>")
 }
+
+func spendCmd(args []string) int {
+	cfg := config.Current()
+	if len(args) == 1 {
+		switch args[0] {
+		case "--halt":
+			if err := spend.Halt(cfg); err != nil {
+				fmt.Fprintln(os.Stderr, "spend:", err)
+				return 1
+			}
+			fmt.Println("halted:", cfg.Spend.HaltFile)
+			return 0
+		case "--resume":
+			if err := spend.Resume(cfg); err != nil {
+				fmt.Fprintln(os.Stderr, "spend:", err)
+				return 1
+			}
+			fmt.Println("resumed")
+			return 0
+		}
+		return bad("usage: gov spend [--halt|--resume]")
+	}
+	if len(args) != 0 {
+		return bad("usage: gov spend [--halt|--resume]")
+	}
+	db, err := observability.Open(govruntime.Home())
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "spend:", err)
+		return 1
+	}
+	defer db.Close()
+	today, err := spend.TodaySpend(db)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "spend:", err)
+		return 1
+	}
+	remaining := "unlimited"
+	if cfg.Spend.DailyCapUSD > 0 {
+		remaining = fmt.Sprintf("$%.4f", cfg.Spend.DailyCapUSD-today.TotalCostUSD)
+	}
+	fmt.Printf("date=%s total_cost_usd=%.4f cap_usd=%.2f remaining=%s runs=%d unknown_cost_runs=%d halted=%t\n",
+		today.Date, today.TotalCostUSD, cfg.Spend.DailyCapUSD, remaining, today.Runs, today.UnknownCostRuns, spend.IsHalted(cfg))
+	return 0
+}
+
 func graphCmd(args []string) int {
 	if len(args) == 0 {
 		return bad("usage: gov graph status|refresh [path] | gov graph query <search> [--path <path>] [--limit <n>]")
@@ -747,6 +795,7 @@ Usage:
   gov score agents --job-type <type>
   gov failures
   gov cost --per-valid-output
+  gov spend [--halt|--resume]
   gov usage summary|<run_id>
   gov route --job-type <type>
   gov repair-packet <run_id>

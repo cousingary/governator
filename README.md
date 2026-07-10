@@ -97,6 +97,7 @@ gov score agents --job-type <type>
 gov route --job-type <type>
 gov failures
 gov cost --per-valid-output
+gov spend [--halt|--resume]
 gov usage summary|<run_id>
 gov repair-packet <run_id>
 gov eval harness <case-dir>

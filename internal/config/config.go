@@ -30,6 +30,11 @@ type Minimalism struct {
 	Mode string `yaml:"mode"`
 }
 
+type Spend struct {
+	DailyCapUSD float64 `yaml:"daily_cap_usd"`
+	HaltFile    string  `yaml:"halt_file"`
+}
+
 type Defaults struct {
 	Agent      string `yaml:"agent"`
 	MaxMinutes int    `yaml:"max_minutes"`
@@ -44,6 +49,7 @@ type Config struct {
 	RTK               RTK                `yaml:"rtk"`
 	Graph             Graph              `yaml:"graph"`
 	Minimalism        Minimalism         `yaml:"minimalism"`
+	Spend             Spend              `yaml:"spend"`
 	Defaults          Defaults           `yaml:"defaults"`
 }
 
@@ -79,6 +85,7 @@ func BuiltIn() Config {
 		RTK:        RTK{Mode: "auto", Bin: "rtk"},
 		Graph:      Graph{Mode: "auto", Provider: "codegraph", Bin: "codegraph"},
 		Minimalism: Minimalism{Mode: "full"},
+		Spend:      Spend{DailyCapUSD: 0, HaltFile: filepath.Join(base, "HALT")},
 		Defaults:   Defaults{Agent: "claude-code", MaxMinutes: 30},
 	}
 }
@@ -112,6 +119,9 @@ func Load() (Config, error) {
 	}
 	if cfg.Minimalism.Mode != "off" && cfg.Minimalism.Mode != "lite" && cfg.Minimalism.Mode != "full" && cfg.Minimalism.Mode != "ultra" {
 		return Config{}, fmt.Errorf("invalid minimalism.mode %q (want off, lite, full, or ultra)", cfg.Minimalism.Mode)
+	}
+	if cfg.Spend.DailyCapUSD < 0 {
+		return Config{}, fmt.Errorf("invalid spend.daily_cap_usd %v (want >= 0, 0 = unlimited)", cfg.Spend.DailyCapUSD)
 	}
 	return cfg, nil
 }
@@ -161,6 +171,12 @@ func merge(dst *Config, src Config) {
 	}
 	if src.Minimalism.Mode != "" {
 		dst.Minimalism.Mode = src.Minimalism.Mode
+	}
+	if src.Spend.DailyCapUSD != 0 {
+		dst.Spend.DailyCapUSD = src.Spend.DailyCapUSD
+	}
+	if src.Spend.HaltFile != "" {
+		dst.Spend.HaltFile = src.Spend.HaltFile
 	}
 	if src.Defaults.Agent != "" {
 		dst.Defaults.Agent = src.Defaults.Agent
@@ -213,6 +229,14 @@ func applyEnv(cfg *Config) {
 	if value := Env("GOV_MINIMALISM_MODE"); value != "" {
 		cfg.Minimalism.Mode = value
 	}
+	if value := Env("GOV_SPEND_DAILY_CAP_USD"); value != "" {
+		if cap, err := strconv.ParseFloat(value, 64); err == nil && cap >= 0 {
+			cfg.Spend.DailyCapUSD = cap
+		}
+	}
+	if value := Env("GOV_SPEND_HALT_FILE"); value != "" {
+		cfg.Spend.HaltFile = value
+	}
 	if value := Env("GOV_DEFAULT_AGENT"); value != "" {
 		cfg.Defaults.Agent = value
 	}
@@ -249,6 +273,7 @@ func clean(cfg *Config) {
 	cfg.Graph.Provider = strings.ToLower(strings.TrimSpace(cfg.Graph.Provider))
 	cfg.Graph.Bin = strings.TrimSpace(cfg.Graph.Bin)
 	cfg.Minimalism.Mode = strings.ToLower(strings.TrimSpace(cfg.Minimalism.Mode))
+	cfg.Spend.HaltFile = expand(cfg.Spend.HaltFile)
 	cfg.ProtectedManifest = expand(cfg.ProtectedManifest)
 	cfg.SnapshotDir = expand(cfg.SnapshotDir)
 	cfg.LedgerDir = expand(cfg.LedgerDir)

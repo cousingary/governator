@@ -6,6 +6,7 @@ All notable changes to Governator are documented here.
 
 ### Added
 
+- Aggregate daily spend cap and kill switch (`internal/spend`): `spend.daily_cap_usd` (default `0`, unlimited) and `spend.halt_file` (default `~/.governator/HALT`) bound cross-run spend on top of the existing per-job `budget.max_tokens` quarantine. `gov run` checks the cap before launching a backend and refuses with a `QUARANTINED`/`SPEND_CAP` run (no workspace created, no backend launched) when the halt file is present or today's recorded cost meets or exceeds the cap; a post-run hook writes the halt file once a completed run crosses the cap so the next run refuses. New `gov spend` reports today's total/cap/remaining/run counts/halt status; `gov spend --halt` / `--resume` toggle the halt file directly.
 - Minimalism prompt optimizer: a YAGNI-first ruleset adapted from ponytail (github.com/DietrichGebert/ponytail, MIT) is injected into every governed prompt (`minimalism.mode`: `off`/`lite`/`full`/`ultra`, default `full`), aimed at smaller diffs and lower per-run cost, with no external binary required. `gov doctor` reports the active mode.
 
 ### Fixed

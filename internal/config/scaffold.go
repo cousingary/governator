@@ -82,6 +82,9 @@ graph:
   bin: codegraph
 minimalism:
   mode: full # off, lite, full, or ultra
+spend:
+  daily_cap_usd: 0 # 0 = unlimited
+  halt_file: ~/.governator/HALT
 defaults:
   agent: claude-code
   max_minutes: 30

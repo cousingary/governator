@@ -30,6 +30,7 @@ import (
 	"github.com/cousingary/governator/internal/policy"
 	"github.com/cousingary/governator/internal/prompts"
 	"github.com/cousingary/governator/internal/protectedpaths"
+	"github.com/cousingary/governator/internal/spend"
 	"github.com/cousingary/governator/internal/tokenoptimizer"
 )
 
@@ -811,6 +812,28 @@ func (r *Runner) Run(ctx context.Context, c contracts.Contract) (RunRecord, erro
 		replayed.Replayed = true
 		return replayed, replayErr
 	}
+	cfg := config.Current()
+	if ok, reason := spend.CheckBudget(cfg, db); !ok {
+		refusedID := fmt.Sprintf("%s-%d", c.JobID, time.Now().UTC().UnixNano())
+		refused := RunRecord{
+			ID: refusedID, JobID: c.JobID, JobType: c.JobType, Agent: c.Agent, Mode: string(c.Mode),
+			Status: "QUARANTINED", Root: root, Created: time.Now().UTC().Format(time.RFC3339Nano),
+			Message: "SPEND_CAP: " + reason, FailureTaxonomy: "SPEND_CAP",
+		}
+		if err := insertRun(db, refused, hash, head); err != nil {
+			return refused, err
+		}
+		if err := observability.RecordIdentity(db, c.JobID, c.JobType, c.Agent, refused.Created); err != nil {
+			return refused, err
+		}
+		if err := observability.RecordCompletion(db, observability.Completion{
+			RunID: refused.ID, Agent: refused.Agent, JobType: refused.JobType, Status: refused.Status,
+			FailureTaxonomy: refused.FailureTaxonomy, Notes: refused.Message, Violations: []string{"spend_cap: " + reason},
+		}); err != nil {
+			return refused, err
+		}
+		return refused, nil
+	}
 	id := fmt.Sprintf("%s-%d", c.JobID, time.Now().UTC().UnixNano())
 	work, branch, err := createWorkspace(root, r.Home, id, git)
 	if err != nil {
@@ -1081,6 +1104,7 @@ func (r *Runner) Run(ctx context.Context, c contracts.Contract) (RunRecord, erro
 	}); err != nil {
 		return rec, err
 	}
+	_ = spend.MaybeHalt(cfg, db)
 	if git {
 		_, _, _ = shell(context.Background(), root, "git worktree remove --force "+shQuote(work))
 		if rec.Status == "APPROVED" {

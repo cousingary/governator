@@ -16,6 +16,7 @@ func cleanEnv(t *testing.T) {
 		"GOV_CODEX_BIN", "GOV_RTK_MODE", "GOV_RTK_BIN",
 		"GOV_GRAPH_MODE", "GOV_GRAPH_PROVIDER", "GOV_GRAPH_BIN",
 		"GOV_MINIMALISM_MODE",
+		"GOV_SPEND_DAILY_CAP_USD", "GOV_SPEND_HALT_FILE",
 		"GOV_DEFAULT_AGENT", "GOV_DEFAULT_MAX_MINUTES",
 	} {
 		t.Setenv(name, "")
@@ -37,6 +38,7 @@ backends:
 rtk: {mode: off, bin: rtk-file}
 graph: {mode: auto, provider: codegraph, bin: codegraph-file}
 minimalism: {mode: lite}
+spend: {daily_cap_usd: 2.5, halt_file: /halt/file}
 defaults: {agent: codex, max_minutes: 12}
 `), 0644); err != nil {
 		t.Fatal(err)
@@ -48,6 +50,7 @@ defaults: {agent: codex, max_minutes: 12}
 	t.Setenv("GOV_GRAPH_MODE", "required")
 	t.Setenv("GOV_GRAPH_BIN", "codegraph-env")
 	t.Setenv("GOV_MINIMALISM_MODE", "ultra")
+	t.Setenv("GOV_SPEND_DAILY_CAP_USD", "9.5")
 	cfg, err := Load()
 	if err != nil {
 		t.Fatal(err)
@@ -66,6 +69,52 @@ defaults: {agent: codex, max_minutes: 12}
 	}
 	if cfg.Minimalism.Mode != "ultra" {
 		t.Fatalf("minimalism config=%+v", cfg.Minimalism)
+	}
+	if cfg.Spend.DailyCapUSD != 9.5 || cfg.Spend.HaltFile != "/halt/file" {
+		t.Fatalf("spend config=%+v", cfg.Spend)
+	}
+}
+
+func TestLoadSpendHaltFileEnvOverride(t *testing.T) {
+	cleanEnv(t)
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("GOV_SPEND_HALT_FILE", "/env/halt")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Spend.HaltFile != "/env/halt" {
+		t.Fatalf("halt file=%s", cfg.Spend.HaltFile)
+	}
+}
+
+func TestLoadDefaultSpendIsUnlimitedWithHaltFileUnderHome(t *testing.T) {
+	cleanEnv(t)
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Spend.DailyCapUSD != 0 {
+		t.Fatalf("expected default daily_cap_usd=0 (unlimited), got %v", cfg.Spend.DailyCapUSD)
+	}
+	want := filepath.Join(home, ".governator", "HALT")
+	if cfg.Spend.HaltFile != want {
+		t.Fatalf("halt file=%s want=%s", cfg.Spend.HaltFile, want)
+	}
+}
+
+func TestLoadRejectsNegativeSpendCap(t *testing.T) {
+	cleanEnv(t)
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	t.Setenv("GOV_CONFIG", path)
+	if err := os.WriteFile(path, []byte("spend: {daily_cap_usd: -1}\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "invalid spend.daily_cap_usd") {
+		t.Fatalf("error=%v", err)
 	}
 }
 

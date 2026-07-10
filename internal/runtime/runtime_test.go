@@ -418,6 +418,102 @@ func TestForbiddenCommandTranscriptIsQuarantined(t *testing.T) {
 	}
 }
 
+func TestSpendCapRefusesRunWithoutLaunchingBackend(t *testing.T) {
+	root, bin := fixture(t)
+	home := t.TempDir()
+	t.Setenv("GOV_HOME", home)
+	t.Setenv("GOV_CLAUDE_BIN", bin)
+	t.Setenv("GOV_CONFIG", filepath.Join(t.TempDir(), "missing-config.yaml"))
+	t.Setenv("GOV_SPEND_DAILY_CAP_USD", "0.01")
+
+	db, err := observability.Open(home)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO runs(id,job_id,status,created,cost_usd) VALUES(?,?,?,?,?)`,
+		"prior-run", "prior-job", "APPROVED", time.Now().UTC().Format(time.RFC3339Nano), 0.02); err != nil {
+		t.Fatal(err)
+	}
+	db.Close()
+
+	r, err := New().Run(context.Background(), contract(root))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r.Status != "QUARANTINED" || r.FailureTaxonomy != "SPEND_CAP" || !strings.Contains(r.Message, "SPEND_CAP:") {
+		t.Fatalf("status=%s taxonomy=%s message=%s", r.Status, r.FailureTaxonomy, r.Message)
+	}
+	if _, err := os.Stat(filepath.Join(root, "output", "result.txt")); !os.IsNotExist(err) {
+		t.Fatalf("backend ran despite spend cap refusal: %v", err)
+	}
+	failures, err := observability.Failures(home, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(failures) != 1 || failures[0].Taxonomy != "SPEND_CAP" {
+		t.Fatalf("unexpected failures: %#v", failures)
+	}
+}
+
+func TestSpendCapZeroIsUnlimited(t *testing.T) {
+	root, bin := fixture(t)
+	home := t.TempDir()
+	t.Setenv("GOV_HOME", home)
+	t.Setenv("GOV_CLAUDE_BIN", bin)
+	t.Setenv("GOV_CONFIG", filepath.Join(t.TempDir(), "missing-config.yaml"))
+	t.Setenv("GOV_SPEND_DAILY_CAP_USD", "0")
+
+	db, err := observability.Open(home)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO runs(id,job_id,status,created,cost_usd) VALUES(?,?,?,?,?)`,
+		"prior-run", "prior-job", "APPROVED", time.Now().UTC().Format(time.RFC3339Nano), 999.0); err != nil {
+		t.Fatal(err)
+	}
+	db.Close()
+
+	r, err := New().Run(context.Background(), contract(root))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r.Status != "APPROVED" {
+		t.Fatalf("expected approval with unlimited cap, got %s: %s", r.Status, r.Message)
+	}
+}
+
+func TestSpendCapAutoHaltsAfterCrossingCapMidRun(t *testing.T) {
+	root, bin := fixture(t)
+	home := t.TempDir()
+	t.Setenv("GOV_HOME", home)
+	t.Setenv("GOV_CLAUDE_BIN", bin)
+	t.Setenv("GOV_CONFIG", filepath.Join(t.TempDir(), "missing-config.yaml"))
+	t.Setenv("GOV_SPEND_DAILY_CAP_USD", "0.20")
+	haltFile := filepath.Join(t.TempDir(), "HALT")
+	t.Setenv("GOV_SPEND_HALT_FILE", haltFile)
+
+	first, err := New().Run(context.Background(), contract(root))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.Status != "APPROVED" || first.CostUSD != 0.25 {
+		t.Fatalf("expected first run approved at $0.25, got status=%s cost=%v msg=%s", first.Status, first.CostUSD, first.Message)
+	}
+	if _, err := os.Stat(haltFile); err != nil {
+		t.Fatalf("expected halt file written after crossing cap: %v", err)
+	}
+
+	root2, bin2 := fixture(t)
+	t.Setenv("GOV_CLAUDE_BIN", bin2)
+	second, err := New().Run(context.Background(), contract(root2))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.Status != "QUARANTINED" || second.FailureTaxonomy != "SPEND_CAP" || !strings.Contains(second.Message, haltFile) {
+		t.Fatalf("expected second run refused by halt file, got status=%s taxonomy=%s message=%s", second.Status, second.FailureTaxonomy, second.Message)
+	}
+}
+
 func TestCanaryMutationIsQuarantined(t *testing.T) {
 	root, bin := fixture(t)
 	t.Setenv("GOV_HOME", t.TempDir())
