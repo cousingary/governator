@@ -2,8 +2,10 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -11,6 +13,79 @@ import (
 	"github.com/cousingary/governator/internal/observability"
 	govruntime "github.com/cousingary/governator/internal/runtime"
 )
+
+func batchGit(t *testing.T, dir string, args ...string) {
+	t.Helper()
+	cmd := exec.Command("git", args...)
+	cmd.Dir = dir
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("git %v: %v: %s", args, err, out)
+	}
+}
+
+// batchJobFixture creates a disposable git repo (a valid gov batch run
+// target's workspace.root) and a job YAML file inside jobsDir pointing at
+// it. Mirrors examples/jobs/code_surgical_fix.yaml's shape.
+func batchJobFixture(t *testing.T, jobsDir, jobID string) string {
+	t.Helper()
+	root := t.TempDir()
+	batchGit(t, root, "init", "-b", "main")
+	batchGit(t, root, "config", "user.email", "test@example.invalid")
+	batchGit(t, root, "config", "user.name", "Governator Test")
+	if err := os.WriteFile(filepath.Join(root, "seed.txt"), []byte("seed\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	batchGit(t, root, "add", ".")
+	batchGit(t, root, "commit", "-m", "seed")
+
+	yaml := fmt.Sprintf(`task: write deterministic test output
+job_id: %s
+job_type: test
+agent: claude-code
+mode: surgeon
+workspace:
+  root: %s
+  worktree: auto
+allowed:
+  read: ["**"]
+  write: ["output/**"]
+  execute: ["test"]
+forbidden:
+  paths: [".git/**"]
+  commands: ["rm -rf"]
+  behaviors: [network]
+budget: {max_minutes: 1, max_commands: 5, max_files_changed: 5, max_lines_changed: 20, max_new_files: 2, max_deleted: 0}
+preflight:
+  intended_writes: ["output/**"]
+success:
+  required_files: ["output/result.txt"]
+  validators: ["test -f output/result.txt"]
+on_violation: quarantine
+`, jobID, root)
+	path := filepath.Join(jobsDir, jobID+".yaml")
+	if err := os.WriteFile(path, []byte(yaml), 0644); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+// batchFakeBin is the same minimal fake claude backend runtime_test.go's
+// fixture() uses: it always succeeds, writing output/result.txt and a
+// $0.25 cost line.
+func batchFakeBin(t *testing.T) string {
+	t.Helper()
+	bin := filepath.Join(t.TempDir(), "fake-claude")
+	s := `#!/bin/sh
+mkdir -p output
+printf 'ok\n' > output/result.txt
+printf '{"status":"complete","files_changed":["output/result.txt"],"commands_run":0,"validation":{"self_checked":true},"violations":[],"blockers":[],"next_recommended_action":"none"}\n' > RESULT.json
+printf '{"type":"result","total_cost_usd":0.25}\n'
+`
+	if err := os.WriteFile(bin, []byte(s), 0755); err != nil {
+		t.Fatal(err)
+	}
+	return bin
+}
 
 func captureHook(t *testing.T, script string) string {
 	t.Helper()
@@ -48,6 +123,63 @@ func captureRunInput(t *testing.T, args []string, input string) (int, string) {
 	os.Stdin, os.Stdout = oldIn, oldOut
 	data, _ := io.ReadAll(outR)
 	return code, string(data)
+}
+
+func TestBatchRunRejectsWholeBatchOnInvalidContract(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("GOV_HOME", home)
+	t.Setenv("GOV_CONFIG", filepath.Join(t.TempDir(), "missing-config.yaml"))
+	t.Setenv("GOV_CLAUDE_BIN", batchFakeBin(t))
+
+	jobsDir := t.TempDir()
+	batchJobFixture(t, jobsDir, "valid-job")
+	invalidPath := filepath.Join(jobsDir, "invalid-job.yaml")
+	if err := os.WriteFile(invalidPath, []byte("task: missing everything else\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	code, output := captureRunInput(t, []string{"batch", "run", jobsDir}, "")
+	if code == 0 {
+		t.Fatalf("expected non-zero exit for a batch containing an invalid contract, got 0: %s", output)
+	}
+
+	db, err := observability.Open(home)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	var runCount int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM runs`).Scan(&runCount); err != nil {
+		t.Fatal(err)
+	}
+	if runCount != 0 {
+		t.Fatalf("expected zero runs launched when any contract in the batch is invalid, got %d", runCount)
+	}
+}
+
+func TestBatchRunResolvesDirectoryAndPrintsSummary(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("GOV_HOME", home)
+	t.Setenv("GOV_CONFIG", filepath.Join(t.TempDir(), "missing-config.yaml"))
+	t.Setenv("GOV_CLAUDE_BIN", batchFakeBin(t))
+
+	jobsDir := t.TempDir()
+	batchJobFixture(t, jobsDir, "dir-job-a")
+	batchJobFixture(t, jobsDir, "dir-job-b")
+
+	code, output := captureRunInput(t, []string{"batch", "run", jobsDir, "--parallel", "2"}, "")
+	if code != 0 {
+		t.Fatalf("exit=%d output=%s", code, output)
+	}
+	if !strings.Contains(output, "batch_id:") {
+		t.Fatalf("expected batch_id header, got %s", output)
+	}
+	if !strings.Contains(output, "dir-job-a") || !strings.Contains(output, "dir-job-b") {
+		t.Fatalf("expected both job ids in summary, got %s", output)
+	}
+	if !strings.Contains(output, "jobs=2 quarantined=0") {
+		t.Fatalf("expected aggregate summary line, got %s", output)
+	}
 }
 
 func TestGateCheckDialectRoundTrip(t *testing.T) {

@@ -18,10 +18,12 @@ Governator stores an SQLite WAL database in `ledger_dir` (default `$HOME/.govern
 | `eval_runs` | Hermetic harness-evaluation outcomes. |
 | `hook_events` | Interactive tool decision, finding, and detail. |
 | `parity_events` | Go/Python shadow decisions and availability. |
+| `batches` | One row per `gov batch run` invocation: batch id, started/finished timestamps, job count, quarantined count, and aggregate cost. |
 
 ## Operations
 
 ```sh
+gov batch run JOBS_DIR --parallel 2
 gov handoff last
 gov diff last
 gov quarantine list
@@ -75,4 +77,14 @@ Cost is parsed from backend transcript formats when exposed. Unsupported or cost
 
 After a run completes, a post-run hook writes the halt file if that run pushed today's total to or past the cap, so the *next* run refuses; a live mid-run abort is out of scope. `gov spend` reports today's total, cap, remaining budget, run and unknown-cost-run counts, and halt status. `gov spend --halt` / `gov spend --resume` write or remove the halt file directly. Both `spend.daily_cap_usd` and `spend.halt_file` can be overridden per-invocation with `GOV_SPEND_DAILY_CAP_USD` and `GOV_SPEND_HALT_FILE`.
 
-This cap is enforced at `gov run`, including every attempt the auto-triggered repair loop (`repair.auto`, see below) fires — each is a normal `Run` call and checks the cap independently. It does not yet cover `gov batch` (planned for a later session).
+This cap is enforced at `gov run`, including every attempt the auto-triggered repair loop (`repair.auto`, see below) fires — each is a normal `Run` call and checks the cap independently. `gov batch run` (below) also honors it, plus an additional in-process reservation layer for the concurrency the ledger-only check can't see.
+
+## Batch runner
+
+`gov batch run <job.yaml|dir|glob>... [--parallel N] [--halt-on-first-quarantine]` runs a set of independent contracts through a worker pool (default 2, max 4). Every path argument may be a single job file, a directory (every `*.yaml` file directly inside it), or a quoted glob. All contracts are parsed and validated up front; if any one fails validation the whole batch refuses before anything launches.
+
+Each job goes through the same single-run path as `gov run` (including any `repair.auto` loop) — its own lock, spend check, gate, and validators apply unmodified. On top of that, a batch run seeds an in-process `spend.Accountant` from today's ledger total: before launching, each worker reserves a conservative per-job cost estimate (`budget.max_tokens` × a per-backend $/1M-token table, or a flat $0.25 estimate when a job sets no token ceiling) and settles it against the real reported cost once the job finishes. This closes a gap the ledger-only `CheckBudget` check can't: `TodaySpend` excludes `RUNNING` rows, so without the accountant, two workers launched close together could both pass the check before either's cost had landed. A worker that can't reserve exits with status `SKIPPED` / taxonomy `SPEND_CAP` without ever calling `Run`; later jobs keep draining the queue, they just skip too once the cap is exhausted.
+
+`--halt-on-first-quarantine` stops launching new jobs as soon as any job in the batch quarantines; jobs already in flight run to completion, and jobs not yet started are marked `SKIPPED`.
+
+Each `gov batch run` writes one row to the `batches` table (batch id, started/finished timestamps, job count, quarantined count, aggregate cost) and prints a `job_id / run_id / status / failure_taxonomy / cost_usd / worktree` table plus an aggregate summary line. Exit code is non-zero if any job did not end `APPROVED`.

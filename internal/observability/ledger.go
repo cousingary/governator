@@ -94,7 +94,13 @@ func Open(home string) (*sql.DB, error) {
 	if err := os.MkdirAll(home, 0700); err != nil {
 		return nil, err
 	}
-	db, err := sql.Open("sqlite", filepath.Join(home, "ledger.db"))
+	// Every call to Run opens (and closes) its own *sql.DB against the same
+	// ledger.db file (see runtime.dbOpen); gov batch launches several of
+	// these concurrently. WAL lets readers and a writer overlap, and a
+	// generous busy_timeout makes SQLite retry instead of returning
+	// SQLITE_BUSY when two connections do briefly contend for the single
+	// writer lock.
+	db, err := sql.Open("sqlite", filepath.Join(home, "ledger.db")+"?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)")
 	if err != nil {
 		return nil, err
 	}
@@ -115,7 +121,8 @@ CREATE TABLE IF NOT EXISTS violations(run_id TEXT, kind TEXT, detail TEXT);
 CREATE TABLE IF NOT EXISTS repair_packets(id INTEGER PRIMARY KEY AUTOINCREMENT, run_id TEXT, taxonomy TEXT, packet_json TEXT, created TEXT);
 CREATE TABLE IF NOT EXISTS eval_runs(id INTEGER PRIMARY KEY AUTOINCREMENT, suite TEXT, case_name TEXT, agent TEXT, mode TEXT, job_type TEXT, passed INTEGER, taxonomy TEXT, cost_usd REAL, created TEXT);
 CREATE TABLE IF NOT EXISTS hook_events(run_id TEXT, tool TEXT, decision TEXT, finding TEXT, detail TEXT, created TEXT);
-CREATE TABLE IF NOT EXISTS parity_events(id INTEGER PRIMARY KEY AUTOINCREMENT, payload_hash TEXT, payload TEXT, go_decision TEXT, py_decision TEXT, matched INTEGER, py_unavailable INTEGER, created TEXT);`
+CREATE TABLE IF NOT EXISTS parity_events(id INTEGER PRIMARY KEY AUTOINCREMENT, payload_hash TEXT, payload TEXT, go_decision TEXT, py_decision TEXT, matched INTEGER, py_unavailable INTEGER, created TEXT);
+CREATE TABLE IF NOT EXISTS batches(batch_id TEXT PRIMARY KEY, started TEXT, finished TEXT, jobs INTEGER NOT NULL DEFAULT 0, quarantined INTEGER NOT NULL DEFAULT 0, total_cost_usd REAL NOT NULL DEFAULT 0);`
 	if _, err = db.Exec(schema); err != nil {
 		db.Close()
 		return nil, err
@@ -145,6 +152,34 @@ CREATE INDEX IF NOT EXISTS commands_run_id ON commands_run(run_id);`); err != ni
 		return nil, err
 	}
 	return db, nil
+}
+
+// Batch summarizes one gov batch run for the ledger's batches table.
+type Batch struct {
+	ID           string  `json:"batch_id"`
+	Started      string  `json:"started"`
+	Finished     string  `json:"finished,omitempty"`
+	Jobs         int     `json:"jobs"`
+	Quarantined  int     `json:"quarantined"`
+	TotalCostUSD float64 `json:"total_cost_usd"`
+}
+
+// RecordBatch upserts a batch summary row, called once at batch start
+// (jobs/quarantined/total_cost_usd zero, finished empty) and again after
+// every job has settled.
+func RecordBatch(db *sql.DB, b Batch) error {
+	_, err := db.Exec(`INSERT INTO batches(batch_id,started,finished,jobs,quarantined,total_cost_usd) VALUES(?,?,?,?,?,?)
+ON CONFLICT(batch_id) DO UPDATE SET finished=excluded.finished,jobs=excluded.jobs,quarantined=excluded.quarantined,total_cost_usd=excluded.total_cost_usd`,
+		b.ID, b.Started, b.Finished, b.Jobs, b.Quarantined, b.TotalCostUSD)
+	return err
+}
+
+// BatchByID looks up one batch summary row, for tests and CLI inspection.
+func BatchByID(db *sql.DB, id string) (Batch, error) {
+	var b Batch
+	err := db.QueryRow(`SELECT batch_id,started,COALESCE(finished,''),jobs,quarantined,total_cost_usd FROM batches WHERE batch_id=?`, id).
+		Scan(&b.ID, &b.Started, &b.Finished, &b.Jobs, &b.Quarantined, &b.TotalCostUSD)
+	return b, err
 }
 
 func RecordIdentity(db *sql.DB, jobID, jobType, agent, created string) error {

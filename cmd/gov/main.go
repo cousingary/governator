@@ -97,6 +97,8 @@ func run(args []string) int {
 			return 1
 		}
 		return 0
+	case "batch":
+		return batchCmd(args[1:])
 	case "handoff":
 		if len(args) > 2 {
 			return bad("usage: gov handoff [last|run_id]")
@@ -421,6 +423,117 @@ func spendCmd(args []string) int {
 	fmt.Printf("date=%s total_cost_usd=%.4f cap_usd=%.2f remaining=%s runs=%d unknown_cost_runs=%d halted=%t\n",
 		today.Date, today.TotalCostUSD, cfg.Spend.DailyCapUSD, remaining, today.Runs, today.UnknownCostRuns, spend.IsHalted(cfg))
 	return 0
+}
+
+func batchCmd(args []string) int {
+	if len(args) < 1 || args[0] != "run" {
+		return bad("usage: gov batch run <job.yaml|dir|glob>... [--parallel N] [--halt-on-first-quarantine]")
+	}
+	args = args[1:]
+
+	opts := govruntime.BatchOptions{}
+	var pathArgs []string
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "--parallel":
+			if i+1 >= len(args) {
+				return bad("usage: gov batch run ... --parallel N")
+			}
+			n, err := strconv.Atoi(args[i+1])
+			if err != nil || n <= 0 {
+				return bad("gov batch run: --parallel must be a positive integer")
+			}
+			opts.Parallel = n
+			i++
+		case "--halt-on-first-quarantine":
+			opts.HaltOnFirstQuarantine = true
+		default:
+			pathArgs = append(pathArgs, args[i])
+		}
+	}
+	if len(pathArgs) == 0 {
+		return bad("usage: gov batch run <job.yaml|dir|glob>... [--parallel N] [--halt-on-first-quarantine]")
+	}
+
+	paths, err := resolveJobPaths(pathArgs)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "batch:", err)
+		return 2
+	}
+	if len(paths) == 0 {
+		fmt.Fprintln(os.Stderr, "batch: no job files matched", pathArgs)
+		return 2
+	}
+
+	jobs := make([]contracts.Contract, 0, len(paths))
+	invalid := false
+	for _, p := range paths {
+		c, err := contracts.ParseFile(p)
+		if err != nil {
+			contractError(p, err)
+			invalid = true
+			continue
+		}
+		jobs = append(jobs, *c)
+	}
+	if invalid {
+		fmt.Fprintln(os.Stderr, "batch: refusing to run — one or more contracts are invalid")
+		return 2
+	}
+
+	summary, err := govruntime.New().RunBatch(context.Background(), jobs, opts)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "batch:", err)
+		return 1
+	}
+
+	fmt.Println("batch_id:", summary.BatchID)
+	fmt.Println("job_id\trun_id\tstatus\ttaxonomy\tcost_usd\tworktree")
+	allApproved := true
+	for _, j := range summary.Jobs {
+		if j.Status != "APPROVED" {
+			allApproved = false
+		}
+		fmt.Printf("%s\t%s\t%s\t%s\t%.4f\t%s\n", j.JobID, j.RunID, j.Status, j.Taxonomy, j.CostUSD, j.Worktree)
+	}
+	fmt.Printf("jobs=%d quarantined=%d total_cost_usd=%.4f\n", len(summary.Jobs), summary.Quarantined, summary.TotalCostUSD)
+	if !allApproved {
+		return 1
+	}
+	return 0
+}
+
+// resolveJobPaths expands a mix of explicit file paths, directories (every
+// *.yaml file directly inside, non-recursive), and shell-style globs (for
+// callers that quote the pattern so their shell doesn't expand it) into a
+// flat, order-preserving list of job contract paths.
+func resolveJobPaths(args []string) ([]string, error) {
+	var out []string
+	for _, a := range args {
+		switch {
+		case strings.ContainsAny(a, "*?["):
+			matches, err := filepath.Glob(a)
+			if err != nil {
+				return nil, fmt.Errorf("glob %s: %w", a, err)
+			}
+			out = append(out, matches...)
+		default:
+			info, err := os.Stat(a)
+			if err != nil {
+				return nil, fmt.Errorf("stat %s: %w", a, err)
+			}
+			if info.IsDir() {
+				matches, err := filepath.Glob(filepath.Join(a, "*.yaml"))
+				if err != nil {
+					return nil, fmt.Errorf("glob %s: %w", a, err)
+				}
+				out = append(out, matches...)
+			} else {
+				out = append(out, a)
+			}
+		}
+	}
+	return out, nil
 }
 
 func graphCmd(args []string) int {
@@ -788,6 +901,7 @@ Usage:
   gov validate <job.yaml>
   gov preflight <job.yaml>
   gov run <job.yaml> [--agent <name>]
+  gov batch run <job.yaml|dir|glob>... [--parallel N] [--halt-on-first-quarantine]
   gov handoff [last|run_id]
   gov diff [last|run_id]
   gov rollback <run_id>
