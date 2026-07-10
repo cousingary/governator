@@ -5,6 +5,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/cousingary/governator/internal/contracts"
 )
 
 func cleanEnv(t *testing.T) {
@@ -17,6 +19,7 @@ func cleanEnv(t *testing.T) {
 		"GOV_GRAPH_MODE", "GOV_GRAPH_PROVIDER", "GOV_GRAPH_BIN",
 		"GOV_MINIMALISM_MODE",
 		"GOV_SPEND_DAILY_CAP_USD", "GOV_SPEND_HALT_FILE",
+		"GOV_DOCTRINE_REQUIRE_CLEANUP",
 		"GOV_DEFAULT_AGENT", "GOV_DEFAULT_MAX_MINUTES",
 	} {
 		t.Setenv(name, "")
@@ -103,6 +106,46 @@ func TestLoadDefaultSpendIsUnlimitedWithHaltFileUnderHome(t *testing.T) {
 	want := filepath.Join(home, ".governator", "HALT")
 	if cfg.Spend.HaltFile != want {
 		t.Fatalf("halt file=%s want=%s", cfg.Spend.HaltFile, want)
+	}
+}
+
+func TestLoadDoctrineRequireCleanupDefaultsFalse(t *testing.T) {
+	cleanEnv(t)
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Doctrine.RequireCleanup {
+		t.Fatalf("expected doctrine.require_cleanup to default false, got true")
+	}
+}
+
+func TestLoadDoctrineRequireCleanupFromFileAndEnv(t *testing.T) {
+	cleanEnv(t)
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	path := filepath.Join(home, "config.yaml")
+	t.Setenv("GOV_CONFIG", path)
+	if err := os.WriteFile(path, []byte("doctrine: {require_cleanup: true}\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.Doctrine.RequireCleanup {
+		t.Fatalf("expected file to enable doctrine.require_cleanup")
+	}
+
+	t.Setenv("GOV_DOCTRINE_REQUIRE_CLEANUP", "false")
+	cfg, err = Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Doctrine.RequireCleanup {
+		t.Fatalf("expected env override to disable doctrine.require_cleanup")
 	}
 }
 
@@ -193,6 +236,15 @@ func TestScaffoldIsIdempotent(t *testing.T) {
 		if !strings.Contains(string(example), want) {
 			t.Fatalf("example contract missing %q", want)
 		}
+	}
+	if _, err := contracts.Parse(example); err != nil {
+		t.Fatalf("scaffolded example contract (with commented cleanup block) does not parse: %v", err)
+	}
+	t.Setenv("GOV_CONFIG", Path())
+	if cfg, err := Load(); err != nil {
+		t.Fatalf("scaffolded config.yaml (with doctrine block) does not load: %v", err)
+	} else if cfg.Doctrine.RequireCleanup {
+		t.Fatalf("scaffolded config should default doctrine.require_cleanup to false")
 	}
 	results, err = Scaffold(t.TempDir())
 	if err != nil {

@@ -143,6 +143,14 @@ CREATE TABLE IF NOT EXISTS batches(batch_id TEXT PRIMARY KEY, started TEXT, fini
 			return nil, alterErr
 		}
 	}
+	// stage distinguishes the cleanup pass (Session 5, doctrine gap #5) from
+	// the pre-existing success.validators rows. Defaulting existing and new
+	// rows to 'success' keeps every prior ledger query (which never filtered
+	// by stage) reading the same rows it always did.
+	if _, alterErr := db.Exec("ALTER TABLE validators ADD COLUMN stage TEXT NOT NULL DEFAULT 'success'"); alterErr != nil && !strings.Contains(strings.ToLower(alterErr.Error()), "duplicate column") {
+		db.Close()
+		return nil, alterErr
+	}
 	if _, err = db.Exec(`CREATE INDEX IF NOT EXISTS runs_key ON runs(contract_hash, approved_head, status);
 CREATE INDEX IF NOT EXISTS runs_failure ON runs(failure_taxonomy, created);
 CREATE INDEX IF NOT EXISTS runs_repair_of ON runs(repair_of);

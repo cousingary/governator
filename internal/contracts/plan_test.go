@@ -8,12 +8,12 @@ import (
 func planJob(root, jobID string) Contract {
 	return Contract{
 		Task: "do the thing", JobID: jobID, JobType: "code_change", Agent: "claude-code", Mode: ModeSurgeon,
-		Workspace: Workspace{Root: root, Worktree: "auto"},
-		Allowed:   Permissions{Read: []string{"**"}, Write: []string{"internal/**"}, Execute: []string{"go build ./..."}},
-		Forbidden: Forbidden{Paths: []string{".git/**"}, Commands: []string{"rm -rf"}, Behaviors: []string{"network"}},
-		Budget:    Budget{MaxMinutes: 10, MaxCommands: 10, MaxFilesChanged: 3, MaxLinesChanged: 100, MaxNewFiles: 1, MaxDeleted: 0, MaxTokens: 10000},
-		Preflight: Preflight{IntendedWrites: []string{"internal/**"}},
-		Success:   Success{RequiredFiles: []string{"internal/x.go"}, Validators: []string{"go build ./..."}},
+		Workspace:   Workspace{Root: root, Worktree: "auto"},
+		Allowed:     Permissions{Read: []string{"**"}, Write: []string{"internal/**"}, Execute: []string{"go build ./..."}},
+		Forbidden:   Forbidden{Paths: []string{".git/**"}, Commands: []string{"rm -rf"}, Behaviors: []string{"network"}},
+		Budget:      Budget{MaxMinutes: 10, MaxCommands: 10, MaxFilesChanged: 3, MaxLinesChanged: 100, MaxNewFiles: 1, MaxDeleted: 0, MaxTokens: 10000},
+		Preflight:   Preflight{IntendedWrites: []string{"internal/**"}},
+		Success:     Success{RequiredFiles: []string{"internal/x.go"}, Validators: []string{"go build ./..."}},
 		OnViolation: "quarantine",
 		RiskClass:   "low",
 	}

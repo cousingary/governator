@@ -75,6 +75,8 @@ Minimalism defaults to `minimalism.mode: full`: Governator appends a YAGNI-first
 
 For each governed run, the controller builds or refreshes the graph inside the disposable worktree before baseline fingerprints, injects bounded read-only query forms into the runtime prompt, and excludes the controller-owned `.codegraph` index from source commits. The ledger records provider version, SHA-256 index fingerprint, file/node/edge counts, and database size. Operators can inspect or explicitly manage an index with `gov graph status [path]`, `gov graph refresh [path]`, and `gov graph query <search> [--path <path>] [--limit <n>]`.
 
+`doctrine.require_cleanup` (default `false`) governs whether `gov validate` treats a missing cleanup pass as advisory or fatal: a `surgeon`, `batch_worker`, or `repair` contract with neither a `cleanup` block nor a lint/format `success.validators` entry always prints a `DOCTRINE WARNING`; setting this to `true` (or `GOV_DOCTRINE_REQUIRE_CLEANUP=true`) upgrades it to a `DOCTRINE ERROR` and a nonzero exit. See [`docs/contracts.md`](docs/contracts.md) for the `cleanup` block itself.
+
 ## Commands
 
 ```text
@@ -82,6 +84,9 @@ gov init
 gov validate <job.yaml>
 gov preflight <job.yaml>
 gov run <job.yaml> [--agent <name>]
+gov batch run <job.yaml|dir|glob>... [--parallel N] [--halt-on-first-quarantine] [--ordered]
+gov plan <intent.md> --out <dir> --envelope <pattern>... --max-total-tokens <n> [--backend <name>]
+gov plan --show <dir>
 gov handoff [last|run_id]
 gov diff [last|run_id]
 gov rollback <run_id>
@@ -101,6 +106,7 @@ gov spend [--halt|--resume]
 gov usage summary|<run_id>
 gov repair-packet <run_id>
 gov eval harness <case-dir>
+gov eval scorecard
 gov doctor
 gov version
 ```

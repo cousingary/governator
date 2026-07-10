@@ -150,3 +150,32 @@ func TestParseOutputPolicy(t *testing.T) {
 		t.Fatalf("error=%v", err)
 	}
 }
+
+func TestParseWithoutCleanupBlockLeavesCleanupNil(t *testing.T) {
+	contract, err := Parse([]byte(validContract))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if contract.Cleanup != nil {
+		t.Fatalf("expected nil Cleanup for a contract with no cleanup block, got %+v", contract.Cleanup)
+	}
+}
+
+func TestParseCleanupBlock(t *testing.T) {
+	withCleanup := strings.Replace(validContract, "on_violation: quarantine", "cleanup: {required: true, validators: [\"gofmt -l .\"]}\non_violation: quarantine", 1)
+	contract, err := Parse([]byte(withCleanup))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if contract.Cleanup == nil || !contract.Cleanup.Required || len(contract.Cleanup.Validators) != 1 || contract.Cleanup.Validators[0] != "gofmt -l ." {
+		t.Fatalf("cleanup=%+v", contract.Cleanup)
+	}
+}
+
+func TestParseCleanupBlockWithoutValidatorsRejected(t *testing.T) {
+	withCleanup := strings.Replace(validContract, "on_violation: quarantine", "cleanup: {required: true, validators: []}\non_violation: quarantine", 1)
+	_, err := Parse([]byte(withCleanup))
+	if err == nil || !strings.Contains(err.Error(), "cleanup.validators") {
+		t.Fatalf("expected cleanup.validators error, got %v", err)
+	}
+}

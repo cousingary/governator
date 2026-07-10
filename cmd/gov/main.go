@@ -49,6 +49,13 @@ func run(args []string) int {
 			return contractError(args[1], err)
 		}
 		fmt.Printf("VALID %s (job_id=%s mode=%s agent=%s)\n", args[1], c.JobID, c.Mode, c.Agent)
+		if issue := policy.CleanupDoctrineIssue(*c); issue != "" {
+			if config.Current().Doctrine.RequireCleanup {
+				fmt.Fprintln(os.Stderr, "DOCTRINE ERROR:", issue)
+				return 1
+			}
+			fmt.Fprintln(os.Stderr, "DOCTRINE WARNING:", issue)
+		}
 		return 0
 	case "preflight":
 		if len(args) != 2 {

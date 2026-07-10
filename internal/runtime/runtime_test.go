@@ -666,3 +666,94 @@ esac
 		t.Fatalf("graph escaped disposable worktree: %v", err)
 	}
 }
+
+// TestCleanupStageRecordsUnderItsOwnLedgerStage pins doctrine gap #5: an
+// optional (required:false) cleanup validator that fails is recorded with
+// stage='cleanup' but does not block the merge, unlike a failing
+// success.validators entry which is always recorded stage='success'.
+func TestCleanupStageRecordsUnderItsOwnLedgerStage(t *testing.T) {
+	root, bin := fixture(t)
+	home := t.TempDir()
+	t.Setenv("GOV_HOME", home)
+	t.Setenv("GOV_CLAUDE_BIN", bin)
+
+	c := contract(root)
+	c.Cleanup = &contracts.Cleanup{Required: false, Validators: []string{"false"}}
+	r, err := New().Run(context.Background(), c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r.Status != "APPROVED" {
+		t.Fatalf("expected optional cleanup failure to still approve, got status=%s message=%s", r.Status, r.Message)
+	}
+	db, err := observability.Open(home)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	var successCount, cleanupCount int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM validators WHERE run_id=? AND stage='success'`, r.ID).Scan(&successCount); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRow(`SELECT COUNT(*) FROM validators WHERE run_id=? AND stage='cleanup' AND command='false' AND exit_code<>0`, r.ID).Scan(&cleanupCount); err != nil {
+		t.Fatal(err)
+	}
+	if successCount == 0 || cleanupCount != 1 {
+		t.Fatalf("success rows=%d cleanup rows=%d, expected both stages recorded distinctly", successCount, cleanupCount)
+	}
+}
+
+// TestCleanupRequiredFailureQuarantines is the mirror case: required:true
+// makes a failing cleanup validator gate the merge exactly like a failed
+// success validator would.
+func TestCleanupRequiredFailureQuarantines(t *testing.T) {
+	root, bin := fixture(t)
+	t.Setenv("GOV_HOME", t.TempDir())
+	t.Setenv("GOV_CLAUDE_BIN", bin)
+
+	c := contract(root)
+	c.Cleanup = &contracts.Cleanup{Required: true, Validators: []string{"false"}}
+	r, err := New().Run(context.Background(), c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r.Status != "QUARANTINED" || !strings.Contains(r.Message, "cleanup validator failed") {
+		t.Fatalf("%s: %s", r.Status, r.Message)
+	}
+	if _, err := os.Stat(filepath.Join(root, "output", "result.txt")); !os.IsNotExist(err) {
+		t.Fatalf("cleanup-quarantined run merged: %v", err)
+	}
+}
+
+// TestCleanupSkippedWhenSuccessValidatorsAlreadyFailed confirms cleanup never
+// runs (and never writes a ledger row) once a success validator has already
+// failed — cleanup is a post-approval tidy pass, not an independent check.
+func TestCleanupSkippedWhenSuccessValidatorsAlreadyFailed(t *testing.T) {
+	root, bin := fixture(t)
+	home := t.TempDir()
+	t.Setenv("GOV_HOME", home)
+	t.Setenv("GOV_CLAUDE_BIN", bin)
+	t.Setenv("FAKE_ALWAYS_FAIL", "1")
+
+	c := contract(root)
+	c.Cleanup = &contracts.Cleanup{Required: false, Validators: []string{"true"}}
+	r, err := New().Run(context.Background(), c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r.Status != "QUARANTINED" {
+		t.Fatalf("expected quarantine from failed success validator, got %s: %s", r.Status, r.Message)
+	}
+	db, err := observability.Open(home)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	var cleanupCount int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM validators WHERE run_id=? AND stage='cleanup'`, r.ID).Scan(&cleanupCount); err != nil {
+		t.Fatal(err)
+	}
+	if cleanupCount != 0 {
+		t.Fatalf("expected no cleanup validator rows after a success-validator failure, got %d", cleanupCount)
+	}
+}

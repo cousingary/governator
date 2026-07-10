@@ -35,6 +35,17 @@ type Spend struct {
 	HaltFile    string  `yaml:"halt_file"`
 }
 
+// Doctrine holds config-gated policy toggles enforced by `gov validate`
+// rather than the always-on schema checks in internal/contracts. Default
+// false on every field so every existing config file and job YAML keeps
+// validating unchanged.
+type Doctrine struct {
+	// RequireCleanup upgrades the cleanup-doctrine check (a write-capable
+	// contract with neither a cleanup block nor a lint/format validator in
+	// success.validators) from a warning to a validation error.
+	RequireCleanup bool `yaml:"require_cleanup"`
+}
+
 type Defaults struct {
 	Agent      string `yaml:"agent"`
 	MaxMinutes int    `yaml:"max_minutes"`
@@ -50,6 +61,7 @@ type Config struct {
 	Graph             Graph              `yaml:"graph"`
 	Minimalism        Minimalism         `yaml:"minimalism"`
 	Spend             Spend              `yaml:"spend"`
+	Doctrine          Doctrine           `yaml:"doctrine"`
 	Defaults          Defaults           `yaml:"defaults"`
 }
 
@@ -86,6 +98,7 @@ func BuiltIn() Config {
 		Graph:      Graph{Mode: "auto", Provider: "codegraph", Bin: "codegraph"},
 		Minimalism: Minimalism{Mode: "full"},
 		Spend:      Spend{DailyCapUSD: 0, HaltFile: filepath.Join(base, "HALT")},
+		Doctrine:   Doctrine{RequireCleanup: false},
 		Defaults:   Defaults{Agent: "claude-code", MaxMinutes: 30},
 	}
 }
@@ -178,6 +191,9 @@ func merge(dst *Config, src Config) {
 	if src.Spend.HaltFile != "" {
 		dst.Spend.HaltFile = src.Spend.HaltFile
 	}
+	if src.Doctrine.RequireCleanup {
+		dst.Doctrine.RequireCleanup = true
+	}
 	if src.Defaults.Agent != "" {
 		dst.Defaults.Agent = src.Defaults.Agent
 	}
@@ -236,6 +252,11 @@ func applyEnv(cfg *Config) {
 	}
 	if value := Env("GOV_SPEND_HALT_FILE"); value != "" {
 		cfg.Spend.HaltFile = value
+	}
+	if value := Env("GOV_DOCTRINE_REQUIRE_CLEANUP"); value != "" {
+		if b, err := strconv.ParseBool(value); err == nil {
+			cfg.Doctrine.RequireCleanup = b
+		}
 	}
 	if value := Env("GOV_DEFAULT_AGENT"); value != "" {
 		cfg.Defaults.Agent = value

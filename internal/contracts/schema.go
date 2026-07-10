@@ -53,6 +53,7 @@ type Contract struct {
 	Success     Success       `yaml:"success" json:"success"`
 	Output      *OutputPolicy `yaml:"output,omitempty" json:"output,omitempty"`
 	Repair      *Repair       `yaml:"repair,omitempty" json:"repair,omitempty"`
+	Cleanup     *Cleanup      `yaml:"cleanup,omitempty" json:"cleanup,omitempty"`
 	OnViolation string        `yaml:"on_violation" json:"on_violation"`
 
 	// RepairLineage tags a contract compiled by the auto-repair loop with the
@@ -161,6 +162,19 @@ func (r *Repair) EffectiveMaxAttempts() int {
 		n = 2
 	}
 	return n
+}
+
+// Cleanup opts a contract into a distinct pre-merge tidy stage that runs
+// after Success.Validators pass: a lint/format/temp-file pass recorded with
+// its own ledger rows (validators.stage = "cleanup") instead of being folded
+// into success.validators. Absent (nil) leaves existing behavior unchanged —
+// no cleanup stage runs. Required governs whether a failing cleanup
+// validator blocks the merge like a success validator (true) or is recorded
+// for visibility only (false, the default) — useful for a lint pass an
+// operator wants observed before it's enforced.
+type Cleanup struct {
+	Required   bool     `yaml:"required,omitempty" json:"required,omitempty"`
+	Validators []string `yaml:"validators" json:"validators"`
 }
 
 type ValidationError struct {
@@ -290,6 +304,13 @@ func (c Contract) Validate() error {
 
 	if c.Repair != nil && c.Repair.MaxAttempts < 0 {
 		add("repair.max_attempts", "must be zero or greater (0 defaults to 1, values above 2 clamp to 2)")
+	}
+
+	if c.Cleanup != nil {
+		if len(c.Cleanup.Validators) == 0 {
+			add("cleanup.validators", "must contain at least one command when the cleanup block is present")
+		}
+		validateNonBlank("cleanup.validators", c.Cleanup.Validators, add)
 	}
 
 	if strings.TrimSpace(c.RiskClass) != "" && !riskClasses[c.RiskClass] {

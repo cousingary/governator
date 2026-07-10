@@ -85,6 +85,10 @@ minimalism:
 spend:
   daily_cap_usd: 0 # 0 = unlimited
   halt_file: ~/.governator/HALT
+doctrine:
+  require_cleanup: false # true = gov validate fails a surgeon/batch_worker/repair
+                          # contract with no cleanup block and no lint/format
+                          # validator instead of just warning
 defaults:
   agent: claude-code
   max_minutes: 30
@@ -118,6 +122,13 @@ preflight:
 success:
   required_files: []
   validators: ["go test ./..."]
+# cleanup:
+#   required: false # true blocks the merge on a failing cleanup validator,
+#                    # like success.validators; false (default) just records it
+#   validators:
+#     - test -z "$(gofmt -l .)"                                            # go: no unformatted files
+#     - test -z "$(git status --porcelain -- . ':(exclude).governator')"   # no stray/temp files left behind
+#     - '! grep -rn "TODO_DEBUG\|console\.log(\"DEBUG" .'                  # no leftover debug prints
 output:
   style: terse
   max_final_words: 80

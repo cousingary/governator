@@ -1006,9 +1006,29 @@ func (r *Runner) Run(ctx context.Context, c contracts.Contract) (RunRecord, erro
 		if e != nil {
 			out += "\n" + e.Error()
 		}
-		_, _ = db.Exec(`INSERT INTO validators(run_id,command,exit_code,output) VALUES(?,?,?,?)`, id, v, code, out)
+		_, _ = db.Exec(`INSERT INTO validators(run_id,command,exit_code,output,stage) VALUES(?,?,?,?,'success')`, id, v, code, out)
 		if code != 0 || e != nil {
 			violations = append(violations, fmt.Sprintf("validator failed (%d): %s", code, v))
+		}
+	}
+	// Cleanup runs as a distinct pre-merge stage once every success validator
+	// has passed (doctrine gap #5): a lint/format/temp-file tidy pass with
+	// its own ledger rows (stage='cleanup') instead of being folded into
+	// success.validators. Required governs whether a failure blocks the
+	// merge like a success validator; unset (the default) records the run
+	// for visibility without gating it.
+	if len(violations) == 0 && c.Cleanup != nil {
+		for _, v := range c.Cleanup.Validators {
+			vctx, cancel := context.WithTimeout(ctx, time.Duration(c.Budget.MaxMinutes)*time.Minute)
+			code, out, e := shell(vctx, work, v)
+			cancel()
+			if e != nil {
+				out += "\n" + e.Error()
+			}
+			_, _ = db.Exec(`INSERT INTO validators(run_id,command,exit_code,output,stage) VALUES(?,?,?,?,'cleanup')`, id, v, code, out)
+			if (code != 0 || e != nil) && c.Cleanup.Required {
+				violations = append(violations, fmt.Sprintf("cleanup validator failed (%d): %s", code, v))
+			}
 		}
 	}
 	// PostRunValidate is the in-process extension of the validator gate above

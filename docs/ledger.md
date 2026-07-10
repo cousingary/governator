@@ -12,7 +12,7 @@ Governator stores an SQLite WAL database in `ledger_dir` (default `$HOME/.govern
 | `agent_profiles` | Runs, valid outputs, failures, and total cost by agent and job type. |
 | `files_touched` | Path and change type per run. |
 | `commands_run` | Audited shell command and classification. |
-| `validators` | Validator command, exit code, and bounded output. |
+| `validators` | Validator command, exit code, bounded output, and `stage` (`success` or `cleanup`; see `docs/contracts.md`). |
 | `violations` | Policy, budget, transcript, and validation failures. |
 | `repair_packets` | Generated failure packet JSON and taxonomy. |
 | `eval_runs` | Hermetic harness-evaluation outcomes. |
