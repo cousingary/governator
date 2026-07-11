@@ -1,0 +1,214 @@
+{
+  "session": "v1.4 Session 1 — Merge, release, and prove",
+  "plan": "agents/governator_v1.4_plan.md",
+  "executed_by": "Claude Sonnet 5",
+  "date": "2026-07-11",
+  "jeremy_gate": {
+    "accept_v1_0_0_and_merge_sequence": "approved 2026-07-11 (AskUserQuestion)",
+    "spend_authorization_for_real_jobs": "approved 2026-07-11 (AskUserQuestion)"
+  },
+  "release": {
+    "source_commit": "226dc1eea68da217c25aa2c10ff66a6f22cd9913",
+    "commit_subject": "Governator job v14-session1-docker-run",
+    "go_version": "go1.26.4",
+    "build_flags": "-s -w -X main.version=1.4.0-session1 (CGO_ENABLED=0)",
+    "vcs_modified": false,
+    "merge_order": ["v1.1-doctrine", "v1.2-routing", "v1.3-hardening"],
+    "merge_method": "fast-forward (main was already an ancestor of all three stacked branches; each stage verified go build/vet/test -race/gofmt clean before proceeding)",
+    "main_before": "f253a28 (Add minimalism prompt optimizer adapted from ponytail)",
+    "main_after_stack_merge": "feb8c9f (Review-harden v1.3 Phases 0-7)",
+    "commits_added_this_session_after_merge": [
+      "2051e9b Ignore /dist/ build output (goreleaser hygiene, needed for a clean vcs.modified=false build)",
+      "38cec6d Fix out-of-scope-read-precedes-write false positive on real transcripts (real bug, see bugs_found_and_fixed)",
+      "92683c3 Governator job v14-session1-approved-run (real approved run, category 1)",
+      "2bbcd90 Governator job v14-session1-validator-quarantine (accidental approval, see notes on job 2)",
+      "f0372d5 Tolerate a leading non-JSON CLI banner line in transcript audit (real bug, see bugs_found_and_fixed)",
+      "11346be Governator job v14-session1-safe-fallback-stub (fallback success entry)",
+      "7e7b36c Governator job v14-session1-fallback-refused (accidental approval, see notes on job 5)",
+      "226dc1e Governator job v14-session1-docker-run (real Docker-runner approved run, category 6)"
+    ]
+  },
+  "binaries": {
+    "goreleaser_config": ".goreleaser.yml (canonical release pipeline, used as-is)",
+    "targets": [
+      {
+        "platform": "linux_amd64",
+        "archive": "gov_0.0.0-SNAPSHOT-none_linux_amd64.tar.gz",
+        "sha256": "59dae206301d13269798b203b91e8f2d4dc38ed81c5129b78028bb94495653ee"
+      },
+      {
+        "platform": "linux_arm64",
+        "archive": "gov_0.0.0-SNAPSHOT-none_linux_arm64.tar.gz",
+        "sha256": "628ffe2f06c16e8b45d92c85a2688d418838c94fb79a5ae4ae65f4baa0641676"
+      },
+      {
+        "platform": "darwin_amd64",
+        "archive": "gov_0.0.0-SNAPSHOT-none_darwin_amd64.tar.gz",
+        "sha256": "d4f535e320cef3c636bba846c52c9db2b6e73eb826b2f011d104ca8ce763bf1c"
+      },
+      {
+        "platform": "darwin_arm64",
+        "archive": "gov_0.0.0-SNAPSHOT-none_darwin_arm64.tar.gz",
+        "sha256": "34e1d6963ac8fabc349c08fdb2a636e820141ad7eab29630607d41e04b6f8607"
+      }
+    ],
+    "sbom_lite_linux_amd64": {
+      "note": "go version -m output, per plan step 2's 'SBOM at minimum'",
+      "mod": "github.com/cousingary/governator v0.0.0-20260711162445-226dc1eea68d",
+      "deps": [
+        "github.com/dustin/go-humanize v1.0.1",
+        "github.com/google/uuid v1.6.0",
+        "github.com/remyoudompheng/bigfft v0.0.0-20230129092748-24d4a6f8daec",
+        "golang.org/x/sys v0.44.0",
+        "gopkg.in/yaml.v3 v3.0.1",
+        "modernc.org/libc v1.73.4",
+        "modernc.org/mathutil v1.7.1",
+        "modernc.org/memory v1.11.0",
+        "modernc.org/sqlite v1.53.0"
+      ],
+      "vcs_revision": "226dc1eea68da217c25aa2c10ff66a6f22cd9913",
+      "vcs_modified": false
+    }
+  },
+  "verification": {
+    "go_build": "PASS at every merge stage and on the final commit",
+    "go_vet": "PASS",
+    "gofmt_l": "clean (no output) at every stage",
+    "go_test_race": "PASS, all 20 packages, at every merge stage and on the final commit",
+    "panel_members_gap": {
+      "flagged_by": "v1.3 Phase 7 analytics note: 'panel_members has a reader but no writer, panel runtime never calls RecordPanelMembers'",
+      "finding": "ALREADY FIXED on v1.3-hardening tip before this session — internal/runtime/panel.go:285 calls recordPanelMembership (added in commit feb8c9f, the same review-harden commit that closed v1.3 Phase 0-7), which calls observability.RecordPanelMembers at panel.go:348. Regression test TestRunPanelQuorumProceedsWithoutStraggler (panel_test.go) asserts panel_members rows land per member and passes.",
+      "action_taken": "none required; verified only"
+    }
+  },
+  "shadow_parity": {
+    "mechanism": "gov hook pre-tool-use --shadow <python-gate> runs the new Go gate and the legacy harness_gate.py on every interactive tool call for this Claude Code user, comparing verdicts (gov parity report)",
+    "coverage_days": 7.21,
+    "events": 4643,
+    "matches": 4639,
+    "mismatches": 0,
+    "python_unavailable": 4,
+    "note": "This evidence predates and continued through this session; it reflects live production shadow-parity between the Go runtime and the legacy Python gate, not a synthetic test."
+  },
+  "bugs_found_and_fixed": [
+    {
+      "commit": "38cec6d",
+      "title": "out-of-scope-read-precedes-write false positive on real transcripts",
+      "found_via": "job v14-session1-approved-run, first attempt (run v14-session1-approved-run-1783783738673399160)",
+      "root_cause": "Real claude-code Read/Write tool_use blocks always carry absolute file_path values (e.g. /home/lam/.governator/worktrees/<run>/CHANGELOG.md), but allowed.read/forbidden.paths are documented and validated as repository-relative (docs/contracts.md). The Phase 6 starter rule set's own tests only ever synthesized relative-looking Subject strings by hand, so this was never caught: in practice the rule denied nearly every real write-capable surgeon run, because editing a file always means reading it first.",
+      "severity": "would have blocked essentially all real approved runs under any allowed.read scope narrower than '**'",
+      "fix": "auditTranscript now takes the run's worktree path and relativizes a Read/Write event's Subject against it before matching allowed.read, only when the absolute path actually falls under the worktree. An absolute read genuinely outside the worktree (or outside allowed.read) still denies; secret-pattern matching (rule 1) is untouched.",
+      "regression_test": "TestAuditRelativizesInScopeAbsoluteWorktreeRead (internal/runtime/runtime_test.go)"
+    },
+    {
+      "commit": "f0372d5",
+      "title": "codex CLI startup banner treated as transcript corruption",
+      "found_via": "job v14-session1-safe-fallback, live codex attempt (run agent=codex, ~16:12 UTC)",
+      "root_cause": "codex exec --json --ephemeral prints a plain-text 'Reading additional input from stdin...' notice on stdout before its first JSON event (real codex CLI behavior). auditTranscript's line-by-line JSONL parser flagged that line as malformed JSON, and on_violation: quarantine turned it into a POLICY_VIOLATION on every single codex-backed run, regardless of what the agent actually did.",
+      "severity": "blocked every real codex-backed approved run",
+      "fix": "Only forgive a malformed line seen BEFORE the first valid JSON line (CLI startup noise, which cannot have encoded a tool_use/tool_result event either way); a malformed line after the JSON stream has started still fails closed exactly as before.",
+      "regression_test": "TestAuditTranscriptTolerantOfLeadingCLIBanner (internal/runtime/transcript_test.go); TestAuditTranscriptRejectsMalformedJSONL (pre-existing) reconfirmed to still fail closed on genuine mid-stream corruption"
+    },
+    {
+      "commit": "2051e9b",
+      "title": "dist/ build output not gitignored",
+      "found_via": "rebuilding release binaries (plan step 2) and noticing go version -m reported vcs.modified=true on an otherwise-clean tree",
+      "fix": "added /dist/ to .gitignore, matching the existing /bin/ pattern",
+      "severity": "low (provenance-quality issue, not a functional bug)"
+    }
+  ],
+  "acceptance_evidence": {
+    "1_approved_run": {
+      "job_id": "v14-session1-approved-run",
+      "backend": "claude-code",
+      "run_id": "v14-session1-approved-run-1783784441601405838",
+      "status": "APPROVED",
+      "merge_commit": "92683c3c470dcb98111b09be3e48f4433dc5517d",
+      "cost_usd": 0.108,
+      "notes": "First attempt (run ...673399160) hit the out-of-scope-read-precedes-write bug above and was quarantined; fixed, rebuilt, retried, approved. Real claude-code call, real merge to main."
+    },
+    "2_deterministic_validator_quarantine": {
+      "job_id": "v14-session1-validator-quarantine-2",
+      "backend": "pi",
+      "run_id": "v14-session1-validator-quarantine-2-1783784651215484898",
+      "status": "QUARANTINED",
+      "failure_taxonomy": "VALIDATION_FAILED",
+      "message": "validator failed (1): test -f this-file-cannot-exist-v14-proof.txt",
+      "notes": "First design (job v14-session1-validator-quarantine, backend codex) hit codex's real QUOTA_EXHAUSTED (see safe-pre-mutation-fallback below) then, retried on opencode, the agent literally wrote the validator's target string into its own changelog entry and passed validation by accident — informative but not the intended demonstration. Redesigned with an unsatisfiable validator (a required file the agent has no write permission to create) that cannot be gamed by content; ran clean on pi."
+    },
+    "3_blocking_assayer_quarantine": {
+      "job_id": "v14-session1-assayer-quarantine",
+      "backend": "claude-code",
+      "run_id": "v14-session1-assayer-quarantine-1783784762834068456",
+      "status": "QUARANTINED",
+      "failure_taxonomy": "ASSAY_FAILED",
+      "message": "assay: profile=coding-output-v1 verdict=fail failed_checks=no_placeholder:content",
+      "assayer_repo": "/mnt/e/downloads/assayer (real Assayer CLI subprocess, GOV_ASSAY_REPO/GOV_ASSAY_PYTHON/GOV_ASSAY_TIMEOUT_SECONDS)",
+      "notes": "Agent wrote a real produced artifact (.governator/artifacts/note.json) containing a deliberate TODO placeholder; the real Assayer subprocess evaluated it under the coding-output-v1 profile (blocking enforcement) and correctly failed it."
+    },
+    "4_safe_pre_mutation_fallback": {
+      "primary_evidence": {
+        "description": "Fully organic, zero synthetic stubs: real codex attempt hit a genuine QUOTA_EXHAUSTED infra failure with zero mutation; the runtime's own fallback loop automatically retried with claude-code.",
+        "job_id": "v14-session1-safe-fallback",
+        "root_run_id": "v14-session1-safe-fallback-1783784860130048383",
+        "attempt_1": {"backend": "codex", "fallback_reason": "QUOTA_EXHAUSTED", "verified_preconditions": "infra taxonomy + zero tool_calls + unchanged worktree (fallback_attempts row + runs.notes=fallback_worktree_unchanged)"},
+        "attempt_2": {"backend": "claude-code", "outcome": "the overall run still ended QUARANTINED (POLICY_VIOLATION, an unrelated allowed.execute scope gap in this job's contract) but the fallback retry itself is fully proven by the fallback_attempts ledger rows"}
+      },
+      "supplementary_evidence_clean_end_to_end": {
+        "description": "Deterministic stub backends (GOV_CLAUDE_BIN/GOV_CODEX_BIN env overrides, run through the real gov run CLI and full governance pipeline — worktree, ledger, merge gate, route broker) used to force a clean APPROVED-via-fallback outcome, since live backend health kept shifting mid-session (codex genuinely recovered partway through, changing routing scores) and the router's own design prefers not to re-attempt a backend the breaker or scoring has already marked unhealthy.",
+        "job_id": "v14-session1-safe-fallback-stub",
+        "root_run_id": "v14-session1-safe-fallback-stub-1783786827588748621",
+        "attempt_1": {"backend": "claude-code (stub)", "status": "QUARANTINED", "failure_taxonomy": "RATE_LIMIT", "mutation": "none"},
+        "attempt_2": {"backend": "codex (stub)", "status": "APPROVED", "merge_commit": "11346be2dff76892f94412cd7c835872647e44b9"},
+        "ledger_verified": "runs table: 2 rows (QUARANTINED then APPROVED); fallback_attempts table: 2 rows, attempt 1 reason=RATE_LIMIT, attempt 2 reason=''"
+      }
+    },
+    "5_fallback_refusal_after_mutation": {
+      "job_id": "v14-session1-fallback-refused-2",
+      "run_id": "v14-session1-fallback-refused-2-1783786946839277024",
+      "backend": "codex (stub)",
+      "status": "QUARANTINED",
+      "failure_taxonomy": "RATE_LIMIT",
+      "notes": "Stub wrote a stray line to CHANGELOG.md, then failed with a RATE_LIMIT infra signature — same taxonomy as the safe-fallback case, but this time with a real prior mutation. fallbackEligible() correctly refused to retry: ledger shows exactly 1 run row and 0 fallback_attempts rows for this job_id, versus 2/2 for the safe-fallback-stub case above. claude-code was available and would have succeeded (as proven by the sibling test) but was never attempted.",
+      "why_stubs_here_too": "Same live-routing-drift reason as category 4: by this point in the session codex had accumulated a stronger ledger-scored track record than claude-code and was winning the broker's pick outright, so the stub roles were swapped to match, keeping the test on the real gov run CLI rather than fighting the (correctly) self-correcting scorer."
+    },
+    "6_docker_run": {
+      "job_id": "v14-session1-docker-run",
+      "backend": "pi",
+      "run_id": "v14-session1-docker-run-1783787081799851792",
+      "status": "APPROVED",
+      "merge_commit": "226dc1eea68da217c25aa2c10ff66a6f22cd9913",
+      "runner": "docker",
+      "image": "gov-v14-session1-fake-pi:latest (purpose-built: FROM alpine:3.20, a deterministic script standing in for the pi CLI since no real backend CLI ships inside a base image)",
+      "notes": "runs.notes includes docker_limits_observed, confirming internal/runner/docker.go's Observe step inspected the container's applied resource limits. Bind-mounted the disposable worktree at /workspace; CHANGELOG.md was genuinely written from inside the container."
+    },
+    "7_stale_run_recovery": {
+      "job_id": "v14-session1-stale-recovery",
+      "run_id": "v14-session1-stale-recovery-1783787151729104106",
+      "backend": "claude-code (stub, sleep 120 to hold AGENT_RUNNING)",
+      "procedure": "Launched gov run in the background, confirmed via direct ledger query it reached stage AGENT_RUNNING with status RUNNING, then SIGKILLed the gov process tree (parent + detached child) to simulate a real crash, then ran gov run recover --stale.",
+      "recovery_result": "run_id / action=safe_resume / detail='worktree unchanged since agent launch'",
+      "final_status": "ABANDONED",
+      "notes": "Confirms the AGENT_RUNNING checkpoint's worktree-digest mechanism correctly distinguished 'agent never touched the worktree' from a mid-edit crash."
+    },
+    "8_panel_quorum_degradation": {
+      "batch_id": "panel-batch-1783787317790501640",
+      "plan_dir": ".gov-plan-scratch/panel-test (generated via gov plan --panel 2, a deterministic template — no live LLM call; removed via git clean after the test)",
+      "setup": "2-member panel; panel-member-2's agent set to glm (binary confirmed absent by gov doctor), guaranteeing it can never launch.",
+      "result": "panel degraded: hard_timeout_elapsed (panel member level exceeded 1m0s before every member got a turn); panel failed: only 0 member(s) produced a usable artifact (comparison needs at least 2)",
+      "member_outcomes": "panel-member-1 QUARANTINED (VALIDATION_FAILED — a real claude-code run that burned its 5000-token budget hunting for a schema file living outside its disposable worktree, a plan/worktree scratch-directory interaction gap worth a follow-up, not a Session 1 blocker); panel-member-2 TIMEOUT (glm never launched); panel-compare and panel-judge SKIPPED (depends_on unmet)",
+      "notes": "The degrade path fired correctly regardless of which member(s) failed — the quorum-insufficiency detection (fewer than min_success usable artifacts) is what this category tests, and it is proven."
+    }
+  },
+  "additional_real_runs_this_session_not_double_counted_above": [
+    {"job_id": "v14-session1-approved-run", "run_id": "...673399160", "backend": "claude-code", "status": "QUARANTINED", "failure_taxonomy": "BUDGET_EXCEEDED", "note": "first attempt, superseded by the fix"},
+    {"job_id": "v14-session1-validator-quarantine", "run_id": "codex attempt", "backend": "codex", "status": "QUARANTINED", "failure_taxonomy": "QUOTA_EXHAUSTED", "note": "real codex quota event; breaker tripped OPEN for real, later reset"},
+    {"job_id": "v14-session1-validator-quarantine", "run_id": "opencode attempt", "backend": "opencode", "status": "APPROVED", "note": "validator gamed by content, see category 2 notes"},
+    {"job_id": "v14-session1-safe-fallback", "run_id": "...850694450826 policy-violation retry", "backend": "codex", "status": "QUARANTINED", "failure_taxonomy": "POLICY_VIOLATION", "note": "the run that surfaced the codex CLI banner bug, fixed in f0372d5"},
+    {"job_id": "v14-session1-fallback-refused (pre-rename)", "backend": "codex", "status": "APPROVED", "merge_commit": "7e7b36cd0c236c24ac44770cb170df2378c05093", "note": "job_id reused a prior content hash and replayed instead of executing fresh; renamed to -2 and rerun for the real test"}
+  ],
+  "backends_exercised": ["claude-code", "codex", "opencode", "pi", "glm (as a deliberate binary_missing failure case)"],
+  "total_real_gov_run_invocations": 17,
+  "breaker_state_at_session_end": "all backends CLOSED (claude-code and codex breakers, tripped by this session's real and stubbed infra failures, explicitly reset via gov health reset before ending)",
+  "acceptance": "No feature in this evidence file is called shipped unless its code, tests, this acceptance evidence, and the rebuilt binaries above correspond to the same commit (226dc1eea68da217c25aa2c10ff66a6f22cd9913), per the plan's standing acceptance rule."
+}
