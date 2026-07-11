@@ -35,7 +35,7 @@ func TestAuditTranscriptPerBackendFormat(t *testing.T) {
 			if err := os.WriteFile(path, []byte(tc.line+"\n"), 0600); err != nil {
 				t.Fatal(err)
 			}
-			audit := auditTranscript(path, tc.format, contract)
+			audit := auditTranscript(path, tc.format, "", contract)
 			if audit.CostUSD != tc.cost || audit.CostUnavailable != tc.costUnavailable {
 				t.Fatalf("audit cost=%v unavailable=%v", audit.CostUSD, audit.CostUnavailable)
 			}
@@ -58,7 +58,7 @@ func TestAuditTranscriptRejectsMalformedJSONL(t *testing.T) {
 	c := contracts.Contract{}
 	c.Allowed.Execute = []string{"go test ./..."}
 	c.Budget.MaxCommands = 10
-	audit := auditTranscript(path, agents.TranscriptCodex, c)
+	audit := auditTranscript(path, agents.TranscriptCodex, "", c)
 	if len(audit.Violations) != 1 || !strings.Contains(audit.Violations[0], "malformed JSON on line 2") {
 		t.Fatalf("malformed transcript must fail closed: %v", audit.Violations)
 	}
@@ -78,7 +78,7 @@ func TestAuditGLMGoldenTranscript(t *testing.T) {
 		Allowed: contracts.Permissions{Execute: []string{"test -f output/result.txt"}},
 		Budget:  contracts.Budget{MaxCommands: 10},
 	}
-	audit := auditTranscript("testdata/glm_stream.jsonl", agents.TranscriptGLM, contract)
+	audit := auditTranscript("testdata/glm_stream.jsonl", agents.TranscriptGLM, "", contract)
 	if !audit.CostAvailable || audit.CostUSD != 0.1375 {
 		t.Fatalf("glm cost not extracted from result envelope: cost=%v available=%v (drift in cost_usd/total_cost_usd field?)", audit.CostUSD, audit.CostAvailable)
 	}

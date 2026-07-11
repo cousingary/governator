@@ -658,7 +658,23 @@ func transcriptTail(path string, maxBytes int64) string {
 	return string(buf[:n])
 }
 
-func auditTranscript(path, format string, c contracts.Contract) transcriptAudit {
+// relUnderWork returns subject's path relative to work (forward-slashed) and
+// true when subject is an absolute path that actually falls under work; it
+// returns ("", false) for anything else (relative subjects, commands, URLs,
+// or absolute paths outside the worktree), so callers can leave those
+// untouched.
+func relUnderWork(work, subject string) (string, bool) {
+	if work == "" || subject == "" || !filepath.IsAbs(subject) {
+		return "", false
+	}
+	rel, err := filepath.Rel(work, subject)
+	if err != nil || rel == "." || strings.HasPrefix(rel, "..") {
+		return "", false
+	}
+	return filepath.ToSlash(rel), true
+}
+
+func auditTranscript(path, format, work string, c contracts.Contract) transcriptAudit {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return transcriptAudit{Violations: []string{"transcript audit: " + err.Error()}, CostUnavailable: true}
@@ -765,7 +781,31 @@ func auditTranscript(path, format string, c contracts.Contract) transcriptAudit 
 	// changes this run's outcome, same posture as an assay advisory verdict).
 	secretPatterns, _ := protectedpaths.Patterns()
 	secretPatterns = append(append([]string{}, secretPatterns...), c.Forbidden.Paths...)
-	audit.RuleViolations = policy.EvaluateTemporalRules(events, secretPatterns, c.Allowed.Read)
+	// Real agent transcripts (Claude's Read/Write tool_use blocks) always
+	// carry absolute file_path values, but allowed.read/forbidden.paths are
+	// documented and validated as repository-relative patterns (see
+	// docs/contracts.md). Rewriting a read/write Subject to its
+	// worktree-relative form — but only when it actually falls under this
+	// run's disposable worktree — lets rule 2 (out-of-scope-read-precedes-
+	// write) match real transcripts correctly, while leaving rule 1 (secret-
+	// precedes-network) unaffected: global protected paths and any operator
+	// secret glob live outside the worktree, so they never take this branch
+	// and keep matching the raw absolute Subject exactly as before.
+	scopedEvents := events
+	if work != "" {
+		scopedEvents = make([]policy.Event, len(events))
+		copy(scopedEvents, events)
+		for i, e := range scopedEvents {
+			if e.Kind != policy.EventRead && e.Kind != policy.EventWrite {
+				continue
+			}
+			if rel, ok := relUnderWork(work, e.Subject); ok {
+				e.Subject = rel
+				scopedEvents[i] = e
+			}
+		}
+	}
+	audit.RuleViolations = policy.EvaluateTemporalRules(scopedEvents, secretPatterns, c.Allowed.Read)
 	for _, rv := range audit.RuleViolations {
 		if rv.Verdict == policy.RuleDeny {
 			audit.Violations = append(audit.Violations, "policy rule violation ("+rv.Rule+"): "+rv.Detail)
@@ -1277,7 +1317,7 @@ func (r *Runner) runOnce(ctx context.Context, c contracts.Contract) (RunRecord, 
 		rec.Notes = appendNote(rec.Notes, obs.Notes)
 	}
 	_ = redact(transcript)
-	audit := auditTranscript(transcript, agent.Capabilities().TranscriptFormat, c)
+	audit := auditTranscript(transcript, agent.Capabilities().TranscriptFormat, work, c)
 	if err := observability.RecordStage(db, id, "AUDITED", "", time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
 		return rec, err
 	}
