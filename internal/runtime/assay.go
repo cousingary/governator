@@ -31,19 +31,24 @@ func runAssayStep(ctx context.Context, db *sql.DB, cfg config.Config, c contract
 		Timeout: time.Duration(cfg.Assay.TimeoutSeconds) * time.Second,
 	}
 
-	// Ledger write errors are swallowed here, matching the existing pattern
-	// for validator rows a few lines above (INSERT INTO validators ...): an
-	// audit-row write failure must not itself quarantine an otherwise fine
-	// run.
+	// A ledger write failure here must not itself quarantine an otherwise
+	// fine run, matching the existing pattern for validator rows a few lines
+	// above (INSERT INTO validators ...). Since Session 4 a failure is no
+	// longer simply swallowed: noteOperationalFailure durably queues the
+	// write for `gov reconcile`.
 	record := func(verdict, policyVersion, checksHash string, failedChecks []string, durationMS int64) {
 		if failedChecks == nil {
 			failedChecks = []string{}
 		}
-		_ = observability.RecordAssayEvaluation(db, observability.AssayEvaluationRecord{
+		evalRec := observability.AssayEvaluationRecord{
 			RunID: runID, AttemptID: runID, JobID: c.JobID, Profile: c.Assay.Profile,
 			PolicyVersion: policyVersion, Verdict: verdict, FailedChecks: failedChecks,
 			ChecksHash: checksHash, DurationMS: durationMS, Created: created,
-		})
+		}
+		if err := observability.RecordAssayEvaluation(db, evalRec); err != nil {
+			payload, _ := json.Marshal(assayEvaluationPayload{Record: evalRec})
+			noteOperationalFailure(db, runID, opAssayEvaluation, err, string(payload))
+		}
 	}
 
 	if !assayCfg.Configured() {

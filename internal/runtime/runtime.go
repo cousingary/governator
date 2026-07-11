@@ -1251,7 +1251,10 @@ func (r *Runner) runOnce(ctx context.Context, c contracts.Contract) (RunRecord, 
 			}); err != nil {
 				return refused, err
 			}
-			_ = breaker.RecordFailure(db, refused.Agent, refused.FailureTaxonomy, time.Now().UTC())
+			if err := breaker.RecordFailure(db, refused.Agent, refused.FailureTaxonomy, time.Now().UTC()); err != nil {
+				payload, _ := json.Marshal(breakerFeedbackPayload{Agent: refused.Agent, FailureKind: refused.FailureTaxonomy})
+				noteOperationalFailure(db, refused.ID, opBreakerFailure, err, string(payload))
+			}
 			if err := observability.RecordStage(db, id, "QUARANTINED", "", time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
 				return refused, err
 			}
@@ -1365,9 +1368,11 @@ func (r *Runner) runOnce(ctx context.Context, c contracts.Contract) (RunRecord, 
 			rec.Notes = appendNote(rec.Notes, obs.Notes)
 		}
 		if obs.OutputTruncated {
-			_ = observability.RecordStage(db, id, "OUTPUT_TRUNCATED",
-				fmt.Sprintf("accepted=%d discarded=%d", obs.BytesAccepted, obs.BytesDiscarded),
-				time.Now().UTC().Format(time.RFC3339Nano))
+			truncDetail := fmt.Sprintf("accepted=%d discarded=%d", obs.BytesAccepted, obs.BytesDiscarded)
+			if err := observability.RecordStage(db, id, "OUTPUT_TRUNCATED", truncDetail, time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
+				payload, _ := json.Marshal(stageEventPayload{RunID: id, Stage: "OUTPUT_TRUNCATED", Detail: truncDetail})
+				noteOperationalFailure(db, id, opStageEvent, err, string(payload))
+			}
 			rec.Notes = appendNote(rec.Notes, fmt.Sprintf("output_truncated: %d bytes discarded of %d total", obs.BytesDiscarded, obs.BytesAccepted+obs.BytesDiscarded))
 		}
 	}
@@ -1387,8 +1392,13 @@ func (r *Runner) runOnce(ctx context.Context, c contracts.Contract) (RunRecord, 
 		}
 		// Best-effort, like the assay bridge's evaluation write: a ledger
 		// failure here must never block a run whose outcome was already
-		// decided by the (already-applied) audit.Violations above.
-		_ = observability.RecordPolicyRuleEvents(db, ruleRows)
+		// decided by the (already-applied) audit.Violations above. Session 4:
+		// a failure no longer just vanishes — noteOperationalFailure durably
+		// queues the write for `gov reconcile`.
+		if err := observability.RecordPolicyRuleEvents(db, ruleRows); err != nil {
+			payload, _ := json.Marshal(policyRuleEventsPayload{Rows: ruleRows})
+			noteOperationalFailure(db, id, opPolicyRuleEvents, err, string(payload))
+		}
 	}
 	rec.CostUSD = audit.CostUSD
 	rec.Usage = audit.Usage
@@ -1700,7 +1710,10 @@ func (r *Runner) runOnce(ctx context.Context, c contracts.Contract) (RunRecord, 
 	}
 	if infraKind == agents.InfraQuotaExhausted || infraKind == agents.InfraRateLimit {
 		if resetAt, ok := agents.ResetHint(transcriptTail(transcript, 4096), time.Now().UTC()); ok {
-			_ = quota.ApplyResetHint(db, rec.Agent, quota.DefaultAccount, resetAt, time.Now().UTC())
+			if err := quota.ApplyResetHint(db, rec.Agent, quota.DefaultAccount, resetAt, time.Now().UTC()); err != nil {
+				payload, _ := json.Marshal(quotaResetHintPayload{Agent: rec.Agent, Account: quota.DefaultAccount, ResetAt: resetAt})
+				noteOperationalFailure(db, rec.ID, opQuotaResetHint, err, string(payload))
+			}
 		}
 	}
 	// Circuit-breaker feedback (Session 2). A run that proved the backend was
@@ -1708,15 +1721,31 @@ func (r *Runner) runOnce(ctx context.Context, c contracts.Contract) (RunRecord, 
 	// produced bad work) — closes a probe / clears DEGRADED. Only an infra
 	// failure opens or extends a breaker (rule 3). A SPEND_CAP refusal never
 	// reaches here (it returns before the workspace is created). Breaker write
-	// errors are non-fatal: a failed audit row must not quarantine an otherwise
-	// approved run, so they are swallowed (the decision already landed).
+	// errors are non-fatal — a failed audit row must not quarantine an
+	// otherwise approved run (the decision already landed) — but since
+	// Session 4 they are durably queued via noteOperationalFailure instead of
+	// being swallowed outright.
 	if infraKind != agents.InfraNone {
-		_ = breaker.RecordFailure(db, rec.Agent, string(infraKind), time.Now().UTC())
+		if err := breaker.RecordFailure(db, rec.Agent, string(infraKind), time.Now().UTC()); err != nil {
+			payload, _ := json.Marshal(breakerFeedbackPayload{Agent: rec.Agent, FailureKind: string(infraKind)})
+			noteOperationalFailure(db, rec.ID, opBreakerFailure, err, string(payload))
+		}
 	} else if rec.FailureTaxonomy != "SPEND_CAP" {
-		_ = breaker.RecordSuccess(db, rec.Agent, time.Now().UTC())
+		if err := breaker.RecordSuccess(db, rec.Agent, time.Now().UTC()); err != nil {
+			payload, _ := json.Marshal(breakerFeedbackPayload{Agent: rec.Agent})
+			noteOperationalFailure(db, rec.ID, opBreakerSuccess, err, string(payload))
+		}
 	}
-	_ = spend.MaybeHalt(cfg, db)
-	_ = rn.Destroy(context.Background(), ws, rec.Status == "APPROVED")
+	if err := spend.MaybeHalt(cfg, db); err != nil {
+		noteOperationalFailure(db, rec.ID, opSpendHaltCheck, err, "{}")
+	}
+	runApproved := rec.Status == "APPROVED"
+	if err := rn.Destroy(context.Background(), ws, runApproved); err != nil {
+		payload, _ := json.Marshal(workspaceDestroyPayload{
+			Path: ws.Path, Root: ws.Root, Branch: ws.Branch, Git: ws.Git, Container: ws.Container, Approved: runApproved,
+		})
+		noteOperationalFailure(db, rec.ID, opWorkspaceDestroy, err, string(payload))
+	}
 	return rec, nil
 }
 

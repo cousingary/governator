@@ -163,7 +163,9 @@ CREATE TABLE IF NOT EXISTS artifacts(run_id TEXT NOT NULL, name TEXT NOT NULL, p
 CREATE TABLE IF NOT EXISTS panel_members(panel_id TEXT NOT NULL, member_label TEXT NOT NULL, job_id TEXT NOT NULL, agent TEXT NOT NULL DEFAULT '', artifact_name TEXT NOT NULL DEFAULT '', created TEXT NOT NULL DEFAULT '', PRIMARY KEY(panel_id,member_label));
 CREATE TABLE IF NOT EXISTS assay_evaluations(id INTEGER PRIMARY KEY AUTOINCREMENT, run_id TEXT NOT NULL, attempt_id TEXT NOT NULL DEFAULT '', job_id TEXT NOT NULL DEFAULT '', profile TEXT NOT NULL DEFAULT '', policy_version TEXT NOT NULL DEFAULT '', verdict TEXT NOT NULL DEFAULT '', failed_checks TEXT NOT NULL DEFAULT '', checks_hash TEXT NOT NULL DEFAULT '', duration_ms INTEGER NOT NULL DEFAULT 0, created TEXT NOT NULL DEFAULT '');
 CREATE TABLE IF NOT EXISTS run_stages(id INTEGER PRIMARY KEY AUTOINCREMENT, run_id TEXT NOT NULL, stage TEXT NOT NULL, detail TEXT NOT NULL DEFAULT '', created TEXT NOT NULL, UNIQUE(run_id,stage));
-CREATE TABLE IF NOT EXISTS policy_rule_events(id INTEGER PRIMARY KEY AUTOINCREMENT, run_id TEXT NOT NULL, rule TEXT NOT NULL, verdict TEXT NOT NULL, detail TEXT NOT NULL DEFAULT '', cause_seq INTEGER NOT NULL DEFAULT 0, trigger_seq INTEGER NOT NULL DEFAULT 0, created TEXT NOT NULL);`
+CREATE TABLE IF NOT EXISTS policy_rule_events(id INTEGER PRIMARY KEY AUTOINCREMENT, run_id TEXT NOT NULL, rule TEXT NOT NULL, verdict TEXT NOT NULL, detail TEXT NOT NULL DEFAULT '', cause_seq INTEGER NOT NULL DEFAULT 0, trigger_seq INTEGER NOT NULL DEFAULT 0, created TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS operational_errors(id INTEGER PRIMARY KEY AUTOINCREMENT, run_id TEXT NOT NULL DEFAULT '', op_kind TEXT NOT NULL, detail TEXT NOT NULL DEFAULT '', created TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS maintenance_outbox(id INTEGER PRIMARY KEY AUTOINCREMENT, run_id TEXT NOT NULL DEFAULT '', op_kind TEXT NOT NULL, payload TEXT NOT NULL DEFAULT '', status TEXT NOT NULL DEFAULT 'pending', attempts INTEGER NOT NULL DEFAULT 0, last_error TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL, updated_at TEXT NOT NULL);`
 	if _, err = db.Exec(schema); err != nil {
 		db.Close()
 		return nil, err
@@ -226,7 +228,9 @@ CREATE INDEX IF NOT EXISTS artifacts_name ON artifacts(name,run_id);
 CREATE INDEX IF NOT EXISTS panel_members_job ON panel_members(job_id);
 CREATE INDEX IF NOT EXISTS assay_evaluations_run ON assay_evaluations(run_id);
 CREATE INDEX IF NOT EXISTS run_stages_run ON run_stages(run_id);
-CREATE INDEX IF NOT EXISTS policy_rule_events_run ON policy_rule_events(run_id);`); err != nil {
+CREATE INDEX IF NOT EXISTS policy_rule_events_run ON policy_rule_events(run_id);
+CREATE INDEX IF NOT EXISTS operational_errors_run ON operational_errors(run_id,op_kind);
+CREATE INDEX IF NOT EXISTS maintenance_outbox_status ON maintenance_outbox(status,op_kind);`); err != nil {
 		db.Close()
 		return nil, err
 	}

@@ -21,6 +21,8 @@ Governator stores an SQLite WAL database in `ledger_dir` (default `$HOME/.govern
 | `batches` | One row per `gov batch run` invocation: batch id, started/finished timestamps, job count, quarantined count, and aggregate cost. |
 | `run_stages` | Durable stage checkpoints for one run (`PARSED`, `PREFLIGHTED`, `ROUTED`, `QUOTA_RESERVED`, `WORKSPACE_READY`, `AGENT_RUNNING`, `AUDITED`, `VALIDATING`, `ASSAYING`, `MERGED`, plus the terminal `APPROVED`/`QUARANTINED`/`ROLLED_BACK`/`ABANDONED` and the conditional `OUTPUT_TRUNCATED`), one row per `(run_id, stage)`. `AGENT_RUNNING`'s detail carries the pre-launch worktree digest recovery compares against. `OUTPUT_TRUNCATED` (Session 3a) is emitted when a Docker run's transcript hit the output cap; its detail is `accepted=<n> discarded=<n>` and it never appears silently — under `docker.require_complete_transcript` the run is also quarantined. See "Run recovery" below. |
 | `policy_rule_events` | Phase 6 temporal rule engine hits: rule name, verdict (`deny`/`flag`), detail, and the cause/trigger event sequence numbers, one row per violation, append-only per run. See `docs/gate.md`. |
+| `operational_errors` | Session 4 (Sol Phase 3): append-only audit row for a best-effort post-run operation (breaker feedback, quota reset hints, spend-halt recalculation, workspace/container destruction, a few audit-row writes) that failed inline — `run_id`, `op_kind`, `detail`, `created`. Never deleted. See "Durable operational reconciliation" below. |
+| `maintenance_outbox` | Session 4: durable retry queue paired with `operational_errors` — `run_id`, `op_kind`, op-kind-specific `payload` JSON, `status` (`pending`/`done`/`dead`), `attempts`, `last_error`, `created_at`, `updated_at`. `gov reconcile` drains `pending` rows; `gov cleanup --stale` marks unrecoverable ones `dead` without deleting them. |
 
 ## Operations
 
@@ -43,6 +45,8 @@ gov route --job-type code_change
 gov repair-packet RUN_ID
 gov eval harness harness_eval
 gov eval scorecard
+gov reconcile
+gov cleanup --stale [--max-attempts N]
 ```
 
 Scoring reports valid-output rate and cost per valid output. Routing orders agents using recorded failure evidence for the requested job type; it does not invent a recommendation when no evidence exists.
@@ -114,7 +118,7 @@ The additive `artifacts` table records typed handoff files copied out of run wor
 
 Panel mode anonymizes member outputs before judge context. The additive `panel_members` table maps `(panel_id, member_label)` to the real `job_id`, backend, and artifact name for operator audit, while model-facing comparison artifacts use only `panelist_N` labels.
 
-Note: as of Phase 7, `observability.RecordPanelMembers` has no caller in the actual panel run path (`internal/runtime/panel.go` tracks `PanelMemberOutcome` in memory but never persists it to `panel_members`). The table and its downstream consumer (`gov analytics summary`'s panel-disagreement metric, below) are wired and tested, but read real data only once a future session adds the `RecordPanelMembers` call to the panel runtime. Until then `gov analytics` correctly reports zero panels rather than fabricating a rate from empty evidence.
+`internal/runtime/panel.go`'s `recordPanelMembership` calls `observability.RecordPanelMembers` after every panel run (wired in the v1.4 Session 1 release), so `gov analytics summary`'s panel-disagreement metric (below) reads real data. A write failure here is queued through the Session 4 outbox (`op_kind=panel_members`, see below) rather than silently dropped.
 
 ## Analytics projection (Phase 7)
 
@@ -125,4 +129,17 @@ gov analytics summary
 gov analytics export [--out <path>]
 ```
 
-`summary` prints tab-separated tables (backend valid-output rate, failure type by backend, fallback frequency, quota utilization, repair depth, validator and assay failure clusters, panel disagreement, cost by outcome). `export` writes the same snapshot as line-delimited JSON, one object per metric row tagged with a `metric` field — the format any external system (a spreadsheet, `jq`, an OpenTelemetry or Langfuse adapter) can consume. There is no outbox or Supabase replication behind this yet: Phase 3A's assay bridge stays deliberately network-free, so JSONL export (to a file or stdout) is the whole shipping mechanism for now. An export failure never affects a run outcome — it runs after the fact, outside any governed job's lifecycle.
+`summary` prints tab-separated tables (backend valid-output rate, failure type by backend, fallback frequency, quota utilization, repair depth, validator and assay failure clusters, panel disagreement, cost by outcome). `export` writes the same snapshot as line-delimited JSON, one object per metric row tagged with a `metric` field — the format any external system (a spreadsheet, `jq`, an OpenTelemetry or Langfuse adapter) can consume. Phase 3A's assay bridge stays deliberately network-free, so JSONL export (to a file or stdout) is the whole shipping mechanism for now — it does not go through the Session 4 `maintenance_outbox` below (that outbox exists for post-run operational side effects, not for this read-only projection; a future session may route `export`/telemetry through it, but this one intentionally left analytics unchanged). An export failure never affects a run outcome — it runs after the fact, outside any governed job's lifecycle.
+
+## Durable operational reconciliation (Session 4 / Sol Phase 3)
+
+A run's decided outcome (`APPROVED`/`QUARANTINED`/...) must never be blocked by a handful of post-run secondary operations — breaker feedback, quota reset hints, spend-halt recalculation, workspace/container destruction, and a few audit-row writes (`policy_rule_events`, `OUTPUT_TRUNCATED`, `panel_members`, `assay_evaluations`) that share the same "must not block an already-decided run" design. Before this session, a failure in any of these was simply swallowed (`_ = ...`). It no longer vanishes:
+
+1. The operation is still attempted inline, exactly as before — the common case (success) has zero behavior change and zero added latency.
+2. On failure, `internal/runtime`'s `noteOperationalFailure` writes an `operational_errors` row (the audit trail: what failed, and why) plus a `maintenance_outbox` row (payload JSON with everything needed to retry the operation with no in-memory state from the original run).
+3. `gov reconcile` drains every `pending` outbox row, re-attempting the operation from its payload alone. A row that succeeds is marked `done`; one that fails again stays `pending` with `attempts` incremented and `last_error` updated, ready for the next pass.
+4. `gov cleanup --stale [--max-attempts N]` (default 8) marks a row `dead` once it has exhausted its retry budget, so `gov reconcile` stops looping on an operation that has proven unrecoverable. Rows are never deleted — `dead` just stops it competing for reconcile's attention; the row's `last_error` and the paired `operational_errors` rows remain as the permanent record.
+
+Both `operational_errors` and `maintenance_outbox` writes go to the same ledger database as the operation that failed, so a truly dead database can still lose the record — at that point the failure is written to stderr as the absolute last resort rather than discarded outright. This is a deliberate scope boundary: the goal is "no silent vanishing under normal failure modes" (transient lock contention, a briefly unreachable Docker daemon, a full disk that clears), not a distributed-transaction guarantee against total ledger loss.
+
+`v1.3` Phase 7 analytics (`gov analytics export`) was built as plain JSONL "since no outbox exists yet" — this session creates the outbox for operational reconciliation, but deliberately does not rewire analytics onto it; that remains a documented seam for a future session.

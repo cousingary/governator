@@ -337,6 +337,10 @@ func run(args []string) int {
 		return hookCmd(args[1:])
 	case "gate":
 		return gateCmd(args[1:])
+	case "reconcile":
+		return reconcileCmd(args[1:])
+	case "cleanup":
+		return cleanupCmd(args[1:])
 	case "doctor":
 		if len(args) != 1 {
 			return bad("usage: gov doctor")
@@ -653,6 +657,70 @@ func quotaCmd(args []string) int {
 			w.Backend, w.Account, w.WindowType, limit, w.MeasuredUsage, w.ReservedUsage, headroom*100,
 			orHealthDash(formatCooldown(w.ResetAt)), w.Confidence, w.Source)
 	}
+	return 0
+}
+
+// reconcileCmd drains the maintenance_outbox (Session 4 / Sol Phase 3): every
+// post-run operation that was swallowed before now durably retries here
+// instead of vanishing with the run that first attempted it.
+func reconcileCmd(args []string) int {
+	if len(args) != 0 {
+		return bad("usage: gov reconcile")
+	}
+	report, err := govruntime.Reconcile(context.Background())
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "reconcile:", err)
+		return 1
+	}
+	output, err := json.MarshalIndent(report, "", "  ")
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "reconcile:", err)
+		return 1
+	}
+	fmt.Println(string(output))
+	if report.Retried > 0 {
+		return 1
+	}
+	return 0
+}
+
+// cleanupCmd handles `gov cleanup --stale`: outbox rows that have exhausted
+// their retry budget are marked dead so `gov reconcile` stops looping on an
+// operation that has proven unrecoverable. Rows are never deleted — the
+// operational_errors/outbox audit trail survives; only the status changes.
+func cleanupCmd(args []string) int {
+	if len(args) < 1 || args[0] != "--stale" {
+		return bad("usage: gov cleanup --stale [--max-attempts N]")
+	}
+	maxAttempts := 8
+	rest := args[1:]
+	for len(rest) > 0 {
+		switch rest[0] {
+		case "--max-attempts":
+			if len(rest) < 2 {
+				return bad("usage: gov cleanup --stale [--max-attempts N]")
+			}
+			n, err := strconv.Atoi(rest[1])
+			if err != nil || n < 1 {
+				return bad("gov cleanup: --max-attempts must be a positive integer")
+			}
+			maxAttempts = n
+			rest = rest[2:]
+		default:
+			return bad("usage: gov cleanup --stale [--max-attempts N]")
+		}
+	}
+	report, err := govruntime.CleanupStale(maxAttempts)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "cleanup:", err)
+		return 1
+	}
+	output, err := json.MarshalIndent(report, "", "  ")
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "cleanup:", err)
+		return 1
+	}
+	fmt.Println(string(output))
 	return 0
 }
 
@@ -1907,6 +1975,8 @@ Usage:
   gov panel compare --out <artifact.json> <input.json>...
   gov gate check
   gov parity report
+  gov reconcile
+  gov cleanup --stale [--max-attempts N]
   gov doctor
   gov health [reset <backend>]
   gov version`)

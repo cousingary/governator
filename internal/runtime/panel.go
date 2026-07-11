@@ -3,6 +3,7 @@ package runtime
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"sort"
 	"time"
@@ -345,7 +346,11 @@ func recordPanelMembership(home string, spec contracts.PanelSpec, assigned []con
 		return
 	}
 	defer db.Close()
-	_ = observability.RecordPanelMembers(db, records, time.Now().UTC().Format(time.RFC3339Nano))
+	created := time.Now().UTC().Format(time.RFC3339Nano)
+	if err := observability.RecordPanelMembers(db, records, created); err != nil {
+		payload, _ := json.Marshal(panelMembersPayload{Records: records, Created: created})
+		noteOperationalFailure(db, spec.ID, opPanelMembers, err, string(payload))
+	}
 }
 
 // adjustComparisonConsumes trims the comparison job's Consumes (and the
