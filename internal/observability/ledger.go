@@ -162,7 +162,8 @@ CREATE TABLE IF NOT EXISTS quota_reservations(id INTEGER PRIMARY KEY AUTOINCREME
 CREATE TABLE IF NOT EXISTS artifacts(run_id TEXT NOT NULL, name TEXT NOT NULL, path TEXT NOT NULL, sha256 TEXT NOT NULL, bytes INTEGER NOT NULL DEFAULT 0, schema_ok INTEGER NOT NULL DEFAULT 0, created TEXT NOT NULL DEFAULT '', PRIMARY KEY(run_id,name));
 CREATE TABLE IF NOT EXISTS panel_members(panel_id TEXT NOT NULL, member_label TEXT NOT NULL, job_id TEXT NOT NULL, agent TEXT NOT NULL DEFAULT '', artifact_name TEXT NOT NULL DEFAULT '', created TEXT NOT NULL DEFAULT '', PRIMARY KEY(panel_id,member_label));
 CREATE TABLE IF NOT EXISTS assay_evaluations(id INTEGER PRIMARY KEY AUTOINCREMENT, run_id TEXT NOT NULL, attempt_id TEXT NOT NULL DEFAULT '', job_id TEXT NOT NULL DEFAULT '', profile TEXT NOT NULL DEFAULT '', policy_version TEXT NOT NULL DEFAULT '', verdict TEXT NOT NULL DEFAULT '', failed_checks TEXT NOT NULL DEFAULT '', checks_hash TEXT NOT NULL DEFAULT '', duration_ms INTEGER NOT NULL DEFAULT 0, created TEXT NOT NULL DEFAULT '');
-CREATE TABLE IF NOT EXISTS run_stages(id INTEGER PRIMARY KEY AUTOINCREMENT, run_id TEXT NOT NULL, stage TEXT NOT NULL, detail TEXT NOT NULL DEFAULT '', created TEXT NOT NULL, UNIQUE(run_id,stage));`
+CREATE TABLE IF NOT EXISTS run_stages(id INTEGER PRIMARY KEY AUTOINCREMENT, run_id TEXT NOT NULL, stage TEXT NOT NULL, detail TEXT NOT NULL DEFAULT '', created TEXT NOT NULL, UNIQUE(run_id,stage));
+CREATE TABLE IF NOT EXISTS policy_rule_events(id INTEGER PRIMARY KEY AUTOINCREMENT, run_id TEXT NOT NULL, rule TEXT NOT NULL, verdict TEXT NOT NULL, detail TEXT NOT NULL DEFAULT '', cause_seq INTEGER NOT NULL DEFAULT 0, trigger_seq INTEGER NOT NULL DEFAULT 0, created TEXT NOT NULL);`
 	if _, err = db.Exec(schema); err != nil {
 		db.Close()
 		return nil, err
@@ -200,6 +201,18 @@ CREATE TABLE IF NOT EXISTS run_stages(id INTEGER PRIMARY KEY AUTOINCREMENT, run_
 		db.Close()
 		return nil, alterErr
 	}
+	// sources/policy_hash (Phase 6) attach provenance to every interactive-hook
+	// gate decision: which policy layer (job contract / project doctrine / org
+	// policy) produced the Finding, and a fingerprint of the exact protected-
+	// path manifest + rule-set version consulted. Empty defaults on
+	// pre-existing rows are honest — those decisions predate the provenance
+	// layer and were genuinely never attributed to a source.
+	for _, column := range []string{"sources TEXT NOT NULL DEFAULT ''", "policy_hash TEXT NOT NULL DEFAULT ''"} {
+		if _, alterErr := db.Exec("ALTER TABLE hook_events ADD COLUMN " + column); alterErr != nil && !strings.Contains(strings.ToLower(alterErr.Error()), "duplicate column") {
+			db.Close()
+			return nil, alterErr
+		}
+	}
 	if _, err = db.Exec(`CREATE INDEX IF NOT EXISTS runs_key ON runs(contract_hash, approved_head, status);
 CREATE INDEX IF NOT EXISTS runs_failure ON runs(failure_taxonomy, created);
 CREATE INDEX IF NOT EXISTS runs_repair_of ON runs(repair_of);
@@ -212,7 +225,8 @@ CREATE INDEX IF NOT EXISTS quota_reservations_open ON quota_reservations(settled
 CREATE INDEX IF NOT EXISTS artifacts_name ON artifacts(name,run_id);
 CREATE INDEX IF NOT EXISTS panel_members_job ON panel_members(job_id);
 CREATE INDEX IF NOT EXISTS assay_evaluations_run ON assay_evaluations(run_id);
-CREATE INDEX IF NOT EXISTS run_stages_run ON run_stages(run_id);`); err != nil {
+CREATE INDEX IF NOT EXISTS run_stages_run ON run_stages(run_id);
+CREATE INDEX IF NOT EXISTS policy_rule_events_run ON policy_rule_events(run_id);`); err != nil {
 		db.Close()
 		return nil, err
 	}
@@ -426,6 +440,65 @@ func StageHistory(db *sql.DB, runID string) ([]StageRecord, error) {
 			return nil, err
 		}
 		out = append(out, s)
+	}
+	return out, rows.Err()
+}
+
+// PolicyRuleEventRecord is one Phase 6 temporal-rule hit: a run's event
+// graph (derived from its agent transcript's tool_use/tool_result blocks)
+// produced a Cause event that, once observed, made a later Trigger event a
+// violation of Rule. Verdict is "deny" (blocking, folded into the run's
+// audit violations) or "flag" (advisory-only, ledgered but never changes the
+// run's outcome — same non-authoritative posture as an assay advisory
+// verdict). Kept as a plain local struct (not reusing internal/policy's
+// RuleViolation type) so observability stays the generic ledger layer and
+// doesn't need to import policy's Go types.
+type PolicyRuleEventRecord struct {
+	RunID      string
+	Rule       string
+	Verdict    string
+	Detail     string
+	CauseSeq   int
+	TriggerSeq int
+	Created    string
+}
+
+// RecordPolicyRuleEvents appends one row per violation. Append-only, like
+// repair_packets/fallback_attempts — a re-audited run keeps its full rule
+// history instead of overwriting it.
+func RecordPolicyRuleEvents(db *sql.DB, events []PolicyRuleEventRecord) error {
+	if len(events) == 0 {
+		return nil
+	}
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	for _, e := range events {
+		if _, err := tx.Exec(`INSERT INTO policy_rule_events(run_id,rule,verdict,detail,cause_seq,trigger_seq,created) VALUES(?,?,?,?,?,?,?)`,
+			e.RunID, e.Rule, e.Verdict, e.Detail, e.CauseSeq, e.TriggerSeq, e.Created); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
+// PolicyRuleEventsForRun returns every policy_rule_events row for one run,
+// oldest first — for tests and CLI inspection.
+func PolicyRuleEventsForRun(db *sql.DB, runID string) ([]PolicyRuleEventRecord, error) {
+	rows, err := db.Query(`SELECT run_id,rule,verdict,detail,cause_seq,trigger_seq,created FROM policy_rule_events WHERE run_id=? ORDER BY id ASC`, runID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []PolicyRuleEventRecord
+	for rows.Next() {
+		var e PolicyRuleEventRecord
+		if err := rows.Scan(&e.RunID, &e.Rule, &e.Verdict, &e.Detail, &e.CauseSeq, &e.TriggerSeq, &e.Created); err != nil {
+			return nil, err
+		}
+		out = append(out, e)
 	}
 	return out, rows.Err()
 }

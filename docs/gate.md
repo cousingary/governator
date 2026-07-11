@@ -16,6 +16,12 @@ Governator exposes one decision core through a Claude Code dialect and a harness
 
 Classification is deliberately conservative and lexical. A native sandbox and the runtime's post-run fingerprint remain necessary.
 
+## Policy decision provenance
+
+Every decision also carries `Sources` and `PolicyHash` (`internal/policy.PolicyDecision`, attached by `internal/runtime.attachProvenance`): `Sources` names which policy layer the finding represents — F2/F4 (protected paths) are `project_doctrine`, F1/F3 (the hardcoded denylist and command classifier) are `org_policy`, and a hard filter raised by the job's own contract (preflight risk flags) is `job_contract`. `PolicyHash` fingerprints the exact protected-path manifest and rule-set version consulted, so two decisions sharing a hash are provably comparing the same policy. `--run ID` persists both into `hook_events.sources`/`hook_events.policy_hash`.
+
+A separate, compact temporal rule engine (`internal/policy.EvaluateTemporalRules`) runs over a run's event graph (derived from its agent transcript's tool-call blocks) rather than a single tool call in isolation, looking for sequences the single-call F1-F7 checks can't see: a protected/secret-path read followed by a network request (deny), a read outside the contract's `allowed.read` scope followed by a write (deny), and tool output containing a suspected prompt-injection marker followed by a shell command (advisory flag only — never blocking). Deny-verdict hits fold into the run's audit violations; every hit (deny and flag) is ledgered to `policy_rule_events` via `RecordPolicyRuleEvents`.
+
 ## Claude Code hook dialect
 
 `gov hook pre-tool-use` accepts Claude's hook object on stdin:

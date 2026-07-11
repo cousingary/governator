@@ -25,6 +25,26 @@ type GateDecision struct {
 	Reason   string `json:"reason,omitempty"`
 	Degraded bool   `json:"degraded,omitempty"`
 	Finding  string `json:"finding,omitempty"` // which F1-F7 axis decided
+	// Sources and PolicyHash are the Phase 6 provenance layer: Sources names
+	// which policy layer(s) the Finding axis represents (see
+	// policy.SourcesForFinding), and PolicyHash fingerprints the exact
+	// protected-path manifest + rule-set version consulted (see
+	// policy.GatePolicyHash) — attached uniformly by attachProvenance so
+	// every GateDecide/GateDegradedDecide return site carries them without
+	// touching the existing F1-F7 branch logic itself.
+	Sources    []string `json:"sources,omitempty"`
+	PolicyHash string   `json:"policy_hash,omitempty"`
+}
+
+// attachProvenance fills Sources/PolicyHash on an already-decided
+// GateDecision from its Finding axis. Kept as a single wrapping step (called
+// at every return site) rather than threaded through the F1-F7 branch logic,
+// so the parity-locked decision matrix in GateDecide/GateDegradedDecide never
+// changes shape.
+func attachProvenance(d GateDecision) GateDecision {
+	d.Sources = policy.SourcesForFinding(d.Finding)
+	d.PolicyHash = policy.GatePolicyHash(loadProtectedPatterns())
+	return d
 }
 
 // GateInput is the PreToolUse payload. ToolName/tool_input mirror Claude Code;
@@ -297,14 +317,14 @@ func GateDecide(in GateInput) (decision GateDecision) {
 			path, _ = in.ToolInput["notebook_path"].(string)
 		}
 		if reason := protectedReasonForPath(path); reason != "" {
-			return GateDecision{Allow: false, Reason: reason, Finding: "F2"}
+			return attachProvenance(GateDecision{Allow: false, Reason: reason, Finding: "F2"})
 		}
-		return GateDecision{Allow: true, Finding: "F2"}
+		return attachProvenance(GateDecision{Allow: true, Finding: "F2"})
 	}
 
 	// Non-Bash, non-mutating tools (Read, Grep, …) carry no free-form string.
 	if in.ToolName != "Bash" {
-		return GateDecision{Allow: true, Finding: "default"}
+		return attachProvenance(GateDecision{Allow: true, Finding: "default"})
 	}
 
 	cmd, _ := in.ToolInput["command"].(string)
@@ -312,14 +332,14 @@ func GateDecide(in GateInput) (decision GateDecision) {
 	// F4: Bash-plane protected-path enforcement runs for EVERY Bash command
 	// before classification. Catches opaque scripts the classifier can't read.
 	if reason := bashProtectedReason(cmd, cwd); reason != "" {
-		return GateDecision{Allow: false, Reason: reason, Finding: "F4"}
+		return attachProvenance(GateDecision{Allow: false, Reason: reason, Finding: "F4"})
 	}
 
 	// F3: hardened classify_shell_command (high_danger_only — block
 	// irreversible/bulk: rm -rf/-r, shred, find -delete, force/main push, DROP).
 	class := policy.ClassifyShellCommand(cmd, true)
 	if class == nil {
-		return GateDecision{Allow: true, Finding: "F3"}
+		return attachProvenance(GateDecision{Allow: true, Finding: "F3"})
 	}
 	// DELIBERATE DIVERGENCE from harness_gate.py: Python consults
 	// authority.check(verb, resource) and can allow a classified command the
@@ -327,10 +347,10 @@ func GateDecide(in GateInput) (decision GateDecision) {
 	// drop) command unconditionally on the interactive plane — stricter than
 	// Python by design, not a parity gap. There is no allow path for these
 	// verbs here.
-	return GateDecision{
+	return attachProvenance(GateDecision{
 		Allow: false, Finding: "F3",
 		Reason: class.Verb + " " + class.Resource + " forbidden by authority manifest",
-	}
+	})
 }
 
 // GateDegradedDecide is the F1 path: the gate cannot fully evaluate (manifest
@@ -344,9 +364,9 @@ func GateDegradedDecide(in GateInput, why string) GateDecision {
 			path, _ = in.ToolInput["notebook_path"].(string)
 		}
 		if reason := protectedReasonForPath(path); reason != "" {
-			return GateDecision{Allow: false, Reason: reason, Degraded: true, Finding: "F2"}
+			return attachProvenance(GateDecision{Allow: false, Reason: reason, Degraded: true, Finding: "F2"})
 		}
-		return GateDecision{Allow: true, Degraded: true, Finding: "F1"}
+		return attachProvenance(GateDecision{Allow: true, Degraded: true, Finding: "F1"})
 	}
 	if in.ToolName == "Bash" {
 		cmd, _ := in.ToolInput["command"].(string)
@@ -355,16 +375,16 @@ func GateDegradedDecide(in GateInput, why string) GateDecision {
 			cwd, _ = os.Getwd()
 		}
 		if reason := bashProtectedReason(cmd, cwd); reason != "" {
-			return GateDecision{Allow: false, Reason: reason, Degraded: true, Finding: "F4"}
+			return attachProvenance(GateDecision{Allow: false, Reason: reason, Degraded: true, Finding: "F4"})
 		}
 		if hit := fallbackDangerHit(cmd); hit != "" {
-			return GateDecision{
+			return attachProvenance(GateDecision{
 				Allow: false, Degraded: true, Finding: "F1",
 				Reason: why + " — blocked by degraded-mode safety net: " + hit,
-			}
+			})
 		}
 	}
-	return GateDecision{Allow: true, Degraded: true, Finding: "F1"}
+	return attachProvenance(GateDecision{Allow: true, Degraded: true, Finding: "F1"})
 }
 
 // hookJSON computes the stdout payload for a hook decision. An explicit

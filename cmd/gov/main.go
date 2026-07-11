@@ -1772,8 +1772,9 @@ func recordHookDecision(runID string, in govruntime.GateInput, d govruntime.Gate
 	payload, _ := json.Marshal(in.ToolInput)
 	cmd, _ := in.ToolInput["command"].(string)
 	detail := in.ToolName + " " + cmd + " " + string(payload)
-	_, _ = db.Exec(`INSERT INTO hook_events(run_id, tool, decision, finding, detail, created) VALUES (?, ?, ?, ?, ?, ?)`,
-		runID, in.ToolName, decision, d.Finding, detail, time.Now().UTC().Format(time.RFC3339))
+	sourcesJSON, _ := json.Marshal(d.Sources)
+	_, _ = db.Exec(`INSERT INTO hook_events(run_id, tool, decision, finding, detail, sources, policy_hash, created) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+		runID, in.ToolName, decision, d.Finding, detail, string(sourcesJSON), d.PolicyHash, time.Now().UTC().Format(time.RFC3339))
 }
 
 func contractError(path string, err error) int {

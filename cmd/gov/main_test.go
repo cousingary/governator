@@ -301,3 +301,40 @@ func TestHandoffCommandReturnsCompactRunEvidence(t *testing.T) {
 		t.Fatalf("handoff=%+v output=%s", handoff, output)
 	}
 }
+
+// TestHookDecisionRecordsProvenance is the Phase 6 acceptance check: every
+// gate denial ledgered via `gov hook pre-tool-use --run` carries the
+// Sources+PolicyHash provenance GateDecide attached (internal/policy,
+// internal/runtime/gate.go attachProvenance), not just the bare
+// allow/deny+finding the pre-Phase-6 hook_events schema recorded.
+func TestHookDecisionRecordsProvenance(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("GOV_HOME", home)
+	t.Setenv("GOV_CONFIG", filepath.Join(t.TempDir(), "missing-config.yaml"))
+
+	payload := `{"tool_name":"Bash","tool_input":{"command":"rm -rf dist"}}`
+	code, _ := captureRunInput(t, []string{"hook", "pre-tool-use", "--run", "provenance-run"}, payload)
+	if code != 0 {
+		t.Fatalf("hook exit=%d", code)
+	}
+
+	db, err := observability.Open(home)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	var decision, finding, sources, policyHash string
+	if err := db.QueryRow(`SELECT decision,finding,sources,policy_hash FROM hook_events WHERE run_id=?`, "provenance-run").
+		Scan(&decision, &finding, &sources, &policyHash); err != nil {
+		t.Fatalf("hook_events row: %v", err)
+	}
+	if decision != "deny" || finding != "F3" {
+		t.Fatalf("decision=%s finding=%s, want deny/F3", decision, finding)
+	}
+	if !strings.Contains(sources, "org_policy") {
+		t.Fatalf("sources=%q, want it to contain org_policy", sources)
+	}
+	if policyHash == "" {
+		t.Fatal("policy_hash was not recorded")
+	}
+}

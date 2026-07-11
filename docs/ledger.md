@@ -16,10 +16,11 @@ Governator stores an SQLite WAL database in `ledger_dir` (default `$HOME/.govern
 | `violations` | Policy, budget, transcript, and validation failures. |
 | `repair_packets` | Generated failure packet JSON and taxonomy. |
 | `eval_runs` | Hermetic harness-evaluation outcomes. |
-| `hook_events` | Interactive tool decision, finding, and detail. |
+| `hook_events` | Interactive tool decision, finding, detail, and (Phase 6) `sources`/`policy_hash` provenance — see `docs/gate.md`. |
 | `parity_events` | Go/Python shadow decisions and availability. |
 | `batches` | One row per `gov batch run` invocation: batch id, started/finished timestamps, job count, quarantined count, and aggregate cost. |
 | `run_stages` | Durable stage checkpoints for one run (`PARSED`, `PREFLIGHTED`, `ROUTED`, `QUOTA_RESERVED`, `WORKSPACE_READY`, `AGENT_RUNNING`, `AUDITED`, `VALIDATING`, `ASSAYING`, `MERGED`, plus the terminal `APPROVED`/`QUARANTINED`/`ROLLED_BACK`/`ABANDONED`), one row per `(run_id, stage)`. `AGENT_RUNNING`'s detail carries the pre-launch worktree digest recovery compares against. See "Run recovery" below. |
+| `policy_rule_events` | Phase 6 temporal rule engine hits: rule name, verdict (`deny`/`flag`), detail, and the cause/trigger event sequence numbers, one row per violation, append-only per run. See `docs/gate.md`. |
 
 ## Operations
 

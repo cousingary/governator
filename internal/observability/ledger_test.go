@@ -248,3 +248,37 @@ func TestRecordAssayEvaluationAppendsRows(t *testing.T) {
 		t.Fatalf("expected empty (non-nil) failed_checks for skipped row, got %#v", rows[1].FailedChecks)
 	}
 }
+
+// TestRecordPolicyRuleEventsAppendsRows is the Phase 6 ledger acceptance
+// check: a run's temporal-rule violations (deny AND advisory flag alike)
+// round-trip through policy_rule_events, append-only per run like
+// assay_evaluations.
+func TestRecordPolicyRuleEventsAppendsRows(t *testing.T) {
+	home := t.TempDir()
+	db, err := Open(home)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	if err := RecordPolicyRuleEvents(db, []PolicyRuleEventRecord{
+		{RunID: "run-1", Rule: "secret-read-precedes-network", Verdict: "deny", Detail: "read then fetch", CauseSeq: 0, TriggerSeq: 2, Created: "2026-07-11T00:00:00Z"},
+		{RunID: "run-1", Rule: "suspected-injection-precedes-exec", Verdict: "flag", Detail: "output then exec", CauseSeq: 3, TriggerSeq: 4, Created: "2026-07-11T00:00:01Z"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	rows, err := PolicyRuleEventsForRun(db, "run-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 2 {
+		t.Fatalf("expected 2 rows, got %d: %+v", len(rows), rows)
+	}
+	if rows[0].Verdict != "deny" || rows[0].CauseSeq != 0 || rows[0].TriggerSeq != 2 {
+		t.Fatalf("deny row not persisted correctly: %+v", rows[0])
+	}
+	if rows[1].Verdict != "flag" || rows[1].Rule != "suspected-injection-precedes-exec" {
+		t.Fatalf("flag row not persisted correctly: %+v", rows[1])
+	}
+}

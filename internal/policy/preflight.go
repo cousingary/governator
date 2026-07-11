@@ -27,6 +27,12 @@ type PreflightReport struct {
 	Steps         []string       `json:"steps"`
 	Mode          contracts.Mode `json:"mode"`
 	Risk          Risk           `json:"risk"`
+	// Decision carries the same information as RiskFlags with explicit
+	// provenance: which policy layer (job contract vs. hardcoded org policy)
+	// raised each flag, and a hash identifying the exact preflight policy
+	// consulted. RiskFlags stays the primary field (existing callers match
+	// against it); Decision is additive.
+	Decision PolicyDecision `json:"decision"`
 }
 
 func Preflight(c contracts.Contract) (PreflightReport, error) {
@@ -70,10 +76,13 @@ func Preflight(c contracts.Contract) (PreflightReport, error) {
 		return report, err
 	}
 
+	var decisions []PolicyDecision
 	for _, pattern := range c.Preflight.IntendedWrites {
 		if !patternWithin(pattern, c.Allowed.Write) {
 			report.Risk = RiskBlocked
-			report.RiskFlags = append(report.RiskFlags, "intended write exceeds allowed.write: "+pattern)
+			reason := "intended write exceeds allowed.write: " + pattern
+			report.RiskFlags = append(report.RiskFlags, reason)
+			decisions = append(decisions, Deny(SourceJobContract, reason))
 		}
 		for _, file := range files {
 			if glob(pattern, file) {
@@ -97,7 +106,9 @@ func Preflight(c contracts.Contract) (PreflightReport, error) {
 	for _, command := range c.Allowed.Execute {
 		if class := ClassifyShellCommand(command, false); class != nil {
 			report.Risk = RiskBlocked
-			report.RiskFlags = append(report.RiskFlags, fmt.Sprintf("destructive command allowed: %s %s", class.Verb, class.Resource))
+			reason := fmt.Sprintf("destructive command allowed: %s %s", class.Verb, class.Resource)
+			report.RiskFlags = append(report.RiskFlags, reason)
+			decisions = append(decisions, Deny(SourceOrgPolicy, reason))
 		}
 	}
 	if report.Risk != RiskBlocked {
@@ -111,11 +122,20 @@ func Preflight(c contracts.Contract) (PreflightReport, error) {
 		switch {
 		case broad || c.Budget.MaxFilesChanged > 50 || c.Budget.MaxLinesChanged > 2000 || c.Budget.MaxNewFiles > 30 || c.Budget.MaxDeleted > 0:
 			report.Risk = RiskHigh
-			report.RiskFlags = append(report.RiskFlags, "large or destructive write envelope")
+			reason := "large or destructive write envelope"
+			report.RiskFlags = append(report.RiskFlags, reason)
+			decisions = append(decisions, Deny(SourceJobContract, reason))
 		case c.Mode == contracts.ModeBatchWorker || c.Budget.MaxFilesChanged > 10 || c.Budget.MaxLinesChanged > 500 || c.Budget.MaxNewFiles > 10:
 			report.Risk = RiskMedium
-			report.RiskFlags = append(report.RiskFlags, "multi-file write envelope")
+			reason := "multi-file write envelope"
+			report.RiskFlags = append(report.RiskFlags, reason)
+			decisions = append(decisions, Deny(SourceJobContract, reason))
 		}
+	}
+	if len(decisions) == 0 {
+		report.Decision = Allow(SourceJobContract, SourceOrgPolicy)
+	} else {
+		report.Decision = Combine(decisions...)
 	}
 	sort.Strings(report.TargetFiles)
 	report.TargetFiles = unique(report.TargetFiles)

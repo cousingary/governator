@@ -515,6 +515,13 @@ type transcriptAudit struct {
 	Usage           observability.TokenUsage
 	ToolCalls       int
 	TranscriptBytes int64
+	// RuleViolations (Phase 6) is every hit from the temporal rule engine —
+	// both the blocking (deny) kind, which is also folded into Violations
+	// above, and the advisory (flag) kind, which is not. Callers ledger the
+	// full list via observability.RecordPolicyRuleEvents regardless of
+	// verdict, so an advisory flag stays visible for operator review even
+	// though it never changed this run's outcome.
+	RuleViolations []policy.RuleViolation
 }
 
 func transcriptCommand(format string, value map[string]any) string {
@@ -559,6 +566,64 @@ func transcriptCommand(format string, value map[string]any) string {
 		}
 	}
 	return ""
+}
+
+// transcriptResultText extracts the plain-text payload of an Anthropic-style
+// tool_result content field, which is either a bare string or a list of
+// content blocks ({"type":"text","text":"..."}). Used only to feed the
+// starter rule set's injection-marker scan (policy.LooksLikeInjection) — the
+// text is read, never interpreted or executed.
+func transcriptResultText(content any) string {
+	switch v := content.(type) {
+	case string:
+		return v
+	case []any:
+		var parts []string
+		for _, item := range v {
+			block, ok := item.(map[string]any)
+			if !ok {
+				continue
+			}
+			if text, ok := block["text"].(string); ok {
+				parts = append(parts, text)
+			}
+		}
+		return strings.Join(parts, "\n")
+	}
+	return ""
+}
+
+// transcriptEvent extracts zero or more Phase 6 policy.Event nodes from one
+// transcript line. Claude/GLM transcripts carry explicit Anthropic-style
+// content blocks (tool_use: name+input; tool_result: content) so every tool
+// call and its output classify directly via policy.ClassifyEvent /
+// policy.ToolOutputEvent. Other backends' transcript formats don't expose a
+// generic tool-call schema the way Claude's does, so they fall back to the
+// exec-only event already available from command (transcriptCommand's
+// extraction, reused rather than recomputed) — the temporal rules that need
+// read/write/network events simply never fire for those formats, which is a
+// coverage gap, not a false signal.
+func transcriptEvent(format string, value map[string]any, seq int, command string) []policy.Event {
+	typeName, _ := value["type"].(string)
+	switch format {
+	case agents.TranscriptClaude, agents.TranscriptGLM:
+		switch typeName {
+		case "tool_use":
+			name, _ := value["name"].(string)
+			input, _ := value["input"].(map[string]any)
+			return []policy.Event{policy.ClassifyEvent(seq, name, input)}
+		case "tool_result":
+			if text := transcriptResultText(value["content"]); text != "" {
+				return []policy.Event{policy.ToolOutputEvent(seq, "tool_result", text)}
+			}
+		}
+		return nil
+	default:
+		if command != "" {
+			return []policy.Event{policy.ClassifyEvent(seq, "bash", map[string]any{"command": command})}
+		}
+		return nil
+	}
 }
 
 // transcriptTail returns the last maxBytes of a transcript file as a string,
@@ -608,6 +673,8 @@ func auditTranscript(path, format string, c contracts.Contract) transcriptAudit 
 	if !known[format] {
 		audit.CostUnavailable = true
 	}
+	var events []policy.Event
+	eventSeq := 0
 	var walk func(any)
 	walk = func(v any) {
 		switch x := v.(type) {
@@ -616,8 +683,14 @@ func auditTranscript(path, format string, c contracts.Contract) transcriptAudit 
 				walk(item)
 			}
 		case map[string]any:
-			if command := transcriptCommand(format, x); command != "" {
+			command := transcriptCommand(format, x)
+			if command != "" {
 				audit.Commands = append(audit.Commands, command)
+			}
+			nodeEvents := transcriptEvent(format, x, eventSeq, command)
+			for _, e := range nodeEvents {
+				events = append(events, e)
+				eventSeq++
 			}
 			for _, key := range []string{"total_cost_usd", "cost_usd"} {
 				if cost, ok := x[key].(float64); ok {
@@ -681,6 +754,21 @@ func auditTranscript(path, format string, c contracts.Contract) transcriptAudit 
 	for _, phrase := range []string{"while i'm here", "while i’m here", "i'll also refactor", "i’ll also refactor", "inspect the broader project"} {
 		if strings.Contains(lower, phrase) {
 			audit.Violations = append(audit.Violations, "scope-expansion tripwire: "+phrase)
+		}
+	}
+	// Phase 6: run the starter temporal rule set over this run's event graph.
+	// secretPatterns = the operator's global protected-path manifest plus
+	// this contract's own forbidden.paths; scopePatterns = this contract's
+	// declared allowed.read. A deny-verdict hit is a real violation (folds
+	// into audit.Violations like any other policy breach); a flag-verdict hit
+	// stays advisory (RuleViolations only — the caller ledgers it but it never
+	// changes this run's outcome, same posture as an assay advisory verdict).
+	secretPatterns, _ := protectedpaths.Patterns()
+	secretPatterns = append(append([]string{}, secretPatterns...), c.Forbidden.Paths...)
+	audit.RuleViolations = policy.EvaluateTemporalRules(events, secretPatterns, c.Allowed.Read)
+	for _, rv := range audit.RuleViolations {
+		if rv.Verdict == policy.RuleDeny {
+			audit.Violations = append(audit.Violations, "policy rule violation ("+rv.Rule+"): "+rv.Detail)
 		}
 	}
 	return audit
@@ -1192,6 +1280,20 @@ func (r *Runner) runOnce(ctx context.Context, c contracts.Contract) (RunRecord, 
 	audit := auditTranscript(transcript, agent.Capabilities().TranscriptFormat, c)
 	if err := observability.RecordStage(db, id, "AUDITED", "", time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
 		return rec, err
+	}
+	if len(audit.RuleViolations) > 0 {
+		created := time.Now().UTC().Format(time.RFC3339Nano)
+		ruleRows := make([]observability.PolicyRuleEventRecord, len(audit.RuleViolations))
+		for i, rv := range audit.RuleViolations {
+			ruleRows[i] = observability.PolicyRuleEventRecord{
+				RunID: id, Rule: rv.Rule, Verdict: string(rv.Verdict), Detail: rv.Detail,
+				CauseSeq: rv.CauseSeq, TriggerSeq: rv.TriggerSeq, Created: created,
+			}
+		}
+		// Best-effort, like the assay bridge's evaluation write: a ledger
+		// failure here must never block a run whose outcome was already
+		// decided by the (already-applied) audit.Violations above.
+		_ = observability.RecordPolicyRuleEvents(db, ruleRows)
 	}
 	rec.CostUSD = audit.CostUSD
 	rec.Usage = audit.Usage
