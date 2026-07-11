@@ -3,6 +3,7 @@ package agents
 import (
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -12,12 +13,21 @@ import (
 	"github.com/cousingary/governator/internal/config"
 )
 
+// Executor overrides how a backend's CLI process is actually spawned. Nil
+// (every caller before the Phase 5 Runner abstraction) uses defaultExecutor,
+// an exact extraction of the previous inline host-subprocess logic. A Runner
+// that needs host-level containment (DockerRunner) supplies its own executor
+// so the same bin/args/workdir/timeout/output contract launches inside a
+// container instead, without any backend adapter needing to change.
+type Executor func(ctx context.Context, bin string, args []string, workdir string, out io.Writer, timeout time.Duration) (exitCode int, timedOut bool, err error)
+
 type Request struct {
 	Prompt     string
 	Workdir    string
 	Transcript string
 	Timeout    time.Duration
 	Spec       BackendSpec
+	Executor   Executor
 }
 
 type Result struct {
@@ -45,6 +55,43 @@ type runCLIRequest struct {
 	// is a caller bug (the backend would block on stdin), so runCLI rejects it.
 	prompt     string
 	extraFlags []string
+	// executor overrides process spawning; nil uses defaultExecutor. Threaded
+	// straight from Request.Executor by every adapter's Run method.
+	executor Executor
+}
+
+// defaultExecutor is the pre-Phase-5 host subprocess launch, extracted
+// unchanged from runCLI so LocalWorktreeRunner-driven runs (every caller that
+// leaves Request.Executor nil) behave identically to before the Runner
+// abstraction existed.
+func defaultExecutor(ctx context.Context, bin string, args []string, workdir string, out io.Writer, timeout time.Duration) (int, bool, error) {
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, bin, args...)
+	cmd.Dir = workdir
+	cmd.Stdout, cmd.Stderr = out, out
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	if err := cmd.Start(); err != nil {
+		return 0, false, err
+	}
+	done := make(chan error, 1)
+	go func() { done <- cmd.Wait() }()
+	select {
+	case err := <-done:
+		if err != nil {
+			if ee, ok := err.(*exec.ExitError); ok {
+				return ee.ExitCode(), false, nil
+			}
+			return 0, false, err
+		}
+		return 0, false, nil
+	case <-ctx.Done():
+		if cmd.Process != nil {
+			_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+		}
+		<-done
+		return -1, true, ctx.Err()
+	}
 }
 
 func runCLI(parent context.Context, r runCLIRequest) (Result, error) {
@@ -59,35 +106,18 @@ func runCLI(parent context.Context, r runCLIRequest) (Result, error) {
 		return Result{}, err
 	}
 	defer out.Close()
-	ctx, cancel := context.WithTimeout(parent, r.timeout)
-	defer cancel()
 	args := append([]string{}, r.extraFlags...)
 	args = append(args, r.prompt)
-	cmd := exec.CommandContext(ctx, r.bin, args...)
-	cmd.Dir = r.workdir
-	cmd.Stdout, cmd.Stderr = out, out
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	if err = cmd.Start(); err != nil {
-		return Result{}, err
+	execute := r.executor
+	if execute == nil {
+		execute = defaultExecutor
 	}
-	done := make(chan error, 1)
-	go func() { done <- cmd.Wait() }()
-	select {
-	case err = <-done:
-	case <-ctx.Done():
-		if cmd.Process != nil {
-			_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
-		}
-		<-done
-		return Result{ExitCode: -1, TimedOut: true}, ctx.Err()
+	code, timedOut, runErr := execute(parent, r.bin, args, r.workdir, out, r.timeout)
+	if timedOut {
+		return Result{ExitCode: -1, TimedOut: true}, runErr
 	}
-	code := 0
-	if err != nil {
-		if ee, ok := err.(*exec.ExitError); ok {
-			code = ee.ExitCode()
-		} else {
-			return Result{}, err
-		}
+	if runErr != nil {
+		return Result{}, runErr
 	}
 	return Result{ExitCode: code}, nil
 }
@@ -147,5 +177,6 @@ func (Claude) Run(parent context.Context, req Request) (Result, error) {
 	return runCLI(parent, runCLIRequest{
 		bin: bin, workdir: req.Workdir, transcript: req.Transcript,
 		timeout: req.Timeout, prompt: req.Prompt, extraFlags: Claude{}.project(req.Spec),
+		executor: req.Executor,
 	})
 }

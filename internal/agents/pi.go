@@ -42,5 +42,6 @@ func (Pi) Run(parent context.Context, req Request) (Result, error) {
 	return runCLI(parent, runCLIRequest{
 		bin: bin, workdir: req.Workdir, transcript: req.Transcript,
 		timeout: req.Timeout, prompt: req.Prompt, extraFlags: flags,
+		executor: req.Executor,
 	})
 }

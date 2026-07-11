@@ -154,6 +154,47 @@ type Assay struct {
 // anything else is a validation error, same pattern as OnViolation/RiskClass).
 var AssayEnforcements = map[string]bool{"blocking": true, "advisory": true, "telemetry": true}
 
+// DockerRunnerConfig configures the Phase 5 DockerRunner: host-level
+// containment for the agent process itself (worktrees, created the same way
+// regardless of runner, only ever isolated the repo, not the OS). Only
+// meaningful when Contract.Runner == "docker".
+type DockerRunnerConfig struct {
+	Image            string   `yaml:"image" json:"image"`
+	CPULimit         string   `yaml:"cpu_limit,omitempty" json:"cpu_limit,omitempty"`
+	MemoryLimit      string   `yaml:"memory_limit,omitempty" json:"memory_limit,omitempty"`
+	PIDsLimit        int      `yaml:"pids_limit,omitempty" json:"pids_limit,omitempty"`
+	Network          string   `yaml:"network,omitempty" json:"network,omitempty"`
+	CredentialMounts []string `yaml:"credential_mounts,omitempty" json:"credential_mounts,omitempty"`
+	OutputCapBytes   int64    `yaml:"output_cap_bytes,omitempty" json:"output_cap_bytes,omitempty"`
+}
+
+// dockerNetworkModes are the valid DockerRunnerConfig.Network values ("" defers
+// to EffectiveNetwork's default-deny).
+var dockerNetworkModes = map[string]bool{"": true, "deny": true, "allow": true}
+
+// EffectiveNetwork defaults an unset Network to "deny" (plan rule: network
+// policy is default deny, contract opt-in). A nil receiver (docker runner not
+// configured) also reports "deny".
+func (d *DockerRunnerConfig) EffectiveNetwork() string {
+	if d == nil || d.Network == "" {
+		return "deny"
+	}
+	return d.Network
+}
+
+// EffectiveOutputCapBytes defaults an unset/invalid cap to 20MiB so a
+// runaway backend can never grow the transcript file without bound.
+func (d *DockerRunnerConfig) EffectiveOutputCapBytes() int64 {
+	if d == nil || d.OutputCapBytes <= 0 {
+		return 20 * 1024 * 1024
+	}
+	return d.OutputCapBytes
+}
+
+// validRunners are the valid Contract.Runner values; "" defers to
+// EffectiveRunner's "local" default.
+var validRunners = map[string]bool{"": true, "local": true, "docker": true}
+
 type Contract struct {
 	Task        string         `yaml:"task,omitempty" json:"task,omitempty"`
 	JobID       string         `yaml:"job_id" json:"job_id"`
@@ -220,6 +261,15 @@ type Contract struct {
 	// opt-in per job, not a global gate.
 	Assay *Assay `yaml:"assay,omitempty" json:"assay,omitempty"`
 
+	// Runner selects host-level containment (Phase 5): "local" (default, the
+	// pre-Phase-5 behavior — a git worktree or plain copy, agent run as a
+	// host subprocess) or "docker" (agent process run inside a container
+	// bind-mounting the same worktree). Docker settings live in Docker,
+	// required when Runner == "docker". An empty value validates and behaves
+	// identically to "local", so every prior job YAML keeps working unchanged.
+	Runner string              `yaml:"runner,omitempty" json:"runner,omitempty"`
+	Docker *DockerRunnerConfig `yaml:"docker,omitempty" json:"docker,omitempty"`
+
 	// PostRunValidate, when set, runs in-process after Success.Validators
 	// pass but before the run merges to the live root — an extra pre-merge
 	// gate for checks too structured for a shell one-liner (e.g. `gov plan`'s
@@ -229,6 +279,14 @@ type Contract struct {
 	// keep it out of the strict decoder and ContractHash (a func value can't
 	// serialize, and letting YAML forge it would be a governance hole).
 	PostRunValidate func(worktree string) error `yaml:"-" json:"-"`
+}
+
+// EffectiveRunner defaults an unset Runner to "local".
+func (c Contract) EffectiveRunner() string {
+	if c.Runner == "" {
+		return "local"
+	}
+	return c.Runner
 }
 
 type Workspace struct {
@@ -476,6 +534,7 @@ func (c Contract) Validate() error {
 	validateRouting(c, add)
 	validateArtifacts(c, add)
 	validateAssay(c, add)
+	validateRunner(c, add)
 
 	// Quarantine is the implemented fail-closed action. Halt and rollback were
 	// previously accepted but ignored; rollback also cannot restore arbitrary
@@ -618,6 +677,49 @@ func validateAssay(c Contract, add func(string, string)) {
 	}
 	if !AssayEnforcements[c.Assay.Enforcement] {
 		add("assay.enforcement", "must be one of blocking, advisory, telemetry")
+	}
+}
+
+// validateRunner enforces the same fail-closed pattern as validateAssay: an
+// unset/"local" Runner (every prior job YAML) is fine, but a "docker" runner
+// must carry a valid Docker block — misconfiguration must never be silently
+// treated as "run locally instead" (that decision belongs to New's docker
+// availability check at run time, not to validation being lenient).
+func validateRunner(c Contract, add func(string, string)) {
+	if !validRunners[c.Runner] {
+		add("runner", "must be 'local' or 'docker' when set")
+		return
+	}
+	if c.Runner != "docker" {
+		if c.Docker != nil {
+			add("docker", "must be absent unless runner: docker")
+		}
+		return
+	}
+	if c.Docker == nil {
+		add("docker", "is required when runner: docker")
+		return
+	}
+	if strings.TrimSpace(c.Docker.Image) == "" {
+		add("docker.image", "is required when runner: docker")
+	}
+	if c.Docker.Network != "" && !dockerNetworkModes[c.Docker.Network] {
+		add("docker.network", "must be 'deny' or 'allow' when set")
+	}
+	if c.Docker.PIDsLimit < 0 {
+		add("docker.pids_limit", "must be zero or greater")
+	}
+	if c.Docker.OutputCapBytes < 0 {
+		add("docker.output_cap_bytes", "must be zero or greater")
+	}
+	for i, mount := range c.Docker.CredentialMounts {
+		field := fmt.Sprintf("docker.credential_mounts[%d]", i)
+		trimmed := strings.TrimSpace(mount)
+		if trimmed == "" {
+			add(field, "must not be blank")
+		} else if !filepath.IsAbs(trimmed) {
+			add(field, "must be an absolute host path")
+		}
 	}
 }
 

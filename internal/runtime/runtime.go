@@ -33,6 +33,7 @@ import (
 	"github.com/cousingary/governator/internal/protectedpaths"
 	"github.com/cousingary/governator/internal/quota"
 	"github.com/cousingary/governator/internal/router"
+	"github.com/cousingary/governator/internal/runner"
 	"github.com/cousingary/governator/internal/spend"
 	"github.com/cousingary/governator/internal/tokenoptimizer"
 )
@@ -464,28 +465,6 @@ func isGit(root string) bool {
 	return c == 0
 }
 
-func createWorkspace(root, home, id string, git bool) (string, string, error) {
-	p := filepath.Join(home, "worktrees", id)
-	if err := os.MkdirAll(filepath.Dir(p), 0700); err != nil {
-		return "", "", err
-	}
-	branch := "gov/job/" + id
-	if git {
-		c, o, e := shell(context.Background(), root, fmt.Sprintf("git worktree add -b %s %s HEAD", shQuote(branch), shQuote(p)))
-		if e != nil || c != 0 {
-			return "", "", fmt.Errorf("git worktree: %s", o)
-		}
-		return p, branch, nil
-	}
-	if err := os.MkdirAll(p, 0700); err != nil {
-		return "", "", err
-	}
-	c, o, e := shell(context.Background(), root, fmt.Sprintf("cp -a --reflink=auto ./. %s", shQuote(p)))
-	if e != nil || c != 0 {
-		return "", "", fmt.Errorf("copy workspace: %s", o)
-	}
-	return p, "", nil
-}
 func shQuote(s string) string { return "'" + strings.ReplaceAll(s, "'", "'\"'\"'") + "'" }
 
 func workspaceDiff(root, work string, git bool, changed, deleted []string) string {
@@ -976,6 +955,14 @@ func (r *Runner) runOnce(ctx context.Context, c contracts.Contract) (RunRecord, 
 	if err := policy.Enforce(preflight, c); err != nil {
 		return RunRecord{}, err
 	}
+	// Runner resolution (Phase 5) happens before any lock/workspace/quota side
+	// effect: a docker request Governator can't satisfy must fail closed with
+	// a clear error here, never silently fall back to LocalWorktreeRunner and
+	// never leave a partially-acquired lock or reservation behind.
+	rn, err := runner.New(c.EffectiveRunner(), c.Docker)
+	if err != nil {
+		return RunRecord{}, err
+	}
 	release, err := lock(root, r.Home)
 	if err != nil {
 		return RunRecord{}, err
@@ -1112,10 +1099,11 @@ func (r *Runner) runOnce(ctx context.Context, c contracts.Contract) (RunRecord, 
 			_ = quota.Release(db, quotaReservation.ID, time.Now().UTC())
 		}
 	}()
-	work, branch, err := createWorkspace(root, r.Home, id, git)
+	ws, err := rn.Prepare(ctx, runner.PrepareRequest{Root: root, Home: r.Home, ID: id, Git: git})
 	if err != nil {
 		return RunRecord{}, err
 	}
+	work, branch := ws.Path, ws.Branch
 	if err := observability.RecordStage(db, id, "WORKSPACE_READY", "", time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
 		return RunRecord{}, err
 	}
@@ -1192,11 +1180,14 @@ func (r *Runner) runOnce(ctx context.Context, c contracts.Contract) (RunRecord, 
 	if err := observability.RecordStage(db, id, "AGENT_RUNNING", string(agentRunningDetail), time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
 		return rec, err
 	}
-	ar, aerr := agent.Run(ctx, agents.Request{
+	ar, aerr := rn.Launch(ctx, ws, runner.LaunchRequest{Agent: agent, Request: agents.Request{
 		Prompt: prompt, Workdir: work, Transcript: transcript,
 		Timeout: time.Duration(c.Budget.MaxMinutes) * time.Minute,
 		Spec:    spec,
-	})
+	}})
+	if obs, oerr := rn.Observe(ctx, ws); oerr == nil && obs.Notes != "" {
+		rec.Notes = appendNote(rec.Notes, obs.Notes)
+	}
 	_ = redact(transcript)
 	audit := auditTranscript(transcript, agent.Capabilities().TranscriptFormat, c)
 	if err := observability.RecordStage(db, id, "AUDITED", "", time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
@@ -1519,14 +1510,7 @@ func (r *Runner) runOnce(ctx context.Context, c contracts.Contract) (RunRecord, 
 		_ = breaker.RecordSuccess(db, rec.Agent, time.Now().UTC())
 	}
 	_ = spend.MaybeHalt(cfg, db)
-	if git {
-		_, _, _ = shell(context.Background(), root, "git worktree remove --force "+shQuote(work))
-		if rec.Status == "APPROVED" {
-			_, _, _ = shell(context.Background(), root, "git branch -D "+shQuote(branch))
-		}
-	} else {
-		_ = os.RemoveAll(work)
-	}
+	_ = rn.Destroy(context.Background(), ws, rec.Status == "APPROVED")
 	return rec, nil
 }
 

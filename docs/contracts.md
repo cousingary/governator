@@ -42,6 +42,12 @@ A job contract is strict YAML: unknown fields, multiple documents, malformed pat
 | `consumes` | Optional artifact names this job requires from `depends_on` ancestors in a validated plan. |
 | `depends_on` | Optional, plan-authoring only. Names sibling `job_id`s within a `gov plan` manifest that must complete first. |
 | `risk_class` | Optional. `low`, `medium`, or `high` — a coarse tier `gov plan --show` renders per job, and (paired with `agent: auto`) the route broker reads too, nudging scoring toward reliability over cost. See [docs/routing.md](routing.md#risk_class-scoring). |
+| `runner` | Optional, `local` (default) or `docker`. Selects host-level containment (Phase 5): `local` runs the agent as a direct host subprocess against the worktree; `docker` runs it inside a container bind-mounting the same worktree. A `docker` request Governator can't satisfy (binary/daemon unavailable) fails closed — it never silently falls back to `local`. |
+| `docker.image` | Required when `runner: docker`. Container image the agent process runs in. |
+| `docker.cpu_limit` / `docker.memory_limit` / `docker.pids_limit` | Optional resource limits (`--cpus`, `--memory`, `--pids-limit`). Unset means Docker's own default (no limit). |
+| `docker.network` | Optional, `deny` (default) or `allow`. Network access is default-deny (`--network none`); a contract must opt in to `allow`. |
+| `docker.credential_mounts` | Optional list of absolute host paths mounted read-only into the container. Empty by default — no credentials are exposed unless explicitly allowlisted. |
+| `docker.output_cap_bytes` | Optional, defaults to 20MiB. Caps how much of the container's stdout/stderr is persisted to the transcript. |
 | `on_violation` | `quarantine`; unsupported actions are rejected during validation. |
 
 All path patterns are repository-relative and may not escape with `..`. Read-only modes are `scout`, `verifier`, and `architect`. `planner` writes only inside its own `gov plan --out` directory, never the target repository. Governator rejects direct-root execution and unimplemented violation actions rather than accepting policy it cannot enforce.
