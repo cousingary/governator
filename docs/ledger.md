@@ -88,3 +88,13 @@ Each job goes through the same single-run path as `gov run` (including any `repa
 `--halt-on-first-quarantine` stops launching new jobs as soon as any job in the batch quarantines; jobs already in flight run to completion, and jobs not yet started are marked `SKIPPED`.
 
 Each `gov batch run` writes one row to the `batches` table (batch id, started/finished timestamps, job count, quarantined count, aggregate cost) and prints a `job_id / run_id / status / failure_taxonomy / cost_usd / worktree` table plus an aggregate summary line. Exit code is non-zero if any job did not end `APPROVED`.
+
+
+## Typed handoff artifacts
+
+The additive `artifacts` table records typed handoff files copied out of run worktrees: `run_id`, `name`, ledger-store `path`, `sha256`, `bytes`, `schema_ok`, and `created`. Runtime stores artifact bytes under `<ledger_dir>/artifacts/<run_id>/...`; source merges exclude `.governator/`, so these files remain ledger evidence rather than repository content. Repair packets include artifact summaries (`name:sha256:bytes`) for the failed run.
+
+
+## Panel label mapping
+
+Panel mode anonymizes member outputs before judge context. The additive `panel_members` table maps `(panel_id, member_label)` to the real `job_id`, backend, and artifact name for operator audit, while model-facing comparison artifacts use only `panelist_N` labels.

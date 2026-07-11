@@ -280,3 +280,73 @@ func TestEnvelopePatternCoversNormalizesDotSegments(t *testing.T) {
 		t.Fatal("a nested dot-dot traversal out of the envelope must not be covered")
 	}
 }
+
+func TestValidatePlanRequiresConsumedArtifactFromDependsOnAncestor(t *testing.T) {
+	root := "/repo"
+	producer := planJob(root, "job-a")
+	producer.Produces = []ArtifactSpec{{Name: "reconnaissance", Path: ".governator/artifacts/scout.json", MaxBytes: 262144}}
+	consumer := planJob(root, "job-b")
+	consumer.Consumes = []string{"reconnaissance"}
+
+	if _, err := ValidatePlan([]Contract{producer, consumer}, root, []string{"internal/**"}, 25000); err == nil {
+		t.Fatal("expected a consumes error without a depends_on ancestor")
+	} else if !strings.Contains(err.Error(), "depends_on ancestor") {
+		t.Fatalf("expected depends_on ancestor error, got %v", err)
+	}
+
+	consumer.DependsOn = []string{"job-a"}
+	levels, err := ValidatePlan([]Contract{producer, consumer}, root, []string{"internal/**"}, 25000)
+	if err != nil {
+		t.Fatalf("unexpected error for ancestor-produced artifact: %v", err)
+	}
+	if got := levels[1][0].ArtifactSources["reconnaissance"]; got != "job-a" {
+		t.Fatalf("ArtifactSources[reconnaissance] = %q, want job-a", got)
+	}
+}
+
+func TestValidatePlanAllowsTransitiveArtifactAncestor(t *testing.T) {
+	root := "/repo"
+	producer := planJob(root, "job-a")
+	producer.Produces = []ArtifactSpec{{Name: "reconnaissance", Path: ".governator/artifacts/scout.json", MaxBytes: 262144}}
+	middle := planJob(root, "job-b")
+	middle.DependsOn = []string{"job-a"}
+	consumer := planJob(root, "job-c")
+	consumer.DependsOn = []string{"job-b"}
+	consumer.Consumes = []string{"reconnaissance"}
+
+	levels, err := ValidatePlan([]Contract{producer, middle, consumer}, root, []string{"internal/**"}, 35000)
+	if err != nil {
+		t.Fatalf("unexpected error for transitive artifact ancestor: %v", err)
+	}
+	if got := levels[2][0].ArtifactSources["reconnaissance"]; got != "job-a" {
+		t.Fatalf("ArtifactSources[reconnaissance] = %q, want job-a", got)
+	}
+}
+
+// Regression for the batch-run wiring: ArtifactSources is yaml:"-", so a set
+// of contracts parsed from exploded job files must be able to recompute the
+// consumed-artifact -> producing-job mapping via ResolveArtifactSources —
+// without it every consuming job refuses to stage its inputs at run time.
+func TestResolveArtifactSourcesPopulatesAndFailsClosed(t *testing.T) {
+	root := "/repo"
+	producer := planJob(root, "job-a")
+	producer.Produces = []ArtifactSpec{{Name: "recon", Path: ".governator/artifacts/recon.json", MaxBytes: 1024}}
+	consumer := planJob(root, "job-b")
+	consumer.DependsOn = []string{"job-a"}
+	consumer.Consumes = []string{"recon"}
+
+	jobs := []Contract{producer, consumer}
+	if errs := ResolveArtifactSources(jobs); len(errs) != 0 {
+		t.Fatalf("unexpected errors: %v", errs)
+	}
+	if got := jobs[1].ArtifactSources["recon"]; got != "job-a" {
+		t.Fatalf("consumer ArtifactSources[recon] = %q, want job-a", got)
+	}
+
+	orphan := planJob(root, "job-c")
+	orphan.Consumes = []string{"recon"} // no depends_on ancestor produces it
+	errs := ResolveArtifactSources([]Contract{orphan})
+	if len(errs) == 0 || !strings.Contains(errs.Error(), "not produced by any depends_on ancestor") {
+		t.Fatalf("expected fail-closed error, got %v", errs)
+	}
+}

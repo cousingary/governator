@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -14,14 +15,18 @@ import (
 	"strings"
 	"time"
 
+	"github.com/cousingary/governator/internal/breaker"
 	"github.com/cousingary/governator/internal/config"
 	"github.com/cousingary/governator/internal/contextgraph"
 	"github.com/cousingary/governator/internal/contracts"
 	"github.com/cousingary/governator/internal/doctor"
 	"github.com/cousingary/governator/internal/observability"
+	"github.com/cousingary/governator/internal/panel"
 	"github.com/cousingary/governator/internal/policy"
 	"github.com/cousingary/governator/internal/protect"
 	"github.com/cousingary/governator/internal/protectedpaths"
+	"github.com/cousingary/governator/internal/quota"
+	"github.com/cousingary/governator/internal/router"
 	govruntime "github.com/cousingary/governator/internal/runtime"
 	"github.com/cousingary/governator/internal/snapshots"
 	"github.com/cousingary/governator/internal/spend"
@@ -94,6 +99,14 @@ func run(args []string) int {
 				return bad("usage: gov run <job.yaml> [--agent <name>]")
 			}
 			c.Agent = args[3]
+			// The override lands after ParseFile already validated the
+			// authored contract, so re-validate: an explicit --agent on a
+			// contract with a routing: block is the same ambiguity the schema
+			// rejects, and an unknown --agent name should refuse here rather
+			// than mid-run.
+			if err := c.Validate(); err != nil {
+				return contractError(args[1], err)
+			}
 		}
 		rec, err := govruntime.New().RunWithAutoRepair(context.Background(), *c)
 		if err != nil {
@@ -109,6 +122,8 @@ func run(args []string) int {
 		return batchCmd(args[1:])
 	case "plan":
 		return planCmd(args[1:])
+	case "panel":
+		return panelCmd(args[1:])
 	case "handoff":
 		if len(args) > 2 {
 			return bad("usage: gov handoff [last|run_id]")
@@ -206,6 +221,8 @@ func run(args []string) int {
 		return 0
 	case "spend":
 		return spendCmd(args[1:])
+	case "quota":
+		return quotaCmd(args[1:])
 	case "usage":
 		if len(args) != 2 {
 			return bad("usage: gov usage summary|<run_id>")
@@ -226,8 +243,11 @@ func run(args []string) int {
 		fmt.Println(report.String())
 		return 0
 	case "route":
+		if len(args) == 3 && args[1] == "--explain" {
+			return routeExplain(args[2])
+		}
 		if len(args) != 3 || args[1] != "--job-type" {
-			return bad("usage: gov route --job-type <type>")
+			return bad("usage: gov route --job-type <type>  |  gov route --explain <contract.yaml>")
 		}
 		candidates, err := observability.RouteAgents(govruntime.Home(), args[2])
 		if err != nil {
@@ -325,6 +345,8 @@ func run(args []string) int {
 		}
 		fmt.Println("doctor: OK")
 		return 0
+	case "health":
+		return healthCmd(args[1:])
 	case "version", "--version", "-version":
 		fmt.Printf("gov %s\n", version)
 		return 0
@@ -435,6 +457,52 @@ func spendCmd(args []string) int {
 	return 0
 }
 
+func quotaCmd(args []string) int {
+	if len(args) != 0 {
+		return bad("usage: gov quota")
+	}
+	db, err := observability.Open(govruntime.Home())
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "quota:", err)
+		return 1
+	}
+	defer db.Close()
+	now := time.Now().UTC()
+	cfg := config.Current()
+	if err := quota.SeedFromConfig(db, cfg, now); err != nil {
+		fmt.Fprintln(os.Stderr, "quota:", err)
+		return 1
+	}
+	if err := quota.ExpireStale(db, now); err != nil {
+		fmt.Fprintln(os.Stderr, "quota:", err)
+		return 1
+	}
+	windows, err := quota.Windows(db, now)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "quota:", err)
+		return 1
+	}
+	if len(windows) == 0 {
+		fmt.Println("no quota windows configured")
+		return 0
+	}
+	fmt.Println("backend\taccount\twindow\tlimit\tmeasured\treserved\theadroom\treset_at\tconfidence\tsource")
+	for _, w := range windows {
+		limit := w.EstimatedLimit
+		headroom := 1.0
+		if limit > 0 {
+			headroom = (limit - w.MeasuredUsage - w.ReservedUsage) / limit
+			if headroom < 0 {
+				headroom = 0
+			}
+		}
+		fmt.Printf("%s\t%s\t%s\t%.0f\t%.0f\t%.0f\t%.1f%%\t%s\t%.2f\t%s\n",
+			w.Backend, w.Account, w.WindowType, limit, w.MeasuredUsage, w.ReservedUsage, headroom*100,
+			orHealthDash(formatCooldown(w.ResetAt)), w.Confidence, w.Source)
+	}
+	return 0
+}
+
 func batchCmd(args []string) int {
 	if len(args) < 1 || args[0] != "run" {
 		return bad("usage: gov batch run <job.yaml|dir|glob>... [--parallel N] [--halt-on-first-quarantine] [--ordered]")
@@ -514,6 +582,16 @@ func batchCmd(args []string) int {
 	}
 	if hasDeps && !ordered {
 		fmt.Fprintln(os.Stderr, "batch: contracts declare depends_on; run with --ordered so dependencies execute first")
+		return 2
+	}
+
+	// ArtifactSources is yaml:"-": the consumed-artifact -> producing-job
+	// mapping never survives the plan -> per-job-file -> ParseFile round trip,
+	// so it must be recomputed over the batch before launch or every consuming
+	// job would refuse to stage its inputs. Fails closed when a consumed
+	// artifact has no producing depends_on ancestor in this batch.
+	if aErrs := contracts.ResolveArtifactSources(jobs); len(aErrs) > 0 {
+		fmt.Fprintln(os.Stderr, "batch:", aErrs.Sorted().Error())
 		return 2
 	}
 
@@ -600,6 +678,7 @@ func excludePlanManifest(paths []string) []string {
 }
 
 const planUsage = "usage: gov plan <intent.md> --out <dir> --envelope <pattern>... --max-total-tokens <n> [--backend <name>]\n" +
+	"       gov plan --panel <n> <intent.md> --out <dir> --envelope <pattern>... --max-total-tokens <n> [--backend <name>]\n" +
 	"       gov plan --show <dir>"
 
 func planCmd(args []string) int {
@@ -611,6 +690,9 @@ func planCmd(args []string) int {
 			return bad(planUsage)
 		}
 		return planShow(args[1])
+	}
+	if args[0] == "--panel" {
+		return planPanelCreate(args[1:])
 	}
 	return planCreate(args)
 }
@@ -729,7 +811,7 @@ func planCreate(args []string) int {
 		if perr != nil {
 			return perr
 		}
-		_, verr := contracts.ValidatePlan(plan.Jobs, root, envelope, maxTotalTokens)
+		_, verr := contracts.ValidatePlanManifest(plan, root, envelope, maxTotalTokens)
 		return verr
 	}
 
@@ -748,7 +830,7 @@ func planCreate(args []string) int {
 		fmt.Fprintln(os.Stderr, "plan:", err)
 		return 1
 	}
-	levels, err := contracts.ValidatePlan(plan.Jobs, root, envelope, maxTotalTokens)
+	levels, err := contracts.ValidatePlanManifest(plan, root, envelope, maxTotalTokens)
 	if err != nil {
 		// PostRunValidate already gated this before the merge, so this
 		// should be unreachable — surfaced defensively rather than exploding
@@ -810,6 +892,147 @@ func printPlanTable(levels [][]contracts.Contract) {
 			fmt.Printf("%d\t%s\t%s\t%d\t%s\n", i, job.JobID, job.RiskClass, job.Budget.MaxTokens, strings.Join(job.DependsOn, ","))
 		}
 	}
+}
+
+func planPanelCreate(args []string) int {
+	if len(args) < 2 {
+		return bad(planUsage)
+	}
+	count, err := strconv.Atoi(args[0])
+	if err != nil || count < 2 {
+		return bad("gov plan --panel: <n> must be an integer >= 2")
+	}
+	intentPath := args[1]
+	var outDir, backend string
+	var envelope []string
+	maxTotalTokens := 0
+	rest := args[2:]
+	for i := 0; i < len(rest); i++ {
+		switch rest[i] {
+		case "--out":
+			if i+1 >= len(rest) {
+				return bad(planUsage)
+			}
+			outDir = rest[i+1]
+			i++
+		case "--envelope":
+			if i+1 >= len(rest) {
+				return bad(planUsage)
+			}
+			envelope = append(envelope, rest[i+1])
+			i++
+		case "--max-total-tokens":
+			if i+1 >= len(rest) {
+				return bad(planUsage)
+			}
+			n, nErr := strconv.Atoi(rest[i+1])
+			if nErr != nil || n <= 0 {
+				return bad("gov plan: --max-total-tokens must be a positive integer")
+			}
+			maxTotalTokens = n
+			i++
+		case "--backend":
+			if i+1 >= len(rest) {
+				return bad(planUsage)
+			}
+			backend = rest[i+1]
+			i++
+		default:
+			return bad(planUsage)
+		}
+	}
+	if outDir == "" || len(envelope) == 0 || maxTotalTokens <= 0 {
+		return bad(planUsage)
+	}
+	intent, err := os.ReadFile(intentPath)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "plan:", err)
+		return 1
+	}
+	root, err := os.Getwd()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "plan:", err)
+		return 1
+	}
+	if backend == "" {
+		backend = config.Current().Defaults.Agent
+	}
+	plan, err := panel.GeneratePlan(panel.Options{Root: root, OutDir: outDir, Envelope: envelope, Count: count, Agent: backend, MaxTotalTokens: maxTotalTokens, Intent: string(intent)})
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "plan:", err)
+		return 1
+	}
+	levels, err := contracts.ValidatePlanManifest(&plan, root, envelope, maxTotalTokens)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "plan:", err)
+		return 1
+	}
+	outRel := filepath.ToSlash(filepath.Clean(outDir))
+	planPath := filepath.Join(root, filepath.FromSlash(outRel), planManifestName)
+	if err := os.MkdirAll(filepath.Dir(planPath), 0755); err != nil {
+		fmt.Fprintln(os.Stderr, "plan:", err)
+		return 1
+	}
+	planData, err := yaml.Marshal(plan)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "plan:", err)
+		return 1
+	}
+	if err := os.WriteFile(planPath, planData, 0644); err != nil {
+		fmt.Fprintln(os.Stderr, "plan:", err)
+		return 1
+	}
+	schemaDir := filepath.Join(root, filepath.FromSlash(outRel), "schemas")
+	if err := os.MkdirAll(schemaDir, 0755); err != nil {
+		fmt.Fprintln(os.Stderr, "plan:", err)
+		return 1
+	}
+	for name, data := range panel.SchemaFiles() {
+		if err := os.WriteFile(filepath.Join(schemaDir, name), data, 0644); err != nil {
+			fmt.Fprintln(os.Stderr, "plan:", err)
+			return 1
+		}
+	}
+	written := 0
+	for _, job := range plan.Jobs {
+		data, mErr := yaml.Marshal(job)
+		if mErr != nil {
+			fmt.Fprintln(os.Stderr, "plan:", mErr)
+			return 1
+		}
+		if wErr := os.WriteFile(filepath.Join(root, filepath.FromSlash(outRel), job.JobID+".yaml"), data, 0644); wErr != nil {
+			fmt.Fprintln(os.Stderr, "plan:", wErr)
+			return 1
+		}
+		written++
+	}
+	fmt.Printf("panel: %d members\nplan: %s\n", count, planPath)
+	printPlanTable(levels)
+	fmt.Printf("jobs=%d levels=%d written=%d schemas=%d\n", len(plan.Jobs), len(levels), written, len(panel.SchemaFiles()))
+	return 0
+}
+
+func panelCmd(args []string) int {
+	if len(args) < 4 || args[0] != "compare" || args[1] != "--out" {
+		return bad("usage: gov panel compare --out <artifact.json> <input.json>...")
+	}
+	out := args[2]
+	inputs := args[3:]
+	data, err := panel.CompareFiles(inputs)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "panel:", err)
+		return 1
+	}
+	if err := os.MkdirAll(filepath.Dir(out), 0755); err != nil {
+		fmt.Fprintln(os.Stderr, "panel:", err)
+		return 1
+	}
+	if err := os.WriteFile(out, data, 0644); err != nil {
+		fmt.Fprintln(os.Stderr, "panel:", err)
+		return 1
+	}
+	fmt.Println(out)
+	return 0
 }
 
 func planTask(intent, root string, envelope []string, planRel string, maxTotalTokens int) string {
@@ -936,6 +1159,150 @@ func graphCmd(args []string) int {
 }
 
 func bad(s string) int { fmt.Fprintln(os.Stderr, s); return 2 }
+
+// routeExplain implements `gov route --explain <contract.yaml>`: a dry run of
+// the route broker against an agent: auto contract. It resolves and prints the
+// full scored candidate table without launching anything and without writing a
+// decision row to the ledger (print-only keeps the ledger clean of previews).
+// The decision reflects current binary health via the default LookPath probe;
+// breaker and quota are read from the live ledger-backed health source.
+func routeExplain(path string) int {
+	contract, err := contracts.ParseFile(path)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "route:", err)
+		return 1
+	}
+	if contract.Agent != contracts.AgentAuto {
+		fmt.Fprintln(os.Stderr, "route: --explain requires agent: auto; an explicit agent overrides the broker")
+		return 1
+	}
+	db, err := observability.Open(govruntime.Home())
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "route:", err)
+		return 1
+	}
+	defer db.Close()
+	decision, err := router.Router{Health: breaker.Store{DB: db}}.Resolve(db, router.RequestFromContract(*contract))
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "route:", err)
+		return 1
+	}
+	if decision.Selected == "" {
+		fmt.Fprintln(os.Stderr, router.ErrNoCandidate.Error())
+		fmt.Print(decision.Format())
+		return 1
+	}
+	fmt.Print(decision.Format())
+	return 0
+}
+
+// healthCmd implements `gov health` — the infrastructure circuit-breaker view
+// (plan Session 2). It prints one row per registered backend (state, failure
+// kind, cooldown, consecutive failures) and, for doctor-gated kinds
+// (AUTH_EXPIRED / BINARY_MISSING / FLAG_DRIFT), runs the backend's doctor probe
+// and auto-closes any breaker whose underlying problem has resolved — so a
+// re-installed binary or refreshed credential recovers without a manual reset.
+// `gov health reset <backend>` forces a backend CLOSED with an audit row, the
+// operator escape hatch for time-based kinds that should not wait out their
+// cooldown.
+func healthCmd(args []string) int {
+	db, err := observability.Open(govruntime.Home())
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "health:", err)
+		return 1
+	}
+	defer db.Close()
+	now := time.Now().UTC()
+	if len(args) == 2 && args[0] == "reset" {
+		if err := breaker.Reset(db, args[1], now, "manual reset via gov health"); err != nil {
+			return bad("health: " + err.Error())
+		}
+		fmt.Printf("reset: %s breaker CLOSED\n", args[1])
+		return 0
+	}
+	if len(args) != 0 {
+		return bad("usage: gov health [reset <backend>]")
+	}
+	recovered := recoverDoctorGatedBreakers(db, now)
+	rows, err := breaker.All(db, now)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "health:", err)
+		return 1
+	}
+	fmt.Println("backend\tstate\tfailure_kind\tcooldown_until\tconsecutive\tupdated")
+	for _, r := range rows {
+		fmt.Printf("%s\t%s\t%s\t%s\t%d\t%s\n",
+			r.Backend, r.EffectiveState, orHealthDash(r.FailureKind),
+			orHealthDash(formatCooldown(r.CooldownUntil)), r.ConsecutiveFailures,
+			orHealthDash(formatCooldown(r.UpdatedAt)))
+	}
+	for _, msg := range recovered {
+		fmt.Println("recovered:", msg)
+	}
+	return 0
+}
+
+// recoverDoctorGatedBreakers runs the backend doctor probes and closes any
+// breaker that is OPEN on a doctor-gated kind whose check now passes. It is
+// best-effort: a doctor failure never blocks the health view, it just leaves
+// the breaker OPEN (correctly — the problem has not resolved).
+func recoverDoctorGatedBreakers(db *sql.DB, now time.Time) []string {
+	checks := doctor.Run()
+	healthy := backendDoctorStatus(checks)
+	var recovered []string
+	for _, backend := range []string{"claude-code", "codex", "glm", "opencode", "pi"} {
+		rec := breaker.Snapshot(db, backend, now)
+		if rec.PersistedState != breaker.Open {
+			continue
+		}
+		if !doctorGatedKind(rec.FailureKind) {
+			continue
+		}
+		if healthy[backend] {
+			if err := breaker.Reset(db, backend, now, "doctor pass: backend:"+backend+" healthy"); err == nil {
+				recovered = append(recovered, backend+" (was "+rec.FailureKind+", doctor now passes)")
+			}
+		}
+	}
+	return recovered
+}
+
+func backendDoctorStatus(checks []doctor.Check) map[string]bool {
+	out := make(map[string]bool)
+	for _, c := range checks {
+		name := strings.TrimPrefix(c.Name, "backend:")
+		if name == c.Name {
+			continue
+		}
+		if name == "claude" {
+			name = "claude-code"
+		}
+		out[name] = c.Status == doctor.StatusOK
+	}
+	return out
+}
+
+func doctorGatedKind(kind string) bool {
+	switch kind {
+	case observability.InfraAuthExpired, observability.InfraBinaryMissing, observability.InfraFlagDrift:
+		return true
+	}
+	return false
+}
+
+func orHealthDash(s string) string {
+	if s == "" {
+		return "-"
+	}
+	return s
+}
+
+func formatCooldown(t time.Time) string {
+	if t.IsZero() {
+		return ""
+	}
+	return t.UTC().Format(time.RFC3339)
+}
 
 // hookCmd implements `gov hook pre-tool-use` — the Phase 5 bridge that lets
 // Governator replace harness_gate.py as the Claude Code PreToolUse hook. It
@@ -1226,6 +1593,7 @@ Usage:
   gov run <job.yaml> [--agent <name>]
   gov batch run <job.yaml|dir|glob>... [--parallel N] [--halt-on-first-quarantine] [--ordered]
   gov plan <intent.md> --out <dir> --envelope <pattern>... --max-total-tokens <n> [--backend <name>]
+  gov plan --panel <n> <intent.md> --out <dir> --envelope <pattern>... --max-total-tokens <n> [--backend <name>]
   gov plan --show <dir>
   gov handoff [last|run_id]
   gov diff [last|run_id]
@@ -1235,8 +1603,10 @@ Usage:
   gov failures
   gov cost --per-valid-output
   gov spend [--halt|--resume]
+  gov quota
   gov usage summary|<run_id>
   gov route --job-type <type>
+  gov route --explain <contract.yaml>
   gov repair-packet <run_id>
   gov eval harness <case-dir>
   gov eval scorecard
@@ -1245,8 +1615,10 @@ Usage:
   gov graph status|refresh [path]
   gov graph query <search> [--path <path>] [--limit <n>]
   gov hook pre-tool-use [--run <id>] [--shadow <python-gate>]
+  gov panel compare --out <artifact.json> <input.json>...
   gov gate check
   gov parity report
   gov doctor
+  gov health [reset <backend>]
   gov version`)
 }

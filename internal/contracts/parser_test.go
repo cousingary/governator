@@ -1,6 +1,7 @@
 package contracts
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 )
@@ -177,5 +178,82 @@ func TestParseCleanupBlockWithoutValidatorsRejected(t *testing.T) {
 	_, err := Parse([]byte(withCleanup))
 	if err == nil || !strings.Contains(err.Error(), "cleanup.validators") {
 		t.Fatalf("expected cleanup.validators error, got %v", err)
+	}
+}
+
+// autoContract is validContract with agent: auto — the base for every routing
+// block test. The routing block only pairs with auto.
+var autoContract = strings.Replace(validContract, "agent: claude", "agent: auto", 1)
+
+func TestParseAgentAutoAcceptedWithoutRouting(t *testing.T) {
+	contract, err := Parse([]byte(autoContract))
+	if err != nil {
+		t.Fatalf("agent: auto must validate without a routing block: %v", err)
+	}
+	if contract.Agent != AgentAuto {
+		t.Fatalf("expected agent: auto, got %q", contract.Agent)
+	}
+}
+
+func TestParseRoutingBlock(t *testing.T) {
+	withRouting := strings.Replace(autoContract, "on_violation: quarantine",
+		"routing:\n  objective: cheapest\n  candidates: [claude-code, codex, glm]\n  max_attempts: 2\n  fallback: infrastructure_only\n  requirements: {native_sandbox: true}\non_violation: quarantine", 1)
+	contract, err := Parse([]byte(withRouting))
+	if err != nil {
+		t.Fatalf("routing block must validate with agent: auto: %v", err)
+	}
+	if contract.Routing == nil || contract.Routing.Objective != "cheapest" ||
+		len(contract.Routing.Candidates) != 3 || contract.Routing.MaxAttempts != 2 ||
+		contract.Routing.Fallback != "infrastructure_only" ||
+		!contract.Routing.Requirements.NativeSandbox {
+		t.Fatalf("routing not parsed: %+v", contract.Routing)
+	}
+}
+
+func TestRoutingBlockRejectedWithExplicitAgent(t *testing.T) {
+	// explicit agent: claude-code + a routing block = ambiguity error.
+	explicit := strings.Replace(validContract, "agent: claude", "agent: claude-code", 1)
+	withRouting := strings.Replace(explicit, "on_violation: quarantine",
+		"routing: {objective: balanced}\non_violation: quarantine", 1)
+	_, err := Parse([]byte(withRouting))
+	if err == nil || !strings.Contains(err.Error(), "routing") {
+		t.Fatalf("expected routing ambiguity error, got %v", err)
+	}
+}
+
+func TestRoutingUnknownObjectiveRejected(t *testing.T) {
+	withRouting := strings.Replace(autoContract, "on_violation: quarantine",
+		"routing: {objective: fastest}\non_violation: quarantine", 1)
+	_, err := Parse([]byte(withRouting))
+	if err == nil || !strings.Contains(err.Error(), "routing.objective") {
+		t.Fatalf("expected routing.objective error, got %v", err)
+	}
+}
+
+func TestRoutingUnknownCandidateRejected(t *testing.T) {
+	withRouting := strings.Replace(autoContract, "on_violation: quarantine",
+		"routing: {candidates: [claude-code, mystery]}\non_violation: quarantine", 1)
+	_, err := Parse([]byte(withRouting))
+	if err == nil || !strings.Contains(err.Error(), "routing.candidates") {
+		t.Fatalf("expected routing.candidates error, got %v", err)
+	}
+}
+
+func TestRoutingMaxAttemptsOutOfRangeRejected(t *testing.T) {
+	for _, n := range []int{-1, 4} {
+		withRouting := strings.Replace(autoContract, "on_violation: quarantine",
+			fmt.Sprintf("routing: {max_attempts: %d}\non_violation: quarantine", n), 1)
+		_, err := Parse([]byte(withRouting))
+		if err == nil || !strings.Contains(err.Error(), "routing.max_attempts") {
+			t.Fatalf("max_attempts=%d: expected routing.max_attempts error, got %v", n, err)
+		}
+	}
+}
+
+func TestExplicitUnknownAgentRejected(t *testing.T) {
+	unknown := strings.Replace(validContract, "agent: claude", "agent: gemini", 1)
+	_, err := Parse([]byte(unknown))
+	if err == nil || !strings.Contains(err.Error(), "agent") {
+		t.Fatalf("expected agent error for unknown backend, got %v", err)
 	}
 }

@@ -85,6 +85,13 @@ minimalism:
 spend:
   daily_cap_usd: 0 # 0 = unlimited
   halt_file: ~/.governator/HALT
+# quotas seed subscription/reset-window headroom. Units are tokens.
+quotas: []
+# - backend: codex
+#   account: default
+#   window_type: daily # 5h, daily, weekly, monthly
+#   estimated_limit: 1000000
+#   confidence: 0.6
 doctrine:
   require_cleanup: false # true = gov validate fails a surgeon/batch_worker/repair
                           # contract with no cleanup block and no lint/format

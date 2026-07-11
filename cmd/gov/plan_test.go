@@ -116,6 +116,50 @@ func TestPlanCommandEndToEndWritesValidatedJobFilesAndShow(t *testing.T) {
 	}
 }
 
+func TestPlanPanelCommandWritesValidatedPanelTemplate(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("GOV_HOME", home)
+	t.Setenv("GOV_CONFIG", filepath.Join(t.TempDir(), "missing-config.yaml"))
+
+	root := planProjectRoot(t)
+	t.Chdir(root)
+	intentPath := filepath.Join(t.TempDir(), "intent.md")
+	if err := os.WriteFile(intentPath, []byte("# Intent\nReview the architecture.\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	code, output := captureRunInput(t, []string{
+		"plan", "--panel", "3", intentPath, "--out", "jobs/panel",
+		"--envelope", "internal/**", "--max-total-tokens", "90000", "--backend", "claude-code",
+	}, "")
+	if code != 0 {
+		t.Fatalf("exit=%d output=%s", code, output)
+	}
+	if !strings.Contains(output, "panel: 3 members") || !strings.Contains(output, "jobs=5 levels=3 written=5 schemas=3") {
+		t.Fatalf("expected panel summary, got %s", output)
+	}
+	for _, rel := range []string{
+		"jobs/panel/PLAN.yaml",
+		"jobs/panel/panel-member-1.yaml",
+		"jobs/panel/panel-member-2.yaml",
+		"jobs/panel/panel-member-3.yaml",
+		"jobs/panel/panel-compare.yaml",
+		"jobs/panel/panel-judge.yaml",
+		"jobs/panel/schemas/panel-member.schema.json",
+	} {
+		if _, err := os.Stat(filepath.Join(root, filepath.FromSlash(rel))); err != nil {
+			t.Fatalf("expected %s on disk: %v", rel, err)
+		}
+	}
+	showCode, showOutput := captureRunInput(t, []string{"plan", "--show", filepath.Join(root, "jobs", "panel")}, "")
+	if showCode != 0 {
+		t.Fatalf("show exit=%d output=%s", showCode, showOutput)
+	}
+	if !strings.Contains(showOutput, "panel-judge") || !strings.Contains(showOutput, "jobs=5 levels=3") {
+		t.Fatalf("expected panel jobs in --show, got %s", showOutput)
+	}
+}
+
 func TestPlanCommandQuarantinesOnCyclicPlanAndWritesNoJobFiles(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("GOV_HOME", home)

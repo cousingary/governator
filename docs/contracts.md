@@ -9,7 +9,7 @@ A job contract is strict YAML: unknown fields, multiple documents, malformed pat
 | `task` | Human-readable instruction compiled into the agent prompt. |
 | `job_id` | Stable alphanumeric, dot, underscore, or hyphen identifier. |
 | `job_type` | Operator-defined category used by scoring and routing. |
-| `agent` | `claude-code`, `codex`, `glm`, `opencode`, or `pi`. |
+| `agent` | `claude-code`, `codex`, `glm`, `opencode`, `pi`, or `auto` (route broker). |
 | `mode` | `scout`, `surgeon`, `batch_worker`, `verifier`, `repair`, `architect`, or `planner`. |
 | `workspace.root` | Absolute path to the source Git repository. |
 | `workspace.worktree` | `auto`; every run uses a disposable Git worktree. |
@@ -38,6 +38,8 @@ A job contract is strict YAML: unknown fields, multiple documents, malformed pat
 | `repair.backend` | Optional. Overrides `agent` for compiled repair attempts only. |
 | `cleanup.required` | Optional, default `false`. `true` makes a failing `cleanup.validators` entry block the merge like a failed `success.validators` entry; `false` records the result without gating. |
 | `cleanup.validators` | Nonempty when `cleanup` is present. Shell commands run as a distinct post-approval stage after every `success.validators` entry passes (see `docs/ledger.md`). |
+| `produces` | Optional typed handoff artifacts: `{name, path, schema, max_bytes}`. Paths must be under `.governator/artifacts/`; artifacts are copied to the ledger store and never merged. |
+| `consumes` | Optional artifact names this job requires from `depends_on` ancestors in a validated plan. |
 | `depends_on` | Optional, plan-authoring only. Names sibling `job_id`s within a `gov plan` manifest that must complete first. |
 | `risk_class` | Optional, plan-authoring only. `low`, `medium`, or `high` — a coarse tier `gov plan --show` renders per job. |
 | `on_violation` | `quarantine`; unsupported actions are rejected during validation. |
@@ -48,9 +50,33 @@ All path patterns are repository-relative and may not escape with `..`. Read-onl
 
 `gov plan <intent.md> --out jobs/<slug>/` compiles a `mode: planner` job whose task is the intent file plus repository context from `internal/contextgraph`. The planner is a normal governed run — read-only against the target repository, write-capable only inside `--out` — and must produce a `PLAN.yaml` manifest: an ordered list of sub-contracts, each with its own `budget`, `success.validators`, `risk_class`, and `depends_on`.
 
-Before anything merges, an in-process post-run gate (`contracts.ValidatePlan`, run via `Contract.PostRunValidate`) checks the manifest deterministically: every sub-contract passes `Contract.Validate()`, `job_id`s are unique, `workspace.root` matches the intent's declared root, every `risk_class` is set and `budget.max_tokens` is nonzero, the sum of sub-budgets doesn't exceed `--max-total-tokens`, every write pattern stays inside the intent's declared envelope, and `depends_on` has no dangling references or cycles. Any failure quarantines the planner run exactly like a failed shell validator — a malformed plan never reaches disk as a runnable job.
+Before anything merges, an in-process post-run gate (`contracts.ValidatePlan`, run via `Contract.PostRunValidate`) checks the manifest deterministically: every sub-contract passes `Contract.Validate()`, `job_id`s are unique, `workspace.root` matches the intent's declared root, every `risk_class` is set and `budget.max_tokens` is nonzero, the sum of sub-budgets doesn't exceed `--max-total-tokens`, every write pattern stays inside the intent's declared envelope, `depends_on` has no dangling references or cycles, and every `consumes` artifact is produced by a `depends_on` ancestor. Any failure quarantines the planner run exactly like a failed shell validator — a malformed plan never reaches disk as a runnable job.
 
 `gov plan --show jobs/<slug>/` renders the dependency DAG with per-job budget and risk. Nothing in a validated plan runs automatically: `gov batch run jobs/<slug>/ --ordered` executes it, honoring `depends_on` as topological levels (serial across dependency edges, parallel within a level) via the same worker pool `gov batch run` uses for independent jobs.
+
+## Typed handoff artifacts
+
+Jobs can make handoffs explicit instead of communicating only through source diffs:
+
+```yaml
+produces:
+  - name: reconnaissance
+    path: .governator/artifacts/scout.json
+    schema: schemas/scout.schema.json
+    max_bytes: 262144
+consumes:
+  - reconnaissance
+```
+
+A produced artifact path must be relative and under `.governator/artifacts/`. At job end Governator checks that each declared artifact exists, is within `max_bytes`, and optionally validates it against a deterministic in-process JSON Schema subset (`type`, `required`, `properties`, `items`, `enum`, and `additionalProperties: false`). Missing, oversized, or schema-invalid artifacts quarantine as `VALIDATION_FAILED`. Valid and invalid existing artifacts are sha256-hashed, copied to `<ledger_dir>/artifacts/<run_id>/...`, and recorded in the `artifacts` table with `schema_ok`. The `.governator/` tree is excluded from source merge and source-change budgeting.
+
+A consuming job must be part of a validated plan: `ValidatePlan` resolves each `consumes` name to a producing `depends_on` ancestor and fails closed when no ancestor produces it. Runtime stages consumed artifacts read-only at `.governator/consumed/<name>` inside the consumer worktree and lists those paths in the prompt preamble.
+
+## Panel plans
+
+`gov plan --panel <n> <intent.md> --out jobs/<slug> --envelope <pattern>... --max-total-tokens <n>` writes a proposal-only panel template: parallel read-only member contracts, a verifier comparison contract that runs `gov panel compare`, and an advisory architect judge. The resulting `PLAN.yaml` includes a top-level `panel:` block mapping members, comparison job, and judge; `ValidatePlanManifest` applies the normal plan checks plus panel-specific hard prohibitions: no write-capable panel members, no shared/concrete worktrees, no write-capable judge, and schema'd artifacts for every panel handoff.
+
+Panel artifacts are typed handoff artifacts, so the Session 5 artifact rules still apply. The comparison command anonymizes provider/model identity before judge context and bundles the anonymous panel outputs for the judge; the ledger-side `panel_members` mapping is for audit only.
 
 ## Minimal read-only example
 
@@ -104,6 +130,36 @@ output:
 ```
 
 Setting `output.style: terse` appends prompt guidance capping the agent's final response at `max_final_words` (default 120). The guidance suppresses task restatement, routine progress narration, and generic advice; it never permits omitting evidence or `RESULT.json`. Leave `output` unset for the unrestricted prompt. `max_final_words` is invalid under `style: normal`.
+
+## Route broker (`agent: auto`)
+
+```yaml
+agent: auto
+routing:
+  objective: balanced          # balanced | cheapest | most_reliable
+  candidates: [claude-code, codex, glm]
+  max_attempts: 2
+  fallback: infrastructure_only
+  requirements:
+    native_sandbox: true
+```
+
+`agent: auto` defers backend selection to the route broker (`internal/router`):
+instead of naming a backend, the contract declares what it needs and the broker
+scores every registered backend against ledger evidence and selects one
+deterministically. An explicit `agent:` is unchanged — the broker never
+overrides an operator's explicit choice. A `routing:` block is only valid with
+`agent: auto`; pairing the two is a validation error (ambiguity).
+
+`requirements` are **hard capability filters**: if no healthy candidate
+satisfies them the job refuses to run rather than silently widening the pool.
+`objective` shifts score weights but never bypasses a hard exclusion.
+`max_attempts` caps the infrastructure-only fallback chain (0 defaults to 2;
+values above 3 are rejected); fallback only retries when the failed attempt left
+the worktree unchanged and executed no tools. See [docs/routing.md](routing.md)
+for the score components, weight tables, and the v1.2 session roadmap. `gov
+route --explain <contract.yaml>` previews the scored decision without
+launching.
 
 ## Cleanup stage and doctrine
 

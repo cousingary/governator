@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"github.com/cousingary/governator/internal/agents"
+	"github.com/cousingary/governator/internal/breaker"
 	"github.com/cousingary/governator/internal/config"
 	"github.com/cousingary/governator/internal/contextgraph"
 	"github.com/cousingary/governator/internal/contracts"
@@ -30,6 +31,8 @@ import (
 	"github.com/cousingary/governator/internal/policy"
 	"github.com/cousingary/governator/internal/prompts"
 	"github.com/cousingary/governator/internal/protectedpaths"
+	"github.com/cousingary/governator/internal/quota"
+	"github.com/cousingary/governator/internal/router"
 	"github.com/cousingary/governator/internal/spend"
 	"github.com/cousingary/governator/internal/tokenoptimizer"
 )
@@ -572,6 +575,38 @@ func transcriptCommand(format string, value map[string]any) string {
 	return ""
 }
 
+// transcriptTail returns the last maxBytes of a transcript file as a string,
+// for infrastructure-failure classification (Session 2). Infra signatures
+// (rate-limit strings, auth errors) appear in the backend's stderr tail, so
+// only the tail is matched — not the whole transcript — keeping the classifier
+// cheap and focused on launch/serve-time failures rather than mid-run noise.
+// A missing or unreadable transcript yields "" (classify as non-infra).
+func transcriptTail(path string, maxBytes int64) string {
+	info, err := os.Stat(path)
+	if err != nil {
+		return ""
+	}
+	size := info.Size()
+	if size <= maxBytes {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return ""
+		}
+		return string(data)
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return ""
+	}
+	defer f.Close()
+	if _, err := f.Seek(size-maxBytes, 0); err != nil {
+		return ""
+	}
+	buf := make([]byte, maxBytes)
+	n, _ := f.Read(buf)
+	return string(buf[:n])
+}
+
 func auditTranscript(path, format string, c contracts.Contract) transcriptAudit {
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -766,6 +801,147 @@ func redact(path string) error {
 }
 
 func (r *Runner) Run(ctx context.Context, c contracts.Contract) (RunRecord, error) {
+	if !routingFallbackEnabled(c) {
+		return r.runOnce(ctx, c)
+	}
+	maxAttempts := c.Routing.EffectiveMaxAttempts()
+	current := c
+	failed := map[string]bool{}
+	var rootRunID string
+	// The loop always returns from inside: every iteration either falls back
+	// (continue) or returns, and the attempt >= maxAttempts arm makes the
+	// final iteration unconditionally a return. No trailing statement — a
+	// reachable one would launch an extra, unledgered attempt.
+	for attempt := 1; ; attempt++ {
+		current = withExcludedRoutingCandidates(current, failed)
+		rec, err := r.runOnce(ctx, current)
+		if rootRunID == "" && rec.ID != "" {
+			rootRunID = rec.ID
+		}
+		fallbackReason := ""
+		eligible, reason, eligErr := r.fallbackEligible(rec)
+		if eligErr != nil {
+			return rec, eligErr
+		}
+		if eligible && attempt < maxAttempts {
+			fallbackReason = reason
+		}
+		if (eligible || attempt > 1) && rootRunID != "" && rec.ID != "" {
+			if err := r.recordFallbackAttempt(rootRunID, rec, attempt, fallbackReason); err != nil {
+				return rec, err
+			}
+		}
+		if err != nil || !eligible || attempt >= maxAttempts {
+			return rec, err
+		}
+		if rec.Agent == "" {
+			return rec, err
+		}
+		failed[rec.Agent] = true
+		if !hasRemainingRoutingCandidate(c, failed) {
+			return rec, err
+		}
+	}
+}
+
+func routingFallbackEnabled(c contracts.Contract) bool {
+	return c.Agent == contracts.AgentAuto && c.Routing.EffectiveMaxAttempts() > 1
+}
+
+func hasRemainingRoutingCandidate(c contracts.Contract, failed map[string]bool) bool {
+	pool := []string{}
+	if c.Routing != nil {
+		pool = append(pool, c.Routing.Candidates...)
+	}
+	if len(pool) == 0 {
+		pool = router.RegisteredAgents()
+	}
+	for _, name := range pool {
+		agent, err := agents.New(name)
+		if err != nil {
+			continue
+		}
+		if !failed[agent.Name()] {
+			return true
+		}
+	}
+	return false
+}
+
+func withExcludedRoutingCandidates(c contracts.Contract, failed map[string]bool) contracts.Contract {
+	if len(failed) == 0 {
+		return c
+	}
+	clone := c
+	var routing contracts.Routing
+	if c.Routing != nil {
+		routing = *c.Routing
+	} else {
+		routing = contracts.Routing{}
+	}
+	pool := append([]string{}, routing.Candidates...)
+	if len(pool) == 0 {
+		pool = router.RegisteredAgents()
+	}
+	filtered := make([]string, 0, len(pool))
+	for _, name := range pool {
+		agent, err := agents.New(name)
+		if err != nil {
+			continue
+		}
+		canonical := agent.Name()
+		if failed[canonical] {
+			continue
+		}
+		filtered = append(filtered, canonical)
+	}
+	routing.Candidates = filtered
+	clone.Routing = &routing
+	return clone
+}
+
+func (r *Runner) fallbackEligible(rec RunRecord) (bool, string, error) {
+	if rec.ID == "" || !observability.IsInfraFailure(rec.FailureTaxonomy) {
+		return false, "", nil
+	}
+	if !strings.Contains(rec.Notes, "fallback_worktree_unchanged") {
+		return false, "", nil
+	}
+	if rec.ToolCalls != 0 {
+		return false, "", nil
+	}
+	db, err := dbOpen(r.Home)
+	if err != nil {
+		return false, "", err
+	}
+	defer db.Close()
+	var touched int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM files_touched WHERE run_id=?`, rec.ID).Scan(&touched); err != nil {
+		return false, "", err
+	}
+	if touched != 0 {
+		return false, "", nil
+	}
+	return true, rec.FailureTaxonomy, nil
+}
+
+func (r *Runner) recordFallbackAttempt(rootRunID string, rec RunRecord, attempt int, reason string) error {
+	db, err := dbOpen(r.Home)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+	return observability.RecordFallbackAttempt(db, observability.FallbackAttempt{
+		RootRunID:      rootRunID,
+		RunID:          rec.ID,
+		Attempt:        attempt,
+		Backend:        rec.Agent,
+		FallbackReason: reason,
+		Created:        time.Now().UTC().Format(time.RFC3339Nano),
+	})
+}
+
+func (r *Runner) runOnce(ctx context.Context, c contracts.Contract) (RunRecord, error) {
 	root, err := filepath.Abs(c.Workspace.Root)
 	if err != nil {
 		return RunRecord{}, err
@@ -814,6 +990,9 @@ func (r *Runner) Run(ctx context.Context, c contracts.Contract) (RunRecord, erro
 		return replayed, replayErr
 	}
 	cfg := config.Current()
+	if err := quota.SeedFromConfig(db, cfg, time.Now().UTC()); err != nil {
+		return RunRecord{}, err
+	}
 	if ok, reason := spend.CheckBudget(cfg, db); !ok {
 		refusedID := fmt.Sprintf("%s-%d", c.JobID, time.Now().UTC().UnixNano())
 		refused := RunRecord{
@@ -836,6 +1015,72 @@ func (r *Runner) Run(ctx context.Context, c contracts.Contract) (RunRecord, erro
 		return refused, nil
 	}
 	id := fmt.Sprintf("%s-%d", c.JobID, time.Now().UTC().UnixNano())
+	// Route broker: agent: auto resolves to a concrete backend here, between
+	// contract validation and workspace creation. Resolving before any worktree
+	// is built means a fail-closed decision (no candidate qualifies) refuses
+	// with no orphan workspace or canary left behind. The resolved agent feeds
+	// every downstream read (prompt registry, agents.New, identity, run record)
+	// so the run reports what actually ran, while the contract hash — computed
+	// earlier from the authored contract — still keys the replay cache on
+	// agent: auto. An explicit agent skips the broker entirely (rule: the
+	// broker validates health but never overrides an explicit choice).
+	resolved := c
+	if c.Agent == contracts.AgentAuto {
+		decision, derr := router.Router{Health: breaker.Store{DB: db}}.Resolve(db, router.RequestFromContract(c))
+		if derr != nil {
+			return RunRecord{}, derr
+		}
+		if decision.Selected == "" {
+			return RunRecord{}, fmt.Errorf("%w:\n%s", router.ErrNoCandidate, decision.Format())
+		}
+		if rerr := observability.RecordRouteDecision(db, routeDecisionRecord(decision, id, time.Now().UTC().Format(time.RFC3339Nano))); rerr != nil {
+			return RunRecord{}, rerr
+		}
+		resolved.Agent = decision.Selected
+	} else {
+		// Explicit agent: the broker never overrides an operator choice, but a
+		// tripped breaker warrants a loud warning (plan Session 2). The run
+		// proceeds regardless — operator override is legitimate. A CLOSED or
+		// HALF_OPEN breaker is silent; OPEN/DEGRADED is surfaced.
+		if snap := breaker.Snapshot(db, c.Agent, time.Now().UTC()); snap.EffectiveState == breaker.Open || snap.EffectiveState == breaker.Degraded {
+			fmt.Fprintf(os.Stderr, "warning: backend %q breaker is %s (%s); running anyway (explicit override)\n",
+				c.Agent, snap.EffectiveState, snap.FailureKind)
+		}
+	}
+	quotaUsageEstimate := quota.EstimateUsage(c.Budget.MaxTokens)
+	quotaTTL := time.Duration(c.Budget.MaxMinutes+5) * time.Minute
+	quotaReservation, qerr := quota.Reserve(db, resolved.Agent, quota.DefaultAccount, id, quotaUsageEstimate, quotaTTL, time.Now().UTC())
+	if qerr != nil {
+		if errors.Is(qerr, quota.ErrNoHeadroom) {
+			refused := RunRecord{
+				ID: id, JobID: c.JobID, JobType: c.JobType, Agent: resolved.Agent, Mode: string(c.Mode),
+				Status: "QUARANTINED", Root: root, Created: time.Now().UTC().Format(time.RFC3339Nano),
+				Message: "QUOTA_EXHAUSTED: " + qerr.Error(), FailureTaxonomy: string(agents.InfraQuotaExhausted),
+				Notes: appendNote("quota_reservation_refused", "fallback_worktree_unchanged"), RepairOf: c.RepairLineage,
+			}
+			if err := insertRun(db, refused, hash, head); err != nil {
+				return refused, err
+			}
+			if err := observability.RecordIdentity(db, c.JobID, c.JobType, resolved.Agent, refused.Created); err != nil {
+				return refused, err
+			}
+			if err := observability.RecordCompletion(db, observability.Completion{
+				RunID: refused.ID, Agent: refused.Agent, JobType: refused.JobType, Status: refused.Status,
+				FailureTaxonomy: refused.FailureTaxonomy, Notes: refused.Notes, Violations: []string{"quota_exhausted: " + qerr.Error()},
+			}); err != nil {
+				return refused, err
+			}
+			_ = breaker.RecordFailure(db, refused.Agent, refused.FailureTaxonomy, time.Now().UTC())
+			return refused, nil
+		}
+		return RunRecord{}, qerr
+	}
+	quotaSettled := false
+	defer func() {
+		if quotaReservation.ID != 0 && !quotaSettled {
+			_ = quota.Release(db, quotaReservation.ID, time.Now().UTC())
+		}
+	}()
 	work, branch, err := createWorkspace(root, r.Home, id, git)
 	if err != nil {
 		return RunRecord{}, err
@@ -853,28 +1098,32 @@ func (r *Runner) Run(ctx context.Context, c contracts.Contract) (RunRecord, erro
 	if err := os.WriteFile(canaryPath, []byte(id+"\n"), 0400); err != nil {
 		return RunRecord{}, fmt.Errorf("create canary: %w", err)
 	}
+	stagedArtifacts, err := stageConsumedArtifacts(db, work, c)
+	if err != nil {
+		return RunRecord{}, err
+	}
 	transcript := filepath.Join(r.Home, "transcripts", id+".jsonl")
 	promptRoot := config.Env("GOV_PROMPTS")
 	if promptRoot == "" {
 		promptRoot = "prompts"
 	}
-	promptVersion, err := prompts.Resolve(promptRoot, c.Agent, string(c.Mode))
+	promptVersion, err := prompts.Resolve(promptRoot, resolved.Agent, string(c.Mode))
 	if err != nil {
 		return RunRecord{}, err
 	}
-	agent, err := agents.New(c.Agent)
+	agent, err := agents.New(resolved.Agent)
 	if err != nil {
 		return RunRecord{}, err
 	}
 	spec := agents.SpecFromContract(c, work)
-	rec := RunRecord{ID: id, JobID: c.JobID, JobType: c.JobType, Agent: c.Agent, Mode: string(c.Mode), Status: "RUNNING", Root: root, Worktree: work, Branch: branch, Transcript: transcript, Created: time.Now().UTC().Format(time.RFC3339Nano), PromptVersion: promptVersion.ID, Envelope: envelopeJSON(spec, agent.Capabilities()), Graph: graphSnapshot, RepairOf: c.RepairLineage}
+	rec := RunRecord{ID: id, JobID: c.JobID, JobType: c.JobType, Agent: resolved.Agent, Mode: string(c.Mode), Status: "RUNNING", Root: root, Worktree: work, Branch: branch, Transcript: transcript, Created: time.Now().UTC().Format(time.RFC3339Nano), PromptVersion: promptVersion.ID, Envelope: envelopeJSON(spec, agent.Capabilities()), Graph: graphSnapshot, RepairOf: c.RepairLineage}
 	if graphSnapshot.Warning != "" {
 		rec.Notes = appendNote(rec.Notes, "graph_warning: "+graphSnapshot.Warning)
 	}
 	if err = insertRun(db, rec, hash, head); err != nil {
 		return rec, err
 	}
-	if err = observability.RecordIdentity(db, c.JobID, c.JobType, c.Agent, rec.Created); err != nil {
+	if err = observability.RecordIdentity(db, c.JobID, c.JobType, resolved.Agent, rec.Created); err != nil {
 		return rec, err
 	}
 	liveBefore, err := fingerprint(root)
@@ -894,6 +1143,7 @@ func (r *Runner) Run(ctx context.Context, c contracts.Contract) (RunRecord, erro
 		return rec, err
 	}
 	prompt += "\nController canary: " + canaryName + " must remain byte-for-byte unchanged. Touching it quarantines the run.\n"
+	prompt += artifactPromptAnnotation(stagedArtifacts, c.Produces)
 	prompt += prompts.Annotation(promptVersion)
 	prompt += rtkAnnotation
 	prompt += contextgraph.PromptAnnotation(graphSnapshot)
@@ -914,6 +1164,19 @@ func (r *Runner) Run(ctx context.Context, c contracts.Contract) (RunRecord, erro
 	}
 	if !audit.Usage.Available {
 		rec.Notes = appendNote(rec.Notes, "usage_unavailable")
+	}
+	// Infra classification (Session 2): a backend that could not be reached or
+	// could not serve the request (rate limit, quota, auth, missing binary,
+	// transient upstream) is an infrastructure failure, distinct from a quality
+	// failure. It takes precedence over the quality taxonomy: a rate-limited
+	// run produces no real work, so the gate's "required file missing" style
+	// violations would otherwise mislabel it VALIDATION_FAILED. The infra kind
+	// drives the circuit breaker; it is recorded in runs but never booked to
+	// agent_profiles (rule 3). A success / quality failure stays InfraNone and
+	// is handled by the breaker as "backend reachable" (RecordSuccess).
+	infraKind := agents.ClassifyInfra(resolved.Agent, ar.ExitCode, aerr, transcriptTail(transcript, 4096))
+	if infraKind != agents.InfraNone {
+		rec.Notes = appendNote(rec.Notes, "infra_failure: "+string(infraKind))
 	}
 	workAfter, werr := fingerprint(work)
 	liveAfter, lerr := fingerprint(root)
@@ -958,7 +1221,13 @@ func (r *Runner) Run(ctx context.Context, c contracts.Contract) (RunRecord, erro
 	if len(protectedChanged)+len(protectedDeleted) > 0 {
 		violations = append(violations, "protected path mutation: "+strings.Join(append(protectedChanged, protectedDeleted...), ","))
 	}
-	changed, deleted := changes(workBefore, workAfter)
+	rawChanged, rawDeleted := changes(workBefore, workAfter)
+	if len(rawChanged)+len(rawDeleted) == 0 {
+		rec.Notes = appendNote(rec.Notes, "fallback_worktree_unchanged")
+	}
+	artifactRecords, artifactViolations := collectProducedArtifacts(r.Home, work, id, c.Produces)
+	violations = append(violations, artifactViolations...)
+	changed, deleted := filterSourceChanges(rawChanged, rawDeleted)
 	liveChanged, liveDeleted := changes(liveBefore, liveAfter)
 	if len(liveChanged)+len(liveDeleted) > 0 {
 		violations = append(violations, "out-of-worktree mutation: "+strings.Join(append(liveChanged, liveDeleted...), ","))
@@ -1045,7 +1314,7 @@ func (r *Runner) Run(ctx context.Context, c contracts.Contract) (RunRecord, erro
 	rec.Diff = workspaceDiff(root, work, git, changed, deleted)
 	if len(violations) == 0 {
 		if git {
-			_, _, _ = shell(ctx, work, "git add -A -- . ':(exclude).codegraph'")
+			_, _, _ = shell(ctx, work, "git add -A -- . ':(exclude).codegraph' ':(exclude).governator'")
 			cm := fmt.Sprintf("Governator job %s\n\nGov-Run: %s", c.JobID, id)
 			code, out, e := shell(ctx, work, "git commit --allow-empty -m "+shQuote(cm))
 			if e != nil || code != 0 {
@@ -1097,16 +1366,23 @@ func (r *Runner) Run(ctx context.Context, c contracts.Contract) (RunRecord, erro
 		}
 		commands = append(commands, observability.CommandFact{Command: command, Classification: classification})
 	}
-	if len(violations) == 0 {
+	if len(violations) == 0 && infraKind == agents.InfraNone {
 		rec.Status = "APPROVED"
 		rec.Message = "merge gate passed"
 		rec.ValidOutput = true
 	} else {
 		rec.Status = "QUARANTINED"
 		rec.Message = strings.Join(violations, "; ")
-		rec.FailureTaxonomy = observability.ClassifyFailure(violations)
+		if infraKind != agents.InfraNone {
+			// Infra takes precedence: the backend did not produce real work,
+			// so the gate violations (required file missing, etc.) describe
+			// the symptom, not the cause.
+			rec.FailureTaxonomy = string(infraKind)
+		} else {
+			rec.FailureTaxonomy = observability.ClassifyFailure(violations)
+		}
 		if git {
-			_, _, _ = shell(ctx, work, "git add -A -- . ':(exclude).codegraph'")
+			_, _, _ = shell(ctx, work, "git add -A -- . ':(exclude).codegraph' ':(exclude).governator'")
 			_, _, _ = shell(ctx, work, "git commit --allow-empty -m "+shQuote("Quarantined Governator run "+id))
 		}
 	}
@@ -1135,6 +1411,36 @@ func (r *Runner) Run(ctx context.Context, c contracts.Contract) (RunRecord, erro
 		TranscriptBytes: rec.TranscriptBytes,
 	}); err != nil {
 		return rec, err
+	}
+	if err := observability.RecordArtifacts(db, artifactRecords, time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
+		return rec, err
+	}
+	if quotaReservation.ID != 0 {
+		measuredQuota := quotaUsageEstimate
+		if rec.Usage.Available && rec.Usage.TotalTokens > 0 {
+			measuredQuota = float64(rec.Usage.TotalTokens)
+		}
+		if err := quota.Settle(db, quotaReservation.ID, measuredQuota, time.Now().UTC()); err != nil {
+			return rec, err
+		}
+		quotaSettled = true
+	}
+	if infraKind == agents.InfraQuotaExhausted || infraKind == agents.InfraRateLimit {
+		if resetAt, ok := agents.ResetHint(transcriptTail(transcript, 4096), time.Now().UTC()); ok {
+			_ = quota.ApplyResetHint(db, rec.Agent, quota.DefaultAccount, resetAt, time.Now().UTC())
+		}
+	}
+	// Circuit-breaker feedback (Session 2). A run that proved the backend was
+	// reachable — APPROVED, or a quality quarantine (the backend answered but
+	// produced bad work) — closes a probe / clears DEGRADED. Only an infra
+	// failure opens or extends a breaker (rule 3). A SPEND_CAP refusal never
+	// reaches here (it returns before the workspace is created). Breaker write
+	// errors are non-fatal: a failed audit row must not quarantine an otherwise
+	// approved run, so they are swallowed (the decision already landed).
+	if infraKind != agents.InfraNone {
+		_ = breaker.RecordFailure(db, rec.Agent, string(infraKind), time.Now().UTC())
+	} else if rec.FailureTaxonomy != "SPEND_CAP" {
+		_ = breaker.RecordSuccess(db, rec.Agent, time.Now().UTC())
 	}
 	_ = spend.MaybeHalt(cfg, db)
 	if git {
@@ -1294,3 +1600,36 @@ func Rollback(ctx context.Context, id string) (RunRecord, error) {
 }
 
 func MarshalRecord(r RunRecord) string { b, _ := json.MarshalIndent(r, "", "  "); return string(b) }
+
+// routeDecisionRecord maps a broker Decision to its persistence shape: one
+// row per candidate (excluded ones included with their reason) so the ledger
+// alone fully explains every routing decision. preview is false here — a real
+// launch always records a non-preview decision; `gov route --explain` is the
+// print-only path and writes nothing.
+func routeDecisionRecord(d router.Decision, runID, created string) observability.RouteDecisionRecord {
+	rows := make([]observability.RouteDecisionRow, 0, len(d.Candidates))
+	for _, c := range d.Candidates {
+		rows = append(rows, observability.RouteDecisionRow{
+			Candidate:            c.Agent,
+			ValidRateScore:       c.ValidRateScore,
+			FailureSeverityScore: c.FailureSeverityScore,
+			CostScore:            c.CostScore,
+			BreakerScore:         c.BreakerScore,
+			QuotaScore:           c.QuotaScore,
+			RepairAffinityScore:  c.RepairAffinityScore,
+			Total:                c.Total,
+			Excluded:             c.Excluded,
+			ExclusionReason:      c.ExclusionReason,
+			Selected:             c.Selected,
+		})
+	}
+	return observability.RouteDecisionRecord{
+		RunID:     runID,
+		JobID:     d.JobID,
+		JobType:   d.JobType,
+		Objective: d.Objective,
+		Preview:   false,
+		Created:   created,
+		Rows:      rows,
+	}
+}

@@ -149,6 +149,40 @@ func TestLoadDoctrineRequireCleanupFromFileAndEnv(t *testing.T) {
 	}
 }
 
+func TestLoadQuotasFromFile(t *testing.T) {
+	cleanEnv(t)
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	t.Setenv("GOV_CONFIG", path)
+	if err := os.WriteFile(path, []byte(`quotas:
+  - backend: Codex
+    account: Default
+    window_type: daily
+    estimated_limit: 1000
+    confidence: 0.75
+`), 0644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.Quotas) != 1 || cfg.Quotas[0].Backend != "codex" || cfg.Quotas[0].Account != "default" || cfg.Quotas[0].WindowType != "daily" || cfg.Quotas[0].EstimatedLimit != 1000 || cfg.Quotas[0].Confidence != 0.75 {
+		t.Fatalf("quotas=%+v", cfg.Quotas)
+	}
+}
+
+func TestLoadRejectsInvalidQuota(t *testing.T) {
+	cleanEnv(t)
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	t.Setenv("GOV_CONFIG", path)
+	if err := os.WriteFile(path, []byte("quotas: [{backend: codex, window_type: yearly, estimated_limit: 1}]\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "invalid quota window_type") {
+		t.Fatalf("error=%v", err)
+	}
+}
+
 func TestLoadRejectsNegativeSpendCap(t *testing.T) {
 	cleanEnv(t)
 	path := filepath.Join(t.TempDir(), "config.yaml")

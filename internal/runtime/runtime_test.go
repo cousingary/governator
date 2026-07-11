@@ -3,6 +3,7 @@ package runtime
 import (
 	"context"
 	"crypto/sha1"
+	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
 	"os"
@@ -72,6 +73,238 @@ func contract(root string) contracts.Contract {
 		Preflight:   contracts.Preflight{IntendedWrites: []string{"output/**"}},
 		Success:     contracts.Success{RequiredFiles: []string{"output/result.txt"}, Validators: []string{"test -f output/result.txt"}},
 		OnViolation: "quarantine",
+	}
+}
+
+func writeFakeBackend(t *testing.T, body string) string {
+	t.Helper()
+	bin := filepath.Join(t.TempDir(), "fake-backend")
+	if err := os.WriteFile(bin, []byte("#!/bin/sh\nset -eu\n"+body), 0755); err != nil {
+		t.Fatal(err)
+	}
+	return bin
+}
+
+func writePrompt(t *testing.T, root, agent, mode string) {
+	t.Helper()
+	dir := filepath.Join(root, agent, mode)
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "v001.md"), []byte("test prompt"), 0644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestAgentAutoFallbackRetriesNextCandidateOnInfraPreMutation(t *testing.T) {
+	root, _ := fixture(t)
+	home := t.TempDir()
+	t.Setenv("GOV_HOME", home)
+	claude := writeFakeBackend(t, `printf 'rate limit: retry later\n' >&2
+exit 1
+`)
+	codex := writeFakeBackend(t, `mkdir -p output
+printf 'ok\n' > output/result.txt
+printf '{"status":"complete","files_changed":["output/result.txt"],"commands_run":0,"validation":{"self_checked":true},"violations":[],"blockers":[],"next_recommended_action":"none"}\n' > RESULT.json
+printf '{"type":"agent_message","total_cost_usd":0.10}\n'
+`)
+	t.Setenv("GOV_CLAUDE_BIN", claude)
+	t.Setenv("GOV_CODEX_BIN", codex)
+	promptRoot := t.TempDir()
+	writePrompt(t, promptRoot, "claude-code", "surgeon")
+	writePrompt(t, promptRoot, "codex", "surgeon")
+	t.Setenv("GOV_PROMPTS", promptRoot)
+	c := contract(root)
+	c.Agent = contracts.AgentAuto
+	c.Routing = &contracts.Routing{Candidates: []string{"claude-code", "codex"}, MaxAttempts: 2}
+
+	rec, err := New().Run(context.Background(), c)
+	if err != nil {
+		t.Fatalf("fallback run failed: %v", err)
+	}
+	if rec.Status != "APPROVED" || rec.Agent != "codex" {
+		t.Fatalf("expected codex approval after fallback, got status=%s agent=%s message=%s", rec.Status, rec.Agent, rec.Message)
+	}
+	db, err := observability.Open(home)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	var runs int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM runs WHERE job_id=?`, c.JobID).Scan(&runs); err != nil {
+		t.Fatal(err)
+	}
+	if runs != 2 {
+		t.Fatalf("expected two run attempts, got %d", runs)
+	}
+	var firstID, firstTaxonomy string
+	if err := db.QueryRow(`SELECT id,failure_taxonomy FROM runs WHERE job_id=? AND agent='claude-code'`, c.JobID).Scan(&firstID, &firstTaxonomy); err != nil {
+		t.Fatal(err)
+	}
+	if firstTaxonomy != observability.InfraRateLimit {
+		t.Fatalf("first taxonomy=%s, want RATE_LIMIT", firstTaxonomy)
+	}
+	var fallbackRows, reasonRows int
+	if err := db.QueryRow(`SELECT COUNT(*),SUM(CASE WHEN fallback_reason='RATE_LIMIT' THEN 1 ELSE 0 END) FROM fallback_attempts WHERE root_run_id=?`, firstID).Scan(&fallbackRows, &reasonRows); err != nil {
+		t.Fatal(err)
+	}
+	if fallbackRows != 2 || reasonRows != 1 {
+		t.Fatalf("fallback_attempts rows=%d reason_rows=%d, want 2/1", fallbackRows, reasonRows)
+	}
+	var firstSelected, secondSelected string
+	if err := db.QueryRow(`SELECT candidate FROM route_decisions WHERE run_id=? AND selected=1`, firstID).Scan(&firstSelected); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRow(`SELECT candidate FROM route_decisions WHERE run_id=? AND selected=1`, rec.ID).Scan(&secondSelected); err != nil {
+		t.Fatal(err)
+	}
+	if firstSelected != "claude-code" || secondSelected != "codex" {
+		t.Fatalf("selected chain = %s -> %s, want claude-code -> codex", firstSelected, secondSelected)
+	}
+}
+
+func TestAgentAutoFallbackBlockedWhenWorktreeChanged(t *testing.T) {
+	root, _ := fixture(t)
+	home := t.TempDir()
+	t.Setenv("GOV_HOME", home)
+	claude := writeFakeBackend(t, `mkdir -p output
+printf 'partial\n' > output/partial.txt
+printf 'rate limit after mutation\n' >&2
+exit 1
+`)
+	codex := writeFakeBackend(t, `mkdir -p output
+printf 'ok\n' > output/result.txt
+printf '{"status":"complete","files_changed":["output/result.txt"],"commands_run":0,"validation":{"self_checked":true},"violations":[],"blockers":[],"next_recommended_action":"none"}\n' > RESULT.json
+printf '{"type":"agent_message","total_cost_usd":0.10}\n'
+`)
+	t.Setenv("GOV_CLAUDE_BIN", claude)
+	t.Setenv("GOV_CODEX_BIN", codex)
+	promptRoot := t.TempDir()
+	writePrompt(t, promptRoot, "claude-code", "surgeon")
+	writePrompt(t, promptRoot, "codex", "surgeon")
+	t.Setenv("GOV_PROMPTS", promptRoot)
+	c := contract(root)
+	c.Agent = contracts.AgentAuto
+	c.Routing = &contracts.Routing{Candidates: []string{"claude-code", "codex"}, MaxAttempts: 2}
+
+	rec, err := New().Run(context.Background(), c)
+	if err != nil {
+		t.Fatalf("run failed: %v", err)
+	}
+	if rec.Status != "QUARANTINED" || rec.Agent != "claude-code" {
+		t.Fatalf("expected mutated infra failure to stay on first quarantine, got status=%s agent=%s", rec.Status, rec.Agent)
+	}
+	db, err := observability.Open(home)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	var runs, fallbacks int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM runs WHERE job_id=?`, c.JobID).Scan(&runs); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRow(`SELECT COUNT(*) FROM fallback_attempts`).Scan(&fallbacks); err != nil {
+		t.Fatal(err)
+	}
+	if runs != 1 || fallbacks != 0 {
+		t.Fatalf("runs=%d fallback_attempts=%d, want 1/0", runs, fallbacks)
+	}
+}
+
+// TestAgentAutoResolvesViaRouteBroker verifies the wiring: an agent: auto
+// contract resolves to a concrete backend (claude-code, the only candidate
+// whose binary is present) before launch, the run records the RESOLVED agent
+// (not "auto"), and a route_decisions row ledgered the choice. Candidates are
+// pinned to claude-code so the test is hermetic — it depends only on the
+// GOV_CLAUDE_BIN fake binary, not on which real backends the host has.
+func TestAgentAutoResolvesViaRouteBroker(t *testing.T) {
+	root, bin := fixture(t)
+	home := t.TempDir()
+	t.Setenv("GOV_HOME", home)
+	t.Setenv("GOV_CLAUDE_BIN", bin)
+	promptRoot := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(promptRoot, "claude-code", "surgeon"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(promptRoot, "claude-code", "surgeon", "v007.md"), []byte("test prompt"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("GOV_PROMPTS", promptRoot)
+	c := contract(root)
+	c.Agent = contracts.AgentAuto
+	c.Routing = &contracts.Routing{Candidates: []string{"claude-code"}}
+	r, err := New().Run(context.Background(), c)
+	if err != nil {
+		t.Fatalf("auto run failed: %v", err)
+	}
+	if r.Status != "APPROVED" {
+		t.Fatalf("expected APPROVED, got %s: %s", r.Status, r.Message)
+	}
+	if r.Agent != "claude-code" {
+		t.Fatalf("run should record the resolved agent, got %q", r.Agent)
+	}
+	db, err := observability.Open(home)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	var selected, preview int
+	if err := db.QueryRow(`SELECT COUNT(*),COALESCE(SUM(preview),0) FROM route_decisions WHERE run_id=?`, r.ID).Scan(&selected, &preview); err != nil {
+		t.Fatal(err)
+	}
+	if selected != 1 || preview != 0 {
+		t.Fatalf("route_decisions: want 1 non-preview row for run, got %d rows preview=%d", selected, preview)
+	}
+	var decided string
+	if err := db.QueryRow(`SELECT candidate FROM route_decisions WHERE run_id=? AND selected=1`, r.ID).Scan(&decided); err != nil {
+		t.Fatalf("no selected route_decisions row: %v", err)
+	}
+	if decided != "claude-code" {
+		t.Fatalf("route_decisions selected %q, want claude-code", decided)
+	}
+}
+
+// TestAgentAutoFailClosedRefusesToRun verifies that when no candidate
+// satisfies the contract (here: a capability no pinned candidate has), the
+// runtime refuses to launch and records nothing as a real run.
+func TestAgentAutoFailClosedRefusesToRun(t *testing.T) {
+	root, bin := fixture(t)
+	home := t.TempDir()
+	t.Setenv("GOV_HOME", home)
+	t.Setenv("GOV_CLAUDE_BIN", bin)
+	c := contract(root)
+	c.Agent = contracts.AgentAuto
+	// glm lacks native_sandbox; pin the pool to it so the broker fail-closes.
+	c.Routing = &contracts.Routing{
+		Candidates:   []string{"glm"},
+		Requirements: contracts.RoutingRequirements{NativeSandbox: true},
+	}
+	_, err := New().Run(context.Background(), c)
+	if err == nil {
+		t.Fatal("expected fail-closed error, got nil")
+	}
+	if !strings.Contains(err.Error(), "fail closed") {
+		t.Fatalf("expected fail-closed error, got %v", err)
+	}
+	// A fail-closed refusal must not have launched a backend, so no real run
+	// row and no route_decisions row should exist for this job.
+	db, err := observability.Open(home)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	var runs, decisions int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM runs WHERE job_id=?`, c.JobID).Scan(&runs); err != nil {
+		t.Fatal(err)
+	}
+	if runs != 0 {
+		t.Fatalf("fail-closed must not insert a run row, got %d", runs)
+	}
+	if err := db.QueryRow(`SELECT COUNT(*) FROM route_decisions WHERE job_id=?`, c.JobID).Scan(&decisions); err != nil {
+		t.Fatal(err)
+	}
+	if decisions != 0 {
+		t.Fatalf("fail-closed must not record a route_decisions row, got %d", decisions)
 	}
 }
 
@@ -755,5 +988,161 @@ func TestCleanupSkippedWhenSuccessValidatorsAlreadyFailed(t *testing.T) {
 	}
 	if cleanupCount != 0 {
 		t.Fatalf("expected no cleanup validator rows after a success-validator failure, got %d", cleanupCount)
+	}
+}
+
+func writeArtifactSchema(t *testing.T, root string) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Join(root, "schemas"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	schema := `{"type":"object","required":["summary"],"properties":{"summary":{"type":"string"}},"additionalProperties":false}`
+	if err := os.WriteFile(filepath.Join(root, "schemas", "scout.schema.json"), []byte(schema), 0644); err != nil {
+		t.Fatal(err)
+	}
+	git(t, root, "add", "schemas/scout.schema.json")
+	git(t, root, "commit", "-m", "schema")
+}
+
+func artifactProducerContract(root string) contracts.Contract {
+	c := contract(root)
+	c.JobID = "artifact-producer"
+	c.Produces = []contracts.ArtifactSpec{{
+		Name: "reconnaissance", Path: ".governator/artifacts/scout.json",
+		Schema: "schemas/scout.schema.json", MaxBytes: 262144,
+	}}
+	return c
+}
+
+func TestProducedArtifactStoredHasStableHashAndIsNotMerged(t *testing.T) {
+	root, _ := fixture(t)
+	writeArtifactSchema(t, root)
+	home := t.TempDir()
+	t.Setenv("GOV_HOME", home)
+	bin := writeFakeBackend(t, `mkdir -p output .governator/artifacts
+printf 'ok\n' > output/result.txt
+printf '{"summary":"ok"}' > .governator/artifacts/scout.json
+printf '{"status":"complete","files_changed":["output/result.txt"],"commands_run":0,"validation":{"self_checked":true},"violations":[],"blockers":[],"next_recommended_action":"none"}\n' > RESULT.json
+printf '{"type":"result","total_cost_usd":0.05}\n'
+`)
+	t.Setenv("GOV_CLAUDE_BIN", bin)
+	promptRoot := t.TempDir()
+	writePrompt(t, promptRoot, "claude-code", "surgeon")
+	t.Setenv("GOV_PROMPTS", promptRoot)
+
+	rec, err := New().Run(context.Background(), artifactProducerContract(root))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rec.Status != "APPROVED" {
+		t.Fatalf("status=%s message=%s", rec.Status, rec.Message)
+	}
+	if _, err := os.Stat(filepath.Join(root, ".governator", "artifacts", "scout.json")); !os.IsNotExist(err) {
+		t.Fatalf("artifact merged into source root, stat err=%v", err)
+	}
+	db, err := observability.Open(home)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	var storedPath, gotSHA string
+	var gotBytes, schemaOK int
+	if err := db.QueryRow(`SELECT path,sha256,bytes,schema_ok FROM artifacts WHERE run_id=? AND name='reconnaissance'`, rec.ID).Scan(&storedPath, &gotSHA, &gotBytes, &schemaOK); err != nil {
+		t.Fatal(err)
+	}
+	wantSum := sha256.Sum256([]byte(`{"summary":"ok"}`))
+	if gotSHA != hex.EncodeToString(wantSum[:]) || gotBytes != len(`{"summary":"ok"}`) || schemaOK != 1 {
+		t.Fatalf("artifact ledger row sha=%s bytes=%d schema_ok=%d", gotSHA, gotBytes, schemaOK)
+	}
+	stored, err := os.ReadFile(storedPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(stored) != `{"summary":"ok"}` {
+		t.Fatalf("stored artifact content = %q", stored)
+	}
+}
+
+func TestConsumedArtifactIsStagedReadOnlyForConsumer(t *testing.T) {
+	root, _ := fixture(t)
+	writeArtifactSchema(t, root)
+	home := t.TempDir()
+	t.Setenv("GOV_HOME", home)
+	producerBin := writeFakeBackend(t, `mkdir -p output .governator/artifacts
+printf 'ok\n' > output/result.txt
+printf '{"summary":"ok"}' > .governator/artifacts/scout.json
+printf '{"status":"complete","files_changed":["output/result.txt"],"commands_run":0,"validation":{"self_checked":true},"violations":[],"blockers":[],"next_recommended_action":"none"}\n' > RESULT.json
+printf '{"type":"result","total_cost_usd":0.05}\n'
+`)
+	t.Setenv("GOV_CLAUDE_BIN", producerBin)
+	promptRoot := t.TempDir()
+	writePrompt(t, promptRoot, "claude-code", "surgeon")
+	t.Setenv("GOV_PROMPTS", promptRoot)
+	producer, err := New().Run(context.Background(), artifactProducerContract(root))
+	if err != nil || producer.Status != "APPROVED" {
+		t.Fatalf("producer status=%s err=%v message=%s", producer.Status, err, producer.Message)
+	}
+
+	consumerBin := writeFakeBackend(t, `test -r .governator/consumed/reconnaissance
+grep -q '"summary":"ok"' .governator/consumed/reconnaissance
+if [ -w .governator/consumed/reconnaissance ]; then echo writable >&2; exit 1; fi
+mkdir -p output
+printf 'used\n' > output/result.txt
+printf '{"status":"complete","files_changed":["output/result.txt"],"commands_run":0,"validation":{"self_checked":true},"violations":[],"blockers":[],"next_recommended_action":"none"}\n' > RESULT.json
+printf '{"type":"result","total_cost_usd":0.05}\n'
+`)
+	t.Setenv("GOV_CLAUDE_BIN", consumerBin)
+	consumer := contract(root)
+	consumer.JobID = "artifact-consumer"
+	consumer.Consumes = []string{"reconnaissance"}
+	consumer.DependsOn = []string{"artifact-producer"}
+	consumer.ArtifactSources = map[string]string{"reconnaissance": "artifact-producer"}
+
+	rec, err := New().Run(context.Background(), consumer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rec.Status != "APPROVED" {
+		t.Fatalf("consumer status=%s message=%s", rec.Status, rec.Message)
+	}
+	if _, err := os.Stat(filepath.Join(root, ".governator", "consumed", "reconnaissance")); !os.IsNotExist(err) {
+		t.Fatalf("consumed artifact merged into source root, stat err=%v", err)
+	}
+}
+
+func TestProducedArtifactSchemaInvalidQuarantines(t *testing.T) {
+	root, _ := fixture(t)
+	writeArtifactSchema(t, root)
+	home := t.TempDir()
+	t.Setenv("GOV_HOME", home)
+	bin := writeFakeBackend(t, `mkdir -p output .governator/artifacts
+printf 'ok\n' > output/result.txt
+printf '{}' > .governator/artifacts/scout.json
+printf '{"status":"complete","files_changed":["output/result.txt"],"commands_run":0,"validation":{"self_checked":true},"violations":[],"blockers":[],"next_recommended_action":"none"}\n' > RESULT.json
+printf '{"type":"result","total_cost_usd":0.05}\n'
+`)
+	t.Setenv("GOV_CLAUDE_BIN", bin)
+	promptRoot := t.TempDir()
+	writePrompt(t, promptRoot, "claude-code", "surgeon")
+	t.Setenv("GOV_PROMPTS", promptRoot)
+
+	rec, err := New().Run(context.Background(), artifactProducerContract(root))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rec.Status != "QUARANTINED" || rec.FailureTaxonomy != "VALIDATION_FAILED" {
+		t.Fatalf("status=%s taxonomy=%s message=%s", rec.Status, rec.FailureTaxonomy, rec.Message)
+	}
+	db, err := observability.Open(home)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	var schemaOK int
+	if err := db.QueryRow(`SELECT schema_ok FROM artifacts WHERE run_id=? AND name='reconnaissance'`, rec.ID).Scan(&schemaOK); err != nil {
+		t.Fatal(err)
+	}
+	if schemaOK != 0 {
+		t.Fatalf("schema_ok=%d, want 0", schemaOK)
 	}
 }

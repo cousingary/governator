@@ -25,6 +25,14 @@ const fallbackCostPerMTokUSD = 15.0
 // throttled by the cap at all.
 const unboundedEstimateUSD = 0.25
 
+// unboundedQuotaTokens is the conservative subscription-window reservation
+// when a contract omits budget.max_tokens. It intentionally differs from the
+// dollar estimate above: quota windows track provider-plan usage units, so the
+// reservation needs a token-shaped floor.
+const unboundedQuotaTokens = 50000
+
+func UnboundedQuotaTokens() int { return unboundedQuotaTokens }
+
 // EstimateCostUSD conservatively estimates a job's worst-case cost from its
 // budget.max_tokens ceiling and a per-backend $/1M-token table, for sizing a
 // batch reservation before the job runs. Pass nil for rates to use

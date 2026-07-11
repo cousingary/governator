@@ -39,22 +39,110 @@ var jobIDPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]*$`)
 
 var riskClasses = map[string]bool{"low": true, "medium": true, "high": true}
 
+// validAgents mirrors internal/agents.New's switch (kept in sync by the
+// router_test cross-check against agents.Registered). Duplicated here so the
+// contracts package can validate an explicit agent without importing agents
+// (which would create a cycle: agents imports contracts for SpecFromContract).
+var validAgents = map[string]bool{
+	"claude-code": true, "claude": true, "codex": true,
+	"glm": true, "opencode": true, "pi": true,
+}
+
+// AgentAuto is the contract sentinel that defers backend selection to the
+// route broker (internal/router). An explicit agent name keeps today's
+// behavior: the broker still validates health but never overrides an
+// operator's explicit choice (it may warn).
+const AgentAuto = "auto"
+
+var routingObjectives = map[string]bool{
+	"balanced": true, "cheapest": true, "most_reliable": true,
+}
+
+var routingFallbacks = map[string]bool{
+	// v1.2 reserves the enum but only this value is meaningful; S3 defines
+	// the fallback behavior. An empty fallback (omitted) is also valid.
+	"infrastructure_only": true,
+}
+
+// Routing is the optional block a contract pairs with agent: auto to shape
+// route-broker selection. It is meaningless (and rejected) with an explicit
+// agent, since an explicit agent is the operator overriding the broker.
+// Hard capability filters live under Requirements and fail closed: if no
+// healthy candidate satisfies them the job refuses to run rather than
+// silently widening the pool.
+type Routing struct {
+	Objective    string              `yaml:"objective,omitempty" json:"objective,omitempty"`
+	Candidates   []string            `yaml:"candidates,omitempty" json:"candidates,omitempty"`
+	MaxAttempts  int                 `yaml:"max_attempts,omitempty" json:"max_attempts,omitempty"`
+	Fallback     string              `yaml:"fallback,omitempty" json:"fallback,omitempty"`
+	Requirements RoutingRequirements `yaml:"requirements,omitempty" json:"requirements,omitempty"`
+}
+
+// EffectiveObjective returns the routing objective defaulted to balanced. The
+// broker shifts weights by objective but never uses it to bypass a hard
+// exclusion (rule: fail closed).
+func (r *Routing) EffectiveObjective() string {
+	if r == nil || r.Objective == "" {
+		return "balanced"
+	}
+	return r.Objective
+}
+
+// EffectiveMaxAttempts returns the fallback-chain cap defaulted to 2. Session 3
+// wires the chain; validation already rejected >3, so this only applies the
+// default for an unset (zero) value.
+func (r *Routing) EffectiveMaxAttempts() int {
+	if r == nil || r.MaxAttempts == 0 {
+		return 2
+	}
+	return r.MaxAttempts
+}
+
+// RoutingRequirements are hard capability filters. Every set field must be
+// satisfied by a candidate's agents.Capability or the candidate is excluded;
+// if none remain the broker fails closed.
+type RoutingRequirements struct {
+	NativeSandbox  bool `yaml:"native_sandbox,omitempty" json:"native_sandbox,omitempty"`
+	NetworkControl bool `yaml:"network_control,omitempty" json:"network_control,omitempty"`
+}
+
+// ArtifactSpec declares a typed handoff artifact a job produces. Artifacts
+// are controller-owned handoff files, not source files: they must live under
+// .governator/artifacts/ in the run worktree, are size-bounded, optionally
+// schema-validated, copied to the ledger-adjacent artifact store, and never
+// merged back into the source root.
+type ArtifactSpec struct {
+	Name     string `yaml:"name" json:"name"`
+	Path     string `yaml:"path" json:"path"`
+	Schema   string `yaml:"schema,omitempty" json:"schema,omitempty"`
+	MaxBytes int64  `yaml:"max_bytes" json:"max_bytes"`
+}
+
 type Contract struct {
-	Task        string        `yaml:"task,omitempty" json:"task,omitempty"`
-	JobID       string        `yaml:"job_id" json:"job_id"`
-	JobType     string        `yaml:"job_type" json:"job_type"`
-	Agent       string        `yaml:"agent" json:"agent"`
-	Mode        Mode          `yaml:"mode" json:"mode"`
-	Workspace   Workspace     `yaml:"workspace" json:"workspace"`
-	Allowed     Permissions   `yaml:"allowed" json:"allowed"`
-	Forbidden   Forbidden     `yaml:"forbidden" json:"forbidden"`
-	Budget      Budget        `yaml:"budget" json:"budget"`
-	Preflight   Preflight     `yaml:"preflight" json:"preflight"`
-	Success     Success       `yaml:"success" json:"success"`
-	Output      *OutputPolicy `yaml:"output,omitempty" json:"output,omitempty"`
-	Repair      *Repair       `yaml:"repair,omitempty" json:"repair,omitempty"`
-	Cleanup     *Cleanup      `yaml:"cleanup,omitempty" json:"cleanup,omitempty"`
-	OnViolation string        `yaml:"on_violation" json:"on_violation"`
+	Task        string         `yaml:"task,omitempty" json:"task,omitempty"`
+	JobID       string         `yaml:"job_id" json:"job_id"`
+	JobType     string         `yaml:"job_type" json:"job_type"`
+	Agent       string         `yaml:"agent" json:"agent"`
+	Mode        Mode           `yaml:"mode" json:"mode"`
+	Workspace   Workspace      `yaml:"workspace" json:"workspace"`
+	Allowed     Permissions    `yaml:"allowed" json:"allowed"`
+	Forbidden   Forbidden      `yaml:"forbidden" json:"forbidden"`
+	Budget      Budget         `yaml:"budget" json:"budget"`
+	Preflight   Preflight      `yaml:"preflight" json:"preflight"`
+	Success     Success        `yaml:"success" json:"success"`
+	Output      *OutputPolicy  `yaml:"output,omitempty" json:"output,omitempty"`
+	Repair      *Repair        `yaml:"repair,omitempty" json:"repair,omitempty"`
+	Cleanup     *Cleanup       `yaml:"cleanup,omitempty" json:"cleanup,omitempty"`
+	Produces    []ArtifactSpec `yaml:"produces,omitempty" json:"produces,omitempty"`
+	Consumes    []string       `yaml:"consumes,omitempty" json:"consumes,omitempty"`
+	OnViolation string         `yaml:"on_violation" json:"on_violation"`
+
+	// Routing shapes route-broker selection and is only meaningful with
+	// agent: auto. Validate rejects a routing block paired with an explicit
+	// agent (the operator already chose). The pointer (not a value) keeps
+	// the block absent on every prior job YAML, so existing contracts keep
+	// validating unchanged.
+	Routing *Routing `yaml:"routing,omitempty" json:"routing,omitempty"`
 
 	// RepairLineage tags a contract compiled by the auto-repair loop with the
 	// id of the original run that started its failure lineage. It is set
@@ -63,6 +151,11 @@ type Contract struct {
 	// it), and `json:"-"` keeps it out of ContractHash and the compiled
 	// prompt.
 	RepairLineage string `yaml:"-" json:"-"`
+
+	// ArtifactSources maps each consumed artifact name to the producing job_id.
+	// ValidatePlan populates it for ordered plan execution; it is intentionally
+	// not part of job YAML, prompts, or ContractHash.
+	ArtifactSources map[string]string `yaml:"-" json:"-"`
 
 	// DependsOn and RiskClass are plan-authoring metadata: a `gov plan`
 	// manifest's sub-contracts use them to declare execution order
@@ -215,6 +308,11 @@ func (c Contract) Validate() error {
 	if strings.TrimSpace(c.Agent) == "" {
 		add("agent", "is required")
 	}
+	// auto defers to the route broker; any other value is an explicit
+	// operator choice that the broker validates but never overrides.
+	if c.Agent != AgentAuto && !validAgents[c.Agent] {
+		add("agent", "must be 'auto' or a known backend (claude-code, claude, codex, glm, opencode, pi)")
+	}
 	if !validModes[c.Mode] {
 		add("mode", "must be one of scout, surgeon, batch_worker, verifier, repair, architect, planner")
 	}
@@ -323,6 +421,9 @@ func (c Contract) Validate() error {
 		}
 	}
 
+	validateRouting(c, add)
+	validateArtifacts(c, add)
+
 	// Quarantine is the implemented fail-closed action. Halt and rollback were
 	// previously accepted but ignored; rollback also cannot restore arbitrary
 	// live-root mutations from fingerprints alone.
@@ -363,5 +464,108 @@ func validateNonBlank(field string, values []string, add func(string, string)) {
 		if strings.TrimSpace(value) == "" {
 			add(fmt.Sprintf("%s[%d]", field, i), "must not be blank")
 		}
+	}
+}
+
+// validateRouting enforces the contract between agent and routing. A routing
+// block is meaningful only with agent: auto — an explicit agent is the
+// operator overriding the broker, so pairing the two is an ambiguity error,
+// not a warning (rule: fail closed on ambiguity). candidate/enum/range
+// checks keep the broker's input well-formed before it ever reads the ledger.
+func validateRouting(c Contract, add func(string, string)) {
+	if c.Routing == nil {
+		return
+	}
+	if c.Agent != AgentAuto {
+		add("routing", "is only valid with agent: auto; an explicit agent overrides the broker")
+		return
+	}
+	r := c.Routing
+	if r.Objective != "" && !routingObjectives[r.Objective] {
+		add("routing.objective", "must be one of balanced, cheapest, most_reliable")
+	}
+	if r.Fallback != "" && !routingFallbacks[r.Fallback] {
+		add("routing.fallback", "must be infrastructure_only in v1.2")
+	}
+	// max_attempts becomes operational in Session 3; validate the range now
+	// so a misconfigured job never reaches a fallback chain. 0 defaults to 2;
+	// >3 is rejected (the two-attempts rule caps effective attempts at 2 once
+	// S3 wires the chain).
+	if r.MaxAttempts < 0 {
+		add("routing.max_attempts", "must be zero or greater (0 defaults to 2)")
+	} else if r.MaxAttempts > 3 {
+		add("routing.max_attempts", "must not exceed 3")
+	}
+	for i, name := range r.Candidates {
+		field := fmt.Sprintf("routing.candidates[%d]", i)
+		trimmed := strings.TrimSpace(name)
+		if trimmed == "" {
+			add(field, "must not be blank")
+			continue
+		}
+		if !validAgents[trimmed] {
+			add(field, "must name a known backend (claude-code, claude, codex, glm, opencode, pi)")
+		}
+	}
+}
+
+func validateArtifacts(c Contract, add func(string, string)) {
+	seenProduces := map[string]bool{}
+	for i, artifact := range c.Produces {
+		field := fmt.Sprintf("produces[%d]", i)
+		name := strings.TrimSpace(artifact.Name)
+		if name == "" {
+			add(field+".name", "is required")
+		} else if !jobIDPattern.MatchString(name) {
+			add(field+".name", "must start with an alphanumeric character and contain only alphanumerics, '.', '_' or '-'")
+		} else if seenProduces[name] {
+			add(field+".name", "duplicates another produced artifact name")
+		}
+		seenProduces[name] = true
+		pathValue := strings.TrimSpace(artifact.Path)
+		if pathValue == "" {
+			add(field+".path", "is required")
+		} else if !validArtifactPath(pathValue) {
+			add(field+".path", "must be a relative path under .governator/artifacts/")
+		}
+		if artifact.MaxBytes <= 0 {
+			add(field+".max_bytes", "must be greater than zero")
+		}
+		if artifact.Schema != "" {
+			validateArtifactSchemaPath(field+".schema", artifact.Schema, add)
+		}
+	}
+	for i, name := range c.Consumes {
+		field := fmt.Sprintf("consumes[%d]", i)
+		trimmed := strings.TrimSpace(name)
+		if trimmed == "" {
+			add(field, "must not be blank")
+		} else if !jobIDPattern.MatchString(trimmed) {
+			add(field, "must look like an artifact name (alphanumeric, '.', '_' or '-')")
+		}
+	}
+}
+
+func validArtifactPath(value string) bool {
+	if strings.ContainsAny(value, "\x00\r\n") || filepath.IsAbs(value) {
+		return false
+	}
+	cleaned := path.Clean(strings.ReplaceAll(value, `\`, "/"))
+	return strings.HasPrefix(cleaned, ".governator/artifacts/") && cleaned != ".governator/artifacts" && !strings.HasSuffix(cleaned, "/")
+}
+
+func validateArtifactSchemaPath(field, value string, add func(string, string)) {
+	trimmed := strings.TrimSpace(value)
+	if trimmed == "" {
+		add(field, "must not be blank when set")
+		return
+	}
+	if strings.ContainsAny(trimmed, "\x00\r\n") || filepath.IsAbs(trimmed) {
+		add(field, "must be relative to workspace.root")
+		return
+	}
+	cleaned := path.Clean(strings.ReplaceAll(trimmed, `\`, "/"))
+	if cleaned == "." || cleaned == ".." || strings.HasPrefix(cleaned, "../") {
+		add(field, "must not escape workspace.root")
 	}
 }

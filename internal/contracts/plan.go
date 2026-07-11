@@ -18,7 +18,19 @@ import (
 // gates it, then the caller (`gov plan`) explodes each job into its own
 // runnable contract file for `gov batch run`.
 type Plan struct {
-	Jobs []Contract `yaml:"jobs" json:"jobs"`
+	Panel *PanelSpec `yaml:"panel,omitempty" json:"panel,omitempty"`
+	Jobs  []Contract `yaml:"jobs" json:"jobs"`
+}
+
+// PanelSpec is plan-level metadata for a cognition-only panel template. It is
+// not a runtime primitive: the jobs remain ordinary contracts, while this
+// block lets ValidatePlanManifest enforce panel-specific prohibitions and lets
+// generated plans map anonymized panelist labels back to job ids.
+type PanelSpec struct {
+	ID            string   `yaml:"id" json:"id"`
+	Members       []string `yaml:"members" json:"members"`
+	ComparisonJob string   `yaml:"comparison_job" json:"comparison_job"`
+	Judge         string   `yaml:"judge" json:"judge"`
 }
 
 func ParsePlanFile(filename string) (*Plan, error) {
@@ -27,6 +39,22 @@ func ParsePlanFile(filename string) (*Plan, error) {
 		return nil, fmt.Errorf("read plan: %w", err)
 	}
 	return ParsePlan(data)
+}
+
+func ValidatePlanManifest(plan *Plan, root string, envelope []string, maxTotalTokens int) ([][]Contract, error) {
+	if plan == nil {
+		return nil, ValidationErrors{{Field: "plan", Message: "is nil"}}
+	}
+	levels, err := ValidatePlan(plan.Jobs, root, envelope, maxTotalTokens)
+	if err != nil {
+		return nil, err
+	}
+	if plan.Panel != nil {
+		if err := validatePanelSpec(*plan.Panel, plan.Jobs); err != nil {
+			return nil, err
+		}
+	}
+	return levels, nil
 }
 
 func ParsePlan(data []byte) (*Plan, error) {
@@ -137,6 +165,8 @@ func ValidatePlan(jobs []Contract, root string, envelope []string, maxTotalToken
 			}
 		}
 	}
+
+	errs = append(errs, ResolveArtifactSources(jobs)...)
 
 	if len(errs) > 0 {
 		return nil, errs.Sorted()
@@ -253,4 +283,82 @@ func envelopePatternCovers(declared, candidate string) bool {
 // outside the declared envelope while remaining inside the workspace.
 func normalizePattern(p string) string {
 	return path.Clean(strings.ReplaceAll(p, `\`, "/"))
+}
+
+// ResolveArtifactSources populates each job's ArtifactSources map from the
+// `produces` declarations of its depends_on ancestors, failing closed when a
+// consumed artifact has no producing ancestor in the set. ArtifactSources is
+// deliberately not part of job YAML (yaml:"-"), so it must be recomputed
+// wherever a set of parsed contracts is about to execute together — both
+// ValidatePlan (plan authoring) and `gov batch run` (execution of exploded
+// job files) call this. Ambiguity (several producing ancestors of the same
+// artifact name) resolves to the lexicographically-last producer for
+// determinism. Mutates jobs in place.
+func ResolveArtifactSources(jobs []Contract) ValidationErrors {
+	producersByName := make(map[string][]string)
+	for _, job := range jobs {
+		for _, artifact := range job.Produces {
+			if artifact.Name != "" {
+				producersByName[artifact.Name] = append(producersByName[artifact.Name], job.JobID)
+			}
+		}
+	}
+	ancestorMap := planAncestors(jobs)
+	var errs ValidationErrors
+	for i := range jobs {
+		field := fmt.Sprintf("jobs[%d].consumes", i)
+		sources := map[string]string{}
+		for _, name := range jobs[i].Consumes {
+			ancestors := ancestorMap[jobs[i].JobID]
+			var matches []string
+			for _, producer := range producersByName[name] {
+				if ancestors[producer] {
+					matches = append(matches, producer)
+				}
+			}
+			sort.Strings(matches)
+			if len(matches) == 0 {
+				errs = append(errs, ValidationError{Field: field, Message: fmt.Sprintf("artifact %q is not produced by any depends_on ancestor", name)})
+			} else {
+				sources[name] = matches[len(matches)-1]
+			}
+		}
+		if len(sources) > 0 {
+			jobs[i].ArtifactSources = sources
+		}
+	}
+	return errs
+}
+
+func planAncestors(jobs []Contract) map[string]map[string]bool {
+	direct := make(map[string][]string, len(jobs))
+	for _, job := range jobs {
+		direct[job.JobID] = append([]string{}, job.DependsOn...)
+	}
+	memo := map[string]map[string]bool{}
+	visiting := map[string]bool{}
+	var visit func(string) map[string]bool
+	visit = func(id string) map[string]bool {
+		if cached, ok := memo[id]; ok {
+			return cached
+		}
+		if visiting[id] {
+			return map[string]bool{}
+		}
+		visiting[id] = true
+		out := map[string]bool{}
+		for _, dep := range direct[id] {
+			out[dep] = true
+			for ancestor := range visit(dep) {
+				out[ancestor] = true
+			}
+		}
+		visiting[id] = false
+		memo[id] = out
+		return out
+	}
+	for _, job := range jobs {
+		visit(job.JobID)
+	}
+	return memo
 }

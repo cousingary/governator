@@ -1,0 +1,595 @@
+// Package router is the Governator route broker: it resolves an agent: auto
+// contract to a concrete backend using structured signals only. It sits
+// between contract validation and backend launch, closing the loop the
+// evidence substrate (ledger stats, capability matrix, spend estimates)
+// always supported but nothing wired together.
+//
+// Standing rules enforced here:
+//   - Fail closed. An unsatisfiable hard requirement refuses to run rather
+//     than silently widening the pool.
+//   - Structured signals only. Route on job_type, mode, budgets, capability
+//     requirements, and ledger evidence — never task text.
+//   - Infrastructure and quality failures are separate metrics. The breaker
+//     (Session 2) carries infra signals only; quality scores never touch it.
+//   - Determinism. No LLM calls. Plain Go + the ledger.
+package router
+
+import (
+	"database/sql"
+	"fmt"
+	"os/exec"
+	"sort"
+	"strings"
+
+	"github.com/cousingary/governator/internal/agents"
+	"github.com/cousingary/governator/internal/config"
+	"github.com/cousingary/governator/internal/contracts"
+	"github.com/cousingary/governator/internal/observability"
+	"github.com/cousingary/governator/internal/spend"
+)
+
+// RegisteredAgents is the canonical, sorted candidate pool the broker draws
+// from when a contract names no allowlist. It mirrors internal/agents.New;
+// contracts.validAgents and router_test cross-check keep them in sync.
+func RegisteredAgents() []string {
+	return []string{"claude-code", "codex", "glm", "opencode", "pi"}
+}
+
+// RequestFromContract builds a broker Request from an agent: auto contract.
+// It is nil-safe on the routing block: agent: auto with no routing: block
+// routes over every registered backend under the balanced default. Objective
+// defaults are applied inside Resolve, so callers need not normalize.
+func RequestFromContract(c contracts.Contract) Request {
+	req := Request{
+		JobID:         c.JobID,
+		JobType:       c.JobType,
+		Mode:          c.Mode,
+		MaxTokens:     c.Budget.MaxTokens,
+		RepairLineage: c.RepairLineage,
+	}
+	if c.Routing != nil {
+		req.Objective = c.Routing.Objective
+		req.Candidates = c.Routing.Candidates
+		req.Requirements = c.Routing.Requirements
+	}
+	return req
+}
+
+// BreakerState is the circuit-breaker state for a backend (Session 2). The
+// broker hard-excludes OPEN backends and penalizes DEGRADED ones; quality
+// failures never reach the breaker (rule 3).
+type BreakerState string
+
+const (
+	BreakerClosed   BreakerState = "CLOSED"
+	BreakerDegraded BreakerState = "DEGRADED"
+	BreakerOpen     BreakerState = "OPEN"
+)
+
+// BreakerSnapshot is the breaker view of one backend at decision time.
+type BreakerSnapshot struct {
+	State  BreakerState
+	Reason string
+}
+
+// QuotaSnapshot is the subscription-headroom view of one backend (Session 4).
+// Available=false means no telemetry: the broker does not penalize a backend
+// for quota data it cannot see.
+type QuotaSnapshot struct {
+	HeadroomPct float64 // 0..1 remaining headroom; 1.0 = full
+	Available   bool    // false = no quota telemetry (do not penalize)
+}
+
+// HealthSource reports infrastructure health (breaker + quota) for a backend.
+// It carries infrastructure signals only — never quality — so a provider
+// outage can never lower a quality score and bad output can never open a
+// breaker (rule 3). A nil HealthSource means every backend reports healthy:
+// the safe default for offline tests and for backends without infra telemetry
+// yet. Session 2 implements the breaker; Session 4 implements quota.
+type HealthSource interface {
+	Breaker(agent string) BreakerSnapshot
+	Quota(agent string) QuotaSnapshot
+}
+
+// Request is the input to a routing decision. Every field is structured —
+// job_type, mode, budgets, capability requirements, ledger evidence — so the
+// broker never sniffs task text (rule 2).
+type Request struct {
+	JobID         string
+	JobType       string
+	Mode          contracts.Mode
+	Objective     string                        // balanced|cheapest|most_reliable; empty = balanced
+	Candidates    []string                      // allowlist; empty = all registered
+	Requirements  contracts.RoutingRequirements // hard capability filters (fail closed)
+	MaxTokens     int                           // sizes spend.EstimateCostUSD
+	RepairLineage string                        // root run id; non-empty = repair job (affinity)
+}
+
+// ScoredCandidate is one evaluated backend in a decision. Every component is
+// recorded separately so the decision is fully explainable from the ledger
+// alone (rule 4).
+type ScoredCandidate struct {
+	Agent                string
+	ValidRateScore       float64
+	FailureSeverityScore float64
+	CostScore            float64
+	BreakerScore         float64
+	QuotaScore           float64
+	RepairAffinityScore  float64
+	Total                float64
+	Excluded             bool
+	ExclusionReason      string
+	Selected             bool
+}
+
+// Decision is the broker's output: the objective, the full scored candidate
+// table (excluded candidates included, with reasons), and the selected
+// backend (empty when fail-closed). Selected is the highest-total
+// non-excluded candidate; ties break by name for reproducibility (rule 5).
+type Decision struct {
+	Objective  string
+	JobID      string
+	JobType    string
+	Selected   string
+	Candidates []ScoredCandidate
+}
+
+// Router resolves agent: auto to a concrete backend. It is deterministic (no
+// LLM calls), reads only the ledger, and fails closed when no healthy
+// candidate satisfies a hard requirement. Health and Binary are optional
+// injection points: nil Health = every backend healthy; nil Binary = the
+// default LookPath probe (S1 binary presence; full flag-drift comes via the
+// doctor-gated breaker in Session 2).
+type Router struct {
+	Health HealthSource
+	Binary func(name string) bool
+}
+
+// Resolve evaluates every candidate and returns a Decision. It never returns
+// an error for "no candidate qualifies" — that is the normal fail-closed
+// outcome, expressed as Decision.Selected == "" with every candidate excluded.
+// An error means the broker could not read its evidence (a broken ledger).
+func (r Router) Resolve(db *sql.DB, req Request) (Decision, error) {
+	objective := req.Objective
+	if objective == "" {
+		objective = "balanced"
+	}
+	weights := objectiveWeights(objective)
+	candidates := r.candidatePool(req.Candidates)
+	lineageAgent, err := lineageAgentFor(db, req.RepairLineage)
+	if err != nil {
+		return Decision{}, err
+	}
+	scored := make([]ScoredCandidate, 0, len(candidates))
+	for _, name := range candidates {
+		scored = append(scored, r.evaluate(db, name, req, weights, lineageAgent))
+	}
+	// cost is normalized across the non-excluded pool, so a second pass fills
+	// CostScore and recomputes Total for the survivors once every raw cost is
+	// known.
+	finalizeCosts(scored, req.MaxTokens, weights)
+	recomputeTotals(scored, weights)
+	selectWinner(scored)
+	return Decision{
+		Objective:  objective,
+		JobID:      req.JobID,
+		JobType:    req.JobType,
+		Selected:   selectedAgent(scored),
+		Candidates: orderForDisplay(scored),
+	}, nil
+}
+
+// candidatePool returns the de-duplicated, canonical-named, sorted candidate
+// list. Empty input yields every registered backend. Each name is normalized
+// through agents.New so the "claude" alias collapses to "claude-code" — the
+// same name recorded in agent_profiles — keeping profile queries aligned.
+func (r Router) candidatePool(allowlist []string) []string {
+	raw := allowlist
+	if len(raw) == 0 {
+		raw = RegisteredAgents()
+	}
+	seen := make(map[string]bool, len(raw))
+	out := make([]string, 0, len(raw))
+	for _, name := range raw {
+		agent, err := agents.New(name)
+		if err != nil {
+			// Validation already rejected unknown candidates; if one reaches
+			// here anyway, skip it rather than panic mid-decision.
+			continue
+		}
+		canonical := agent.Name()
+		if !seen[canonical] {
+			seen[canonical] = true
+			out = append(out, canonical)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+func (r Router) health() HealthSource {
+	if r.Health == nil {
+		return closedHealth{}
+	}
+	return r.Health
+}
+
+func (r Router) binaryProbe() func(string) bool {
+	if r.Binary != nil {
+		return r.Binary
+	}
+	return defaultBinaryPresent
+}
+
+// defaultBinaryPresent is the S1 binary-health floor: the backend's configured
+// binary resolves in PATH. It runs no --help/--version probe (that flag-drift
+// check is the doctor's job, surfaced through the Session 2 breaker), so it is
+// cheap and offline-safe in tests via Binary injection.
+func defaultBinaryPresent(name string) bool {
+	bin := config.BackendBin(name)
+	if bin == "" {
+		bin = name
+	}
+	if _, err := exec.LookPath(bin); err != nil {
+		return false
+	}
+	return true
+}
+
+// closedHealth is the nil-HealthSource stand-in: every backend CLOSED and
+// every quota unmeasured, so neither infra signal differentiates candidates
+// until Sessions 2 and 4 light them up.
+type closedHealth struct{}
+
+func (closedHealth) Breaker(string) BreakerSnapshot { return BreakerSnapshot{State: BreakerClosed} }
+func (closedHealth) Quota(string) QuotaSnapshot     { return QuotaSnapshot{Available: false} }
+
+// evaluate scores one candidate. Hard exclusions (capability, binary, OPEN
+// breaker) mark the candidate Excluded and short-circuit the soft scores.
+func (r Router) evaluate(db *sql.DB, name string, req Request, w weightSet, lineageAgent string) ScoredCandidate {
+	candidate := ScoredCandidate{Agent: name}
+	cap, err := agents.New(name)
+	if err != nil {
+		return excluded(candidate, "unknown backend")
+	}
+	capability := cap.Capabilities()
+	if req.Requirements.NativeSandbox && !capability.NativeSandbox {
+		return excluded(candidate, "native_sandbox required")
+	}
+	if req.Requirements.NetworkControl && !capability.NetworkControl {
+		return excluded(candidate, "network_control required")
+	}
+	if !r.binaryProbe()(name) {
+		return excluded(candidate, "binary_missing")
+	}
+	h := r.health()
+	breaker := h.Breaker(name)
+	if breaker.State == BreakerOpen {
+		return excluded(candidate, "breaker_open"+reasonSuffix(breaker.Reason))
+	}
+
+	// Soft scores.
+	runs, valid, severityRate := evidenceFor(db, name, req.JobType)
+	candidate.ValidRateScore = validRateComponent(runs, valid)
+	candidate.FailureSeverityScore = severityComponent(severityRate)
+	candidate.BreakerScore = breakerScore(breaker.State)
+	quota := h.Quota(name)
+	candidate.QuotaScore = quotaScore(quota)
+	candidate.RepairAffinityScore = affinityScore(req.RepairLineage, lineageAgent, name)
+	candidate.CostScore = 0 // finalizeCosts fills this in the pool pass.
+	candidate.Total = totalScore(candidate, w)
+	return candidate
+}
+
+func excluded(c ScoredCandidate, reason string) ScoredCandidate {
+	c.Excluded = true
+	c.ExclusionReason = reason
+	return c
+}
+
+func reasonSuffix(reason string) string {
+	if reason == "" {
+		return ""
+	}
+	return ": " + reason
+}
+
+// weightSet holds the per-objective component weights. The objective shifts
+// weights but never bypasses a hard exclusion. Weights sum to 1.0; in v1.2
+// the breaker and quota weights are forward placeholders (both stub healthy)
+// that become discriminating once Sessions 2 and 4 implement them.
+type weightSet struct {
+	validRate float64
+	severity  float64
+	cost      float64
+	breaker   float64
+	quota     float64
+	affinity  float64
+}
+
+func objectiveWeights(objective string) weightSet {
+	switch objective {
+	case "cheapest":
+		return weightSet{validRate: 0.20, severity: 0.10, cost: 0.55, breaker: 0.05, quota: 0.05, affinity: 0.05}
+	case "most_reliable":
+		return weightSet{validRate: 0.35, severity: 0.30, cost: 0.05, breaker: 0.20, quota: 0.05, affinity: 0.05}
+	default: // "balanced" and any unrecognized value (validation rejects those)
+		return weightSet{validRate: 0.30, severity: 0.15, cost: 0.25, breaker: 0.10, quota: 0.05, affinity: 0.15}
+	}
+}
+
+func totalScore(c ScoredCandidate, w weightSet) float64 {
+	return c.ValidRateScore*w.validRate +
+		c.FailureSeverityScore*w.severity +
+		c.CostScore*w.cost +
+		c.BreakerScore*w.breaker +
+		c.QuotaScore*w.quota +
+		c.RepairAffinityScore*w.affinity
+}
+
+func recomputeTotals(scored []ScoredCandidate, w weightSet) {
+	for i := range scored {
+		if scored[i].Excluded {
+			continue
+		}
+		scored[i].Total = totalScore(scored[i], w)
+	}
+}
+
+// validRateComponent is the historical valid-output rate for (agent, job_type)
+// from agent_profiles. No evidence (runs==0) is neutral 0.5: a brand-new
+// backend is neither penalized for being unproven nor rewarded over a proven
+// one — the cost and capability signals still differentiate it.
+func validRateComponent(runs, valid int) float64 {
+	if runs <= 0 {
+		return 0.5
+	}
+	return clampUnit(float64(valid) / float64(runs))
+}
+
+// failureSeverity weights quality-failure taxonomies by severity and returns
+// the severity-weighted failure RATE (severe failures count more). The score
+// component (severityComponent) inverts it: milder-failure backends score
+// higher. Infra taxonomies do not exist yet (Session 2) and SPEND_CAP is never
+// booked to agent_profiles, so every taxonomy here is a quality kind — the
+// rule that quality and infra are separate metrics holds.
+var failureSeverity = map[string]float64{
+	"SCOPE_DRIFT":           1.0,
+	"OVERWRITE_RISK":        1.0,
+	"DESTRUCTIVE_COMMAND":   1.0,
+	"UNAUTHORIZED_REFACTOR": 1.0,
+	"REPEATED_COMMAND_LOOP": 0.7,
+	"POLICY_VIOLATION":      0.7,
+	"AGENT_FAILURE":         0.7,
+	"VALIDATION_FAILED":     0.4,
+	"BUDGET_EXCEEDED":       0.4,
+}
+
+// severityWeight treats a taxonomy missing from the table as medium (0.7):
+// ClassifyFailure defaults unknowns to POLICY_VIOLATION today, but a future
+// taxonomy must still count as a failure rather than silently weigh zero.
+func severityWeight(taxonomy string) float64 {
+	if w, ok := failureSeverity[taxonomy]; ok {
+		return w
+	}
+	return 0.7
+}
+
+func severityRateOf(counts map[string]int, runs int) float64 {
+	if runs <= 0 {
+		return 0
+	}
+	weighted := 0.0
+	for taxonomy, n := range counts {
+		weighted += severityWeight(taxonomy) * float64(n)
+	}
+	return clampUnit(weighted / float64(runs))
+}
+
+func severityComponent(severityRate float64) float64 {
+	return clampUnit(1 - severityRate)
+}
+
+func breakerScore(state BreakerState) float64 {
+	switch state {
+	case BreakerDegraded:
+		return 0.5
+	default: // CLOSED (OPEN is excluded before scoring)
+		return 1.0
+	}
+}
+
+func quotaScore(q QuotaSnapshot) float64 {
+	if !q.Available {
+		return 1.0 // no telemetry — do not penalize
+	}
+	return clampUnit(q.HeadroomPct)
+}
+
+// affinityScore gives a repair job a clear (not absolute) preference for the
+// backend that ran the run it is repairing. Non-repair jobs are neutral 1.0,
+// so the affinity weight does not differentiate them.
+func affinityScore(repairLineage, lineageAgent, candidate string) float64 {
+	if repairLineage == "" {
+		return 1.0
+	}
+	if candidate == lineageAgent && lineageAgent != "" {
+		return 1.0
+	}
+	return 0.0
+}
+
+func clampUnit(v float64) float64 {
+	if v < 0 {
+		return 0
+	}
+	if v > 1 {
+		return 1
+	}
+	return v
+}
+
+// finalizeCosts assigns CostScore by min-max normalizing raw cost estimates
+// across the non-excluded candidates: cheapest survivor scores 1.0, most
+// expensive 0.0. A single survivor has no peer to compare against and scores
+// 1.0 (cost cannot differentiate a one-candidate pool). Excluded candidates
+// keep CostScore 0; their Total is irrelevant.
+func finalizeCosts(scored []ScoredCandidate, maxTokens int, _ weightSet) {
+	minCost, maxCost := -1.0, -1.0
+	for i := range scored {
+		if scored[i].Excluded {
+			continue
+		}
+		c := spend.EstimateCostUSD(scored[i].Agent, maxTokens, nil)
+		if minCost < 0 || c < minCost {
+			minCost = c
+		}
+		if maxCost < 0 || c > maxCost {
+			maxCost = c
+		}
+	}
+	for i := range scored {
+		if scored[i].Excluded {
+			continue
+		}
+		c := spend.EstimateCostUSD(scored[i].Agent, maxTokens, nil)
+		if maxCost > minCost {
+			scored[i].CostScore = clampUnit((maxCost - c) / (maxCost - minCost))
+		} else {
+			scored[i].CostScore = 1.0
+		}
+	}
+}
+
+// selectWinner marks the highest-total non-excluded candidate Selected. Ties
+// break by ascending name for reproducibility. All-excluded leaves none
+// selected (fail closed).
+func selectWinner(scored []ScoredCandidate) {
+	bestIdx := -1
+	for i := range scored {
+		if scored[i].Excluded {
+			continue
+		}
+		if bestIdx == -1 ||
+			scored[i].Total > scored[bestIdx].Total ||
+			(scored[i].Total == scored[bestIdx].Total && scored[i].Agent < scored[bestIdx].Agent) {
+			bestIdx = i
+		}
+	}
+	if bestIdx >= 0 {
+		scored[bestIdx].Selected = true
+	}
+}
+
+func selectedAgent(scored []ScoredCandidate) string {
+	for _, c := range scored {
+		if c.Selected {
+			return c.Agent
+		}
+	}
+	return ""
+}
+
+// orderForDisplay returns survivors (highest total first, ties by name) then
+// excluded candidates (by name), so a printed decision table reads best-first
+// while still showing every exclusion.
+func orderForDisplay(scored []ScoredCandidate) []ScoredCandidate {
+	out := append([]ScoredCandidate(nil), scored...)
+	sort.SliceStable(out, func(i, j int) bool {
+		ei, ej := out[i].Excluded, out[j].Excluded
+		if ei != ej {
+			return !ei // non-excluded first
+		}
+		if !ei {
+			if out[i].Total != out[j].Total {
+				return out[i].Total > out[j].Total
+			}
+		}
+		return out[i].Agent < out[j].Agent
+	})
+	return out
+}
+
+// lineageAgentFor returns the backend that ran the run a repair job is
+// repairing, so the broker can prefer it (repair-lineage affinity). An empty
+// lineage (not a repair job) or a missing run yields "" — affinity then falls
+// back to neutral for every candidate.
+func lineageAgentFor(db *sql.DB, lineage string) (string, error) {
+	if lineage == "" {
+		return "", nil
+	}
+	var agent string
+	err := db.QueryRow(`SELECT COALESCE(agent,'') FROM runs WHERE id=?`, lineage).Scan(&agent)
+	if err == sql.ErrNoRows {
+		return "", nil
+	}
+	return agent, err
+}
+
+// evidenceFor reads one (agent, job_type) profile's run/valid counts and its
+// quality-failure taxonomy breakdown from the ledger. The taxonomy breakdown
+// comes from the runs table (agent_profiles only stores aggregates); SPEND_CAP
+// is excluded since it was never booked as a real run. A read error is treated
+// as no evidence rather than failing the whole decision — a partial ledger
+// should not make routing impossible, and the profile is still the source of
+// truth for run/valid totals.
+func evidenceFor(db *sql.DB, agent, jobType string) (runs, valid int, severityRate float64) {
+	_ = db.QueryRow(`SELECT runs,valid_outputs FROM agent_profiles WHERE agent=? AND job_type=?`, agent, jobType).Scan(&runs, &valid)
+	if runs <= 0 {
+		return runs, valid, 0
+	}
+	rows, err := db.Query(`SELECT failure_taxonomy,COUNT(*) FROM runs WHERE agent=? AND job_type=? AND failure_taxonomy<>'' AND failure_taxonomy<>'SPEND_CAP' GROUP BY failure_taxonomy`, agent, jobType)
+	if err != nil {
+		return runs, valid, 0
+	}
+	defer rows.Close()
+	counts := make(map[string]int)
+	for rows.Next() {
+		var taxonomy string
+		var n int
+		if err := rows.Scan(&taxonomy, &n); err != nil {
+			return runs, valid, 0
+		}
+		taxonomy = strings.ToUpper(strings.TrimSpace(taxonomy))
+		// Infra failures (Session 2) are recorded in the runs table for
+		// visibility but must not influence quality severity — rule 3. They
+		// are already excluded from agent_profiles.runs (the denominator), so
+		// a failure_kind with zero severity weight would otherwise dilute the
+		// rate and marginally flatter a backend that had an outage. Skip them.
+		if observability.IsInfraFailure(taxonomy) {
+			continue
+		}
+		counts[taxonomy] = n
+	}
+	return runs, valid, severityRateOf(counts, runs)
+}
+
+// ErrNoCandidate is returned by the runtime layer (not Resolve) when a
+// decision fail-closes — Resolve expresses the same outcome as Selected==""
+// so the CLI can print the table without treating it as an error.
+var ErrNoCandidate = fmt.Errorf("route broker: no candidate satisfies the contract requirements (fail closed)")
+
+// Format renders a Decision as the table `gov route --explain` prints.
+func (d Decision) Format() string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "objective=%s job_type=%s selected=%s\n", d.Objective, d.JobType, orDash(d.Selected))
+	b.WriteString("agent\ttotal\tvalid_rate\tseverity\tcost\tbreaker\tquota\taffinity\texcluded\treason\n")
+	for _, c := range d.Candidates {
+		selected := ""
+		if c.Selected {
+			selected = " *"
+		}
+		fmt.Fprintf(&b, "%s%s\t%.4f\t%.4f\t%.4f\t%.4f\t%.4f\t%.4f\t%.4f\t%t\t%s\n",
+			c.Agent, selected, c.Total, c.ValidRateScore, c.FailureSeverityScore,
+			c.CostScore, c.BreakerScore, c.QuotaScore, c.RepairAffinityScore,
+			c.Excluded, orDash(c.ExclusionReason))
+	}
+	return b.String()
+}
+
+func orDash(s string) string {
+	if s == "" {
+		return "-"
+	}
+	return s
+}

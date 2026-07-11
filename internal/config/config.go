@@ -35,6 +35,20 @@ type Spend struct {
 	HaltFile    string  `yaml:"halt_file"`
 }
 
+// QuotaWindow seeds a subscription/reset window for a backend. Usage units are
+// tokens by convention; runtime reservations use budget.max_tokens and
+// completion replaces the reservation with measured total_tokens when the
+// backend reports them.
+type QuotaWindow struct {
+	Backend         string  `yaml:"backend"`
+	Account         string  `yaml:"account"`
+	WindowType      string  `yaml:"window_type"` // 5h, daily, weekly, monthly
+	WindowStartedAt string  `yaml:"window_started_at"`
+	ResetAt         string  `yaml:"reset_at"`
+	EstimatedLimit  float64 `yaml:"estimated_limit"`
+	Confidence      float64 `yaml:"confidence"`
+}
+
 // Doctrine holds config-gated policy toggles enforced by `gov validate`
 // rather than the always-on schema checks in internal/contracts. Default
 // false on every field so every existing config file and job YAML keeps
@@ -61,6 +75,7 @@ type Config struct {
 	Graph             Graph              `yaml:"graph"`
 	Minimalism        Minimalism         `yaml:"minimalism"`
 	Spend             Spend              `yaml:"spend"`
+	Quotas            []QuotaWindow      `yaml:"quotas"`
 	Doctrine          Doctrine           `yaml:"doctrine"`
 	Defaults          Defaults           `yaml:"defaults"`
 }
@@ -98,6 +113,7 @@ func BuiltIn() Config {
 		Graph:      Graph{Mode: "auto", Provider: "codegraph", Bin: "codegraph"},
 		Minimalism: Minimalism{Mode: "full"},
 		Spend:      Spend{DailyCapUSD: 0, HaltFile: filepath.Join(base, "HALT")},
+		Quotas:     nil,
 		Doctrine:   Doctrine{RequireCleanup: false},
 		Defaults:   Defaults{Agent: "claude-code", MaxMinutes: 30},
 	}
@@ -135,6 +151,17 @@ func Load() (Config, error) {
 	}
 	if cfg.Spend.DailyCapUSD < 0 {
 		return Config{}, fmt.Errorf("invalid spend.daily_cap_usd %v (want >= 0, 0 = unlimited)", cfg.Spend.DailyCapUSD)
+	}
+	for _, q := range cfg.Quotas {
+		if q.EstimatedLimit < 0 {
+			return Config{}, fmt.Errorf("invalid quota estimated_limit %v for backend %q (want >= 0)", q.EstimatedLimit, q.Backend)
+		}
+		if q.Confidence < 0 || q.Confidence > 1 {
+			return Config{}, fmt.Errorf("invalid quota confidence %v for backend %q (want 0..1)", q.Confidence, q.Backend)
+		}
+		if q.WindowType != "" && q.WindowType != "5h" && q.WindowType != "daily" && q.WindowType != "weekly" && q.WindowType != "monthly" {
+			return Config{}, fmt.Errorf("invalid quota window_type %q (want 5h, daily, weekly, or monthly)", q.WindowType)
+		}
 	}
 	return cfg, nil
 }
@@ -190,6 +217,9 @@ func merge(dst *Config, src Config) {
 	}
 	if src.Spend.HaltFile != "" {
 		dst.Spend.HaltFile = src.Spend.HaltFile
+	}
+	if src.Quotas != nil {
+		dst.Quotas = append([]QuotaWindow(nil), src.Quotas...)
 	}
 	if src.Doctrine.RequireCleanup {
 		dst.Doctrine.RequireCleanup = true
@@ -304,6 +334,11 @@ func clean(cfg *Config) {
 	cfg.Graph.Bin = strings.TrimSpace(cfg.Graph.Bin)
 	cfg.Minimalism.Mode = strings.ToLower(strings.TrimSpace(cfg.Minimalism.Mode))
 	cfg.Spend.HaltFile = expand(cfg.Spend.HaltFile)
+	for i := range cfg.Quotas {
+		cfg.Quotas[i].Backend = strings.ToLower(strings.TrimSpace(cfg.Quotas[i].Backend))
+		cfg.Quotas[i].Account = strings.ToLower(strings.TrimSpace(cfg.Quotas[i].Account))
+		cfg.Quotas[i].WindowType = strings.ToLower(strings.TrimSpace(cfg.Quotas[i].WindowType))
+	}
 	cfg.ProtectedManifest = expand(cfg.ProtectedManifest)
 	cfg.SnapshotDir = expand(cfg.SnapshotDir)
 	cfg.LedgerDir = expand(cfg.LedgerDir)

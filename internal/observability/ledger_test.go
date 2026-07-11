@@ -50,7 +50,7 @@ func TestOpenMigratesLegacyLedger(t *testing.T) {
 			t.Errorf("missing migrated column %s", name)
 		}
 	}
-	for _, table := range []string{"runs", "jobs", "agents", "agent_profiles", "files_touched", "commands_run", "validators", "violations", "repair_packets", "eval_runs", "hook_events", "parity_events"} {
+	for _, table := range []string{"runs", "jobs", "agents", "agent_profiles", "files_touched", "commands_run", "validators", "violations", "repair_packets", "eval_runs", "hook_events", "parity_events", "batches", "route_decisions", "artifacts"} {
 		var count int
 		if err := migrated.QueryRow("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?", table).Scan(&count); err != nil {
 			t.Fatal(err)
@@ -130,5 +130,51 @@ func TestRecordCompletionSpendCapRefusalDoesNotTouchAgentProfiles(t *testing.T) 
 	}
 	if runs != 1 || failures != 1 {
 		t.Fatalf("real quarantine must book exactly one run+failure, got runs=%d failures=%d", runs, failures)
+	}
+}
+
+func TestRecordRouteDecisionPersistsOneRowPerCandidate(t *testing.T) {
+	home := t.TempDir()
+	db, err := Open(home)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := RecordRouteDecision(db, RouteDecisionRecord{
+		RunID: "run-1", JobID: "j", JobType: "code", Objective: "balanced",
+		Preview: false, Created: "2026-07-10T00:00:00Z",
+		Rows: []RouteDecisionRow{
+			{Candidate: "claude-code", Total: 0.85, Selected: true},
+			{Candidate: "glm", Excluded: true, ExclusionReason: "binary_missing"},
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var n int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM route_decisions WHERE run_id='run-1'`).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 2 {
+		t.Fatalf("expected one row per candidate (2), got %d", n)
+	}
+	var selected, excluded, preview int
+	if err := db.QueryRow(`SELECT COUNT(*),COALESCE(SUM(excluded),0),COALESCE(SUM(preview),0) FROM route_decisions WHERE run_id='run-1'`).Scan(&selected, &excluded, &preview); err != nil {
+		t.Fatal(err)
+	}
+	if selected != 2 { // total rows
+		t.Fatalf("expected 2 rows, got %d", selected)
+	}
+	if excluded != 1 {
+		t.Fatalf("expected 1 excluded row, got %d", excluded)
+	}
+	if preview != 0 {
+		t.Fatalf("preview flag not persisted, got %d", preview)
+	}
+	var selCount int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM route_decisions WHERE run_id='run-1' AND selected=1`).Scan(&selCount); err != nil {
+		t.Fatal(err)
+	}
+	if selCount != 1 {
+		t.Fatalf("expected exactly one selected row, got %d", selCount)
 	}
 }

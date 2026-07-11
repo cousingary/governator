@@ -57,6 +57,7 @@ type RepairPacket struct {
 	Files      []string `json:"files"`
 	Commands   []string `json:"commands"`
 	Validators []string `json:"failed_validators"`
+	Artifacts  []string `json:"artifacts,omitempty"`
 }
 
 func GenerateRepairPacket(home, runID string) (RepairPacket, error) {
@@ -98,6 +99,9 @@ func GenerateRepairPacket(home, runID string) (RepairPacket, error) {
 	if err := readStrings("SELECT command || ': exit=' || exit_code FROM validators WHERE run_id=? AND exit_code<>0 ORDER BY rowid LIMIT 20", &packet.Validators); err != nil {
 		return RepairPacket{}, err
 	}
+	if err := readStrings("SELECT name || ':' || sha256 || ':' || bytes FROM artifacts WHERE run_id=? ORDER BY name LIMIT 20", &packet.Artifacts); err != nil {
+		return RepairPacket{}, err
+	}
 	data, err := json.Marshal(packet)
 	if err != nil {
 		return RepairPacket{}, err
@@ -120,6 +124,36 @@ func RepairAttempts(db *sql.DB, rootID string) (int, error) {
 	return n, err
 }
 
+// Infrastructure failure taxonomies. These are distinct from the quality
+// kinds ClassifyFailure returns: an infra failure means the backend could not
+// be reached or could not serve the request (rate limit, quota, auth, missing
+// binary, flag drift, transient upstream), NOT that it produced bad work.
+// Rule 3 of the route broker: infra and quality are separate metrics — an
+// infra failure opens a circuit breaker but never lowers a quality score, and
+// a quality failure never touches the breaker. Session 2 classifies these from
+// CLI exit codes / stderr (agents.ClassifyInfra) and feeds them to the breaker.
+const (
+	InfraRateLimit         = "RATE_LIMIT"
+	InfraQuotaExhausted    = "QUOTA_EXHAUSTED"
+	InfraAuthExpired       = "AUTH_EXPIRED"
+	InfraBinaryMissing     = "BINARY_MISSING"
+	InfraFlagDrift         = "FLAG_DRIFT"
+	InfraTransientUpstream = "TRANSIENT_UPSTREAM"
+)
+
+// IsInfraFailure reports whether a failure taxonomy is an infrastructure kind
+// (Session 2). Quality kinds (SCOPE_DRIFT, VALIDATION_FAILED, ...) and SPEND_CAP
+// are not infra. Used to keep infra failures out of agent_profiles quality
+// scoring and out of the router's quality-severity evidence.
+func IsInfraFailure(taxonomy string) bool {
+	switch taxonomy {
+	case InfraRateLimit, InfraQuotaExhausted, InfraAuthExpired,
+		InfraBinaryMissing, InfraFlagDrift, InfraTransientUpstream:
+		return true
+	}
+	return false
+}
+
 func ClassifyFailure(violations []string) string {
 	lower := strings.ToLower(strings.Join(violations, "\n"))
 	switch {
@@ -131,7 +165,7 @@ func ClassifyFailure(violations []string) string {
 		return "OVERWRITE_RISK"
 	case strings.Contains(lower, "max_commands"):
 		return "REPEATED_COMMAND_LOOP"
-	case strings.Contains(lower, "validator failed"), strings.Contains(lower, "required file missing"):
+	case strings.Contains(lower, "validator failed"), strings.Contains(lower, "required file missing"), strings.Contains(lower, "artifact"):
 		return "VALIDATION_FAILED"
 	case strings.Contains(lower, "destructive command"), strings.Contains(lower, "forbidden command"):
 		return "DESTRUCTIVE_COMMAND"
