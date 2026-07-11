@@ -66,7 +66,7 @@ from the ledger alone:
 | estimated cost | `internal/spend/estimate.go` (`max_tokens` × $/1M-tok) | soft, normalized across the pool |
 | capability fit | `agents.Capability` vs `requirements` | **hard exclusion** |
 | binary health | `config.BackendBin` + PATH presence (S1 floor) | **hard exclusion** |
-| breaker state | `HealthSource.Breaker` (Session 2; stubbed CLOSED) | OPEN = exclusion, DEGRADED = penalty |
+| breaker state | `HealthSource.Breaker` (live via `breaker.Store`) | OPEN = exclusion, DEGRADED = penalty |
 | quota headroom | `HealthSource.Quota` from `quota_windows` | soft when telemetry available |
 | repair-lineage affinity | the backend that ran the root of the lineage | soft (repair jobs only) |
 

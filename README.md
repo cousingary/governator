@@ -86,28 +86,33 @@ gov preflight <job.yaml>
 gov run <job.yaml> [--agent <name>]
 gov batch run <job.yaml|dir|glob>... [--parallel N] [--halt-on-first-quarantine] [--ordered]
 gov plan <intent.md> --out <dir> --envelope <pattern>... --max-total-tokens <n> [--backend <name>]
+gov plan --panel <n> <intent.md> --out <dir> --envelope <pattern>... --max-total-tokens <n> [--backend <name>]
 gov plan --show <dir>
 gov handoff [last|run_id]
 gov diff [last|run_id]
 gov rollback <run_id>
 gov quarantine list|show <id>|diff <id>
-gov hook pre-tool-use [--run <id>] [--shadow <python-gate>]
-gov gate check
-gov parity report
+gov score agents --job-type <type>
+gov failures
+gov cost --per-valid-output
+gov spend [--halt|--resume]
+gov quota
+gov usage summary|<run_id>
+gov route --job-type <type>
+gov route --explain <contract.yaml>
+gov repair-packet <run_id>
+gov eval harness <case-dir>
+gov eval scorecard
 gov protect status|apply|release <path>
 gov snap create [label]|list|diff <id>|restore <id> [--dry-run]
 gov graph status|refresh [path]
 gov graph query <search> [--path <path>] [--limit <n>]
-gov score agents --job-type <type>
-gov route --job-type <type>
-gov failures
-gov cost --per-valid-output
-gov spend [--halt|--resume]
-gov usage summary|<run_id>
-gov repair-packet <run_id>
-gov eval harness <case-dir>
-gov eval scorecard
+gov hook pre-tool-use [--run <id>] [--shadow <python-gate>]
+gov panel compare --out <artifact.json> <input.json>...
+gov gate check
+gov parity report
 gov doctor
+gov health [reset <backend>]
 gov version
 ```
 

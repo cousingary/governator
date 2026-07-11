@@ -84,8 +84,8 @@ type QuotaSnapshot struct {
 // It carries infrastructure signals only — never quality — so a provider
 // outage can never lower a quality score and bad output can never open a
 // breaker (rule 3). A nil HealthSource means every backend reports healthy:
-// the safe default for offline tests and for backends without infra telemetry
-// yet. Session 2 implements the breaker; Session 4 implements quota.
+// the safe default for offline tests. Production callers inject breaker.Store
+// (breaker added in Session 2, quota in Session 4; both live).
 type HealthSource interface {
 	Breaker(agent string) BreakerSnapshot
 	Quota(agent string) QuotaSnapshot
@@ -237,8 +237,9 @@ func defaultBinaryPresent(name string) bool {
 }
 
 // closedHealth is the nil-HealthSource stand-in: every backend CLOSED and
-// every quota unmeasured, so neither infra signal differentiates candidates
-// until Sessions 2 and 4 light them up.
+// every quota unmeasured, so neither infra signal differentiates candidates.
+// Production callers inject breaker.Store; this fallback only fires for
+// offline tests and other callers that construct a Router without Health.
 type closedHealth struct{}
 
 func (closedHealth) Breaker(string) BreakerSnapshot { return BreakerSnapshot{State: BreakerClosed} }
@@ -295,9 +296,9 @@ func reasonSuffix(reason string) string {
 }
 
 // weightSet holds the per-objective component weights. The objective shifts
-// weights but never bypasses a hard exclusion. Weights sum to 1.0; in v1.2
-// the breaker and quota weights are forward placeholders (both stub healthy)
-// that become discriminating once Sessions 2 and 4 implement them.
+// weights but never bypasses a hard exclusion. Weights sum to 1.0; the
+// breaker and quota weights are live and discriminating whenever
+// breaker.Store has telemetry (production callers always inject it).
 type weightSet struct {
 	validRate float64
 	severity  float64

@@ -6,7 +6,7 @@ Security fixes are applied to the latest tagged release candidate or stable rele
 
 ## Reporting
 
-Please report suspected vulnerabilities privately to **security-contact-placeholder@example.invalid**. Do not open a public issue until maintainers confirm that disclosure is safe. Include the affected version, reproduction steps, impact, and any proposed mitigation; never send live credentials.
+Please report suspected vulnerabilities privately to **webmaster@jeremylamkin.com**. Do not open a public issue until maintainers confirm that disclosure is safe. Include the affected version, reproduction steps, impact, and any proposed mitigation; never send live credentials.
 
 ## Security boundary
 
