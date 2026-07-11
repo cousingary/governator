@@ -2,6 +2,7 @@ package runtime
 
 import (
 	"context"
+	"crypto/ed25519"
 	"crypto/sha1"
 	"crypto/sha256"
 	"encoding/hex"
@@ -15,6 +16,7 @@ import (
 	"time"
 
 	"github.com/cousingary/governator/internal/agents"
+	"github.com/cousingary/governator/internal/config"
 	"github.com/cousingary/governator/internal/contracts"
 	"github.com/cousingary/governator/internal/observability"
 	"github.com/cousingary/governator/internal/policy"
@@ -1257,5 +1259,65 @@ printf '{"type":"result","total_cost_usd":0.05}\n'
 	}
 	if schemaOK != 0 {
 		t.Fatalf("schema_ok=%d, want 0", schemaOK)
+	}
+}
+
+// TestEnforceContainmentHighRiskAcceptanceCriterion pins Session 3c directly:
+// the runtime's containment wiring resolves the backend's native-sandbox
+// capability (a verified agent fact, not a contract claim) and the operator
+// override key from config, then fails closed for a high-risk local run that
+// lacks qualifying containment. This is the precise "fails before launch"
+// unit the acceptance criterion names.
+func TestEnforceContainmentHighRiskAcceptanceCriterion(t *testing.T) {
+	base := contract("")
+	base.RiskClass = "high"
+	base.Runner = "" // local default
+
+	// glm declares no native sandbox capability → high-risk local must fail.
+	c := base
+	c.Agent = "glm"
+	if err := enforceContainment(c, "glm", config.Config{}); err == nil {
+		t.Fatal("expected high-risk local glm (no native sandbox, no override) to fail closed, got nil")
+	}
+
+	// claude-code declares a native sandbox → high-risk local passes.
+	c = base
+	c.Agent = "claude-code"
+	if err := enforceContainment(c, "claude-code", config.Config{}); err != nil {
+		t.Fatalf("native-sandbox-capable backend should pass high-risk local: %v", err)
+	}
+
+	// A signed override rescues a non-sandbox high-risk local run.
+	pub, priv, _ := ed25519.GenerateKey(nil)
+	c = base
+	c.Agent = "glm"
+	reason := "isolated trusted host"
+	sig := ed25519.Sign(priv, []byte(c.JobID+":"+reason))
+	c.Containment = &contracts.Containment{OverrideReason: reason, OverrideSignature: hex.EncodeToString(sig)}
+	if err := enforceContainment(c, "glm", config.Config{Containment: config.Containment{OverridePublicKey: hex.EncodeToString(pub)}}); err != nil {
+		t.Fatalf("valid signed override should rescue high-risk local glm: %v", err)
+	}
+
+	// Non-high-risk is a no-op regardless of agent/runner.
+	c = base
+	c.RiskClass = "low"
+	c.Agent = "glm"
+	if err := enforceContainment(c, "glm", config.Config{}); err != nil {
+		t.Fatalf("low-risk must be a containment no-op: %v", err)
+	}
+}
+
+// TestRunRejectsHighRiskLocalWithoutContainment is the end-to-end acceptance
+// test: a real Run() of a high-risk local contract on a non-sandbox backend
+// returns a containment error before launch (no workspace, no agent process).
+func TestRunRejectsHighRiskLocalWithoutContainment(t *testing.T) {
+	root, _ := fixture(t)
+	t.Setenv("GOV_HOME", t.TempDir())
+	c := contract(root)
+	c.Agent = "glm" // no native sandbox capability
+	c.RiskClass = "high"
+	_, err := New().Run(context.Background(), c)
+	if err == nil || !strings.Contains(err.Error(), "containment") {
+		t.Fatalf("expected containment failure before launch, got err=%v", err)
 	}
 }

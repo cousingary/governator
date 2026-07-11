@@ -73,6 +73,15 @@ type Doctrine struct {
 	RequireCleanup bool `yaml:"require_cleanup"`
 }
 
+// Containment configures the Session 3 (Phase 2) risk-class containment
+// policy. OverridePublicKey is the ed25519 public key (hex) an operator uses
+// to sign high-risk containment overrides. Empty (the default) means overrides
+// are refused — a high-risk job without qualifying containment simply fails
+// before launch. Configure it only when you genuinely need the escape hatch.
+type Containment struct {
+	OverridePublicKey string `yaml:"override_public_key"`
+}
+
 type Defaults struct {
 	Agent      string `yaml:"agent"`
 	MaxMinutes int    `yaml:"max_minutes"`
@@ -105,6 +114,7 @@ type Config struct {
 	Doctrine          Doctrine           `yaml:"doctrine"`
 	Defaults          Defaults           `yaml:"defaults"`
 	Assay             Assay              `yaml:"assay"`
+	Containment       Containment        `yaml:"containment"`
 }
 
 // Env is the single environment lookup seam used by Governator packages.
@@ -147,6 +157,9 @@ func BuiltIn() Config {
 		// (see Assay's doc comment). Python/TimeoutSeconds default sensibly
 		// so a config that only sets `assay.repo` gets a working invocation.
 		Assay: Assay{Python: "python3", TimeoutSeconds: 60},
+		// Containment intentionally left unset: no override key means high-risk
+		// jobs must qualify for containment on their own (fail-closed).
+		Containment: Containment{},
 	}
 }
 
@@ -290,6 +303,9 @@ func merge(dst *Config, src Config) {
 	if src.Assay.TimeoutSeconds > 0 {
 		dst.Assay.TimeoutSeconds = src.Assay.TimeoutSeconds
 	}
+	if src.Containment.OverridePublicKey != "" {
+		dst.Containment.OverridePublicKey = src.Containment.OverridePublicKey
+	}
 }
 
 func applyEnv(cfg *Config) {
@@ -375,6 +391,9 @@ func applyEnv(cfg *Config) {
 		if seconds, err := strconv.Atoi(value); err == nil && seconds > 0 {
 			cfg.Assay.TimeoutSeconds = seconds
 		}
+	}
+	if value := Env("GOV_CONTAINMENT_OVERRIDE_PUBLIC_KEY"); value != "" {
+		cfg.Containment.OverridePublicKey = value
 	}
 }
 

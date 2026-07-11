@@ -2,6 +2,7 @@ package contracts
 
 import (
 	"sort"
+	"strings"
 	"testing"
 )
 
@@ -102,5 +103,120 @@ func TestValidAgentsMatchesCanonicalBackends(t *testing.T) {
 		if got[i] != want[i] {
 			t.Fatalf("validAgents drift: got %v want %v", got, want)
 		}
+	}
+}
+
+// TestDockerIsHardened pins Session 3's definition of hardened containment:
+// every one of the privilege-reducing controls must be set, and the image must
+// be pinned by digest (or carry the documented mutable-tag exception). A nil
+// config is never hardened, so a high-risk job with no docker block cannot
+// sneak through IsHardened.
+func TestDockerIsHardened(t *testing.T) {
+	pinned := "ghcr.io/acme/agent@sha256:" + strings.Repeat("a", 64)
+	cases := []struct {
+		name string
+		d    *DockerRunnerConfig
+		want bool
+	}{
+		{"nil config", nil, false},
+		{"bare image no controls", &DockerRunnerConfig{Image: "agent:latest"}, false},
+		{"all controls but mutable tag", &DockerRunnerConfig{
+			Image: "agent:latest", User: "65532:65532", ReadOnlyRootfs: true,
+			CapDropAll: true, NoNewPrivileges: true,
+		}, false},
+		{"pinned image but missing one control", &DockerRunnerConfig{
+			Image: pinned, User: "65532:65532", ReadOnlyRootfs: true,
+			CapDropAll: true, // NoNewPrivileges missing
+		}, false},
+		{"pinned image all controls", &DockerRunnerConfig{
+			Image: pinned, User: "65532:65532", ReadOnlyRootfs: true,
+			CapDropAll: true, NoNewPrivileges: true,
+		}, true},
+		{"mutable tag with explicit exception all controls", &DockerRunnerConfig{
+			Image: "agent:latest", AllowMutableTag: true, User: "65532:65532",
+			ReadOnlyRootfs: true, CapDropAll: true, NoNewPrivileges: true,
+		}, true},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := c.d.IsHardened(); got != c.want {
+				t.Fatalf("IsHardened() = %v, want %v", got, c.want)
+			}
+		})
+	}
+}
+
+// TestValidateContainmentOverrideBothOrNeither pins the fail-closed rule: an
+// override reason and signature must appear together — a half-declared escape
+// hatch is never silently accepted as either "no override" or "override
+// granted." Calls validateContainment directly (the add closure) so the test
+// isolates this one validator from every other Contract.Validate requirement.
+func TestValidateContainmentOverrideBothOrNeither(t *testing.T) {
+	cases := []struct {
+		name        string
+		cont        *Containment
+		wantErrOn   string
+		expectClean bool
+	}{
+		{"absent is fine", nil, "", true},
+		{"empty is fine", &Containment{}, "", true},
+		{"reason without signature", &Containment{OverrideReason: "trusted host"}, "containment.override_signature", false},
+		{"signature without reason", &Containment{OverrideSignature: "deadbeef"}, "containment.override_reason", false},
+		{"both present passes structurally", &Containment{OverrideReason: "ok", OverrideSignature: "abcd"}, "", true},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			var errs ValidationErrors
+			add := func(field, message string) { errs = append(errs, ValidationError{Field: field, Message: message}) }
+			validateContainment(Contract{JobID: "j", Containment: c.cont}, add)
+			if c.expectClean {
+				if len(errs) != 0 {
+					t.Fatalf("expected no validation error, got %+v", errs)
+				}
+				return
+			}
+			found := false
+			for _, ve := range errs {
+				if ve.Field == c.wantErrOn {
+					found = true
+					break
+				}
+			}
+			if !found {
+				t.Fatalf("expected field %q, got %+v", c.wantErrOn, errs)
+			}
+		})
+	}
+}
+
+// TestValidateRunnerHardeningFieldsStructural calls validateRunner directly to
+// isolate the Session 3 seccomp/tmpfs/egress structural checks from the rest
+// of Contract.Validate.
+func TestValidateRunnerHardeningFieldsStructural(t *testing.T) {
+	cases := []struct {
+		name   string
+		docker DockerRunnerConfig
+		field  string
+	}{
+		{"relative seccomp profile", DockerRunnerConfig{Image: "img:latest", SeccompProfile: "rel/seccomp.json"}, "docker.seccomp_profile"},
+		{"blank tmpfs entry", DockerRunnerConfig{Image: "img:latest", Tmpfs: []string{"/tmp", "  "}}, "docker.tmpfs[1]"},
+		{"blank egress entry", DockerRunnerConfig{Image: "img:latest", EgressAllowlist: []string{"  "}}, "docker.egress_allowlist[0]"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			var errs ValidationErrors
+			add := func(field, message string) { errs = append(errs, ValidationError{Field: field, Message: message}) }
+			validateRunner(Contract{Runner: "docker", Docker: &c.docker}, add)
+			found := false
+			for _, ve := range errs {
+				if ve.Field == c.field {
+					found = true
+					break
+				}
+			}
+			if !found {
+				t.Fatalf("expected field %q in errors, got %+v", c.field, errs)
+			}
+		})
 	}
 }

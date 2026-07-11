@@ -24,6 +24,7 @@ import (
 	"github.com/cousingary/governator/internal/agents"
 	"github.com/cousingary/governator/internal/breaker"
 	"github.com/cousingary/governator/internal/config"
+	"github.com/cousingary/governator/internal/containment"
 	"github.com/cousingary/governator/internal/contextgraph"
 	"github.com/cousingary/governator/internal/contracts"
 	"github.com/cousingary/governator/internal/minimalism"
@@ -463,6 +464,23 @@ func gitHead(root string) (string, error) {
 func isGit(root string) bool {
 	c, _, _ := shell(context.Background(), root, "git rev-parse --is-inside-work-tree")
 	return c == 0
+}
+
+// enforceContainment applies the Session 3 (Phase 2) risk-class containment
+// policy. It resolves the backend's native-sandbox capability (a verified
+// agent-layer fact, not a contract claim) and the operator override key from
+// config, then delegates to containment.Enforce. Non-high-risk contracts are
+// a no-op. The check runs before quota/workspace acquisition so a denied
+// high-risk run leaves no side effects.
+func enforceContainment(c contracts.Contract, agent string, cfg config.Config) error {
+	if strings.TrimSpace(c.RiskClass) != "high" {
+		return nil
+	}
+	nativeSandbox := false
+	if a, err := agents.New(agent); err == nil {
+		nativeSandbox = a.Capabilities().NativeSandbox
+	}
+	return containment.Enforce(c, nativeSandbox, cfg.Containment.OverridePublicKey)
 }
 
 func shQuote(s string) string { return "'" + strings.ReplaceAll(s, "'", "'\"'\"'") + "'" }
@@ -1200,6 +1218,16 @@ func (r *Runner) runOnce(ctx context.Context, c contracts.Contract) (RunRecord, 
 	if err := observability.RecordStage(db, id, "ROUTED", resolved.Agent, time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
 		return RunRecord{}, err
 	}
+	// Session 3 containment policy (Phase 2): a risk_class: high contract must
+	// not silently resolve to local execution. Qualifying containment is
+	// hardened Docker, a backend with a verified native sandbox, or a signed
+	// operator override. Checked after the route broker resolves the agent
+	// (native sandbox is a backend capability, not a contract claim) and
+	// before any quota/workspace side effect, so a failure leaves nothing
+	// behind — exactly the "fails before launch" acceptance for high-risk.
+	if err := enforceContainment(c, resolved.Agent, cfg); err != nil {
+		return RunRecord{}, err
+	}
 	quotaUsageEstimate := quota.EstimateUsage(c.Budget.MaxTokens)
 	quotaTTL := time.Duration(c.Budget.MaxMinutes+5) * time.Minute
 	quotaReservation, qerr := quota.Reserve(db, resolved.Agent, quota.DefaultAccount, id, quotaUsageEstimate, quotaTTL, time.Now().UTC())
@@ -1326,8 +1354,22 @@ func (r *Runner) runOnce(ctx context.Context, c contracts.Contract) (RunRecord, 
 		Timeout: time.Duration(c.Budget.MaxMinutes) * time.Minute,
 		Spec:    spec,
 	}})
-	if obs, oerr := rn.Observe(ctx, ws); oerr == nil && obs.Notes != "" {
-		rec.Notes = appendNote(rec.Notes, obs.Notes)
+	// Session 3a: surface runner observations — limits/provenance as notes,
+	// and output truncation as a loud OUTPUT_TRUNCATED ledger event. A run
+	// requiring a complete transcript (docker.require_complete_transcript)
+	// that was capped is turned into a blocking violation below, so a
+	// truncated evidence trail can never be approved.
+	obs, oerr := rn.Observe(ctx, ws)
+	if oerr == nil {
+		if obs.Notes != "" {
+			rec.Notes = appendNote(rec.Notes, obs.Notes)
+		}
+		if obs.OutputTruncated {
+			_ = observability.RecordStage(db, id, "OUTPUT_TRUNCATED",
+				fmt.Sprintf("accepted=%d discarded=%d", obs.BytesAccepted, obs.BytesDiscarded),
+				time.Now().UTC().Format(time.RFC3339Nano))
+			rec.Notes = appendNote(rec.Notes, fmt.Sprintf("output_truncated: %d bytes discarded of %d total", obs.BytesDiscarded, obs.BytesAccepted+obs.BytesDiscarded))
+		}
 	}
 	_ = redact(transcript)
 	audit := auditTranscript(transcript, agent.Capabilities().TranscriptFormat, work, c)
@@ -1375,6 +1417,15 @@ func (r *Runner) runOnce(ctx context.Context, c contracts.Contract) (RunRecord, 
 	liveAfter, lerr := fingerprint(root)
 	protectedAfter, perr := protectedFingerprint()
 	violations := append([]string{}, audit.Violations...)
+	// Session 3a: a run whose transcript was capped is a blocking violation
+	// when it required a complete (evidence-bearing) transcript — such a run
+	// is quarantined, never approved on an incomplete audit trail. Non-
+	// requiring runs still had the truncation recorded loudly above.
+	if oerr == nil && obs.OutputTruncated && c.Docker != nil && c.Docker.RequireCompleteTranscript {
+		violations = append(violations, fmt.Sprintf(
+			"output truncated: %d of %d transcript bytes discarded (complete transcript required)",
+			obs.BytesDiscarded, obs.BytesAccepted+obs.BytesDiscarded))
+	}
 	var selfReviewJSON string
 	rec.SelfReview, selfReviewJSON = readSelfReview(work)
 	if before, ok := workBefore[canaryName]; !ok || workAfter[canaryName] != before {

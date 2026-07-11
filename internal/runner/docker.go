@@ -6,8 +6,10 @@ import (
 	"fmt"
 	"io"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/cousingary/governator/internal/agents"
@@ -45,8 +47,38 @@ func trimmed(b []byte) string {
 // the container boundary — resource limits, network policy, and credential
 // exposure are enforced there instead of trusted to the agent's own
 // restraint.
+//
+// Session 3 (Phase 2) adds hardening flags (see Config.IsHardened) and makes
+// output truncation loud: the cappedWriter records how many bytes were kept
+// vs. discarded, surfaced through Observe so the runtime can emit an
+// OUTPUT_TRUNCATED ledger event and quarantine runs that required a complete
+// transcript. One DockerRunner serves a single run (runner.New builds a fresh
+// instance per run), so the truncation tally is read after Launch by Observe.
 type DockerRunner struct {
 	Config contracts.DockerRunnerConfig
+
+	mu    sync.Mutex
+	trunc truncationStats
+}
+
+// truncationStats is the loud accounting Session 3a replaces the silent
+// cappedWriter discard with: how much transcript was retained, how much was
+// dropped past the cap, and whether any drop happened at all.
+type truncationStats struct {
+	accepted  int64
+	discarded int64
+	truncated bool
+}
+
+// metadataSinkholeHosts are the cloud-metadata endpoints redirected to
+// loopback via docker --add-host when DenyMetadataAndLocalNet is set under a
+// network: allow config. Raw-IP access (e.g. dialling 169.254.169.254
+// directly) is not blocked by /etc/hosts; the safe default remains network:
+// deny. These entries cover name-based lookups, which is all the CLI can do.
+var metadataSinkholeHosts = []string{
+	"metadata.google.internal", // GCP
+	"metadata",                 // GCP alias
+	"metadata.azure.com",       // Azure
 }
 
 func (d *DockerRunner) Prepare(ctx context.Context, req PrepareRequest) (Workspace, error) {
@@ -82,31 +114,51 @@ func (d *DockerRunner) executor(ws Workspace) agents.Executor {
 		}
 		done := make(chan error, 1)
 		go func() { done <- cmd.Wait() }()
+		var code int
+		var timedOut bool
+		var runErr error
 		select {
 		case err := <-done:
 			if err != nil {
 				if ee, ok := err.(*exec.ExitError); ok {
-					return ee.ExitCode(), false, nil
+					code = ee.ExitCode()
+				} else {
+					runErr = err
 				}
-				return 0, false, err
 			}
-			return 0, false, nil
 		case <-runCtx.Done():
 			stopCtx, stopCancel := context.WithTimeout(context.Background(), 10*time.Second)
 			_ = d.Stop(stopCtx, ws)
 			stopCancel()
 			<-done
-			return -1, true, runCtx.Err()
+			code = -1
+			timedOut = true
+			runErr = runCtx.Err()
 		}
+		// Record truncation accounting (Session 3a): loud, never silent. The
+		// cap protects the transcript from unbounded growth; surfacing how much
+		// was kept vs. discarded keeps the audit trail honest and lets the
+		// runtime quarantine runs that required a complete transcript.
+		capped.mu.Lock()
+		stats := truncationStats{accepted: capped.accepted, discarded: capped.discarded, truncated: capped.discarded > 0}
+		capped.mu.Unlock()
+		d.mu.Lock()
+		d.trunc = stats
+		d.mu.Unlock()
+		return code, timedOut, runErr
 	}
 }
 
 // runArgs builds the `docker run` argument list: bind-mount the workspace,
 // apply resource limits, default-deny network (contract opt-in to allow),
 // mount only the explicitly allowlisted credential paths (read-only), then
-// the image and the backend's own bin+args as the container command.
+// the image and the backend's own bin+args as the container command. Session
+// 3 (Phase 2) appends the hardening controls from Config when set.
 func (d *DockerRunner) runArgs(ws Workspace, bin string, args []string) []string {
-	out := []string{"run", "--name", ws.Container, "-v", ws.Path + ":/workspace", "-w", "/workspace"}
+	// Canonicalize the workspace bind so a trailing slash or ../ noise in the
+	// worktree path can't shift where the repo lands inside the container.
+	wsPath := filepath.Clean(ws.Path)
+	out := []string{"run", "--name", ws.Container, "-v", wsPath + ":/workspace", "-w", "/workspace"}
 	if d.Config.MemoryLimit != "" {
 		out = append(out, "--memory", d.Config.MemoryLimit)
 	}
@@ -116,35 +168,95 @@ func (d *DockerRunner) runArgs(ws Workspace, bin string, args []string) []string
 	if d.Config.PIDsLimit > 0 {
 		out = append(out, "--pids-limit", strconv.Itoa(d.Config.PIDsLimit))
 	}
+	// Session 3 (Phase 2) hardening controls — emitted only when the contract
+	// opts into each, so every prior job YAML produces byte-identical args.
+	if d.Config.User != "" {
+		out = append(out, "--user", d.Config.User)
+	}
+	if d.Config.ReadOnlyRootfs {
+		out = append(out, "--read-only")
+	}
+	if d.Config.CapDropAll {
+		out = append(out, "--cap-drop=ALL")
+	}
+	if d.Config.NoNewPrivileges {
+		out = append(out, "--security-opt", "no-new-privileges")
+	}
+	if d.Config.SeccompProfile != "" {
+		out = append(out, "--security-opt", "seccomp="+d.Config.SeccompProfile)
+	}
+	if d.Config.AppArmorProfile != "" {
+		out = append(out, "--security-opt", "apparmor="+d.Config.AppArmorProfile)
+	}
+	for _, t := range d.Config.Tmpfs {
+		if t = strings.TrimSpace(t); t != "" {
+			out = append(out, "--tmpfs", t)
+		}
+	}
+	// Network policy: default-deny (--network none). An allow opt-in may
+	// additionally sinkhole cloud-metadata endpoints when configured.
 	if d.Config.EffectiveNetwork() != "allow" {
 		out = append(out, "--network", "none")
+	} else if d.Config.DenyMetadataAndLocalNet {
+		for _, host := range metadataSinkholeHosts {
+			out = append(out, "--add-host", host+":127.0.0.1")
+		}
 	}
 	for _, mount := range d.Config.CredentialMounts {
-		// A bare host path (the form contract validation blesses) mounts at
-		// the same path inside the container; a host:container pair passes
-		// through. Without this, "/host/.netrc"+":ro" would hand docker
-		// "ro" as the container path and every bare-path mount would fail
-		// at launch.
-		if !strings.Contains(mount, ":") {
-			mount = mount + ":" + mount
-		}
-		out = append(out, "-v", mount+":ro")
+		// canonicalMount cleans each side so a relative segment or trailing
+		// slash can't point the bind elsewhere than validation intended; a
+		// bare host path (the form contract validation blesses) still mounts
+		// at the same path inside the container.
+		out = append(out, "-v", canonicalMount(mount)+":ro")
 	}
 	out = append(out, d.Config.Image, bin)
 	out = append(out, args...)
 	return out
 }
 
+// canonicalMount resolves a credential mount to a canonical host:container
+// pair, filepath.Clean-ing each side. A bare host path (the only form contract
+// validation blesses) mounts at the same path inside the container; a
+// host:container pair passes through with both sides cleaned.
+func canonicalMount(mount string) string {
+	if !strings.Contains(mount, ":") {
+		cleaned := filepath.Clean(mount)
+		return cleaned + ":" + cleaned
+	}
+	parts := strings.SplitN(mount, ":", 2)
+	return filepath.Clean(parts[0]) + ":" + filepath.Clean(parts[1])
+}
+
 // Observe inspects the container's applied HostConfig so tests (and
 // operators) can verify the resource limits actually took effect, not just
-// that they were requested.
+// that they were requested. Session 3 also surfaces output-truncation
+// accounting (kept vs. discarded bytes) gathered during Launch, and records
+// image provenance so a "hardened" run can be tied back to the exact image.
 func (d *DockerRunner) Observe(ctx context.Context, ws Workspace) (ObserveResult, error) {
+	d.mu.Lock()
+	trunc := d.trunc
+	d.mu.Unlock()
+	base := ObserveResult{
+		OutputTruncated: trunc.truncated,
+		BytesAccepted:   trunc.accepted,
+		BytesDiscarded:  trunc.discarded,
+	}
+	// Image provenance: record the image reference the contract requested so a
+	// hardened/digest-pinned run is auditable back to its source, even when no
+	// container is left to inspect (e.g. after Destroy or in unit tests).
+	if d.Config.Image != "" {
+		if base.Limits == nil {
+			base.Limits = map[string]string{}
+		}
+		base.Limits["image"] = d.Config.Image
+	}
 	if ws.Container == "" {
-		return ObserveResult{}, nil
+		return base, nil
 	}
 	out, err := exec.CommandContext(ctx, "docker", "inspect", ws.Container, "--format", "{{json .HostConfig}}").Output()
 	if err != nil {
-		return ObserveResult{Notes: "docker_inspect_failed: " + err.Error()}, nil
+		base.Notes = "docker_inspect_failed: " + err.Error()
+		return base, nil
 	}
 	var hc struct {
 		Memory      int64  `json:"Memory"`
@@ -153,17 +265,23 @@ func (d *DockerRunner) Observe(ctx context.Context, ws Workspace) (ObserveResult
 		NetworkMode string `json:"NetworkMode"`
 	}
 	if err := json.Unmarshal(out, &hc); err != nil {
-		return ObserveResult{Notes: "docker_inspect_parse_failed: " + err.Error()}, nil
+		base.Notes = "docker_inspect_parse_failed: " + err.Error()
+		return base, nil
 	}
-	return ObserveResult{
-		Notes: "docker_limits_observed",
-		Limits: map[string]string{
-			"memory":       strconv.FormatInt(hc.Memory, 10),
-			"nano_cpus":    strconv.FormatInt(hc.NanoCpus, 10),
-			"pids_limit":   strconv.FormatInt(hc.PidsLimit, 10),
-			"network_mode": hc.NetworkMode,
-		},
-	}, nil
+	base.Notes = "docker_limits_observed"
+	base.Limits = map[string]string{
+		"memory":       strconv.FormatInt(hc.Memory, 10),
+		"nano_cpus":    strconv.FormatInt(hc.NanoCpus, 10),
+		"pids_limit":   strconv.FormatInt(hc.PidsLimit, 10),
+		"network_mode": hc.NetworkMode,
+	}
+	// Preserve the image provenance set above on the freshly-allocated Limits
+	// map (the inspect path replaces Limits wholesale with the hostconfig
+	// readings, so re-attach the image reference operators declared).
+	if d.Config.Image != "" {
+		base.Limits["image"] = d.Config.Image
+	}
+	return base, nil
 }
 
 // Stop issues a graceful (then, after 5s, forceful) docker stop. Called both
@@ -186,17 +304,25 @@ func (d *DockerRunner) Destroy(ctx context.Context, ws Workspace, approved bool)
 	return destroyWorktree(ctx, ws, approved)
 }
 
-// cappedWriter forwards at most `remaining` bytes to w, silently discarding
-// anything past the cap (plan rule: output-size cap), while always reporting
-// the full length written so callers (os/exec's stdout/stderr plumbing)
-// never see a short-write error.
+// cappedWriter forwards at most `remaining` bytes to w, and since Session 3a
+// records how many bytes were accepted vs. discarded past the cap instead of
+// dropping them silently. It always reports the full length written so
+// callers (os/exec's stdout/stderr plumbing) never see a short-write error.
+// The mutex guards remaining/accepted/discarded because os/exec copies Stdout
+// and Stderr from separate goroutines into the same writer.
 type cappedWriter struct {
+	mu        sync.Mutex
 	w         io.Writer
 	remaining int64
+	accepted  int64
+	discarded int64
 }
 
 func (c *cappedWriter) Write(p []byte) (int, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	if c.remaining <= 0 {
+		c.discarded += int64(len(p))
 		return len(p), nil
 	}
 	chunk := p
@@ -204,7 +330,11 @@ func (c *cappedWriter) Write(p []byte) (int, error) {
 		chunk = chunk[:c.remaining]
 	}
 	n, err := c.w.Write(chunk)
+	c.accepted += int64(n)
 	c.remaining -= int64(n)
+	if rem := int64(len(p)) - int64(n); rem > 0 {
+		c.discarded += rem
+	}
 	if err != nil {
 		return n, err
 	}

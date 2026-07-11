@@ -41,16 +41,37 @@ A job contract is strict YAML: unknown fields, multiple documents, malformed pat
 | `produces` | Optional typed handoff artifacts: `{name, path, schema, max_bytes}`. Paths must be under `.governator/artifacts/`; artifacts are copied to the ledger store and never merged. |
 | `consumes` | Optional artifact names this job requires from `depends_on` ancestors in a validated plan. |
 | `depends_on` | Optional, plan-authoring only. Names sibling `job_id`s within a `gov plan` manifest that must complete first. |
-| `risk_class` | Optional. `low`, `medium`, or `high` — a coarse tier `gov plan --show` renders per job, and (paired with `agent: auto`) the route broker reads too, nudging scoring toward reliability over cost. See [docs/routing.md](routing.md#risk_class-scoring). |
+| `risk_class` | Optional. `low`, `medium`, or `high` — a coarse tier `gov plan --show` renders per job, and (paired with `agent: auto`) the route broker reads too, nudging scoring toward reliability over cost. **`high` also gates containment (Session 3):** a high-risk job must run under hardened Docker, a backend with a verified native sandbox, or a signed operator override (`containment.*`) — otherwise it fails before launch. See [docs/routing.md](routing.md#risk_class-scoring) and [Containment](#containment-and-risk-class) below. |
 | `runner` | Optional, `local` (default) or `docker`. Selects host-level containment (Phase 5): `local` runs the agent as a direct host subprocess against the worktree; `docker` runs it inside a container bind-mounting the same worktree. A `docker` request Governator can't satisfy (binary/daemon unavailable) fails closed — it never silently falls back to `local`. |
-| `docker.image` | Required when `runner: docker`. Container image the agent process runs in. |
+| `docker.image` | Required when `runner: docker`. Container image the agent process runs in. Hardened configs (`docker.*` controls below) require a digest-pinned reference (`image@sha256:…`) unless `allow_mutable_tag` is set. |
 | `docker.cpu_limit` / `docker.memory_limit` / `docker.pids_limit` | Optional resource limits (`--cpus`, `--memory`, `--pids-limit`). Unset means Docker's own default (no limit). |
 | `docker.network` | Optional, `deny` (default) or `allow`. Network access is default-deny (`--network none`); a contract must opt in to `allow`. |
-| `docker.credential_mounts` | Optional list of absolute host paths mounted read-only into the container. Empty by default — no credentials are exposed unless explicitly allowlisted. |
-| `docker.output_cap_bytes` | Optional, defaults to 20MiB. Caps how much of the container's stdout/stderr is persisted to the transcript. |
+| `docker.credential_mounts` | Optional list of absolute host paths mounted read-only into the container (canonicalized before launch). Empty by default — no credentials are exposed unless explicitly allowlisted. |
+| `docker.output_cap_bytes` | Optional, defaults to 20MiB. Caps how much of the container's stdout/stderr is persisted to the transcript. Truncation past the cap is **loud** (Session 3a): bytes accepted/discarded are recorded, an `OUTPUT_TRUNCATED` ledger stage is emitted, and when `require_complete_transcript` is set the run is quarantined rather than approved on an incomplete trail. |
+| `docker.user` | Optional. Runs the container as a non-root user (`--user`). Required for a hardened config. |
+| `docker.read_only_rootfs` | Optional. Mounts the root filesystem read-only (`--read-only`). Required for a hardened config; pair with `tmpfs` for dirs the backend must write. |
+| `docker.cap_drop_all` | Optional. Drops every Linux capability (`--cap-drop=ALL`). Required for a hardened config. |
+| `docker.no_new_privileges` | Optional. Sets `--security-opt no-new-privileges`. Required for a hardened config. |
+| `docker.seccomp_profile` / `docker.apparmor_profile` | Optional absolute-path seccomp profile / named AppArmor profile (`--security-opt seccomp=…` / `apparmor=…`). |
+| `docker.tmpfs` | Optional list of controlled `--tmpfs` mounts (e.g. `/tmp`, `/run`) — needed under `read_only_rootfs`. |
+| `docker.allow_mutable_tag` | Optional. The documented exception to the digest requirement; records the choice in provenance. Without it, a hardened config's image must be `image@sha256:…`. |
+| `docker.egress_allowlist` | Optional list of `host:port` destinations a `network: allow` container may reach. Recorded for provenance; the docker-level enforcement combines `deny_metadata_and_local_net` with the operator's network policy. |
+| `docker.deny_metadata_and_local_net` | Optional. Under `network: allow`, redirects cloud-metadata hostnames to loopback via `--add-host`. The safe default remains `network: deny`. |
+| `docker.require_complete_transcript` | Optional. Makes output truncation a blocking violation — a run whose transcript was capped is quarantined. Defaults false (truncation recorded but non-blocking); high-risk hardened contracts should set it true. |
+| `containment.override_reason` / `containment.override_signature` | Optional. A signed operator escape hatch for `risk_class: high` jobs that can't meet hardened Docker or a native sandbox. The signature is ed25519 (hex) over `<job_id>:<override_reason>`, verified against `containment.override_public_key` in config. Both fields must appear together or not at all; with no key configured, no override is ever accepted (fail-closed). |
 | `on_violation` | `quarantine`; unsupported actions are rejected during validation. |
 
 All path patterns are repository-relative and may not escape with `..`. Read-only modes are `scout`, `verifier`, and `architect`. `planner` writes only inside its own `gov plan --out` directory, never the target repository. Governator rejects direct-root execution and unimplemented violation actions rather than accepting policy it cannot enforce.
+
+## Containment and risk-class
+
+A `risk_class: high` contract must not silently resolve to local execution (Session 3, Phase 2). At run time — after the route broker resolves the agent (native sandbox is a verified backend capability, never a contract claim) and before any quota or workspace side effect — Governator requires one of:
+
+- **Hardened Docker** (`runner: docker` with `docker.user`, `docker.read_only_rootfs`, `docker.cap_drop_all`, `docker.no_new_privileges`, and a digest-pinned `docker.image` — i.e. `IsHardened()`). These map to real `docker run` flags; credential mounts and the workspace bind are canonicalized before launch, and image provenance is recorded.
+- **A verified native sandbox** for a `runner: local` job — the resolved backend declares `NativeSandbox` (e.g. Claude Code's `--safe-mode`, Codex's sandbox).
+- **A signed operator override** (`containment.override_signature`), verified against `containment.override_public_key` in config (or `GOV_CONTAINMENT_OVERRIDE_PUBLIC_KEY`). With no key configured, no override is accepted — high-risk local jobs without qualifying containment simply fail before launch.
+
+Everything else passes through untouched: `low`/`medium`/unset risk classes are scoring-only and never containment-gated, and a non-hardened docker config is still valid for ordinary jobs. To sign an override, the operator signs `<job_id>:<override_reason>` with their ed25519 private key; the binding to `job_id` prevents an override minted for one high-risk job being replayed against another.
 
 ## Task decomposition (`gov plan`)
 

@@ -158,6 +158,11 @@ var AssayEnforcements = map[string]bool{"blocking": true, "advisory": true, "tel
 // containment for the agent process itself (worktrees, created the same way
 // regardless of runner, only ever isolated the repo, not the OS). Only
 // meaningful when Contract.Runner == "docker".
+//
+// The Session 3 (Phase 2) hardening fields below (User through
+// RequireCompleteTranscript) are individually optional: a non-hardened config
+// is still valid for ordinary jobs. IsHardened reports when enough of them are
+// set to satisfy a risk_class: high contract (see internal/containment).
 type DockerRunnerConfig struct {
 	Image            string   `yaml:"image" json:"image"`
 	CPULimit         string   `yaml:"cpu_limit,omitempty" json:"cpu_limit,omitempty"`
@@ -166,6 +171,49 @@ type DockerRunnerConfig struct {
 	Network          string   `yaml:"network,omitempty" json:"network,omitempty"`
 	CredentialMounts []string `yaml:"credential_mounts,omitempty" json:"credential_mounts,omitempty"`
 	OutputCapBytes   int64    `yaml:"output_cap_bytes,omitempty" json:"output_cap_bytes,omitempty"`
+
+	// User runs the container process as a non-root user (docker --user),
+	// e.g. "65532:65532". Required for IsHardened — root inside the container
+	// defeats the capability/read-only controls below.
+	User string `yaml:"user,omitempty" json:"user,omitempty"`
+	// ReadOnlyRootfs mounts the root filesystem read-only (--read-only).
+	// Required for IsHardened; pair with Tmpfs for the dirs an agent must write.
+	ReadOnlyRootfs bool `yaml:"read_only_rootfs,omitempty" json:"read_only_rootfs,omitempty"`
+	// CapDropAll drops every Linux capability (--cap-drop=ALL). Required for
+	// IsHardened; the agent gets no kernel surface to escalate through.
+	CapDropAll bool `yaml:"cap_drop_all,omitempty" json:"cap_drop_all,omitempty"`
+	// NoNewPrivileges sets --security-opt no-new-privileges. Required for
+	// IsHardened; blocks setuid/file-capability escalation paths.
+	NoNewPrivileges bool `yaml:"no_new_privileges,omitempty" json:"no_new_privileges,omitempty"`
+	// SeccompProfile applies a seccomp profile (--security-opt seccomp=<path>).
+	// Must be an absolute host path when set.
+	SeccompProfile string `yaml:"seccomp_profile,omitempty" json:"seccomp_profile,omitempty"`
+	// AppArmorProfile applies an AppArmor profile (--security-opt
+	// apparmor=<profile>).
+	AppArmorProfile string `yaml:"apparmor_profile,omitempty" json:"apparmor_profile,omitempty"`
+	// Tmpfs mounts controlled temporary filesystems (--tmpfs). Needed under
+	// ReadOnlyRootfs for /tmp, /run, and any dir the backend CLI writes to.
+	Tmpfs []string `yaml:"tmpfs,omitempty" json:"tmpfs,omitempty"`
+	// AllowMutableTag is the documented operator exception to the digest
+	// requirement: a mutable tag (image:latest) is accepted only when this is
+	// set, and the choice is recorded in provenance. Without it, IsHardened
+	// requires Image to be pinned by digest (image@sha256:...).
+	AllowMutableTag bool `yaml:"allow_mutable_tag,omitempty" json:"allow_mutable_tag,omitempty"`
+	// EgressAllowlist declares the only host:port destinations a network:
+	// allow container may reach. Recorded for provenance; the docker-level
+	// enforcement combines metadata/local-network denial with the operator's
+	// network policy. An empty list under network: allow is the pre-Session-3
+	// full-egress opt-in and is NOT hardened.
+	EgressAllowlist []string `yaml:"egress_allowlist,omitempty" json:"egress_allowlist,omitempty"`
+	// DenyMetadataAndLocalNet sinkholes cloud-metadata endpoints when network
+	// is allowed (--add-host redirection to loopback). The safe default remains
+	// network: deny; this narrows the allow opt-in.
+	DenyMetadataAndLocalNet bool `yaml:"deny_metadata_and_local_net,omitempty" json:"deny_metadata_and_local_net,omitempty"`
+	// RequireCompleteTranscript makes output truncation a blocking violation:
+	// a run whose transcript was capped is quarantined rather than approved on
+	// an incomplete evidence trail. Defaults false (truncation is recorded but
+	// non-blocking); high-risk hardened contracts should set it true.
+	RequireCompleteTranscript bool `yaml:"require_complete_transcript,omitempty" json:"require_complete_transcript,omitempty"`
 }
 
 // dockerNetworkModes are the valid DockerRunnerConfig.Network values ("" defers
@@ -189,6 +237,33 @@ func (d *DockerRunnerConfig) EffectiveOutputCapBytes() int64 {
 		return 20 * 1024 * 1024
 	}
 	return d.OutputCapBytes
+}
+
+// imagePinned reports whether Image references an immutable digest, the
+// hardening requirement — a mutable tag (image:latest) can be silently
+// retagged underneath a "hardened" config. AllowMutableTag is the documented
+// operator exception (recorded, not enforced, at the registry).
+func (d *DockerRunnerConfig) imagePinned() bool {
+	if d == nil {
+		return false
+	}
+	if d.AllowMutableTag {
+		return true
+	}
+	return strings.Contains(d.Image, "@sha256:")
+}
+
+// IsHardened reports whether every Session 3 (Phase 2) containment control is
+// in place: non-root user, read-only root filesystem, cap-drop=ALL,
+// no-new-privileges, and a pinned (digest) image. A risk_class: high contract
+// requires an IsHardened docker config — or a verified native sandbox / signed
+// override (see internal/containment) — and must never silently resolve to
+// local execution. A nil receiver (no docker config) is never hardened.
+func (d *DockerRunnerConfig) IsHardened() bool {
+	if d == nil {
+		return false
+	}
+	return d.User != "" && d.ReadOnlyRootfs && d.CapDropAll && d.NoNewPrivileges && d.imagePinned()
 }
 
 // validRunners are the valid Contract.Runner values; "" defers to
@@ -270,6 +345,11 @@ type Contract struct {
 	Runner string              `yaml:"runner,omitempty" json:"runner,omitempty"`
 	Docker *DockerRunnerConfig `yaml:"docker,omitempty" json:"docker,omitempty"`
 
+	// Containment is the Session 3 (Phase 2) risk-class containment override
+	// surface — optional on every contract, and absent on every prior job YAML
+	// so existing contracts keep validating unchanged. See the Containment type.
+	Containment *Containment `yaml:"containment,omitempty" json:"containment,omitempty"`
+
 	// PostRunValidate, when set, runs in-process after Success.Validators
 	// pass but before the run merges to the live root — an extra pre-merge
 	// gate for checks too structured for a shell one-liner (e.g. `gov plan`'s
@@ -287,6 +367,20 @@ func (c Contract) EffectiveRunner() string {
 		return "local"
 	}
 	return c.Runner
+}
+
+// Containment carries Session 3 (Phase 2) risk-class containment declarations.
+// It is optional on every contract. A risk_class: high contract that cannot
+// satisfy hardened Docker or a verified native sandbox may set an override: an
+// explicit, cryptographically signed operator assertion that the run may
+// proceed under lesser containment. The signature is ed25519 over
+// "<job_id>:<override_reason>", verified at run time against the operator
+// public key in config (containment.override_public_key). With no key
+// configured, no override is ever accepted (fail-closed): high-risk local
+// execution without qualifying containment simply fails before launch.
+type Containment struct {
+	OverrideReason    string `yaml:"override_reason,omitempty" json:"override_reason,omitempty"`
+	OverrideSignature string `yaml:"override_signature,omitempty" json:"override_signature,omitempty"`
 }
 
 type Workspace struct {
@@ -535,6 +629,7 @@ func (c Contract) Validate() error {
 	validateArtifacts(c, add)
 	validateAssay(c, add)
 	validateRunner(c, add)
+	validateContainment(c, add)
 
 	// Quarantine is the implemented fail-closed action. Halt and rollback were
 	// previously accepted but ignored; rollback also cannot restore arbitrary
@@ -720,6 +815,46 @@ func validateRunner(c Contract, add func(string, string)) {
 		} else if !filepath.IsAbs(trimmed) {
 			add(field, "must be an absolute host path")
 		}
+	}
+	// Session 3 (Phase 2) hardening field validation is structural, not a
+	// hardening gate: a non-hardened docker config is valid for ordinary jobs;
+	// IsHardened (a runtime policy check in internal/containment) decides
+	// whether it qualifies for risk_class: high. Seccomp paths must be real
+	// filesystem locations; tmpfs/egress entries must be non-empty.
+	if c.Docker.SeccompProfile != "" && !filepath.IsAbs(c.Docker.SeccompProfile) {
+		add("docker.seccomp_profile", "must be an absolute host path when set")
+	}
+	for i, t := range c.Docker.Tmpfs {
+		field := fmt.Sprintf("docker.tmpfs[%d]", i)
+		if strings.TrimSpace(t) == "" {
+			add(field, "must not be blank")
+		}
+	}
+	for i, e := range c.Docker.EgressAllowlist {
+		field := fmt.Sprintf("docker.egress_allowlist[%d]", i)
+		if strings.TrimSpace(e) == "" {
+			add(field, "must not be blank")
+		}
+	}
+}
+
+// validateContainment enforces that an override is complete or absent — a
+// reason without a signature (or vice versa) is a half-declared escape hatch
+// and must never silently behave as either "no override" or "override
+// granted." Cryptographic verification happens at run time
+// (internal/containment), not here, since it depends on the operator key in
+// config.
+func validateContainment(c Contract, add func(string, string)) {
+	if c.Containment == nil {
+		return
+	}
+	reason := strings.TrimSpace(c.Containment.OverrideReason)
+	sig := strings.TrimSpace(c.Containment.OverrideSignature)
+	if sig != "" && reason == "" {
+		add("containment.override_reason", "is required when override_signature is set")
+	}
+	if reason != "" && sig == "" {
+		add("containment.override_signature", "is required when override_reason is set")
 	}
 }
 

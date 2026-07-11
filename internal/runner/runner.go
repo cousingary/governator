@@ -54,10 +54,15 @@ type LaunchRequest struct {
 // ObserveResult carries runner-specific diagnostics gathered after Launch
 // completes. LocalWorktreeRunner has none to report; DockerRunner reports
 // the resource limits actually applied to the container (verified via
-// `docker inspect`).
+// `docker inspect`) and, since Session 3a, output-truncation accounting so
+// the runtime can emit OUTPUT_TRUNCATED and quarantine runs that required a
+// complete transcript.
 type ObserveResult struct {
-	Notes  string
-	Limits map[string]string
+	Notes           string
+	Limits          map[string]string
+	OutputTruncated bool
+	BytesAccepted   int64
+	BytesDiscarded  int64
 }
 
 // Runner is the Phase 5 execution abstraction: Prepare an isolated

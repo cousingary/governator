@@ -1,10 +1,12 @@
 package runner
 
 import (
+	"bytes"
 	"context"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -159,5 +161,181 @@ func TestDockerRunArgsCredentialMounts(t *testing.T) {
 		if !found {
 			t.Errorf("expected mount arg %q in runArgs output:\n%s", want, joined)
 		}
+	}
+}
+
+// TestDockerRunArgsCanonicalizesMounts pins Session 3b: mount paths are
+// filepath.Clean'd so a relative segment or trailing slash can't point the
+// bind elsewhere than validation intended. No daemon required.
+func TestDockerRunArgsCanonicalizesMounts(t *testing.T) {
+	d := &DockerRunner{Config: contracts.DockerRunnerConfig{
+		Image:            dockerTestImage,
+		CredentialMounts: []string{"/host/../host/.netrc", "/host/creds/:/root/creds/"},
+	}}
+	args := d.runArgs(Workspace{Container: "c", Path: "/ws/"}, "bin", nil)
+	want := map[string]bool{
+		"/host/.netrc:/host/.netrc:ro": true,
+		"/host/creds:/root/creds:ro":   true,
+	}
+	for _, a := range args {
+		if want[a] {
+			delete(want, a)
+		}
+	}
+	if len(want) > 0 {
+		t.Errorf("missing canonicalized mount args %v in: %v", want, args)
+	}
+	// Workspace bind is also canonicalized (trailing slash dropped).
+	foundWS := false
+	for _, a := range args {
+		if a == "/ws:/workspace" {
+			foundWS = true
+		}
+	}
+	if !foundWS {
+		t.Errorf("workspace bind not canonicalized, got args: %v", args)
+	}
+}
+
+// TestDockerRunArgsHardeningFlags pins Session 3b: each hardened control maps
+// to the expected docker flag, and absent controls produce no flag (so prior
+// job YAML stays byte-identical). No daemon required.
+func TestDockerRunArgsHardeningFlags(t *testing.T) {
+	d := &DockerRunner{Config: contracts.DockerRunnerConfig{
+		Image:                   "img@sha256:" + strings.Repeat("a", 64),
+		User:                    "65532:65532",
+		ReadOnlyRootfs:          true,
+		CapDropAll:              true,
+		NoNewPrivileges:         true,
+		SeccompProfile:          "/etc/docker/seccomp.json",
+		AppArmorProfile:         "governator",
+		Tmpfs:                   []string{"/tmp", "/run"},
+		Network:                 "allow",
+		DenyMetadataAndLocalNet: true,
+	}}
+	args := d.runArgs(Workspace{Container: "c", Path: "/ws"}, "bin", nil)
+	joined := strings.Join(args, "\n")
+	wants := []string{
+		"--user", "65532:65532",
+		"--read-only",
+		"--cap-drop=ALL",
+		"--security-opt", "no-new-privileges",
+		"--security-opt", "seccomp=/etc/docker/seccomp.json",
+		"--security-opt", "apparmor=governator",
+		"--tmpfs", "/tmp",
+		"--tmpfs", "/run",
+		"--add-host", "metadata.google.internal:127.0.0.1",
+		"--add-host", "metadata:127.0.0.1",
+		"--add-host", "metadata.azure.com:127.0.0.1",
+	}
+	for _, w := range wants {
+		if !strings.Contains(joined, "\n"+w) && !strings.HasPrefix(joined, w) {
+			t.Errorf("expected %q in runArgs:\n%s", w, joined)
+		}
+	}
+	// network: allow must NOT emit --network none when metadata denial is on.
+	if strings.Contains(joined, "--network") {
+		t.Errorf("network: allow with no --network none expected, got:\n%s", joined)
+	}
+}
+
+// TestDockerRunArgsDefaultDenyNoHardening pins that an ordinary config
+// (no hardening fields) produces args with none of the new flags — the
+// regression guard for "prior job YAML stays byte-identical."
+func TestDockerRunArgsDefaultDenyNoHardening(t *testing.T) {
+	d := &DockerRunner{Config: contracts.DockerRunnerConfig{Image: dockerTestImage}}
+	args := d.runArgs(Workspace{Container: "c", Path: "/ws"}, "bin", nil)
+	joined := strings.Join(args, "\n")
+	for _, forbidden := range []string{"--read-only", "--cap-drop", "--user", "--tmpfs", "no-new-privileges", "seccomp", "apparmor", "--add-host"} {
+		if strings.Contains(joined, forbidden) {
+			t.Errorf("plain config must not emit %q, got:\n%s", forbidden, joined)
+		}
+	}
+	if !strings.Contains(joined, "--network") {
+		t.Errorf("plain config must default-deny via --network none, got:\n%s", joined)
+	}
+}
+
+// TestCappedWriterAccounting pins Session 3a: truncation is no longer silent.
+// Under-cap writes are fully accepted; over-cap writes split into accepted +
+// discarded exactly; the exact-cap boundary discards nothing.
+func TestCappedWriterAccounting(t *testing.T) {
+	t.Run("under cap", func(t *testing.T) {
+		var buf bytes.Buffer
+		c := &cappedWriter{w: &buf, remaining: 100}
+		n, err := c.Write([]byte("hello"))
+		if err != nil || n != 5 {
+			t.Fatalf("Write: n=%d err=%v", n, err)
+		}
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		if c.accepted != 5 || c.discarded != 0 {
+			t.Fatalf("accepted=%d discarded=%d, want 5/0", c.accepted, c.discarded)
+		}
+	})
+
+	t.Run("over cap discards the tail", func(t *testing.T) {
+		var buf bytes.Buffer
+		c := &cappedWriter{w: &buf, remaining: 3}
+		// First write consumes the whole cap; second is entirely discarded.
+		c.Write([]byte("abc"))
+		n, _ := c.Write([]byte("DEFGH"))
+		if n != 5 {
+			t.Fatalf("Write must report full length 5 (no short-write), got %d", n)
+		}
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		if c.accepted != 3 || c.discarded != 5 {
+			t.Fatalf("accepted=%d discarded=%d, want 3/5", c.accepted, c.discarded)
+		}
+		if buf.String() != "abc" {
+			t.Fatalf("buffer=%q, want \"abc\"", buf.String())
+		}
+	})
+
+	t.Run("exact boundary discards nothing", func(t *testing.T) {
+		var buf bytes.Buffer
+		c := &cappedWriter{w: &buf, remaining: 4}
+		c.Write([]byte("abcd"))
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		if c.accepted != 4 || c.discarded != 0 {
+			t.Fatalf("accepted=%d discarded=%d, want 4/0", c.accepted, c.discarded)
+		}
+	})
+}
+
+// TestDockerObserveSurfacesTruncationAndProvenance pins Session 3a/3b: Observe
+// reports the truncation tally stashed during Launch and records image
+// provenance — without needing a live container (the truncation path is
+// exercised by setting the stats directly, exactly as Launch would).
+func TestDockerObserveSurfacesTruncationAndProvenance(t *testing.T) {
+	d := &DockerRunner{Config: contracts.DockerRunnerConfig{Image: "img@sha256:abc"}}
+	d.mu.Lock()
+	d.trunc = truncationStats{accepted: 100, discarded: 50, truncated: true}
+	d.mu.Unlock()
+
+	obs, err := d.Observe(context.Background(), Workspace{})
+	if err != nil {
+		t.Fatalf("Observe: %v", err)
+	}
+	if !obs.OutputTruncated || obs.BytesAccepted != 100 || obs.BytesDiscarded != 50 {
+		t.Fatalf("truncation not surfaced: %+v", obs)
+	}
+	if obs.Limits["image"] != "img@sha256:abc" {
+		t.Errorf("image provenance not recorded: got %q", obs.Limits["image"])
+	}
+}
+
+// TestDockerObserveNoTruncationByDefault pins the zero state: a run that did
+// not overflow the cap reports no truncation.
+func TestDockerObserveNoTruncationByDefault(t *testing.T) {
+	d := &DockerRunner{Config: contracts.DockerRunnerConfig{Image: dockerTestImage}}
+	obs, err := d.Observe(context.Background(), Workspace{})
+	if err != nil {
+		t.Fatalf("Observe: %v", err)
+	}
+	if obs.OutputTruncated || obs.BytesAccepted != 0 || obs.BytesDiscarded != 0 {
+		t.Fatalf("fresh runner must report no truncation, got %+v", obs)
 	}
 }

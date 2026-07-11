@@ -22,6 +22,7 @@ func cleanEnv(t *testing.T) {
 		"GOV_DOCTRINE_REQUIRE_CLEANUP",
 		"GOV_DEFAULT_AGENT", "GOV_DEFAULT_MAX_MINUTES",
 		"GOV_ASSAY_REPO", "GOV_ASSAY_PYTHON", "GOV_ASSAY_TIMEOUT_SECONDS",
+		"GOV_CONTAINMENT_OVERRIDE_PUBLIC_KEY",
 	} {
 		t.Setenv(name, "")
 	}
@@ -415,5 +416,43 @@ func TestLoadGovHomeDoesNotOverrideExplicitHaltFile(t *testing.T) {
 	}
 	if cfg.Spend.HaltFile != "/halt/explicit" {
 		t.Fatalf("explicit halt_file must win over the GOV_HOME redirect, got %s", cfg.Spend.HaltFile)
+	}
+}
+
+// TestLoadContainmentOverridePublicKey is the Session 3 (Phase 2) config
+// regression: the operator ed25519 override key loads from file and env, and
+// defaults empty (fail-closed — no key means no high-risk override accepted).
+func TestLoadContainmentOverridePublicKey(t *testing.T) {
+	cleanEnv(t)
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Containment.OverridePublicKey != "" {
+		t.Fatalf("expected containment.override_public_key to default empty (fail-closed), got %q", cfg.Containment.OverridePublicKey)
+	}
+
+	path := filepath.Join(home, "config.yaml")
+	t.Setenv("GOV_CONFIG", path)
+	if err := os.WriteFile(path, []byte("containment: {override_public_key: deadbeef}\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err = Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Containment.OverridePublicKey != "deadbeef" {
+		t.Fatalf("file override key = %q", cfg.Containment.OverridePublicKey)
+	}
+
+	t.Setenv("GOV_CONTAINMENT_OVERRIDE_PUBLIC_KEY", "cafef00d")
+	cfg, err = Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Containment.OverridePublicKey != "cafef00d" {
+		t.Fatalf("env override key = %q", cfg.Containment.OverridePublicKey)
 	}
 }
