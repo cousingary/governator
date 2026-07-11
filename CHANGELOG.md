@@ -2,6 +2,13 @@
 
 All notable changes to Governator are documented here.
 
+## v1.4-session1-validator-test
+
+Deterministic-validator-quarantine test: a deliberately-unsatisfiable
+`success.validators` entry (`ZZZ_THIS_STRING_DELIBERATELY_NEVER_EXISTS_ZZZ`)
+exercises the fail-closed quarantine path against this v1.4 Session 1
+worktree. No code changed; this entry is the sole mutation.
+
 ## v1.4-session1
 
 Merge + release-evidence proof landed on commit `2051e9b7`.
