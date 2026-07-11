@@ -120,7 +120,7 @@ func Last(id string) (RunRecord, error) {
 		return RunRecord{}, err
 	}
 	defer db.Close()
-	q := `SELECT id,job_id,COALESCE(job_type,''),COALESCE(agent,''),COALESCE(mode,''),status,root,worktree,branch,diff,transcript,message,commit_hash,created,cost_usd,valid_output,failure_taxonomy,result_json,COALESCE(prompt_version,''),COALESCE(envelope_json,''),COALESCE(notes,''),input_tokens,output_tokens,cached_input_tokens,cache_creation_tokens,reasoning_tokens,total_tokens,usage_available,tool_calls,transcript_bytes,COALESCE(graph_provider,''),COALESCE(graph_version,''),COALESCE(graph_fingerprint,''),graph_files,graph_nodes,graph_edges,graph_db_bytes,COALESCE(repair_of,'') FROM runs`
+	q := `SELECT id,job_id,COALESCE(job_type,''),COALESCE(agent,''),COALESCE(mode,''),status,root,worktree,branch,diff,transcript,message,COALESCE(commit_hash,''),created,cost_usd,valid_output,failure_taxonomy,result_json,COALESCE(prompt_version,''),COALESCE(envelope_json,''),COALESCE(notes,''),input_tokens,output_tokens,cached_input_tokens,cache_creation_tokens,reasoning_tokens,total_tokens,usage_available,tool_calls,transcript_bytes,COALESCE(graph_provider,''),COALESCE(graph_version,''),COALESCE(graph_fingerprint,''),graph_files,graph_nodes,graph_edges,graph_db_bytes,COALESCE(repair_of,'') FROM runs`
 	var row *sql.Row
 	if id == "" || id == "last" {
 		row = db.QueryRow(q + ` ORDER BY created DESC LIMIT 1`)
@@ -137,7 +137,7 @@ func Quarantines() ([]RunRecord, error) {
 		return nil, err
 	}
 	defer db.Close()
-	rows, err := db.Query(`SELECT id,job_id,COALESCE(job_type,''),COALESCE(agent,''),COALESCE(mode,''),status,root,worktree,branch,diff,transcript,message,commit_hash,created,cost_usd,valid_output,failure_taxonomy,result_json,COALESCE(prompt_version,''),COALESCE(envelope_json,''),COALESCE(notes,''),input_tokens,output_tokens,cached_input_tokens,cache_creation_tokens,reasoning_tokens,total_tokens,usage_available,tool_calls,transcript_bytes,COALESCE(graph_provider,''),COALESCE(graph_version,''),COALESCE(graph_fingerprint,''),graph_files,graph_nodes,graph_edges,graph_db_bytes,COALESCE(repair_of,'') FROM runs WHERE status='QUARANTINED' ORDER BY created DESC`)
+	rows, err := db.Query(`SELECT id,job_id,COALESCE(job_type,''),COALESCE(agent,''),COALESCE(mode,''),status,root,worktree,branch,diff,transcript,message,COALESCE(commit_hash,''),created,cost_usd,valid_output,failure_taxonomy,result_json,COALESCE(prompt_version,''),COALESCE(envelope_json,''),COALESCE(notes,''),input_tokens,output_tokens,cached_input_tokens,cache_creation_tokens,reasoning_tokens,total_tokens,usage_available,tool_calls,transcript_bytes,COALESCE(graph_provider,''),COALESCE(graph_version,''),COALESCE(graph_fingerprint,''),graph_files,graph_nodes,graph_edges,graph_db_bytes,COALESCE(repair_of,'') FROM runs WHERE status='QUARANTINED' ORDER BY created DESC`)
 	if err != nil {
 		return nil, err
 	}
@@ -207,13 +207,20 @@ func processStartTicks(pid int) string {
 	return fields[19]
 }
 
-func lock(root, home string) (func(), error) {
+// lockPath returns the workspace lock file path for root, shared by lock()
+// and the Phase 4 recovery checks (which need to read a lock's liveness
+// without acquiring it).
+func lockPath(root, home string) string {
 	sum := sha1.Sum([]byte(root))
+	return filepath.Join(home, "locks", hex.EncodeToString(sum[:])+".lock")
+}
+
+func lock(root, home string) (func(), error) {
 	dir := filepath.Join(home, "locks")
 	if err := os.MkdirAll(dir, 0700); err != nil {
 		return nil, err
 	}
-	p := filepath.Join(dir, hex.EncodeToString(sum[:])+".lock")
+	p := lockPath(root, home)
 	for tries := 0; tries < 2; tries++ {
 		pid := os.Getpid()
 		created := time.Now().UTC().UnixNano()
@@ -946,6 +953,14 @@ func (r *Runner) runOnce(ctx context.Context, c contracts.Contract) (RunRecord, 
 	if err != nil {
 		return RunRecord{}, err
 	}
+	// id is minted here (rather than just before workspace creation, where it
+	// used to live) so the Phase 4 stage checkpoints below — PARSED and
+	// PREFLIGHTED happen before any workspace or quota reservation exists —
+	// have a run_id to key on from the very first checkpoint. run_stages has
+	// no foreign key to runs (like every other run_id-keyed table in this
+	// ledger), so recording a stage before the runs row itself is inserted is
+	// safe.
+	id := fmt.Sprintf("%s-%d", c.JobID, time.Now().UTC().UnixNano())
 	rtkAnnotation, err := tokenoptimizer.PromptAnnotation()
 	if err != nil {
 		return RunRecord{}, err
@@ -971,6 +986,12 @@ func (r *Runner) runOnce(ctx context.Context, c contracts.Contract) (RunRecord, 
 		return RunRecord{}, err
 	}
 	defer db.Close()
+	if err := observability.RecordStage(db, id, "PARSED", "", time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
+		return RunRecord{}, err
+	}
+	if err := observability.RecordStage(db, id, "PREFLIGHTED", "", time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
+		return RunRecord{}, err
+	}
 	hash, err := contracts.ContractHash(c)
 	if err != nil {
 		return RunRecord{}, err
@@ -994,9 +1015,8 @@ func (r *Runner) runOnce(ctx context.Context, c contracts.Contract) (RunRecord, 
 		return RunRecord{}, err
 	}
 	if ok, reason := spend.CheckBudget(cfg, db); !ok {
-		refusedID := fmt.Sprintf("%s-%d", c.JobID, time.Now().UTC().UnixNano())
 		refused := RunRecord{
-			ID: refusedID, JobID: c.JobID, JobType: c.JobType, Agent: c.Agent, Mode: string(c.Mode),
+			ID: id, JobID: c.JobID, JobType: c.JobType, Agent: c.Agent, Mode: string(c.Mode),
 			Status: "QUARANTINED", Root: root, Created: time.Now().UTC().Format(time.RFC3339Nano),
 			Message: "SPEND_CAP: " + reason, FailureTaxonomy: "SPEND_CAP", RepairOf: c.RepairLineage,
 		}
@@ -1012,9 +1032,11 @@ func (r *Runner) runOnce(ctx context.Context, c contracts.Contract) (RunRecord, 
 		}); err != nil {
 			return refused, err
 		}
+		if err := observability.RecordStage(db, id, "QUARANTINED", "", time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
+			return refused, err
+		}
 		return refused, nil
 	}
-	id := fmt.Sprintf("%s-%d", c.JobID, time.Now().UTC().UnixNano())
 	// Route broker: agent: auto resolves to a concrete backend here, between
 	// contract validation and workspace creation. Resolving before any worktree
 	// is built means a fail-closed decision (no candidate qualifies) refuses
@@ -1047,6 +1069,9 @@ func (r *Runner) runOnce(ctx context.Context, c contracts.Contract) (RunRecord, 
 				c.Agent, snap.EffectiveState, snap.FailureKind)
 		}
 	}
+	if err := observability.RecordStage(db, id, "ROUTED", resolved.Agent, time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
+		return RunRecord{}, err
+	}
 	quotaUsageEstimate := quota.EstimateUsage(c.Budget.MaxTokens)
 	quotaTTL := time.Duration(c.Budget.MaxMinutes+5) * time.Minute
 	quotaReservation, qerr := quota.Reserve(db, resolved.Agent, quota.DefaultAccount, id, quotaUsageEstimate, quotaTTL, time.Now().UTC())
@@ -1071,9 +1096,15 @@ func (r *Runner) runOnce(ctx context.Context, c contracts.Contract) (RunRecord, 
 				return refused, err
 			}
 			_ = breaker.RecordFailure(db, refused.Agent, refused.FailureTaxonomy, time.Now().UTC())
+			if err := observability.RecordStage(db, id, "QUARANTINED", "", time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
+				return refused, err
+			}
 			return refused, nil
 		}
 		return RunRecord{}, qerr
+	}
+	if err := observability.RecordStage(db, id, "QUOTA_RESERVED", "", time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
+		return RunRecord{}, err
 	}
 	quotaSettled := false
 	defer func() {
@@ -1083,6 +1114,9 @@ func (r *Runner) runOnce(ctx context.Context, c contracts.Contract) (RunRecord, 
 	}()
 	work, branch, err := createWorkspace(root, r.Home, id, git)
 	if err != nil {
+		return RunRecord{}, err
+	}
+	if err := observability.RecordStage(db, id, "WORKSPACE_READY", "", time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
 		return RunRecord{}, err
 	}
 	graphSnapshot, err := contextgraph.Prepare(ctx, work)
@@ -1148,6 +1182,16 @@ func (r *Runner) runOnce(ctx context.Context, c contracts.Contract) (RunRecord, 
 	prompt += rtkAnnotation
 	prompt += contextgraph.PromptAnnotation(graphSnapshot)
 	prompt += minimalismAnnotation
+	// The AGENT_RUNNING checkpoint carries a digest of workBefore (the
+	// worktree's pre-launch fingerprint) as its detail so a recovery pass
+	// (gov run resume/recover --stale) run against a later crashed process can
+	// tell "the agent never touched the worktree" (digest still matches) from
+	// "the agent was mid-edit when it died" (digest no longer matches) without
+	// needing that in-memory snapshot to have survived the crash.
+	agentRunningDetail, _ := json.Marshal(map[string]string{"worktree_digest": snapshotDigest(workBefore)})
+	if err := observability.RecordStage(db, id, "AGENT_RUNNING", string(agentRunningDetail), time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
+		return rec, err
+	}
 	ar, aerr := agent.Run(ctx, agents.Request{
 		Prompt: prompt, Workdir: work, Transcript: transcript,
 		Timeout: time.Duration(c.Budget.MaxMinutes) * time.Minute,
@@ -1155,6 +1199,9 @@ func (r *Runner) runOnce(ctx context.Context, c contracts.Contract) (RunRecord, 
 	})
 	_ = redact(transcript)
 	audit := auditTranscript(transcript, agent.Capabilities().TranscriptFormat, c)
+	if err := observability.RecordStage(db, id, "AUDITED", "", time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
+		return rec, err
+	}
 	rec.CostUSD = audit.CostUSD
 	rec.Usage = audit.Usage
 	rec.ToolCalls = audit.ToolCalls
@@ -1268,6 +1315,9 @@ func (r *Runner) runOnce(ctx context.Context, c contracts.Contract) (RunRecord, 
 			violations = append(violations, "required file missing: "+p)
 		}
 	}
+	if err := observability.RecordStage(db, id, "VALIDATING", "", time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
+		return rec, err
+	}
 	for _, v := range c.Success.Validators {
 		vctx, cancel := context.WithTimeout(ctx, time.Duration(c.Budget.MaxMinutes)*time.Minute)
 		code, out, e := shell(vctx, work, v)
@@ -1324,6 +1374,9 @@ func (r *Runner) runOnce(ctx context.Context, c contracts.Contract) (RunRecord, 
 	// VerdictSkipped row, so "skipped" is always visible and distinguishable
 	// from "never asked for" in the ledger.
 	if c.Assay != nil {
+		if err := observability.RecordStage(db, id, "ASSAYING", "", time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
+			return rec, err
+		}
 		runAssayStep(ctx, db, cfg, c, id, hash, rec.Agent, artifactRecords, &violations)
 	}
 	rec.Diff = workspaceDiff(root, work, git, changed, deleted)
@@ -1359,6 +1412,11 @@ func (r *Runner) runOnce(ctx context.Context, c contracts.Contract) (RunRecord, 
 				if err := os.Remove(filepath.Join(root, filepath.FromSlash(p))); err != nil && !os.IsNotExist(err) {
 					violations = append(violations, "merge delete: "+err.Error())
 				}
+			}
+		}
+		if len(violations) == 0 {
+			if err := observability.RecordStage(db, id, "MERGED", "", time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
+				return rec, err
 			}
 		}
 	}
@@ -1400,6 +1458,9 @@ func (r *Runner) runOnce(ctx context.Context, c contracts.Contract) (RunRecord, 
 			_, _, _ = shell(ctx, work, "git add -A -- . ':(exclude).codegraph' ':(exclude).governator'")
 			_, _, _ = shell(ctx, work, "git commit --allow-empty -m "+shQuote("Quarantined Governator run "+id))
 		}
+	}
+	if err := observability.RecordStage(db, id, rec.Status, "", time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
+		return rec, err
 	}
 	approved := head
 	if rec.Status == "APPROVED" && git {
@@ -1592,6 +1653,9 @@ func Rollback(ctx context.Context, id string) (RunRecord, error) {
 		defer db.Close()
 		_, openErr = db.Exec(`UPDATE runs SET status='ROLLED_BACK',message=? WHERE id=?`, "restored recall snapshot", r.ID)
 		r.Status, r.Message = "ROLLED_BACK", "restored recall snapshot"
+		if openErr == nil {
+			openErr = observability.RecordStage(db, r.ID, "ROLLED_BACK", "", time.Now().UTC().Format(time.RFC3339Nano))
+		}
 		return r, openErr
 	}
 	release, err := lock(r.Root, Home())
@@ -1609,6 +1673,9 @@ func Rollback(ctx context.Context, id string) (RunRecord, error) {
 	}
 	defer db.Close()
 	_, e = db.Exec(`UPDATE runs SET status='ROLLED_BACK',message=? WHERE id=?`, "reverted "+r.Commit, r.ID)
+	if e == nil {
+		e = observability.RecordStage(db, r.ID, "ROLLED_BACK", "", time.Now().UTC().Format(time.RFC3339Nano))
+	}
 	r.Status = "ROLLED_BACK"
 	r.Message = "reverted " + r.Commit
 	return r, e

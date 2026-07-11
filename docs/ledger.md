@@ -19,6 +19,7 @@ Governator stores an SQLite WAL database in `ledger_dir` (default `$HOME/.govern
 | `hook_events` | Interactive tool decision, finding, and detail. |
 | `parity_events` | Go/Python shadow decisions and availability. |
 | `batches` | One row per `gov batch run` invocation: batch id, started/finished timestamps, job count, quarantined count, and aggregate cost. |
+| `run_stages` | Durable stage checkpoints for one run (`PARSED`, `PREFLIGHTED`, `ROUTED`, `QUOTA_RESERVED`, `WORKSPACE_READY`, `AGENT_RUNNING`, `AUDITED`, `VALIDATING`, `ASSAYING`, `MERGED`, plus the terminal `APPROVED`/`QUARANTINED`/`ROLLED_BACK`/`ABANDONED`), one row per `(run_id, stage)`. `AGENT_RUNNING`'s detail carries the pre-launch worktree digest recovery compares against. See "Run recovery" below. |
 
 ## Operations
 
@@ -44,6 +45,19 @@ gov eval scorecard
 ```
 
 Scoring reports valid-output rate and cost per valid output. Routing orders agents using recorded failure evidence for the requested job type; it does not invent a recommendation when no evidence exists.
+
+## Run recovery
+
+A crash (or `kill -9`) mid-`gov run` leaves a `runs` row stuck at `status='RUNNING'` — the process died before reaching a terminal status update — plus, potentially, an open quota reservation and a worktree still on disk. `run_stages` records how far the run actually got, so recovery does not have to guess:
+
+```sh
+gov run inspect <run_id>     # run record + full stage checkpoint history
+gov run resume <run_id>      # recover one interrupted run
+gov run abandon <run_id>     # force-cleanup one interrupted run regardless of stage
+gov run recover --stale      # apply the resume rule to every RUNNING run
+```
+
+The recovery rule: if the last recorded checkpoint is before `AGENT_RUNNING`, no agent work happened, so the run is safe to discard as a fresh attempt (`status='ABANDONED'`). If it reached `AGENT_RUNNING` or later, the current worktree fingerprint is compared against the digest recorded at that checkpoint — byte-identical means safe (`ABANDONED`), anything else (changed, missing, or no baseline recorded) fails closed to `status='QUARANTINED'`. Either way, any open quota reservation for the run is released and any leftover worktree/branch is destroyed. `gov run resume`/`recover --stale` both refuse to touch a run whose workspace lock is still held by a live process (reported as `still_running`); `gov run abandon` is the same rule but treats every case as safe, for an operator who has already made the call. All three are safe to re-run: an already-terminal run is reported as `already_terminal` and left untouched.
 
 ## Handoffs
 

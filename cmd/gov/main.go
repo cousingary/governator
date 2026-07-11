@@ -87,6 +87,16 @@ func run(args []string) int {
 		}
 		return 0
 	case "run":
+		if len(args) < 2 {
+			return bad("usage: gov run <job.yaml> [--agent <name>] | gov run inspect|resume|abandon <run_id> | gov run recover --stale")
+		}
+		// Phase 4 durable-recovery subcommands (`gov run inspect|resume|
+		// abandon|recover`). These are reserved words: job.yaml paths never
+		// collide with them since a contract file always ends in .yaml/.yml.
+		switch args[1] {
+		case "inspect", "resume", "abandon", "recover":
+			return runRecoveryDispatch(args[1:])
+		}
 		if len(args) != 2 && len(args) != 4 {
 			return bad("usage: gov run <job.yaml> [--agent <name>]")
 		}
@@ -411,6 +421,72 @@ func quarantine(args []string) int {
 		return 0
 	}
 	return bad("usage: gov quarantine list|show <id>|diff <id>")
+}
+
+// runRecoveryDispatch handles the Phase 4 durable-recovery subcommands: `gov
+// run inspect|resume|abandon <run_id>` and `gov run recover --stale`. args[0]
+// is the subcommand name (inspect/resume/abandon/recover).
+func runRecoveryDispatch(args []string) int {
+	switch args[0] {
+	case "inspect":
+		if len(args) != 2 {
+			return bad("usage: gov run inspect <run_id>")
+		}
+		rec, stages, err := govruntime.InspectRun(args[1])
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "run inspect:", err)
+			return 1
+		}
+		fmt.Println(govruntime.MarshalRecord(rec))
+		fmt.Println("stage\tdetail\tcreated")
+		for _, s := range stages {
+			fmt.Printf("%s\t%s\t%s\n", s.Stage, s.Detail, s.Created)
+		}
+		return 0
+	case "resume":
+		if len(args) != 2 {
+			return bad("usage: gov run resume <run_id>")
+		}
+		v, err := govruntime.ResumeRun(context.Background(), args[1])
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "run resume:", err)
+			return 1
+		}
+		return printRecoveryVerdicts([]govruntime.RecoveryVerdict{v})
+	case "abandon":
+		if len(args) != 2 {
+			return bad("usage: gov run abandon <run_id>")
+		}
+		v, err := govruntime.AbandonRun(args[1])
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "run abandon:", err)
+			return 1
+		}
+		return printRecoveryVerdicts([]govruntime.RecoveryVerdict{v})
+	case "recover":
+		if len(args) != 2 || args[1] != "--stale" {
+			return bad("usage: gov run recover --stale")
+		}
+		verdicts, err := govruntime.RecoverStaleRuns(context.Background())
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "run recover:", err)
+			return 1
+		}
+		if len(verdicts) == 0 {
+			fmt.Println("no interrupted runs found")
+			return 0
+		}
+		return printRecoveryVerdicts(verdicts)
+	}
+	return bad("usage: gov run inspect|resume|abandon <run_id> | gov run recover --stale")
+}
+
+func printRecoveryVerdicts(verdicts []govruntime.RecoveryVerdict) int {
+	fmt.Println("run_id\taction\tdetail")
+	for _, v := range verdicts {
+		fmt.Printf("%s\t%s\t%s\n", v.RunID, v.Action, v.Detail)
+	}
+	return 0
 }
 
 func spendCmd(args []string) int {
@@ -1720,6 +1796,10 @@ Usage:
   gov validate <job.yaml>
   gov preflight <job.yaml>
   gov run <job.yaml> [--agent <name>]
+  gov run inspect <run_id>
+  gov run resume <run_id>
+  gov run abandon <run_id>
+  gov run recover --stale
   gov batch run <job.yaml|dir|glob>... [--parallel N] [--halt-on-first-quarantine] [--ordered]
   gov plan <intent.md> --out <dir> --envelope <pattern>... --max-total-tokens <n> [--backend <name>]
   gov plan --panel <n> <intent.md> --out <dir> --envelope <pattern>... --max-total-tokens <n> [--backend <name>]

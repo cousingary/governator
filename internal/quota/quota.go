@@ -147,6 +147,38 @@ func Reserve(db *sql.DB, backend, account, runID string, usage float64, ttl time
 	return Reservation{ID: id, Backend: backend, Account: account, Usage: usage}, nil
 }
 
+// ReleaseForRun releases every still-open (unsettled) reservation belonging
+// to runID. Used by run recovery (Phase 4): an interrupted run must not hold
+// quota headroom hostage until its TTL expires on its own.
+func ReleaseForRun(db *sql.DB, runID string, now time.Time) error {
+	if db == nil || runID == "" {
+		return nil
+	}
+	rows, err := db.Query(`SELECT id FROM quota_reservations WHERE run_id=? AND settled_at=''`, runID)
+	if err != nil {
+		return err
+	}
+	var ids []int64
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return err
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	rows.Close()
+	for _, id := range ids {
+		if err := Release(db, id, now); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func Release(db *sql.DB, reservationID int64, now time.Time) error {
 	if db == nil || reservationID == 0 {
 		return nil

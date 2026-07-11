@@ -161,7 +161,8 @@ CREATE TABLE IF NOT EXISTS quota_windows(backend TEXT NOT NULL, account TEXT NOT
 CREATE TABLE IF NOT EXISTS quota_reservations(id INTEGER PRIMARY KEY AUTOINCREMENT, run_id TEXT NOT NULL DEFAULT '', backend TEXT NOT NULL, account TEXT NOT NULL DEFAULT 'default', usage REAL NOT NULL DEFAULT 0, measured_usage REAL NOT NULL DEFAULT 0, expires_at TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL DEFAULT '', settled_at TEXT NOT NULL DEFAULT '', expired INTEGER NOT NULL DEFAULT 0);
 CREATE TABLE IF NOT EXISTS artifacts(run_id TEXT NOT NULL, name TEXT NOT NULL, path TEXT NOT NULL, sha256 TEXT NOT NULL, bytes INTEGER NOT NULL DEFAULT 0, schema_ok INTEGER NOT NULL DEFAULT 0, created TEXT NOT NULL DEFAULT '', PRIMARY KEY(run_id,name));
 CREATE TABLE IF NOT EXISTS panel_members(panel_id TEXT NOT NULL, member_label TEXT NOT NULL, job_id TEXT NOT NULL, agent TEXT NOT NULL DEFAULT '', artifact_name TEXT NOT NULL DEFAULT '', created TEXT NOT NULL DEFAULT '', PRIMARY KEY(panel_id,member_label));
-CREATE TABLE IF NOT EXISTS assay_evaluations(id INTEGER PRIMARY KEY AUTOINCREMENT, run_id TEXT NOT NULL, attempt_id TEXT NOT NULL DEFAULT '', job_id TEXT NOT NULL DEFAULT '', profile TEXT NOT NULL DEFAULT '', policy_version TEXT NOT NULL DEFAULT '', verdict TEXT NOT NULL DEFAULT '', failed_checks TEXT NOT NULL DEFAULT '', checks_hash TEXT NOT NULL DEFAULT '', duration_ms INTEGER NOT NULL DEFAULT 0, created TEXT NOT NULL DEFAULT '');`
+CREATE TABLE IF NOT EXISTS assay_evaluations(id INTEGER PRIMARY KEY AUTOINCREMENT, run_id TEXT NOT NULL, attempt_id TEXT NOT NULL DEFAULT '', job_id TEXT NOT NULL DEFAULT '', profile TEXT NOT NULL DEFAULT '', policy_version TEXT NOT NULL DEFAULT '', verdict TEXT NOT NULL DEFAULT '', failed_checks TEXT NOT NULL DEFAULT '', checks_hash TEXT NOT NULL DEFAULT '', duration_ms INTEGER NOT NULL DEFAULT 0, created TEXT NOT NULL DEFAULT '');
+CREATE TABLE IF NOT EXISTS run_stages(id INTEGER PRIMARY KEY AUTOINCREMENT, run_id TEXT NOT NULL, stage TEXT NOT NULL, detail TEXT NOT NULL DEFAULT '', created TEXT NOT NULL, UNIQUE(run_id,stage));`
 	if _, err = db.Exec(schema); err != nil {
 		db.Close()
 		return nil, err
@@ -210,7 +211,8 @@ CREATE INDEX IF NOT EXISTS quota_reservations_run ON quota_reservations(run_id);
 CREATE INDEX IF NOT EXISTS quota_reservations_open ON quota_reservations(settled_at,expires_at);
 CREATE INDEX IF NOT EXISTS artifacts_name ON artifacts(name,run_id);
 CREATE INDEX IF NOT EXISTS panel_members_job ON panel_members(job_id);
-CREATE INDEX IF NOT EXISTS assay_evaluations_run ON assay_evaluations(run_id);`); err != nil {
+CREATE INDEX IF NOT EXISTS assay_evaluations_run ON assay_evaluations(run_id);
+CREATE INDEX IF NOT EXISTS run_stages_run ON run_stages(run_id);`); err != nil {
 		db.Close()
 		return nil, err
 	}
@@ -383,6 +385,47 @@ func AssayEvaluationsForRun(db *sql.DB, runID string) ([]AssayEvaluationRecord, 
 			}
 		}
 		out = append(out, rec)
+	}
+	return out, rows.Err()
+}
+
+// StageRecord is one checkpoint in a run's durable stage state machine
+// (Phase 4): PARSED -> PREFLIGHTED -> ROUTED -> QUOTA_RESERVED ->
+// WORKSPACE_READY -> AGENT_RUNNING -> AUDITED -> VALIDATING -> ASSAYING ->
+// MERGED -> APPROVED, with QUARANTINED/ROLLED_BACK/ABANDONED as alternate
+// terminal stages recorded whenever a run actually lands there. Detail is
+// free-form JSON (e.g. AGENT_RUNNING carries the pre-launch worktree digest
+// recovery compares against).
+type StageRecord struct {
+	Stage   string `json:"stage"`
+	Detail  string `json:"detail,omitempty"`
+	Created string `json:"created"`
+}
+
+// RecordStage appends one stage checkpoint. It is idempotent per (run_id,
+// stage): replaying the same checkpoint (e.g. a recovery pass re-observing
+// state already recorded) is a no-op rather than an error, so callers never
+// need to check "have I already recorded this" before calling.
+func RecordStage(db *sql.DB, runID, stage, detail, created string) error {
+	_, err := db.Exec(`INSERT INTO run_stages(run_id,stage,detail,created) VALUES(?,?,?,?) ON CONFLICT(run_id,stage) DO NOTHING`,
+		runID, stage, detail, created)
+	return err
+}
+
+// StageHistory returns every checkpoint recorded for runID, oldest first.
+func StageHistory(db *sql.DB, runID string) ([]StageRecord, error) {
+	rows, err := db.Query(`SELECT stage,detail,created FROM run_stages WHERE run_id=? ORDER BY id ASC`, runID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []StageRecord
+	for rows.Next() {
+		var s StageRecord
+		if err := rows.Scan(&s.Stage, &s.Detail, &s.Created); err != nil {
+			return nil, err
+		}
+		out = append(out, s)
 	}
 	return out, rows.Err()
 }

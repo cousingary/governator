@@ -84,6 +84,10 @@ gov init
 gov validate <job.yaml>
 gov preflight <job.yaml>
 gov run <job.yaml> [--agent <name>]
+gov run inspect <run_id>
+gov run resume <run_id>
+gov run abandon <run_id>
+gov run recover --stale
 gov batch run <job.yaml|dir|glob>... [--parallel N] [--halt-on-first-quarantine] [--ordered]
 gov plan <intent.md> --out <dir> --envelope <pattern>... --max-total-tokens <n> [--backend <name>]
 gov plan --panel <n> <intent.md> --out <dir> --envelope <pattern>... --max-total-tokens <n> [--backend <name>]
