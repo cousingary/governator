@@ -221,3 +221,10 @@ backend simulating a real RATE_LIMIT infra failure) failed before touching
 the worktree, exactly matching fallbackEligible's preconditions (infra
 taxonomy, zero tool calls, unchanged worktree); the runtime's fallback loop
 retried the next candidate, which completed this write and was approved.
+
+## v1.4-session1-docker-run-test
+
+Docker-runner test: this entry was written by a process running inside a
+container (image built for this test, workspace bind-mounted read-write),
+proving runner: docker actually launches in a container rather than
+silently falling back to a host subprocess.
