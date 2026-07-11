@@ -3,13 +3,14 @@ package spend
 import (
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/cousingary/governator/internal/config"
 )
 
 func TestAccountantReserveRefusesOverCap(t *testing.T) {
 	db, _ := openLedger(t)
-	insertRun(t, db, "r1", "APPROVED", rfc("2026-07-10", 1), 0.15, "")
+	insertRun(t, db, "r1", "APPROVED", time.Now().UTC().Format(time.RFC3339Nano), 0.15, "")
 	cfg := config.Config{Spend: config.Spend{DailyCapUSD: 0.20}}
 
 	a, err := NewAccountant(cfg, db)
