@@ -113,3 +113,16 @@ The additive `artifacts` table records typed handoff files copied out of run wor
 ## Panel label mapping
 
 Panel mode anonymizes member outputs before judge context. The additive `panel_members` table maps `(panel_id, member_label)` to the real `job_id`, backend, and artifact name for operator audit, while model-facing comparison artifacts use only `panelist_N` labels.
+
+Note: as of Phase 7, `observability.RecordPanelMembers` has no caller in the actual panel run path (`internal/runtime/panel.go` tracks `PanelMemberOutcome` in memory but never persists it to `panel_members`). The table and its downstream consumer (`gov analytics summary`'s panel-disagreement metric, below) are wired and tested, but read real data only once a future session adds the `RecordPanelMembers` call to the panel runtime. Until then `gov analytics` correctly reports zero panels rather than fabricating a rate from empty evidence.
+
+## Analytics projection (Phase 7)
+
+SQLite stays authoritative; `gov analytics` is a read-only derived view over the tables above, never a write path:
+
+```sh
+gov analytics summary
+gov analytics export [--out <path>]
+```
+
+`summary` prints tab-separated tables (backend valid-output rate, failure type by backend, fallback frequency, quota utilization, repair depth, validator and assay failure clusters, panel disagreement, cost by outcome). `export` writes the same snapshot as line-delimited JSON, one object per metric row tagged with a `metric` field — the format any external system (a spreadsheet, `jq`, an OpenTelemetry or Langfuse adapter) can consume. There is no outbox or Supabase replication behind this yet: Phase 3A's assay bridge stays deliberately network-free, so JSONL export (to a file or stdout) is the whole shipping mechanism for now. An export failure never affects a run outcome — it runs after the fact, outside any governed job's lifecycle.

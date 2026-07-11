@@ -104,6 +104,8 @@ gov cost --per-valid-output
 gov spend [--halt|--resume]
 gov quota
 gov usage summary|<run_id>
+gov analytics summary
+gov analytics export [--out <path>]
 gov route --job-type <type>
 gov route --explain <contract.yaml>
 gov repair-packet <run_id>

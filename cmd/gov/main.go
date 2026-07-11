@@ -252,6 +252,8 @@ func run(args []string) int {
 		}
 		fmt.Println(report.String())
 		return 0
+	case "analytics":
+		return analyticsCmd(args[1:])
 	case "route":
 		if len(args) == 3 && args[1] == "--explain" {
 			return routeExplain(args[2])
@@ -421,6 +423,81 @@ func quarantine(args []string) int {
 		return 0
 	}
 	return bad("usage: gov quarantine list|show <id>|diff <id>")
+}
+
+// analyticsCmd handles the Phase 7 analytical-projection subcommands.
+// `summary` prints every metric as tab-separated tables (matching the
+// score/failures/route command idiom); `export` writes the same snapshot as
+// line-delimited JSON — the whole Phase 7 shipping mechanism, since no
+// outbox/Supabase replication exists to hand this to (see phase7.go).
+func analyticsCmd(args []string) int {
+	if len(args) == 0 {
+		return bad("usage: gov analytics summary|export [--out <path>]")
+	}
+	switch args[0] {
+	case "summary":
+		if len(args) != 1 {
+			return bad("usage: gov analytics summary")
+		}
+		snap, err := observability.BuildAnalyticsSnapshot(govruntime.Home())
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "analytics:", err)
+			return 1
+		}
+		fmt.Println("backend\truns\tvalid_outputs\tvalid_rate")
+		for _, r := range snap.BackendValidRate {
+			fmt.Printf("%s\t%d\t%d\t%.4f\n", r.Backend, r.Runs, r.ValidOutputs, r.ValidRate)
+		}
+		fmt.Println("backend\ttaxonomy\tcount")
+		for _, r := range snap.FailureByBackend {
+			fmt.Printf("%s\t%s\t%d\n", r.Backend, r.Taxonomy, r.Count)
+		}
+		fmt.Println("backend\tfallback_count")
+		for _, r := range snap.FallbackFreq {
+			fmt.Printf("%s\t%d\n", r.Backend, r.Count)
+		}
+		fmt.Println("backend\taccount\twindow\tutilization\tconfidence")
+		for _, r := range snap.QuotaUtil {
+			fmt.Printf("%s\t%s\t%s\t%.4f\t%.2f\n", r.Backend, r.Account, r.WindowType, r.Utilization, r.Confidence)
+		}
+		fmt.Printf("repair_depth\tlineages=%d total=%d max=%d avg=%.2f\n",
+			snap.RepairDepth.Lineages, snap.RepairDepth.TotalRepairs, snap.RepairDepth.MaxDepth, snap.RepairDepth.AvgDepth)
+		fmt.Println("assay_profile\tfailed_check\tcount")
+		for _, r := range snap.AssayFails {
+			fmt.Printf("%s\t%s\t%d\n", r.Profile, r.FailedCheck, r.Count)
+		}
+		fmt.Println("validator_command\tfailures")
+		for _, r := range snap.ValidatorFails {
+			fmt.Printf("%s\t%d\n", r.Command, r.Count)
+		}
+		fmt.Printf("panel_disagreement\tpanels=%d disagreements=%d rate=%.4f\n",
+			snap.PanelDisagree.Panels, snap.PanelDisagree.Disagreements, snap.PanelDisagree.Rate)
+		fmt.Printf("cost_by_outcome\tapproved=%d($%.2f, $%.4f/ea)\trejected=%d($%.2f, $%.4f/ea)\n",
+			snap.CostByOutcome.ApprovedCount, snap.CostByOutcome.ApprovedCostUSD, snap.CostByOutcome.CostPerApproved,
+			snap.CostByOutcome.RejectedCount, snap.CostByOutcome.RejectedCostUSD, snap.CostByOutcome.CostPerRejected)
+		return 0
+	case "export":
+		rest := args[1:]
+		out := os.Stdout
+		if len(rest) == 2 && rest[0] == "--out" {
+			f, err := os.Create(rest[1])
+			if err != nil {
+				fmt.Fprintln(os.Stderr, "analytics export:", err)
+				return 1
+			}
+			defer f.Close()
+			out = f
+		} else if len(rest) != 0 {
+			return bad("usage: gov analytics export [--out <path>]")
+		}
+		if err := observability.ExportJSONL(govruntime.Home(), out); err != nil {
+			fmt.Fprintln(os.Stderr, "analytics export:", err)
+			return 1
+		}
+		return 0
+	default:
+		return bad("usage: gov analytics summary|export [--out <path>]")
+	}
 }
 
 // runRecoveryDispatch handles the Phase 4 durable-recovery subcommands: `gov
@@ -1815,6 +1892,8 @@ Usage:
   gov spend [--halt|--resume]
   gov quota
   gov usage summary|<run_id>
+  gov analytics summary
+  gov analytics export [--out <path>]
   gov route --job-type <type>
   gov route --explain <contract.yaml>
   gov repair-packet <run_id>
