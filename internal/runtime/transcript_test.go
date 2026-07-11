@@ -64,6 +64,36 @@ func TestAuditTranscriptRejectsMalformedJSONL(t *testing.T) {
 	}
 }
 
+// TestAuditTranscriptTolerantOfLeadingCLIBanner is the regression case for a
+// real bug found running v1.4 Session 1's release-evidence jobs: codex's
+// `exec --json --ephemeral` prints a plain-text "Reading additional input
+// from stdin..." notice on stdout before its first JSON event (real codex
+// CLI behavior, not a Governator artifact), which every codex-backed run hit
+// unconditionally and got quarantined as a POLICY_VIOLATION over. A leading
+// non-JSON line — before any valid JSON has been seen — can't have encoded a
+// tool_use/tool_result event either way, so it costs no audit signal to
+// skip. TestAuditTranscriptRejectsMalformedJSONL (above) proves this does not
+// weaken the fail-closed guarantee for genuine mid-stream corruption: its
+// malformed line comes after a valid one and still denies.
+func TestAuditTranscriptTolerantOfLeadingCLIBanner(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "codex.jsonl")
+	data := []byte("Reading additional input from stdin...\n" +
+		`{"type":"item.completed","item":{"type":"command_execution","command":"go test ./..."}}` + "\n")
+	if err := os.WriteFile(path, data, 0600); err != nil {
+		t.Fatal(err)
+	}
+	c := contracts.Contract{}
+	c.Allowed.Execute = []string{"go test ./..."}
+	c.Budget.MaxCommands = 10
+	audit := auditTranscript(path, agents.TranscriptCodex, "", c)
+	if len(audit.Violations) != 0 {
+		t.Fatalf("leading CLI banner before the JSON stream starts must not violate: %v", audit.Violations)
+	}
+	if len(audit.Commands) != 1 || audit.Commands[0] != "go test ./..." {
+		t.Fatalf("valid JSON after the banner must still be parsed: %+v", audit.Commands)
+	}
+}
+
 // TestAuditGLMGoldenTranscript pins the glm-cli stream-json shape the audit
 // pipeline depends on. The fixture (testdata/glm_stream.jsonl) is a richer,
 // more realistic transcript than the single-line case above: it exercises

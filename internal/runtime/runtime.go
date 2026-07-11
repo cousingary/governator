@@ -721,16 +721,29 @@ func auditTranscript(path, format, work string, c contracts.Contract) transcript
 			}
 		}
 	}
+	sawValidJSON := false
 	for lineNumber, line := range strings.Split(string(data), "\n") {
 		if strings.TrimSpace(line) == "" {
 			continue
 		}
 		var v any
 		if err := json.Unmarshal([]byte(line), &v); err != nil {
-			audit.Violations = append(audit.Violations,
-				fmt.Sprintf("transcript audit: malformed JSON on line %d", lineNumber+1))
+			// A line before the JSON stream has started is CLI startup
+			// noise (e.g. codex's `exec --json` prints a plain-text
+			// "Reading additional input from stdin..." notice on stdout
+			// before its first JSON event) rather than stream corruption:
+			// it can't have encoded a tool_use/tool_result event either
+			// way, so skipping it costs no audit signal. A malformed line
+			// AFTER at least one valid JSON line has already been seen is
+			// still treated as corruption and fails closed exactly as
+			// before (see TestAuditTranscriptRejectsMalformedJSONL).
+			if sawValidJSON {
+				audit.Violations = append(audit.Violations,
+					fmt.Sprintf("transcript audit: malformed JSON on line %d", lineNumber+1))
+			}
 			continue
 		}
+		sawValidJSON = true
 		usage.walk(format, v)
 		walk(v)
 	}
