@@ -138,6 +138,22 @@ type ArtifactSpec struct {
 	MaxBytes int64  `yaml:"max_bytes" json:"max_bytes"`
 }
 
+// Assay is the optional block a contract uses to opt into the
+// Governator<->Assayer synchronous bridge (Phase 3A). Profile names a check
+// profile the local Assayer subprocess understands. Enforcement controls
+// what a FAIL/ERROR verdict does to the run: "blocking" routes a FAIL/ERROR
+// into the existing quarantine path exactly like a failed validator;
+// "advisory"/"telemetry" record the verdict in the assay_evaluations ledger
+// table but never block the merge.
+type Assay struct {
+	Profile     string `yaml:"profile" json:"profile"`
+	Enforcement string `yaml:"enforcement" json:"enforcement"`
+}
+
+// AssayEnforcements are the valid Assay.Enforcement values (fail-closed:
+// anything else is a validation error, same pattern as OnViolation/RiskClass).
+var AssayEnforcements = map[string]bool{"blocking": true, "advisory": true, "telemetry": true}
+
 type Contract struct {
 	Task        string         `yaml:"task,omitempty" json:"task,omitempty"`
 	JobID       string         `yaml:"job_id" json:"job_id"`
@@ -194,6 +210,15 @@ type Contract struct {
 	// scoring-neutral, so no prior agent: auto contract routes differently.
 	DependsOn []string `yaml:"depends_on,omitempty" json:"depends_on,omitempty"`
 	RiskClass string   `yaml:"risk_class,omitempty" json:"risk_class,omitempty"`
+
+	// Assay opts a job's produced artifacts into the Governator<->Assayer
+	// synchronous bridge (Phase 3A): Profile names a check profile the
+	// Assayer subprocess understands (e.g. "coding-output-v1"), and
+	// Enforcement controls what a FAIL/ERROR verdict does. The pointer
+	// (not a value) keeps the block absent on every prior job YAML, so
+	// existing contracts keep validating and running unchanged — assay is
+	// opt-in per job, not a global gate.
+	Assay *Assay `yaml:"assay,omitempty" json:"assay,omitempty"`
 
 	// PostRunValidate, when set, runs in-process after Success.Validators
 	// pass but before the run merges to the live root — an extra pre-merge
@@ -450,6 +475,7 @@ func (c Contract) Validate() error {
 
 	validateRouting(c, add)
 	validateArtifacts(c, add)
+	validateAssay(c, add)
 
 	// Quarantine is the implemented fail-closed action. Halt and rollback were
 	// previously accepted but ignored; rollback also cannot restore arbitrary
@@ -576,6 +602,22 @@ func validateArtifacts(c Contract, add func(string, string)) {
 		} else if !jobIDPattern.MatchString(trimmed) {
 			add(field, "must look like an artifact name (alphanumeric, '.', '_' or '-')")
 		}
+	}
+}
+
+// validateAssay enforces the same fail-closed pattern as OnViolation/RiskClass:
+// an unset Assay block is fine (assay is opt-in), but a present one must
+// name a profile and a known enforcement mode — an unrecognized enforcement
+// value must never be silently treated as "off" or "advisory".
+func validateAssay(c Contract, add func(string, string)) {
+	if c.Assay == nil {
+		return
+	}
+	if strings.TrimSpace(c.Assay.Profile) == "" {
+		add("assay.profile", "is required when the assay block is present")
+	}
+	if !AssayEnforcements[c.Assay.Enforcement] {
+		add("assay.enforcement", "must be one of blocking, advisory, telemetry")
 	}
 }
 

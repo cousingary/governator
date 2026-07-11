@@ -2,6 +2,7 @@ package observability
 
 import (
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -159,7 +160,8 @@ CREATE TABLE IF NOT EXISTS fallback_attempts(id INTEGER PRIMARY KEY AUTOINCREMEN
 CREATE TABLE IF NOT EXISTS quota_windows(backend TEXT NOT NULL, account TEXT NOT NULL DEFAULT 'default', window_type TEXT NOT NULL, window_started_at TEXT NOT NULL DEFAULT '', reset_at TEXT NOT NULL DEFAULT '', estimated_limit REAL NOT NULL DEFAULT 0, measured_usage REAL NOT NULL DEFAULT 0, reserved_usage REAL NOT NULL DEFAULT 0, confidence REAL NOT NULL DEFAULT 0, source TEXT NOT NULL DEFAULT '', updated_at TEXT NOT NULL DEFAULT '', PRIMARY KEY(backend,account,window_type));
 CREATE TABLE IF NOT EXISTS quota_reservations(id INTEGER PRIMARY KEY AUTOINCREMENT, run_id TEXT NOT NULL DEFAULT '', backend TEXT NOT NULL, account TEXT NOT NULL DEFAULT 'default', usage REAL NOT NULL DEFAULT 0, measured_usage REAL NOT NULL DEFAULT 0, expires_at TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL DEFAULT '', settled_at TEXT NOT NULL DEFAULT '', expired INTEGER NOT NULL DEFAULT 0);
 CREATE TABLE IF NOT EXISTS artifacts(run_id TEXT NOT NULL, name TEXT NOT NULL, path TEXT NOT NULL, sha256 TEXT NOT NULL, bytes INTEGER NOT NULL DEFAULT 0, schema_ok INTEGER NOT NULL DEFAULT 0, created TEXT NOT NULL DEFAULT '', PRIMARY KEY(run_id,name));
-CREATE TABLE IF NOT EXISTS panel_members(panel_id TEXT NOT NULL, member_label TEXT NOT NULL, job_id TEXT NOT NULL, agent TEXT NOT NULL DEFAULT '', artifact_name TEXT NOT NULL DEFAULT '', created TEXT NOT NULL DEFAULT '', PRIMARY KEY(panel_id,member_label));`
+CREATE TABLE IF NOT EXISTS panel_members(panel_id TEXT NOT NULL, member_label TEXT NOT NULL, job_id TEXT NOT NULL, agent TEXT NOT NULL DEFAULT '', artifact_name TEXT NOT NULL DEFAULT '', created TEXT NOT NULL DEFAULT '', PRIMARY KEY(panel_id,member_label));
+CREATE TABLE IF NOT EXISTS assay_evaluations(id INTEGER PRIMARY KEY AUTOINCREMENT, run_id TEXT NOT NULL, attempt_id TEXT NOT NULL DEFAULT '', job_id TEXT NOT NULL DEFAULT '', profile TEXT NOT NULL DEFAULT '', policy_version TEXT NOT NULL DEFAULT '', verdict TEXT NOT NULL DEFAULT '', failed_checks TEXT NOT NULL DEFAULT '', checks_hash TEXT NOT NULL DEFAULT '', duration_ms INTEGER NOT NULL DEFAULT 0, created TEXT NOT NULL DEFAULT '');`
 	if _, err = db.Exec(schema); err != nil {
 		db.Close()
 		return nil, err
@@ -207,7 +209,8 @@ CREATE INDEX IF NOT EXISTS quota_windows_backend ON quota_windows(backend,accoun
 CREATE INDEX IF NOT EXISTS quota_reservations_run ON quota_reservations(run_id);
 CREATE INDEX IF NOT EXISTS quota_reservations_open ON quota_reservations(settled_at,expires_at);
 CREATE INDEX IF NOT EXISTS artifacts_name ON artifacts(name,run_id);
-CREATE INDEX IF NOT EXISTS panel_members_job ON panel_members(job_id);`); err != nil {
+CREATE INDEX IF NOT EXISTS panel_members_job ON panel_members(job_id);
+CREATE INDEX IF NOT EXISTS assay_evaluations_run ON assay_evaluations(run_id);`); err != nil {
 		db.Close()
 		return nil, err
 	}
@@ -321,6 +324,67 @@ func RecordArtifacts(db *sql.DB, artifacts []ArtifactRecord, created string) err
 		}
 	}
 	return tx.Commit()
+}
+
+// AssayEvaluationRecord is one Governator<->Assayer bridge verdict (Phase
+// 3A). FailedChecks is stored as a JSON array in failed_checks; Verdict is
+// one of pass|advisory|fail|error|skipped ("skipped" is a Governator-only
+// pseudo-verdict for a run where assay was not configured — see
+// internal/assay — Assayer itself never returns it).
+type AssayEvaluationRecord struct {
+	RunID         string
+	AttemptID     string
+	JobID         string
+	Profile       string
+	PolicyVersion string
+	Verdict       string
+	FailedChecks  []string
+	ChecksHash    string
+	DurationMS    int64
+	Created       string
+}
+
+// RecordAssayEvaluation appends one assay_evaluations row. Append-only, like
+// repair_packets/fallback_attempts (no ON CONFLICT) — every evaluation
+// attempt, including a skipped one, gets its own permanent ledger row so a
+// re-evaluated run keeps its full history instead of overwriting it.
+func RecordAssayEvaluation(db *sql.DB, rec AssayEvaluationRecord) error {
+	failedChecks := rec.FailedChecks
+	if failedChecks == nil {
+		failedChecks = []string{}
+	}
+	failedJSON, err := json.Marshal(failedChecks)
+	if err != nil {
+		return err
+	}
+	_, err = db.Exec(`INSERT INTO assay_evaluations(run_id,attempt_id,job_id,profile,policy_version,verdict,failed_checks,checks_hash,duration_ms,created) VALUES(?,?,?,?,?,?,?,?,?,?)`,
+		rec.RunID, rec.AttemptID, rec.JobID, rec.Profile, rec.PolicyVersion, rec.Verdict, string(failedJSON), rec.ChecksHash, rec.DurationMS, rec.Created)
+	return err
+}
+
+// AssayEvaluationsForRun returns every assay_evaluations row for one run,
+// oldest first — for tests and CLI inspection.
+func AssayEvaluationsForRun(db *sql.DB, runID string) ([]AssayEvaluationRecord, error) {
+	rows, err := db.Query(`SELECT run_id,attempt_id,job_id,profile,policy_version,verdict,failed_checks,checks_hash,duration_ms,created FROM assay_evaluations WHERE run_id=? ORDER BY id ASC`, runID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []AssayEvaluationRecord
+	for rows.Next() {
+		var rec AssayEvaluationRecord
+		var failedJSON string
+		if err := rows.Scan(&rec.RunID, &rec.AttemptID, &rec.JobID, &rec.Profile, &rec.PolicyVersion, &rec.Verdict, &failedJSON, &rec.ChecksHash, &rec.DurationMS, &rec.Created); err != nil {
+			return nil, err
+		}
+		if failedJSON != "" {
+			if err := json.Unmarshal([]byte(failedJSON), &rec.FailedChecks); err != nil {
+				return nil, err
+			}
+		}
+		out = append(out, rec)
+	}
+	return out, rows.Err()
 }
 
 func RecordPanelMembers(db *sql.DB, members []PanelMemberRecord, created string) error {

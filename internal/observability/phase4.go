@@ -165,6 +165,8 @@ func ClassifyFailure(violations []string) string {
 		return "OVERWRITE_RISK"
 	case strings.Contains(lower, "max_commands"):
 		return "REPEATED_COMMAND_LOOP"
+	case strings.Contains(lower, "assay:"):
+		return "ASSAY_FAILED"
 	case strings.Contains(lower, "validator failed"), strings.Contains(lower, "required file missing"), strings.Contains(lower, "artifact"):
 		return "VALIDATION_FAILED"
 	case strings.Contains(lower, "destructive command"), strings.Contains(lower, "forbidden command"):

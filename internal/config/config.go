@@ -78,6 +78,19 @@ type Defaults struct {
 	MaxMinutes int    `yaml:"max_minutes"`
 }
 
+// Assay configures the Governator<->Assayer synchronous bridge (Phase 3A):
+// Repo is the assayer checkout containing cli.py, Python is the interpreter
+// to invoke it with, TimeoutSeconds bounds the subprocess call. Repo empty
+// (the default — BuiltIn leaves it unset) means assay steps are SKIPPED and
+// RECORDED AS SKIPPED by internal/assay: every existing config and every
+// existing run that doesn't set this keeps behaving exactly as it did
+// before this field existed.
+type Assay struct {
+	Repo           string `yaml:"repo"`
+	Python         string `yaml:"python"`
+	TimeoutSeconds int    `yaml:"timeout_seconds"`
+}
+
 type Config struct {
 	ProtectedManifest string             `yaml:"protected_manifest"`
 	SnapshotDir       string             `yaml:"snapshot_dir"`
@@ -91,6 +104,7 @@ type Config struct {
 	Quotas            []QuotaWindow      `yaml:"quotas"`
 	Doctrine          Doctrine           `yaml:"doctrine"`
 	Defaults          Defaults           `yaml:"defaults"`
+	Assay             Assay              `yaml:"assay"`
 }
 
 // Env is the single environment lookup seam used by Governator packages.
@@ -129,6 +143,10 @@ func BuiltIn() Config {
 		Quotas:     nil,
 		Doctrine:   Doctrine{RequireCleanup: false},
 		Defaults:   Defaults{Agent: "claude-code", MaxMinutes: 30},
+		// Repo intentionally left unset: assay steps are skipped by default
+		// (see Assay's doc comment). Python/TimeoutSeconds default sensibly
+		// so a config that only sets `assay.repo` gets a working invocation.
+		Assay: Assay{Python: "python3", TimeoutSeconds: 60},
 	}
 }
 
@@ -263,6 +281,15 @@ func merge(dst *Config, src Config) {
 	if src.Defaults.MaxMinutes > 0 {
 		dst.Defaults.MaxMinutes = src.Defaults.MaxMinutes
 	}
+	if src.Assay.Repo != "" {
+		dst.Assay.Repo = src.Assay.Repo
+	}
+	if src.Assay.Python != "" {
+		dst.Assay.Python = src.Assay.Python
+	}
+	if src.Assay.TimeoutSeconds > 0 {
+		dst.Assay.TimeoutSeconds = src.Assay.TimeoutSeconds
+	}
 }
 
 func applyEnv(cfg *Config) {
@@ -338,6 +365,17 @@ func applyEnv(cfg *Config) {
 			cfg.Defaults.MaxMinutes = minutes
 		}
 	}
+	if value := Env("GOV_ASSAY_REPO"); value != "" {
+		cfg.Assay.Repo = value
+	}
+	if value := Env("GOV_ASSAY_PYTHON"); value != "" {
+		cfg.Assay.Python = value
+	}
+	if value := Env("GOV_ASSAY_TIMEOUT_SECONDS"); value != "" {
+		if seconds, err := strconv.Atoi(value); err == nil && seconds > 0 {
+			cfg.Assay.TimeoutSeconds = seconds
+		}
+	}
 }
 
 func firstEnv(names ...string) string {
@@ -375,6 +413,10 @@ func clean(cfg *Config) {
 	cfg.ProtectedManifest = expand(cfg.ProtectedManifest)
 	cfg.SnapshotDir = expand(cfg.SnapshotDir)
 	cfg.LedgerDir = expand(cfg.LedgerDir)
+	cfg.Assay.Python = strings.TrimSpace(cfg.Assay.Python)
+	if strings.TrimSpace(cfg.Assay.Repo) != "" {
+		cfg.Assay.Repo = expand(cfg.Assay.Repo)
+	}
 	for i := range cfg.SnapshotRoots {
 		cfg.SnapshotRoots[i] = expand(cfg.SnapshotRoots[i])
 	}

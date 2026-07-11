@@ -50,7 +50,7 @@ func TestOpenMigratesLegacyLedger(t *testing.T) {
 			t.Errorf("missing migrated column %s", name)
 		}
 	}
-	for _, table := range []string{"runs", "jobs", "agents", "agent_profiles", "files_touched", "commands_run", "validators", "violations", "repair_packets", "eval_runs", "hook_events", "parity_events", "batches", "route_decisions", "artifacts"} {
+	for _, table := range []string{"runs", "jobs", "agents", "agent_profiles", "files_touched", "commands_run", "validators", "violations", "repair_packets", "eval_runs", "hook_events", "parity_events", "batches", "route_decisions", "artifacts", "assay_evaluations"} {
 		var count int
 		if err := migrated.QueryRow("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?", table).Scan(&count); err != nil {
 			t.Fatal(err)
@@ -199,5 +199,52 @@ func TestRecordRouteDecisionPersistsPolicyHash(t *testing.T) {
 	}
 	if got != "deadbeef01234567" {
 		t.Fatalf("policy_hash not persisted, got %q", got)
+	}
+}
+
+func TestRecordAssayEvaluationAppendsRows(t *testing.T) {
+	home := t.TempDir()
+	db, err := Open(home)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	if err := RecordAssayEvaluation(db, AssayEvaluationRecord{
+		RunID: "run-1", AttemptID: "run-1", JobID: "job-1", Profile: "coding-output-v1",
+		PolicyVersion: "v1", Verdict: "fail", FailedChecks: []string{"required_fields", "no_boilerplate:content"},
+		ChecksHash: "abc123", DurationMS: 42, Created: "2026-07-11T00:00:00Z",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// Append-only, like repair_packets: a second evaluation for the same run
+	// gets its own row rather than overwriting the first.
+	if err := RecordAssayEvaluation(db, AssayEvaluationRecord{
+		RunID: "run-1", AttemptID: "run-1", JobID: "job-1", Profile: "coding-output-v1",
+		Verdict: "skipped", Created: "2026-07-11T00:00:01Z",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	rows, err := AssayEvaluationsForRun(db, "run-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 2 {
+		t.Fatalf("expected 2 append-only rows, got %d: %+v", len(rows), rows)
+	}
+	if rows[0].Verdict != "fail" || rows[1].Verdict != "skipped" {
+		t.Fatalf("unexpected verdict order: %+v", rows)
+	}
+	if rows[0].ChecksHash != "abc123" || rows[0].DurationMS != 42 || rows[0].PolicyVersion != "v1" {
+		t.Fatalf("fields not persisted: %+v", rows[0])
+	}
+	if len(rows[0].FailedChecks) != 2 || rows[0].FailedChecks[0] != "required_fields" {
+		t.Fatalf("failed_checks not round-tripped: %+v", rows[0].FailedChecks)
+	}
+	// A verdict with no failed checks must round-trip as an empty slice,
+	// not nil, so callers can range over it unconditionally.
+	if rows[1].FailedChecks == nil || len(rows[1].FailedChecks) != 0 {
+		t.Fatalf("expected empty (non-nil) failed_checks for skipped row, got %#v", rows[1].FailedChecks)
 	}
 }

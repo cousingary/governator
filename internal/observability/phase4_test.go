@@ -7,6 +7,13 @@ import (
 	"testing"
 )
 
+func TestClassifyFailureAssayViolation(t *testing.T) {
+	got := ClassifyFailure([]string{"assay: profile=coding-output-v1 verdict=fail failed_checks=no_boilerplate:content reason=see failed_checks"})
+	if got != "ASSAY_FAILED" {
+		t.Fatalf("expected ASSAY_FAILED, got %s", got)
+	}
+}
+
 func TestNegativeRoutingAndRepairPacket(t *testing.T) {
 	home := t.TempDir()
 	db, err := Open(home)

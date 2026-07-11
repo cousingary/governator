@@ -21,6 +21,7 @@ func cleanEnv(t *testing.T) {
 		"GOV_SPEND_DAILY_CAP_USD", "GOV_SPEND_HALT_FILE",
 		"GOV_DOCTRINE_REQUIRE_CLEANUP",
 		"GOV_DEFAULT_AGENT", "GOV_DEFAULT_MAX_MINUTES",
+		"GOV_ASSAY_REPO", "GOV_ASSAY_PYTHON", "GOV_ASSAY_TIMEOUT_SECONDS",
 	} {
 		t.Setenv(name, "")
 	}
@@ -178,6 +179,59 @@ func TestLoadDoctrineRequireCleanupFromFileAndEnv(t *testing.T) {
 	}
 	if cfg.Doctrine.RequireCleanup {
 		t.Fatalf("expected env override to disable doctrine.require_cleanup")
+	}
+}
+
+// TestLoadAssayDefaultsToUnconfigured is the Phase 3A skip-by-default
+// regression test: with no assay.repo set anywhere (no config file, no
+// env), Assay.Repo must stay empty so internal/assay.Config.Configured()
+// reports false and every existing run/test that never heard of assay
+// keeps behaving exactly as before this field existed.
+func TestLoadAssayDefaultsToUnconfigured(t *testing.T) {
+	cleanEnv(t)
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Assay.Repo != "" {
+		t.Fatalf("expected assay.repo to default empty (unconfigured), got %q", cfg.Assay.Repo)
+	}
+	if cfg.Assay.Python != "python3" {
+		t.Fatalf("expected assay.python to default to python3, got %q", cfg.Assay.Python)
+	}
+	if cfg.Assay.TimeoutSeconds != 60 {
+		t.Fatalf("expected assay.timeout_seconds to default to 60, got %d", cfg.Assay.TimeoutSeconds)
+	}
+}
+
+func TestLoadAssayFromFileAndEnv(t *testing.T) {
+	cleanEnv(t)
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	path := filepath.Join(home, "config.yaml")
+	t.Setenv("GOV_CONFIG", path)
+	if err := os.WriteFile(path, []byte("assay: {repo: /opt/assayer, python: python3.11, timeout_seconds: 30}\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Assay.Repo != "/opt/assayer" || cfg.Assay.Python != "python3.11" || cfg.Assay.TimeoutSeconds != 30 {
+		t.Fatalf("assay config=%+v", cfg.Assay)
+	}
+
+	t.Setenv("GOV_ASSAY_REPO", "/env/assayer")
+	t.Setenv("GOV_ASSAY_PYTHON", "python3.12")
+	t.Setenv("GOV_ASSAY_TIMEOUT_SECONDS", "45")
+	cfg, err = Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Assay.Repo != "/env/assayer" || cfg.Assay.Python != "python3.12" || cfg.Assay.TimeoutSeconds != 45 {
+		t.Fatalf("assay env-overridden config=%+v", cfg.Assay)
 	}
 }
 

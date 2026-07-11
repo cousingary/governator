@@ -1311,6 +1311,21 @@ func (r *Runner) runOnce(ctx context.Context, c contracts.Contract) (RunRecord, 
 			violations = append(violations, "post-run validation failed: "+err.Error())
 		}
 	}
+	// Assay (Phase 3A: Governator<->Assayer synchronous bridge). Runs in the
+	// same position as the validators above — after every shell/PostRunValidate
+	// check has passed, strictly before the merge below — so a blocking
+	// FAIL/ERROR verdict quarantines the run through the exact same
+	// `violations` mechanism a failed validator uses (reused, not
+	// duplicated). advisory/telemetry verdicts are ledgered but never
+	// appended to violations, so they never affect the merge decision.
+	// c.Assay == nil (every job YAML predating this field) skips this block
+	// entirely — no ledger row, no behavior change. c.Assay != nil but assay
+	// not configured in Governator's own config still writes a
+	// VerdictSkipped row, so "skipped" is always visible and distinguishable
+	// from "never asked for" in the ledger.
+	if c.Assay != nil {
+		runAssayStep(ctx, db, cfg, c, id, hash, rec.Agent, artifactRecords, &violations)
+	}
 	rec.Diff = workspaceDiff(root, work, git, changed, deleted)
 	if len(violations) == 0 {
 		if git {

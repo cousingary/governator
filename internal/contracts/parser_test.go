@@ -288,3 +288,57 @@ func TestExplicitUnknownAgentRejected(t *testing.T) {
 		t.Fatalf("expected agent error for unknown backend, got %v", err)
 	}
 }
+
+// TestParseWithoutAssayBlockLeavesAssayNil is the regression test for Phase
+// 3A: every job YAML predating the assay field (i.e. every existing
+// contract in this test file) must keep parsing and validating exactly as
+// before — assay is opt-in, not a new required block.
+func TestParseWithoutAssayBlockLeavesAssayNil(t *testing.T) {
+	contract, err := Parse([]byte(validContract))
+	if err != nil {
+		t.Fatalf("Parse(validContract) error = %v", err)
+	}
+	if contract.Assay != nil {
+		t.Fatalf("expected nil Assay on a contract without an assay block, got %+v", contract.Assay)
+	}
+}
+
+func TestParseAssayBlock(t *testing.T) {
+	withAssay := strings.Replace(validContract, "on_violation: quarantine",
+		"assay: {profile: coding-output-v1, enforcement: blocking}\non_violation: quarantine", 1)
+	contract, err := Parse([]byte(withAssay))
+	if err != nil {
+		t.Fatalf("assay block must validate: %v", err)
+	}
+	if contract.Assay == nil || contract.Assay.Profile != "coding-output-v1" || contract.Assay.Enforcement != "blocking" {
+		t.Fatalf("assay not parsed: %+v", contract.Assay)
+	}
+}
+
+func TestAssayAdvisoryAndTelemetryEnforcementAccepted(t *testing.T) {
+	for _, enforcement := range []string{"advisory", "telemetry"} {
+		withAssay := strings.Replace(validContract, "on_violation: quarantine",
+			fmt.Sprintf("assay: {profile: coding-output-v1, enforcement: %s}\non_violation: quarantine", enforcement), 1)
+		if _, err := Parse([]byte(withAssay)); err != nil {
+			t.Fatalf("enforcement=%s must validate: %v", enforcement, err)
+		}
+	}
+}
+
+func TestAssayMissingProfileRejected(t *testing.T) {
+	withAssay := strings.Replace(validContract, "on_violation: quarantine",
+		"assay: {enforcement: blocking}\non_violation: quarantine", 1)
+	_, err := Parse([]byte(withAssay))
+	if err == nil || !strings.Contains(err.Error(), "assay.profile") {
+		t.Fatalf("expected assay.profile error, got %v", err)
+	}
+}
+
+func TestAssayUnknownEnforcementRejected(t *testing.T) {
+	withAssay := strings.Replace(validContract, "on_violation: quarantine",
+		"assay: {profile: coding-output-v1, enforcement: sometimes}\non_violation: quarantine", 1)
+	_, err := Parse([]byte(withAssay))
+	if err == nil || !strings.Contains(err.Error(), "assay.enforcement") {
+		t.Fatalf("expected assay.enforcement error, got %v", err)
+	}
+}
