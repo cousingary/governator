@@ -55,12 +55,59 @@ func setAssayEnv(t *testing.T, repo string) {
 	t.Setenv("GOV_ASSAY_TIMEOUT_SECONDS", "10")
 }
 
-// TestAssayNotConfiguredSkipsAndRecordsSkipped is the Phase 3A regression
-// test (plan item 7, "assay not configured -> skipped and recorded as
-// skipped, run proceeds normally"): a contract that declares an assay block
-// must still run and merge exactly as it would have before assay existed
-// when Governor's own config never points at an assayer checkout.
+// TestAssayNotConfiguredSkipsAndRecordsSkipped covers the plan's
+// "not configured -> skipped and recorded as skipped" default for the
+// non-blocking enforcement modes: an advisory contract still runs and
+// merges exactly as it would have before assay existed when Governator's
+// own config never points at an assayer checkout. (Blocking enforcement
+// deliberately does NOT get this grace — see
+// TestAssayBlockingUnconfiguredQuarantines.)
 func TestAssayNotConfiguredSkipsAndRecordsSkipped(t *testing.T) {
+	root, _ := fixture(t)
+	writeArtifactSchema(t, root)
+	home := t.TempDir()
+	t.Setenv("GOV_HOME", home)
+	t.Setenv("GOV_ASSAY_REPO", "") // explicit: unconfigured
+	bin := writeFakeBackend(t, `mkdir -p output .governator/artifacts
+printf 'ok\n' > output/result.txt
+printf '{"summary":"ok"}' > .governator/artifacts/scout.json
+printf '{"status":"complete","files_changed":["output/result.txt"],"commands_run":0,"validation":{"self_checked":true},"violations":[],"blockers":[],"next_recommended_action":"none"}\n' > RESULT.json
+printf '{"type":"result","total_cost_usd":0.05}\n'
+`)
+	t.Setenv("GOV_CLAUDE_BIN", bin)
+	promptRoot := t.TempDir()
+	writePrompt(t, promptRoot, "claude-code", "surgeon")
+	t.Setenv("GOV_PROMPTS", promptRoot)
+
+	rec, err := New().Run(context.Background(), assayProducerContract(root, "advisory"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rec.Status != "APPROVED" {
+		t.Fatalf("expected assay-not-configured advisory to leave the run unaffected, got status=%s message=%s", rec.Status, rec.Message)
+	}
+
+	db, err := observability.Open(home)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	rows, err := observability.AssayEvaluationsForRun(db, rec.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 || rows[0].Verdict != "skipped" {
+		t.Fatalf("expected exactly one skipped assay_evaluations row, got %+v", rows)
+	}
+}
+
+// TestAssayBlockingUnconfiguredQuarantines: a contract that explicitly
+// declares blocking assay enforcement on a Governator with no assayer
+// configured must quarantine, not silently skip-and-merge — "the gating
+// tool isn't installed" is fail-open, the same reason runner: docker
+// errors rather than quietly running local. The skipped ledger row is
+// still written so the operator can see exactly why.
+func TestAssayBlockingUnconfiguredQuarantines(t *testing.T) {
 	root, _ := fixture(t)
 	writeArtifactSchema(t, root)
 	home := t.TempDir()
@@ -81,8 +128,8 @@ printf '{"type":"result","total_cost_usd":0.05}\n'
 	if err != nil {
 		t.Fatal(err)
 	}
-	if rec.Status != "APPROVED" {
-		t.Fatalf("expected assay-not-configured to leave the run unaffected, got status=%s message=%s", rec.Status, rec.Message)
+	if rec.Status != "QUARANTINED" {
+		t.Fatalf("expected blocking assay with no assayer configured to quarantine, got status=%s message=%s", rec.Status, rec.Message)
 	}
 
 	db, err := observability.Open(home)

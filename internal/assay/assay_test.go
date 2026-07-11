@@ -242,6 +242,17 @@ func TestBlocks(t *testing.T) {
 		{VerdictError, EnforcementAdvisory, false},
 		{VerdictFail, EnforcementTelemetry, false},
 		{VerdictError, EnforcementTelemetry, false},
+		// Fail-closed at the subprocess trust boundary: any verdict string
+		// that isn't a known-good pass/advisory must block under blocking
+		// enforcement — an unrecognized verdict means "not verified," not
+		// "fine." (The Python side only emits the four canonical lowercase
+		// values today; this guards drift, wrong-case, and truncation.)
+		{"", EnforcementBlocking, true},
+		{"PASS", EnforcementBlocking, true},
+		{"quarantine", EnforcementBlocking, true},
+		{VerdictSkipped, EnforcementBlocking, true},
+		{"", EnforcementAdvisory, false},
+		{"PASS", EnforcementTelemetry, false},
 	}
 	for _, c := range cases {
 		got := Blocks(c.verdict, c.enforcement)
@@ -250,6 +261,3 @@ func TestBlocks(t *testing.T) {
 		}
 	}
 }
-
-
-

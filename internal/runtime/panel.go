@@ -9,6 +9,7 @@ import (
 
 	"github.com/cousingary/governator/internal/breaker"
 	"github.com/cousingary/governator/internal/contracts"
+	"github.com/cousingary/governator/internal/observability"
 	"github.com/cousingary/governator/internal/router"
 )
 
@@ -281,6 +282,7 @@ func (r *Runner) RunPanel(ctx context.Context, spec contracts.PanelSpec, levels 
 	if hardTimeoutHit {
 		report.degrade(fmt.Sprintf("hard_timeout_elapsed: panel member level exceeded %s before every member got a turn", hardTimeout))
 	}
+	recordPanelMembership(r.Home, spec, assigned)
 
 	if len(succeededIDs) < 2 {
 		report.degrade(fmt.Sprintf("panel failed: only %d member(s) produced a usable artifact (comparison needs at least 2)", len(succeededIDs)))
@@ -307,6 +309,43 @@ func (r *Runner) RunPanel(ctx context.Context, spec contracts.PanelSpec, levels 
 	combined.TotalCostUSD += tailSummary.TotalCostUSD
 	combined.Quarantined += tailSummary.Quarantined
 	return combined, report, nil
+}
+
+// recordPanelMembership persists one panel_members row per member so the
+// Phase 7 panel-disagreement metric (observability.PanelDisagreementRate,
+// which joins panel_members to each member's runs via job_id) has data —
+// before this call was wired in, the table was written by nothing and the
+// metric correctly-but-uselessly reported zero panels. Labels are positional
+// (member-1, member-2, ...) in spec.Members order, matching the anonymous
+// ordering the comparison stage uses. Best-effort: a ledger write failure
+// here must not fail a panel whose members already ran (same policy as the
+// swallowed validator/assay audit-row writes in runtime.go).
+func recordPanelMembership(home string, spec contracts.PanelSpec, assigned []contracts.Contract) {
+	byID := make(map[string]contracts.Contract, len(assigned))
+	for _, job := range assigned {
+		byID[job.JobID] = job
+	}
+	records := make([]observability.PanelMemberRecord, 0, len(spec.Members))
+	for i, memberID := range spec.Members {
+		job := byID[memberID]
+		artifact := ""
+		if len(job.Produces) > 0 {
+			artifact = job.Produces[0].Name
+		}
+		records = append(records, observability.PanelMemberRecord{
+			PanelID:      spec.ID,
+			MemberLabel:  fmt.Sprintf("member-%d", i+1),
+			JobID:        memberID,
+			Agent:        job.Agent,
+			ArtifactName: artifact,
+		})
+	}
+	db, err := dbOpen(home)
+	if err != nil {
+		return
+	}
+	defer db.Close()
+	_ = observability.RecordPanelMembers(db, records, time.Now().UTC().Format(time.RFC3339Nano))
 }
 
 // adjustComparisonConsumes trims the comparison job's Consumes (and the

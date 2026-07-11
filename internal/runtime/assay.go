@@ -51,7 +51,17 @@ func runAssayStep(ctx context.Context, db *sql.DB, cfg config.Config, c contract
 		// Python invocation) and record the skip so the ledger shows *why*
 		// no real verdict exists for this run, rather than looking
 		// identical to a contract that never declared assay at all.
+		//
+		// Under advisory/telemetry that skip is the whole story. Under
+		// blocking enforcement it is not: the contract explicitly demanded
+		// a verdict gate the merge, and "the tool isn't installed" silently
+		// waving every run through would be fail-open — the same reason
+		// runner: docker errors rather than quietly running local. Quarantine
+		// instead, with the remediation in the reason.
 		record(assay.VerdictSkipped, "", "", nil, 0)
+		if c.Assay.Enforcement == assay.EnforcementBlocking {
+			*violations = append(*violations, "assay: blocking enforcement declared but no assayer is configured (set assay.repo in config.yaml or GOV_ASSAY_REPO)")
+		}
 		return
 	}
 

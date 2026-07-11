@@ -44,6 +44,84 @@ called the breaker/quota `HealthSource` a Session 2/4 "stub" when
 See [docs/routing.md](docs/routing.md) for the score-components table,
 `risk_class` scoring, and the policy hash.
 
+### Phase 2 — Panel plurality + quorum
+
+`panel:` gains `min_success`, `member_timeout_seconds`, `hard_timeout_seconds`,
+and a `diversity: {group_by, min_unique, fallback_group_by}` block. Auto
+members route with earlier members' backends hard-excluded
+(`router.Request.ExcludeAgents`); an unsatisfiable diversity requirement
+degrades the panel explicitly (`insufficient_diversity`), never silently.
+Quorum stops launching members once `min_success` are APPROVED (rest SKIPPED)
+or the level's hard timeout elapses (rest TIMEOUT, panel degraded); the
+comparison job's consumes are trimmed to the members that actually succeeded.
+Also fixed a pre-existing bug: panel member contracts' `max_new_files: 0`
+budget-excluded every real member run (RESULT.json is always a new file).
+
+### Phase 3A — Governator↔Assayer synchronous bridge
+
+New `internal/assay` invokes Assayer's `cli.py evaluate --profile` as a local
+subprocess (JSON on stdin/stdout, no network) with pre- AND post-evaluation
+artifact sha256 re-checks (TOCTOU ⇒ ERROR). Contracts gain
+`assay: {profile, enforcement: blocking|advisory|telemetry}`; config gains
+`assay.repo/.python/.timeout_seconds`. New `assay_evaluations` ledger table;
+blocking FAIL/ERROR reuses the existing violations→quarantine machinery; new
+`ASSAY_FAILED` taxonomy (quality evidence only — never touches the breaker).
+
+### Phase 4 — Durable run recovery
+
+New `run_stages` checkpoint table (PARSED → … → APPROVED, idempotent per
+run_id+stage) and `gov run inspect|resume|abandon|recover --stale`.
+Recovery rule: pre-AGENT_RUNNING discards safely; AGENT_RUNNING-or-later
+compares the worktree fingerprint recorded at launch (unchanged ⇒ safe,
+changed/missing ⇒ fail-closed quarantine). Quota reservations are always
+released and leftover worktrees destroyed. Also fixed a pre-existing
+NULL-scan crash in `Last()`/`Quarantines()` on genuinely-interrupted runs.
+
+### Phase 5 — Runner interface + Docker runner
+
+`internal/runner` extracts Prepare/Launch/Observe/Stop/Destroy;
+`LocalWorktreeRunner` is the pre-Phase-5 behavior moved verbatim.
+`DockerRunner` (contract `runner: docker` + `docker:` block) adds
+`--memory/--cpus/--pids-limit`, default-deny network, allowlisted read-only
+credential mounts, an output-size cap, and docker-inspect-verified limits.
+Docker unavailable + `runner: docker` fails closed — never silent local.
+
+### Phase 6 — Policy provenance + temporal event rules
+
+`internal/policy.PolicyDecision` (Allowed/Reasons/Sources/PolicyHash) routes
+the F1-F7 gate; `hook_events` gains `sources`/`policy_hash`. A transcript
+event graph + temporal rule engine ships 3 starter rules (secret-read →
+network = deny; out-of-scope read → write = deny; suspected injection →
+exec = advisory flag), ledgered to new `policy_rule_events`.
+
+### Phase 7 — Analytical projection
+
+`gov analytics summary|export` derives backend valid-output rate, failure
+type by backend, fallback frequency, quota utilization, repair depth,
+validator/assay failure clusters, panel disagreement, and cost by outcome
+from the ledger (read-only; JSONL export; SQLite stays authoritative).
+
+### Review pass (Fable, 2026-07-11) — 4 findings fixed
+
+1. **`assay.Blocks` failed open on unrecognized verdicts**: under blocking
+   enforcement, any verdict string other than the literal `fail`/`error`
+   (empty, wrong-case, future/foreign values) cleared the gate. Now only
+   known-good `pass`/`advisory` clear it — unrecognized means "not
+   verified," and blocks.
+2. **Blocking assay on an unconfigured Governator silently skipped and
+   merged**: a contract explicitly demanding `enforcement: blocking` now
+   quarantines when no assayer is configured (same fail-closed principle as
+   `runner: docker` without Docker); advisory/telemetry keep the
+   skip-and-record behavior.
+3. **Bare-path `docker.credential_mounts` entries could never mount**:
+   validation blesses a bare absolute host path, but `runArgs` appended
+   `:ro` directly, handing Docker `ro` as the container path — every such
+   mount failed at launch. Bare paths now mount at the same container path.
+4. **`panel_members` was written by nothing** (Phase 7 flagged it):
+   `RunPanel` now records one row per member, so the panel-disagreement
+   metric has data. Plus gofmt cleanup in two test files that shipped
+   unformatted despite commit messages claiming `gofmt -l` clean.
+
 ## [Unreleased] — v1.2 routing (branch `v1.2-routing`)
 
 The route broker closes the loop the evidence substrate always supported but

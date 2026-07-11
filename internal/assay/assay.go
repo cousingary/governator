@@ -191,14 +191,18 @@ func Evaluate(ctx context.Context, cfg Config, req Request, artifactPath string)
 }
 
 // Blocks reports whether verdict v under enforcement mode should quarantine
-// the run: only a FAIL or ERROR verdict under "blocking" enforcement blocks.
-// advisory/telemetry never block regardless of verdict, and a pass/advisory
-// verdict never blocks regardless of enforcement.
+// the run. advisory/telemetry never block regardless of verdict. Under
+// "blocking" enforcement only the two known-good verdicts (pass, advisory)
+// clear the gate; fail, error, AND any string this side doesn't recognize
+// (empty, wrong case, a future Assayer verdict this binary predates) all
+// block. The subprocess boundary is exactly where fail-open would be
+// cheapest to introduce by accident — an unrecognized verdict must read as
+// "not verified," never as "fine."
 func Blocks(verdict, enforcement string) bool {
 	if enforcement != EnforcementBlocking {
 		return false
 	}
-	return verdict == VerdictFail || verdict == VerdictError
+	return verdict != VerdictPass && verdict != VerdictAdvisory
 }
 
 func sha256File(path string) (string, error) {

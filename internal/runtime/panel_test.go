@@ -169,13 +169,13 @@ func panelExecContract(root, id, jobType, agent string, produces []contracts.Art
 	validators := []string{"test -f " + produces[0].Path}
 	return contracts.Contract{
 		JobID: id, JobType: jobType, Agent: agent, Mode: contracts.ModeArchitect,
-		Workspace:       contracts.Workspace{Root: root, Worktree: "auto"},
-		Allowed:         contracts.Permissions{Read: []string{"**"}, Write: []string{}, Execute: []string{"test -f *"}},
-		Forbidden:       contracts.Forbidden{Paths: []string{".git/**"}, Commands: []string{"rm -rf"}, Behaviors: []string{"network"}},
-		Budget:          contracts.Budget{MaxMinutes: 5, MaxCommands: 5, MaxFilesChanged: 1, MaxLinesChanged: 1, MaxNewFiles: 1, MaxTokens: 1000},
-		Preflight:       contracts.Preflight{IntendedWrites: []string{}},
-		Success:         contracts.Success{RequiredFiles: []string{}, Validators: validators},
-		Produces:        produces, Consumes: consumes, DependsOn: dependsOn, ArtifactSources: artifactSources,
+		Workspace: contracts.Workspace{Root: root, Worktree: "auto"},
+		Allowed:   contracts.Permissions{Read: []string{"**"}, Write: []string{}, Execute: []string{"test -f *"}},
+		Forbidden: contracts.Forbidden{Paths: []string{".git/**"}, Commands: []string{"rm -rf"}, Behaviors: []string{"network"}},
+		Budget:    contracts.Budget{MaxMinutes: 5, MaxCommands: 5, MaxFilesChanged: 1, MaxLinesChanged: 1, MaxNewFiles: 1, MaxTokens: 1000},
+		Preflight: contracts.Preflight{IntendedWrites: []string{}},
+		Success:   contracts.Success{RequiredFiles: []string{}, Validators: validators},
+		Produces:  produces, Consumes: consumes, DependsOn: dependsOn, ArtifactSources: artifactSources,
 		RiskClass: "low", OnViolation: "quarantine",
 	}
 }
@@ -300,6 +300,45 @@ printf '{"summary":"judged","recommendation":"n/a"}' > .governator/artifacts/pan
 	}
 	if len(report.SucceededMembers) != 2 {
 		t.Fatalf("expected 2 succeeded members recorded, got %v", report.SucceededMembers)
+	}
+
+	// Membership must land in panel_members so the Phase 7 disagreement
+	// metric has data (recordPanelMembership) — one row per member, in
+	// spec.Members order, including the timed-out straggler.
+	db, err := observability.Open(Home())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	rows, err := db.Query(`SELECT member_label, job_id, agent FROM panel_members WHERE panel_id='panel' ORDER BY member_label ASC`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	type memberRow struct{ label, jobID, agent string }
+	var got []memberRow
+	for rows.Next() {
+		var m memberRow
+		if err := rows.Scan(&m.label, &m.jobID, &m.agent); err != nil {
+			t.Fatal(err)
+		}
+		got = append(got, m)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	want := []memberRow{
+		{"member-1", "m1", "claude-code"},
+		{"member-2", "m2", "codex"},
+		{"member-3", "m3", "glm"},
+	}
+	if len(got) != len(want) {
+		t.Fatalf("expected %d panel_members rows, got %+v", len(want), got)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("panel_members[%d] = %+v, want %+v", i, got[i], want[i])
+		}
 	}
 }
 

@@ -7,6 +7,7 @@ import (
 	"io"
 	"os/exec"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/cousingary/governator/internal/agents"
@@ -119,6 +120,14 @@ func (d *DockerRunner) runArgs(ws Workspace, bin string, args []string) []string
 		out = append(out, "--network", "none")
 	}
 	for _, mount := range d.Config.CredentialMounts {
+		// A bare host path (the form contract validation blesses) mounts at
+		// the same path inside the container; a host:container pair passes
+		// through. Without this, "/host/.netrc"+":ro" would hand docker
+		// "ro" as the container path and every bare-path mount would fail
+		// at launch.
+		if !strings.Contains(mount, ":") {
+			mount = mount + ":" + mount
+		}
 		out = append(out, "-v", mount+":ro")
 	}
 	out = append(out, d.Config.Image, bin)

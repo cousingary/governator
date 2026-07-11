@@ -132,3 +132,32 @@ func TestDockerRunnerNetworkAllowOptIn(t *testing.T) {
 		t.Errorf("network: allow should not apply --network none, got %q", obs.Limits["network_mode"])
 	}
 }
+
+// TestDockerRunArgsCredentialMounts needs no docker daemon: runArgs is a
+// pure function. A bare host path (the only form contract validation
+// requires) must become host:host:ro — appending ":ro" directly would hand
+// docker "ro" as the container path and fail every bare-path mount at
+// launch. A host:container pair passes through with ":ro" appended.
+func TestDockerRunArgsCredentialMounts(t *testing.T) {
+	d := &DockerRunner{Config: contracts.DockerRunnerConfig{
+		Image:            dockerTestImage,
+		CredentialMounts: []string{"/host/.netrc", "/host/creds:/root/creds"},
+	}}
+	args := d.runArgs(Workspace{Container: "c", Path: "/ws"}, "bin", nil)
+	joined := ""
+	for _, a := range args {
+		joined += a + "\n"
+	}
+	for _, want := range []string{"/host/.netrc:/host/.netrc:ro", "/host/creds:/root/creds:ro"} {
+		found := false
+		for _, a := range args {
+			if a == want {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("expected mount arg %q in runArgs output:\n%s", want, joined)
+		}
+	}
+}
