@@ -21,6 +21,7 @@ func validatePanelSpec(spec PanelSpec, jobs []Contract) error {
 	if spec.Judge == "" {
 		add("panel.judge", "is required")
 	}
+	validatePanelQuorum(spec, add)
 
 	byID := make(map[string]Contract, len(jobs))
 	for _, job := range jobs {
@@ -143,6 +144,50 @@ func validatePanelSpec(spec PanelSpec, jobs []Contract) error {
 		return errs.Sorted()
 	}
 	return nil
+}
+
+// validatePanelQuorum checks the optional min_success/timeouts/diversity
+// block against the member count. len(spec.Members) may itself already be
+// invalid (< 2, checked above by the caller) — every bound here compares
+// against the raw count regardless, so a malformed panel reports every
+// problem at once instead of hiding these behind the members error.
+func validatePanelQuorum(spec PanelSpec, add func(string, string)) {
+	n := len(spec.Members)
+	if spec.MinSuccess != 0 {
+		if spec.MinSuccess < 2 {
+			add("panel.min_success", "must be at least 2 when set (the comparison job needs at least two artifacts)")
+		} else if spec.MinSuccess > n {
+			add("panel.min_success", fmt.Sprintf("must not exceed panel.members count (%d)", n))
+		}
+	}
+	if spec.MemberTimeoutSeconds < 0 {
+		add("panel.member_timeout_seconds", "must be zero or greater")
+	}
+	if spec.HardTimeoutSeconds < 0 {
+		add("panel.hard_timeout_seconds", "must be zero or greater")
+	}
+	if spec.MemberTimeoutSeconds > 0 && spec.HardTimeoutSeconds > 0 && spec.HardTimeoutSeconds < spec.MemberTimeoutSeconds {
+		add("panel.hard_timeout_seconds", "must be greater than or equal to panel.member_timeout_seconds when both are set")
+	}
+	if spec.Diversity == nil {
+		return
+	}
+	d := spec.Diversity
+	if d.GroupBy != "" && !panelDiversityKeys[d.GroupBy] {
+		add("panel.diversity.group_by", "must be 'backend' or 'model_family' when set")
+	}
+	if d.FallbackGroupBy != "" {
+		if !panelDiversityKeys[d.FallbackGroupBy] {
+			add("panel.diversity.fallback_group_by", "must be 'backend' or 'model_family' when set")
+		} else if d.FallbackGroupBy == d.GroupBy {
+			add("panel.diversity.fallback_group_by", "must differ from panel.diversity.group_by")
+		}
+	}
+	if d.MinUnique < 0 {
+		add("panel.diversity.min_unique", "must be zero or greater")
+	} else if d.MinUnique > n {
+		add("panel.diversity.min_unique", fmt.Sprintf("must not exceed panel.members count (%d)", n))
+	}
 }
 
 func containsString(values []string, want string) bool {

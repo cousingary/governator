@@ -26,11 +26,113 @@ type Plan struct {
 // not a runtime primitive: the jobs remain ordinary contracts, while this
 // block lets ValidatePlanManifest enforce panel-specific prohibitions and lets
 // generated plans map anonymized panelist labels back to job ids.
+//
+// MinSuccess, the timeouts, and Diversity are quorum/diversity policy read by
+// internal/runtime.RunPanel, not by ValidatePlan itself — a plan without a
+// panel block (or an older panel plan predating these fields) keeps running
+// exactly as before via plain RunBatchOrdered, since every field here is
+// optional and its Effective* accessor defaults to the pre-Phase-2 behavior
+// (wait for every member, no diversity requirement).
 type PanelSpec struct {
 	ID            string   `yaml:"id" json:"id"`
 	Members       []string `yaml:"members" json:"members"`
 	ComparisonJob string   `yaml:"comparison_job" json:"comparison_job"`
 	Judge         string   `yaml:"judge" json:"judge"`
+
+	// MinSuccess is how many members must complete before the comparison job
+	// is allowed to run. 0 (unset) defaults to every member — the original
+	// behavior. Comparison always needs at least 2 usable artifacts
+	// (panel.CompareArtifacts), so an explicit value below 2 fails validation.
+	MinSuccess int `yaml:"min_success,omitempty" json:"min_success,omitempty"`
+
+	// MemberTimeoutSeconds bounds a single member's run; RunPanel applies it
+	// as that member job's budget.max_minutes (rounded up), reusing the
+	// existing per-job wall-clock gate rather than adding a second one. 0
+	// defaults to 120s.
+	MemberTimeoutSeconds int `yaml:"member_timeout_seconds,omitempty" json:"member_timeout_seconds,omitempty"`
+
+	// HardTimeoutSeconds bounds the whole member level: once it elapses,
+	// RunPanel stops waiting on stragglers and proceeds with whatever
+	// quorum (MinSuccess) it has, or reports panel failure if it never
+	// reached 2 successes. 0 defaults to 180s. Must be >= the effective
+	// MemberTimeoutSeconds when both are set explicitly.
+	HardTimeoutSeconds int `yaml:"hard_timeout_seconds,omitempty" json:"hard_timeout_seconds,omitempty"`
+
+	// Diversity is the backend-plurality requirement across members. A nil
+	// value defaults to key: backend, min_unique: len(members) — the
+	// strictest reading ("every member on a different backend"), reported
+	// (never silently relaxed) as degraded when the live candidate pool
+	// can't satisfy it.
+	Diversity *PanelDiversity `yaml:"diversity,omitempty" json:"diversity,omitempty"`
+}
+
+// PanelDiversity configures the backend-plurality check RunPanel enforces
+// across a panel's members via router exclusion sets (Request.ExcludeAgents).
+//
+// Field names deliberately avoid the substring "key" in their YAML/JSON
+// tags (GroupBy, not Key): contracts.ParsePlan's literal-secret scan flags
+// any `<word>KEY: <8+ char value>` pattern in a manifest, case-insensitive,
+// to catch an accidentally-committed API key — "key: model_family" would
+// false-positive on that heuristic every time. GroupBy sidesteps it while
+// meaning the same thing.
+type PanelDiversity struct {
+	// GroupBy groups candidates for exclusion purposes: "backend" (default,
+	// the literal agent name) or "model_family" (a coarser grouping — see
+	// internal/runtime.diversityGroup — for when distinct CLI wrappers front
+	// the same underlying model).
+	GroupBy string `yaml:"group_by,omitempty" json:"group_by,omitempty"`
+	// MinUnique is how many distinct groups the assignment must achieve. 0
+	// defaults to len(members).
+	MinUnique int `yaml:"min_unique,omitempty" json:"min_unique,omitempty"`
+	// FallbackGroupBy, if set, is tried once GroupBy's exclusion leaves no
+	// candidate for a member — a coarser regrouping before RunPanel gives up
+	// and reuses a backend (recording degraded either way).
+	FallbackGroupBy string `yaml:"fallback_group_by,omitempty" json:"fallback_group_by,omitempty"`
+}
+
+var panelDiversityKeys = map[string]bool{"backend": true, "model_family": true}
+
+// EffectiveMinSuccess defaults to every member — RunPanel waits for all of
+// them, matching pre-Phase-2 behavior — when unset.
+func (s PanelSpec) EffectiveMinSuccess() int {
+	if s.MinSuccess > 0 {
+		return s.MinSuccess
+	}
+	return len(s.Members)
+}
+
+// EffectiveMemberTimeoutSeconds defaults to 120s.
+func (s PanelSpec) EffectiveMemberTimeoutSeconds() int {
+	if s.MemberTimeoutSeconds > 0 {
+		return s.MemberTimeoutSeconds
+	}
+	return 120
+}
+
+// EffectiveHardTimeoutSeconds defaults to 180s.
+func (s PanelSpec) EffectiveHardTimeoutSeconds() int {
+	if s.HardTimeoutSeconds > 0 {
+		return s.HardTimeoutSeconds
+	}
+	return 180
+}
+
+// EffectiveDiversity defaults to group_by: backend, min_unique:
+// len(members), no fallback — the strictest reading, applied whenever the
+// panel omits the block entirely.
+func (s PanelSpec) EffectiveDiversity() PanelDiversity {
+	d := PanelDiversity{GroupBy: "backend", MinUnique: len(s.Members)}
+	if s.Diversity == nil {
+		return d
+	}
+	if s.Diversity.GroupBy != "" {
+		d.GroupBy = s.Diversity.GroupBy
+	}
+	if s.Diversity.MinUnique > 0 {
+		d.MinUnique = s.Diversity.MinUnique
+	}
+	d.FallbackGroupBy = s.Diversity.FallbackGroupBy
+	return d
 }
 
 func ParsePlanFile(filename string) (*Plan, error) {

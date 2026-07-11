@@ -87,6 +87,8 @@ gov run <job.yaml> [--agent <name>]
 gov batch run <job.yaml|dir|glob>... [--parallel N] [--halt-on-first-quarantine] [--ordered]
 gov plan <intent.md> --out <dir> --envelope <pattern>... --max-total-tokens <n> [--backend <name>]
 gov plan --panel <n> <intent.md> --out <dir> --envelope <pattern>... --max-total-tokens <n> [--backend <name>]
+    [--min-success <n>] [--member-timeout-seconds <n>] [--hard-timeout-seconds <n>]
+    [--diversity-key backend|model_family] [--diversity-min-unique <n>] [--diversity-fallback-key backend|model_family]
 gov plan --show <dir>
 gov handoff [last|run_id]
 gov diff [last|run_id]

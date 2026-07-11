@@ -595,6 +595,15 @@ func batchCmd(args []string) int {
 		return 2
 	}
 
+	var panelSpec *contracts.PanelSpec
+	if ordered {
+		panelSpec, err = detectPanelSpec(pathArgs)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "batch:", err)
+			return 2
+		}
+	}
+
 	var summary govruntime.BatchSummary
 	if ordered {
 		levels, lErr := contracts.TopologicalLevels(jobs)
@@ -602,7 +611,13 @@ func batchCmd(args []string) int {
 			fmt.Fprintln(os.Stderr, "batch:", lErr)
 			return 2
 		}
-		summary, err = govruntime.New().RunBatchOrdered(context.Background(), levels, opts)
+		if panelSpec != nil {
+			var preport govruntime.PanelReport
+			summary, preport, err = govruntime.New().RunPanel(context.Background(), *panelSpec, levels, opts)
+			printPanelReport(preport)
+		} else {
+			summary, err = govruntime.New().RunBatchOrdered(context.Background(), levels, opts)
+		}
 	} else {
 		summary, err = govruntime.New().RunBatch(context.Background(), jobs, opts)
 	}
@@ -666,6 +681,64 @@ func resolveJobPaths(args []string) ([]string, error) {
 	return out, nil
 }
 
+// detectPanelSpec looks for a PLAN.yaml with a panel: block alongside any
+// directory argument in a `gov batch run --ordered` invocation. PLAN.yaml
+// itself is always excluded from the job set (excludePlanManifest), so this
+// is the only place batchCmd ever reads it: finding it here is what
+// switches execution from plain RunBatchOrdered to RunPanel's
+// diversity/quorum-aware path, without requiring a separate `gov panel run`
+// subcommand or changing what `gov batch run --ordered jobs/panel/` looks
+// like on the command line. Non-directory args and directories with no
+// PLAN.yaml (or a PLAN.yaml with no panel: block) are ordinary batches.
+// More than one panel plan among the arguments is refused — a single batch
+// run drives at most one panel's quorum/diversity accounting.
+func detectPanelSpec(pathArgs []string) (*contracts.PanelSpec, error) {
+	var found *contracts.PanelSpec
+	var foundAt string
+	for _, a := range pathArgs {
+		info, err := os.Stat(a)
+		if err != nil || !info.IsDir() {
+			continue
+		}
+		planPath := filepath.Join(a, planManifestName)
+		data, err := os.ReadFile(planPath)
+		if err != nil {
+			continue
+		}
+		plan, perr := contracts.ParsePlan(data)
+		if perr != nil {
+			return nil, fmt.Errorf("%s: %w", planPath, perr)
+		}
+		if plan.Panel == nil {
+			continue
+		}
+		if found != nil {
+			return nil, fmt.Errorf("multiple panel plans found (%s and %s) — run each panel separately", foundAt, planPath)
+		}
+		found, foundAt = plan.Panel, planPath
+	}
+	return found, nil
+}
+
+// printPanelReport prints the diversity/quorum accounting RunPanel produced
+// — the Phase 2 "never silently" bar applied to CLI output: an operator
+// sees exactly which backends were chosen and why the panel degraded (if it
+// did), not just a plain job table indistinguishable from an ordinary batch.
+func printPanelReport(r govruntime.PanelReport) {
+	if len(r.Diversity) > 0 {
+		fmt.Printf("panel diversity: key=%s unique=%d/%d\n", r.DiversityKey, r.DiversityUnique, r.DiversityWanted)
+		for _, d := range r.Diversity {
+			fmt.Printf("  %s -> %s\n", d.JobID, d.Selected)
+		}
+	}
+	if r.Degraded {
+		fmt.Println("panel degraded:")
+		for _, reason := range r.DegradedReasons {
+			fmt.Println("  -", reason)
+		}
+	}
+}
+
 func excludePlanManifest(paths []string) []string {
 	out := make([]string, 0, len(paths))
 	for _, p := range paths {
@@ -679,6 +752,8 @@ func excludePlanManifest(paths []string) []string {
 
 const planUsage = "usage: gov plan <intent.md> --out <dir> --envelope <pattern>... --max-total-tokens <n> [--backend <name>]\n" +
 	"       gov plan --panel <n> <intent.md> --out <dir> --envelope <pattern>... --max-total-tokens <n> [--backend <name>]\n" +
+	"           [--min-success <n>] [--member-timeout-seconds <n>] [--hard-timeout-seconds <n>]\n" +
+	"           [--diversity-key backend|model_family] [--diversity-min-unique <n>] [--diversity-fallback-key backend|model_family]\n" +
 	"       gov plan --show <dir>"
 
 func planCmd(args []string) int {
@@ -903,10 +978,20 @@ func planPanelCreate(args []string) int {
 		return bad("gov plan --panel: <n> must be an integer >= 2")
 	}
 	intentPath := args[1]
-	var outDir, backend string
+	var outDir, backend, diversityKey, diversityFallbackKey string
 	var envelope []string
-	maxTotalTokens := 0
+	maxTotalTokens, minSuccess, memberTimeoutSeconds, hardTimeoutSeconds, diversityMinUnique := 0, 0, 0, 0, 0
 	rest := args[2:]
+	intArg := func(name string, i int) (int, error) {
+		if i+1 >= len(rest) {
+			return 0, errors.New(planUsage)
+		}
+		n, err := strconv.Atoi(rest[i+1])
+		if err != nil || n <= 0 {
+			return 0, fmt.Errorf("gov plan --panel: %s must be a positive integer", name)
+		}
+		return n, nil
+	}
 	for i := 0; i < len(rest); i++ {
 		switch rest[i] {
 		case "--out":
@@ -937,6 +1022,46 @@ func planPanelCreate(args []string) int {
 			}
 			backend = rest[i+1]
 			i++
+		case "--min-success":
+			n, err := intArg("--min-success", i)
+			if err != nil {
+				return bad(err.Error())
+			}
+			minSuccess = n
+			i++
+		case "--member-timeout-seconds":
+			n, err := intArg("--member-timeout-seconds", i)
+			if err != nil {
+				return bad(err.Error())
+			}
+			memberTimeoutSeconds = n
+			i++
+		case "--hard-timeout-seconds":
+			n, err := intArg("--hard-timeout-seconds", i)
+			if err != nil {
+				return bad(err.Error())
+			}
+			hardTimeoutSeconds = n
+			i++
+		case "--diversity-key":
+			if i+1 >= len(rest) {
+				return bad(planUsage)
+			}
+			diversityKey = rest[i+1]
+			i++
+		case "--diversity-min-unique":
+			n, err := intArg("--diversity-min-unique", i)
+			if err != nil {
+				return bad(err.Error())
+			}
+			diversityMinUnique = n
+			i++
+		case "--diversity-fallback-key":
+			if i+1 >= len(rest) {
+				return bad(planUsage)
+			}
+			diversityFallbackKey = rest[i+1]
+			i++
 		default:
 			return bad(planUsage)
 		}
@@ -957,7 +1082,11 @@ func planPanelCreate(args []string) int {
 	if backend == "" {
 		backend = config.Current().Defaults.Agent
 	}
-	plan, err := panel.GeneratePlan(panel.Options{Root: root, OutDir: outDir, Envelope: envelope, Count: count, Agent: backend, MaxTotalTokens: maxTotalTokens, Intent: string(intent)})
+	plan, err := panel.GeneratePlan(panel.Options{
+		Root: root, OutDir: outDir, Envelope: envelope, Count: count, Agent: backend, MaxTotalTokens: maxTotalTokens, Intent: string(intent),
+		MinSuccess: minSuccess, MemberTimeoutSeconds: memberTimeoutSeconds, HardTimeoutSeconds: hardTimeoutSeconds,
+		DiversityKey: diversityKey, DiversityMinUnique: diversityMinUnique, DiversityFallbackKey: diversityFallbackKey,
+	})
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "plan:", err)
 		return 1

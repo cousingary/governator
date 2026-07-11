@@ -115,6 +115,38 @@ func TestFailClosedWhenAllExcluded(t *testing.T) {
 	}
 }
 
+func TestExcludeAgentsHardExcludes(t *testing.T) {
+	db := newLedger(t)
+	r := Router{Binary: allPresent}
+	req := baseReq("code_change")
+	req.ExcludeAgents = []string{"claude-code"}
+	d := mustResolve(t, r, db, req)
+	if d.Selected == "claude-code" {
+		t.Fatalf("expected claude-code to be excluded, got selected %q", d.Selected)
+	}
+	if d.Selected != "codex" {
+		t.Fatalf("tie among survivors should break to codex, got %q\n%s", d.Selected, d.Format())
+	}
+	for _, c := range d.Candidates {
+		if c.Agent == "claude-code" {
+			if !c.Excluded || c.ExclusionReason != "diversity_exclusion" {
+				t.Fatalf("expected claude-code excluded with diversity_exclusion, got %+v", c)
+			}
+		}
+	}
+}
+
+func TestExcludeAgentsFailsClosedWhenAllExcluded(t *testing.T) {
+	db := newLedger(t)
+	r := Router{Binary: allPresent}
+	req := baseReq("code_change")
+	req.ExcludeAgents = append([]string{}, RegisteredAgents()...)
+	d := mustResolve(t, r, db, req)
+	if d.Selected != "" {
+		t.Fatalf("expected fail-closed when every candidate is diversity-excluded, got %q", d.Selected)
+	}
+}
+
 func TestCapabilityRequirementExcludesUncapable(t *testing.T) {
 	db := newLedger(t)
 	r := Router{Binary: allPresent}

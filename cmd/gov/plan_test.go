@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/cousingary/governator/internal/contracts"
 	"github.com/cousingary/governator/internal/observability"
 )
 
@@ -157,6 +158,80 @@ func TestPlanPanelCommandWritesValidatedPanelTemplate(t *testing.T) {
 	}
 	if !strings.Contains(showOutput, "panel-judge") || !strings.Contains(showOutput, "jobs=5 levels=3") {
 		t.Fatalf("expected panel jobs in --show, got %s", showOutput)
+	}
+}
+
+func TestPlanPanelCommandHonorsQuorumAndDiversityFlags(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("GOV_HOME", home)
+	t.Setenv("GOV_CONFIG", filepath.Join(t.TempDir(), "missing-config.yaml"))
+
+	root := planProjectRoot(t)
+	t.Chdir(root)
+	intentPath := filepath.Join(t.TempDir(), "intent.md")
+	if err := os.WriteFile(intentPath, []byte("# Intent\nReview the architecture.\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	code, output := captureRunInput(t, []string{
+		"plan", "--panel", "3", intentPath, "--out", "jobs/panel2",
+		"--envelope", "internal/**", "--max-total-tokens", "90000", "--backend", "claude-code",
+		"--min-success", "2", "--member-timeout-seconds", "90", "--hard-timeout-seconds", "200",
+		"--diversity-key", "model_family", "--diversity-min-unique", "2", "--diversity-fallback-key", "backend",
+	}, "")
+	if code != 0 {
+		t.Fatalf("exit=%d output=%s", code, output)
+	}
+	plan, err := contracts.ParsePlanFile(filepath.Join(root, "jobs", "panel2", "PLAN.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if plan.Panel.EffectiveMinSuccess() != 2 {
+		t.Fatalf("expected min_success=2, got %d", plan.Panel.EffectiveMinSuccess())
+	}
+	if plan.Panel.EffectiveHardTimeoutSeconds() != 200 {
+		t.Fatalf("expected hard_timeout_seconds=200, got %d", plan.Panel.EffectiveHardTimeoutSeconds())
+	}
+	d := plan.Panel.EffectiveDiversity()
+	if d.GroupBy != "model_family" || d.MinUnique != 2 || d.FallbackGroupBy != "backend" {
+		t.Fatalf("expected model_family/2/backend, got %+v", d)
+	}
+}
+
+func TestDetectPanelSpecFindsPanelPlanAlongsideJobFiles(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("GOV_HOME", home)
+	t.Setenv("GOV_CONFIG", filepath.Join(t.TempDir(), "missing-config.yaml"))
+	root := planProjectRoot(t)
+	t.Chdir(root)
+	intentPath := filepath.Join(t.TempDir(), "intent.md")
+	if err := os.WriteFile(intentPath, []byte("# Intent\nReview.\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if code, output := captureRunInput(t, []string{
+		"plan", "--panel", "2", intentPath, "--out", "jobs/panel3",
+		"--envelope", "internal/**", "--max-total-tokens", "90000", "--backend", "claude-code",
+	}, ""); code != 0 {
+		t.Fatalf("exit=%d output=%s", code, output)
+	}
+
+	spec, err := detectPanelSpec([]string{filepath.Join(root, "jobs", "panel3")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if spec == nil || spec.ID != "panel" || len(spec.Members) != 2 {
+		t.Fatalf("expected the panel spec to be found, got %+v", spec)
+	}
+
+	// An ordinary batch directory (no PLAN.yaml) must not be mistaken for a
+	// panel plan.
+	ordinary := t.TempDir()
+	spec, err = detectPanelSpec([]string{ordinary})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if spec != nil {
+		t.Fatalf("expected no panel spec for a plain directory, got %+v", spec)
 	}
 }
 

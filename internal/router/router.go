@@ -112,6 +112,15 @@ type Request struct {
 	Requirements  contracts.RoutingRequirements // hard capability filters (fail closed)
 	MaxTokens     int                           // sizes spend.EstimateCostUSD
 	RepairLineage string                        // root run id; non-empty = repair job (affinity)
+
+	// ExcludeAgents hard-excludes named candidates from this decision. It is
+	// never set from a contract (RequestFromContract leaves it empty) — it is
+	// runtime orchestration state a caller builds per call, the same tier as
+	// a capability requirement miss. internal/runtime.resolvePanelBackends is
+	// the first caller: it grows this set across a panel's members so a
+	// backend already assigned to an earlier member is excluded from later
+	// ones (Phase 2 diversity).
+	ExcludeAgents []string
 }
 
 // ScoredCandidate is one evaluated backend in a decision. Every component is
@@ -288,6 +297,9 @@ func (closedHealth) Quota(string) QuotaSnapshot     { return QuotaSnapshot{Avail
 // breaker) mark the candidate Excluded and short-circuit the soft scores.
 func (r Router) evaluate(db *sql.DB, name string, req Request, w weightSet, lineageAgent string, cfg config.Config) ScoredCandidate {
 	candidate := ScoredCandidate{Agent: name}
+	if containsAgent(req.ExcludeAgents, name) {
+		return excluded(candidate, "diversity_exclusion")
+	}
 	cap, err := agents.New(name)
 	if err != nil {
 		return excluded(candidate, "unknown backend")
@@ -343,6 +355,19 @@ func excluded(c ScoredCandidate, reason string) ScoredCandidate {
 	c.Excluded = true
 	c.ExclusionReason = reason
 	return c
+}
+
+// containsAgent reports whether name (already canonical — evaluate is called
+// per candidatePool entry, which is always agents.New-normalized) appears in
+// values. A plain loop, not a set: ExcludeAgents is at most a handful of
+// entries per panel member.
+func containsAgent(values []string, name string) bool {
+	for _, v := range values {
+		if v == name {
+			return true
+		}
+	}
+	return false
 }
 
 func reasonSuffix(reason string) string {
