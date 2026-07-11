@@ -188,6 +188,15 @@ CREATE TABLE IF NOT EXISTS panel_members(panel_id TEXT NOT NULL, member_label TE
 		db.Close()
 		return nil, alterErr
 	}
+	// policy_hash (Phase 1) fingerprints the scoring weights + requirement set
+	// behind each row's decision. Empty-string default on pre-existing rows is
+	// honest: those decisions predate the hash and were never actually
+	// fingerprinted, so backfilling a computed value would misrepresent them
+	// as verified against a policy they were never checked against.
+	if _, alterErr := db.Exec("ALTER TABLE route_decisions ADD COLUMN policy_hash TEXT NOT NULL DEFAULT ''"); alterErr != nil && !strings.Contains(strings.ToLower(alterErr.Error()), "duplicate column") {
+		db.Close()
+		return nil, alterErr
+	}
 	if _, err = db.Exec(`CREATE INDEX IF NOT EXISTS runs_key ON runs(contract_hash, approved_head, status);
 CREATE INDEX IF NOT EXISTS runs_failure ON runs(failure_taxonomy, created);
 CREATE INDEX IF NOT EXISTS runs_repair_of ON runs(repair_of);
@@ -257,13 +266,14 @@ type RouteDecisionRow struct {
 // RunID is empty for a preview (`gov route --explain`), which the preview flag
 // records so reports can separate dry-run decisions from real launches.
 type RouteDecisionRecord struct {
-	RunID     string
-	JobID     string
-	JobType   string
-	Objective string
-	Preview   bool
-	Created   string
-	Rows      []RouteDecisionRow
+	RunID      string
+	JobID      string
+	JobType    string
+	Objective  string
+	PolicyHash string
+	Preview    bool
+	Created    string
+	Rows       []RouteDecisionRow
 }
 
 // RecordRouteDecision persists one broker decision: one route_decisions row
@@ -277,8 +287,8 @@ func RecordRouteDecision(db *sql.DB, rec RouteDecisionRecord) error {
 	}
 	defer tx.Rollback()
 	for _, row := range rec.Rows {
-		if _, err = tx.Exec(`INSERT INTO route_decisions(run_id,job_id,job_type,objective,candidate,valid_rate_score,failure_severity_score,cost_score,breaker_score,quota_score,repair_affinity_score,total,excluded,exclusion_reason,selected,preview,created) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-			rec.RunID, rec.JobID, rec.JobType, rec.Objective, row.Candidate,
+		if _, err = tx.Exec(`INSERT INTO route_decisions(run_id,job_id,job_type,objective,policy_hash,candidate,valid_rate_score,failure_severity_score,cost_score,breaker_score,quota_score,repair_affinity_score,total,excluded,exclusion_reason,selected,preview,created) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+			rec.RunID, rec.JobID, rec.JobType, rec.Objective, rec.PolicyHash, row.Candidate,
 			row.ValidRateScore, row.FailureSeverityScore, row.CostScore,
 			row.BreakerScore, row.QuotaScore, row.RepairAffinityScore, row.Total,
 			boolInt(row.Excluded), row.ExclusionReason, boolInt(row.Selected),

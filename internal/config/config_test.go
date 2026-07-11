@@ -78,6 +78,38 @@ defaults: {agent: codex, max_minutes: 12}
 	}
 }
 
+func TestLoadBackendModelCapabilitiesMergeFieldByField(t *testing.T) {
+	// A file declaring only model facts (no bin override) must not lose those
+	// facts just because Bin is blank -- merge is field-by-field, not a
+	// wholesale Backend replace keyed on Bin being set.
+	cleanEnv(t)
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	path := filepath.Join(home, "custom.yaml")
+	t.Setenv("GOV_CONFIG", path)
+	if err := os.WriteFile(path, []byte(`backends:
+  claude-code:
+    vision: true
+    tool_calling: true
+    local_only: true
+    context_tokens: 200000
+    output_tokens: 8192
+`), 0644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := cfg.Backends["claude-code"]
+	if got.Bin != "claude" {
+		t.Fatalf("bin override absent from file must keep the built-in default, got %q", got.Bin)
+	}
+	if !got.Vision || !got.ToolCalling || !got.LocalOnly || got.ContextTokens != 200000 || got.OutputTokens != 8192 {
+		t.Fatalf("model capability fields not merged: %+v", got)
+	}
+}
+
 func TestLoadSpendHaltFileEnvOverride(t *testing.T) {
 	cleanEnv(t)
 	home := t.TempDir()

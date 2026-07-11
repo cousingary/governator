@@ -65,6 +65,11 @@ ledger_dir: ~/.governator
 backends:
   claude-code:
     bin: claude
+    # vision: true            # operator-declared facts about the model this
+    # tool_calling: true      # backend is pointed at -- used only by
+    # local_only: false       # routing.requirements hard filters (vision,
+    # context_tokens: 200000  # tool_calling, local_only, min_context_tokens,
+    # output_tokens: 8192     # min_output_tokens). Unset = unsupported/0.
   codex:
     bin: codex
   glm:

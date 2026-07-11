@@ -1624,12 +1624,13 @@ func routeDecisionRecord(d router.Decision, runID, created string) observability
 		})
 	}
 	return observability.RouteDecisionRecord{
-		RunID:     runID,
-		JobID:     d.JobID,
-		JobType:   d.JobType,
-		Objective: d.Objective,
-		Preview:   false,
-		Created:   created,
-		Rows:      rows,
+		RunID:      runID,
+		JobID:      d.JobID,
+		JobType:    d.JobType,
+		Objective:  d.Objective,
+		PolicyHash: d.PolicyHash,
+		Preview:    false,
+		Created:    created,
+		Rows:       rows,
 	}
 }

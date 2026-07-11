@@ -210,6 +210,37 @@ func TestParseRoutingBlock(t *testing.T) {
 	}
 }
 
+func TestParseRoutingRequirementsExpandedFields(t *testing.T) {
+	withRouting := strings.Replace(autoContract, "on_violation: quarantine",
+		"routing:\n  requirements: {read_only_mode: true, vision: true, tool_calling: true, local_only: true, min_context_tokens: 100000, min_output_tokens: 8192}\non_violation: quarantine", 1)
+	contract, err := Parse([]byte(withRouting))
+	if err != nil {
+		t.Fatalf("expanded requirements must validate: %v", err)
+	}
+	r := contract.Routing.Requirements
+	if !r.ReadOnlyMode || !r.Vision || !r.ToolCalling || !r.LocalOnly || r.MinContextTokens != 100000 || r.MinOutputTokens != 8192 {
+		t.Fatalf("requirements not parsed: %+v", r)
+	}
+}
+
+func TestRoutingMinContextTokensNegativeRejected(t *testing.T) {
+	withRouting := strings.Replace(autoContract, "on_violation: quarantine",
+		"routing: {requirements: {min_context_tokens: -1}}\non_violation: quarantine", 1)
+	_, err := Parse([]byte(withRouting))
+	if err == nil || !strings.Contains(err.Error(), "routing.requirements.min_context_tokens") {
+		t.Fatalf("expected routing.requirements.min_context_tokens error, got %v", err)
+	}
+}
+
+func TestRoutingMinOutputTokensNegativeRejected(t *testing.T) {
+	withRouting := strings.Replace(autoContract, "on_violation: quarantine",
+		"routing: {requirements: {min_output_tokens: -1}}\non_violation: quarantine", 1)
+	_, err := Parse([]byte(withRouting))
+	if err == nil || !strings.Contains(err.Error(), "routing.requirements.min_output_tokens") {
+		t.Fatalf("expected routing.requirements.min_output_tokens error, got %v", err)
+	}
+}
+
 func TestRoutingBlockRejectedWithExplicitAgent(t *testing.T) {
 	// explicit agent: claude-code + a routing block = ambiguity error.
 	explicit := strings.Replace(validContract, "agent: claude", "agent: claude-code", 1)

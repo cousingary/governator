@@ -11,8 +11,21 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
+// Backend configures one routing candidate. Bin overrides the binary path.
+// The remaining fields are operator-declared facts about whichever model the
+// operator has pointed this backend at (vision, tool calling, locality,
+// context/output limits) — Governator never infers them from the backend
+// name, since the same CLI wrapper can run different models over time. They
+// back the router's optional RoutingRequirements hard filters (see
+// internal/contracts.RoutingRequirements and docs/routing.md) and default to
+// unsupported/zero (fail closed) until declared here.
 type Backend struct {
-	Bin string `yaml:"bin"`
+	Bin           string `yaml:"bin"`
+	Vision        bool   `yaml:"vision,omitempty"`
+	ToolCalling   bool   `yaml:"tool_calling,omitempty"`
+	LocalOnly     bool   `yaml:"local_only,omitempty"`
+	ContextTokens int    `yaml:"context_tokens,omitempty"`
+	OutputTokens  int    `yaml:"output_tokens,omitempty"`
 }
 
 type RTK struct {
@@ -190,9 +203,29 @@ func merge(dst *Config, src Config) {
 		dst.LedgerDir = src.LedgerDir
 	}
 	for name, backend := range src.Backends {
+		// Field-by-field, not a wholesale replace: an operator declaring only
+		// `backends.codex.vision: true` (no bin override) must not silently
+		// lose that declaration just because Bin is blank.
+		existing := dst.Backends[name]
 		if backend.Bin != "" {
-			dst.Backends[name] = backend
+			existing.Bin = backend.Bin
 		}
+		if backend.Vision {
+			existing.Vision = backend.Vision
+		}
+		if backend.ToolCalling {
+			existing.ToolCalling = backend.ToolCalling
+		}
+		if backend.LocalOnly {
+			existing.LocalOnly = backend.LocalOnly
+		}
+		if backend.ContextTokens > 0 {
+			existing.ContextTokens = backend.ContextTokens
+		}
+		if backend.OutputTokens > 0 {
+			existing.OutputTokens = backend.OutputTokens
+		}
+		dst.Backends[name] = existing
 	}
 	if src.RTK.Mode != "" {
 		dst.RTK.Mode = src.RTK.Mode

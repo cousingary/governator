@@ -7,15 +7,22 @@
 // Standing rules enforced here:
 //   - Fail closed. An unsatisfiable hard requirement refuses to run rather
 //     than silently widening the pool.
-//   - Structured signals only. Route on job_type, mode, budgets, capability
-//     requirements, and ledger evidence — never task text.
+//   - Structured signals only. Route on job_type, risk_class, budgets,
+//     capability requirements, and ledger evidence — never task text. Mode is
+//     carried on Request for downstream context (e.g. `gov route --explain`
+//     display) but is deliberately score-neutral: risk_class is the intended
+//     lever for "route this one more conservatively," and doubling that up
+//     with an implicit mode-based nudge would make decisions harder to
+//     explain from the ledger (rule 4).
 //   - Infrastructure and quality failures are separate metrics. The breaker
 //     (Session 2) carries infra signals only; quality scores never touch it.
 //   - Determinism. No LLM calls. Plain Go + the ledger.
 package router
 
 import (
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"fmt"
 	"os/exec"
 	"sort"
@@ -44,6 +51,7 @@ func RequestFromContract(c contracts.Contract) Request {
 		JobID:         c.JobID,
 		JobType:       c.JobType,
 		Mode:          c.Mode,
+		RiskClass:     c.RiskClass,
 		MaxTokens:     c.Budget.MaxTokens,
 		RepairLineage: c.RepairLineage,
 	}
@@ -98,6 +106,7 @@ type Request struct {
 	JobID         string
 	JobType       string
 	Mode          contracts.Mode
+	RiskClass     string                        // low|medium|high; empty = scoring-neutral
 	Objective     string                        // balanced|cheapest|most_reliable; empty = balanced
 	Candidates    []string                      // allowlist; empty = all registered
 	Requirements  contracts.RoutingRequirements // hard capability filters (fail closed)
@@ -126,10 +135,15 @@ type ScoredCandidate struct {
 // table (excluded candidates included, with reasons), and the selected
 // backend (empty when fail-closed). Selected is the highest-total
 // non-excluded candidate; ties break by name for reproducibility (rule 5).
+// PolicyHash identifies the exact scoring weights + requirement set that
+// produced this decision (see policyHash) — two decisions with the same hash
+// used the identical policy even if the ledger evidence they scored differed.
 type Decision struct {
 	Objective  string
 	JobID      string
 	JobType    string
+	RiskClass  string
+	PolicyHash string
 	Selected   string
 	Candidates []ScoredCandidate
 }
@@ -143,6 +157,13 @@ type Decision struct {
 type Router struct {
 	Health HealthSource
 	Binary func(name string) bool
+	// ModelCapability overlays operator-declared model facts (vision, tool
+	// calling, locality, context/output limits) onto a candidate's static
+	// capability profile. nil = defaultModelCapability, which reads
+	// config.Current().Backends[name] once per Resolve call. Tests inject a
+	// stub so requirement checks never depend on the host's real config.yaml
+	// (the same reason Binary is injectable).
+	ModelCapability func(name string, base agents.Capability) agents.Capability
 }
 
 // Resolve evaluates every candidate and returns a Decision. It never returns
@@ -154,7 +175,11 @@ func (r Router) Resolve(db *sql.DB, req Request) (Decision, error) {
 	if objective == "" {
 		objective = "balanced"
 	}
-	weights := objectiveWeights(objective)
+	weights := riskAdjustedWeights(objectiveWeights(objective), req.RiskClass)
+	// Loaded once per decision (not once per candidate): config.Current()
+	// re-reads config.yaml from disk, and a decision only has a handful of
+	// candidates.
+	cfg := config.Current()
 	candidates := r.candidatePool(req.Candidates)
 	lineageAgent, err := lineageAgentFor(db, req.RepairLineage)
 	if err != nil {
@@ -162,7 +187,7 @@ func (r Router) Resolve(db *sql.DB, req Request) (Decision, error) {
 	}
 	scored := make([]ScoredCandidate, 0, len(candidates))
 	for _, name := range candidates {
-		scored = append(scored, r.evaluate(db, name, req, weights, lineageAgent))
+		scored = append(scored, r.evaluate(db, name, req, weights, lineageAgent, cfg))
 	}
 	// cost is normalized across the non-excluded pool, so a second pass fills
 	// CostScore and recomputes Total for the survivors once every raw cost is
@@ -174,6 +199,8 @@ func (r Router) Resolve(db *sql.DB, req Request) (Decision, error) {
 		Objective:  objective,
 		JobID:      req.JobID,
 		JobType:    req.JobType,
+		RiskClass:  req.RiskClass,
+		PolicyHash: policyHash(weights, req),
 		Selected:   selectedAgent(scored),
 		Candidates: orderForDisplay(scored),
 	}, nil
@@ -221,6 +248,18 @@ func (r Router) binaryProbe() func(string) bool {
 	return defaultBinaryPresent
 }
 
+// modelCapability overlays operator-declared model facts onto base. The
+// default path reads cfg.Backends[name] (a zero-value config.Backend when
+// the operator declared nothing, leaving every model field at its
+// fail-closed default — see agents.WithConfiguredModel); r.ModelCapability
+// overrides it so tests never depend on the host's real config.yaml.
+func (r Router) modelCapability(cfg config.Config, name string, base agents.Capability) agents.Capability {
+	if r.ModelCapability != nil {
+		return r.ModelCapability(name, base)
+	}
+	return agents.WithConfiguredModel(base, cfg.Backends[name])
+}
+
 // defaultBinaryPresent is the S1 binary-health floor: the backend's configured
 // binary resolves in PATH. It runs no --help/--version probe (that flag-drift
 // check is the doctor's job, surfaced through the Session 2 breaker), so it is
@@ -247,18 +286,36 @@ func (closedHealth) Quota(string) QuotaSnapshot     { return QuotaSnapshot{Avail
 
 // evaluate scores one candidate. Hard exclusions (capability, binary, OPEN
 // breaker) mark the candidate Excluded and short-circuit the soft scores.
-func (r Router) evaluate(db *sql.DB, name string, req Request, w weightSet, lineageAgent string) ScoredCandidate {
+func (r Router) evaluate(db *sql.DB, name string, req Request, w weightSet, lineageAgent string, cfg config.Config) ScoredCandidate {
 	candidate := ScoredCandidate{Agent: name}
 	cap, err := agents.New(name)
 	if err != nil {
 		return excluded(candidate, "unknown backend")
 	}
-	capability := cap.Capabilities()
+	capability := r.modelCapability(cfg, name, cap.Capabilities())
 	if req.Requirements.NativeSandbox && !capability.NativeSandbox {
 		return excluded(candidate, "native_sandbox required")
 	}
 	if req.Requirements.NetworkControl && !capability.NetworkControl {
 		return excluded(candidate, "network_control required")
+	}
+	if req.Requirements.ReadOnlyMode && !capability.NativeReadOnly {
+		return excluded(candidate, "read_only_mode required")
+	}
+	if req.Requirements.Vision && !capability.Vision {
+		return excluded(candidate, "vision required")
+	}
+	if req.Requirements.ToolCalling && !capability.ToolCalling {
+		return excluded(candidate, "tool_calling required")
+	}
+	if req.Requirements.LocalOnly && !capability.LocalOnly {
+		return excluded(candidate, "local_only required")
+	}
+	if req.Requirements.MinContextTokens > 0 && capability.ContextTokens < req.Requirements.MinContextTokens {
+		return excluded(candidate, fmt.Sprintf("min_context_tokens required (need >= %d, have %d)", req.Requirements.MinContextTokens, capability.ContextTokens))
+	}
+	if req.Requirements.MinOutputTokens > 0 && capability.OutputTokens < req.Requirements.MinOutputTokens {
+		return excluded(candidate, fmt.Sprintf("min_output_tokens required (need >= %d, have %d)", req.Requirements.MinOutputTokens, capability.OutputTokens))
 	}
 	if !r.binaryProbe()(name) {
 		return excluded(candidate, "binary_missing")
@@ -317,6 +374,55 @@ func objectiveWeights(objective string) weightSet {
 	default: // "balanced" and any unrecognized value (validation rejects those)
 		return weightSet{validRate: 0.30, severity: 0.15, cost: 0.25, breaker: 0.10, quota: 0.05, affinity: 0.15}
 	}
+}
+
+// riskAdjustedWeights nudges the objective's weights toward reliability for a
+// risky job by moving a bounded slice of the cost weight onto valid-rate,
+// severity, and breaker — the three reliability components — split
+// proportionally (50/30/20) so the total stays exactly 1.0. It never touches
+// quota or affinity (rule 3: infra/quality signals stay separate from
+// anything risk-flavored) and never bypasses a hard exclusion — only soft
+// scores among survivors move. "low" and an unset RiskClass are a deliberate
+// no-op: unset keeps every prior agent: auto contract routing exactly as it
+// did before RiskClass existed, and "low" means "score this the way the
+// chosen objective already would."
+func riskAdjustedWeights(w weightSet, risk string) weightSet {
+	var shift float64
+	switch risk {
+	case "high":
+		shift = 0.15
+	case "medium":
+		shift = 0.05
+	default: // "low", "", and any unrecognized value (validation rejects those)
+		return w
+	}
+	if shift > w.cost {
+		shift = w.cost
+	}
+	w.cost -= shift
+	w.validRate += shift * 0.5
+	w.severity += shift * 0.3
+	w.breaker += shift * 0.2
+	return w
+}
+
+// policyHash fingerprints the exact scoring weights and requirement set
+// behind a decision: a short hex digest an operator (or `gov route
+// --explain`) can compare across two decisions to confirm they used the
+// identical policy, without diffing source or trusting memory of which
+// weights were live on a given day. w is the final, risk-adjusted weightSet
+// actually used to score every candidate in this decision.
+func policyHash(w weightSet, req Request) string {
+	r := req.Requirements
+	material := fmt.Sprintf(
+		"weights:valid=%.4f,severity=%.4f,cost=%.4f,breaker=%.4f,quota=%.4f,affinity=%.4f|"+
+			"requirements:native_sandbox=%t,network_control=%t,read_only_mode=%t,vision=%t,tool_calling=%t,local_only=%t,min_context_tokens=%d,min_output_tokens=%d",
+		w.validRate, w.severity, w.cost, w.breaker, w.quota, w.affinity,
+		r.NativeSandbox, r.NetworkControl, r.ReadOnlyMode, r.Vision, r.ToolCalling, r.LocalOnly,
+		r.MinContextTokens, r.MinOutputTokens,
+	)
+	sum := sha256.Sum256([]byte(material))
+	return hex.EncodeToString(sum[:8]) // 16 hex chars (64 bits): enough to spot drift, short enough for a ledger row / CLI table
 }
 
 func totalScore(c ScoredCandidate, w weightSet) float64 {
@@ -573,7 +679,8 @@ var ErrNoCandidate = fmt.Errorf("route broker: no candidate satisfies the contra
 // Format renders a Decision as the table `gov route --explain` prints.
 func (d Decision) Format() string {
 	var b strings.Builder
-	fmt.Fprintf(&b, "objective=%s job_type=%s selected=%s\n", d.Objective, d.JobType, orDash(d.Selected))
+	fmt.Fprintf(&b, "objective=%s risk_class=%s job_type=%s policy_hash=%s selected=%s\n",
+		d.Objective, orDash(d.RiskClass), d.JobType, d.PolicyHash, orDash(d.Selected))
 	b.WriteString("agent\ttotal\tvalid_rate\tseverity\tcost\tbreaker\tquota\taffinity\texcluded\treason\n")
 	for _, c := range d.Candidates {
 		selected := ""

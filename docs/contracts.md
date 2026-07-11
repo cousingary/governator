@@ -41,7 +41,7 @@ A job contract is strict YAML: unknown fields, multiple documents, malformed pat
 | `produces` | Optional typed handoff artifacts: `{name, path, schema, max_bytes}`. Paths must be under `.governator/artifacts/`; artifacts are copied to the ledger store and never merged. |
 | `consumes` | Optional artifact names this job requires from `depends_on` ancestors in a validated plan. |
 | `depends_on` | Optional, plan-authoring only. Names sibling `job_id`s within a `gov plan` manifest that must complete first. |
-| `risk_class` | Optional, plan-authoring only. `low`, `medium`, or `high` — a coarse tier `gov plan --show` renders per job. |
+| `risk_class` | Optional. `low`, `medium`, or `high` — a coarse tier `gov plan --show` renders per job, and (paired with `agent: auto`) the route broker reads too, nudging scoring toward reliability over cost. See [docs/routing.md](routing.md#risk_class-scoring). |
 | `on_violation` | `quarantine`; unsupported actions are rejected during validation. |
 
 All path patterns are repository-relative and may not escape with `..`. Read-only modes are `scout`, `verifier`, and `architect`. `planner` writes only inside its own `gov plan --out` directory, never the target repository. Governator rejects direct-root execution and unimplemented violation actions rather than accepting policy it cannot enforce.
@@ -142,6 +142,10 @@ routing:
   fallback: infrastructure_only
   requirements:
     native_sandbox: true
+    # read_only_mode, vision, tool_calling, local_only, min_context_tokens,
+    # min_output_tokens are also available — see docs/routing.md.
+risk_class: low                 # low | medium | high; optional, shifts scoring toward
+                                 # reliability when paired with agent: auto
 ```
 
 `agent: auto` defers backend selection to the route broker (`internal/router`):
@@ -153,13 +157,18 @@ overrides an operator's explicit choice. A `routing:` block is only valid with
 
 `requirements` are **hard capability filters**: if no healthy candidate
 satisfies them the job refuses to run rather than silently widening the pool.
-`objective` shifts score weights but never bypasses a hard exclusion.
-`max_attempts` caps the infrastructure-only fallback chain (0 defaults to 2;
-values above 3 are rejected); fallback only retries when the failed attempt left
-the worktree unchanged and executed no tools. See [docs/routing.md](routing.md)
-for the score components, weight tables, and the v1.2 session roadmap. `gov
-route --explain <contract.yaml>` previews the scored decision without
-launching.
+`native_sandbox`, `network_control`, and `read_only_mode` check the backend's
+CLI wrapper; `vision`, `tool_calling`, `local_only`, `min_context_tokens`, and
+`min_output_tokens` check the model the operator has configured for that
+backend (`config.yaml` `backends.<name>`) and default to unsupported/zero
+until declared. `objective` and `risk_class` both shift score weights but
+neither ever bypasses a hard exclusion. `max_attempts` caps the
+infrastructure-only fallback chain (0 defaults to 2; values above 3 are
+rejected); fallback only retries when the failed attempt left the worktree
+unchanged and executed no tools. See [docs/routing.md](routing.md) for the
+score components, weight tables, `risk_class` scoring, the policy hash, and
+the session/phase roadmap. `gov route --explain <contract.yaml>` previews the
+scored decision (including its policy hash) without launching.
 
 ## Cleanup stage and doctrine
 

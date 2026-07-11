@@ -2,6 +2,8 @@ package router
 
 import (
 	"database/sql"
+	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/cousingary/governator/internal/agents"
@@ -154,6 +156,198 @@ func TestNetworkControlRequirementSelectsCodexOnly(t *testing.T) {
 	d := mustResolve(t, r, db, req)
 	if d.Selected != "codex" {
 		t.Fatalf("only codex has network_control, got %q\n%s", d.Selected, d.Format())
+	}
+}
+
+// --- Phase 1: expanded RoutingRequirements (all fail closed) ---
+
+func TestReadOnlyModeRequirementExcludesUncapable(t *testing.T) {
+	db := newLedger(t)
+	r := Router{Binary: allPresent}
+	req := baseReq("code_change")
+	req.Requirements = contracts.RoutingRequirements{ReadOnlyMode: true}
+	req.Candidates = []string{"glm", "opencode"} // neither declares native_read_only
+	d := mustResolve(t, r, db, req)
+	if d.Selected != "" {
+		t.Fatalf("expected fail-closed (no candidate has native_read_only), got %q", d.Selected)
+	}
+	for _, c := range d.Candidates {
+		if c.ExclusionReason != "read_only_mode required" {
+			t.Fatalf("expected read_only_mode exclusion, got %+v", c)
+		}
+	}
+}
+
+func TestReadOnlyModeRequirementAdmitsCapable(t *testing.T) {
+	db := newLedger(t)
+	r := Router{Binary: allPresent}
+	req := baseReq("code_change")
+	req.Requirements = contracts.RoutingRequirements{ReadOnlyMode: true}
+	req.Candidates = []string{"pi"} // declares native_read_only
+	d := mustResolve(t, r, db, req)
+	if d.Selected != "pi" {
+		t.Fatalf("pi has native_read_only; expected selection, got %q\n%s", d.Selected, d.Format())
+	}
+}
+
+func TestVisionRequirementExcludesUnconfigured(t *testing.T) {
+	// No ModelCapability override: every candidate's model fields default to
+	// the fail-closed zero value, since none is declared in config.yaml.
+	db := newLedger(t)
+	r := Router{Binary: allPresent}
+	req := baseReq("code_change")
+	req.Requirements = contracts.RoutingRequirements{Vision: true}
+	req.Candidates = []string{"claude-code"}
+	d := mustResolve(t, r, db, req)
+	if d.Selected != "" {
+		t.Fatalf("no backend declares vision by default; expected fail-closed, got %q", d.Selected)
+	}
+	if reason := d.Candidates[0].ExclusionReason; reason != "vision required" {
+		t.Fatalf("expected vision exclusion, got %q", reason)
+	}
+}
+
+func TestVisionRequirementAdmitsConfigured(t *testing.T) {
+	db := newLedger(t)
+	r := Router{
+		Binary: allPresent,
+		ModelCapability: func(name string, base agents.Capability) agents.Capability {
+			if name == "claude-code" {
+				base.Vision = true
+			}
+			return base
+		},
+	}
+	req := baseReq("code_change")
+	req.Requirements = contracts.RoutingRequirements{Vision: true}
+	req.Candidates = []string{"claude-code", "codex"}
+	d := mustResolve(t, r, db, req)
+	if d.Selected != "claude-code" {
+		t.Fatalf("only claude-code is configured with vision, got %q\n%s", d.Selected, d.Format())
+	}
+}
+
+func TestToolCallingRequirementExcludesUnconfigured(t *testing.T) {
+	db := newLedger(t)
+	r := Router{Binary: allPresent}
+	req := baseReq("code_change")
+	req.Requirements = contracts.RoutingRequirements{ToolCalling: true}
+	req.Candidates = []string{"glm"}
+	d := mustResolve(t, r, db, req)
+	if reason := d.Candidates[0].ExclusionReason; reason != "tool_calling required" {
+		t.Fatalf("expected tool_calling exclusion, got %q", reason)
+	}
+}
+
+func TestLocalOnlyRequirementExcludesUnconfigured(t *testing.T) {
+	db := newLedger(t)
+	r := Router{Binary: allPresent}
+	req := baseReq("code_change")
+	req.Requirements = contracts.RoutingRequirements{LocalOnly: true}
+	req.Candidates = []string{"pi"}
+	d := mustResolve(t, r, db, req)
+	if reason := d.Candidates[0].ExclusionReason; reason != "local_only required" {
+		t.Fatalf("expected local_only exclusion, got %q", reason)
+	}
+}
+
+func TestMinContextTokensRequirementExcludesInsufficient(t *testing.T) {
+	db := newLedger(t)
+	r := Router{
+		Binary: allPresent,
+		ModelCapability: func(name string, base agents.Capability) agents.Capability {
+			base.ContextTokens = 1000
+			return base
+		},
+	}
+	req := baseReq("code_change")
+	req.Requirements = contracts.RoutingRequirements{MinContextTokens: 5000}
+	req.Candidates = []string{"claude-code"}
+	d := mustResolve(t, r, db, req)
+	if d.Selected != "" {
+		t.Fatalf("1000 < 5000 required context tokens; expected fail-closed, got %q", d.Selected)
+	}
+	if reason := d.Candidates[0].ExclusionReason; reason != "min_context_tokens required (need >= 5000, have 1000)" {
+		t.Fatalf("unexpected exclusion reason %q", reason)
+	}
+}
+
+func TestMinContextTokensRequirementAdmitsSufficient(t *testing.T) {
+	db := newLedger(t)
+	r := Router{
+		Binary: allPresent,
+		ModelCapability: func(name string, base agents.Capability) agents.Capability {
+			base.ContextTokens = 200000
+			return base
+		},
+	}
+	req := baseReq("code_change")
+	req.Requirements = contracts.RoutingRequirements{MinContextTokens: 5000}
+	req.Candidates = []string{"claude-code"}
+	d := mustResolve(t, r, db, req)
+	if d.Selected != "claude-code" {
+		t.Fatalf("200000 >= 5000; expected selection, got %q\n%s", d.Selected, d.Format())
+	}
+}
+
+func TestMinOutputTokensRequirementExcludesInsufficient(t *testing.T) {
+	db := newLedger(t)
+	r := Router{
+		Binary: allPresent,
+		ModelCapability: func(name string, base agents.Capability) agents.Capability {
+			base.OutputTokens = 100
+			return base
+		},
+	}
+	req := baseReq("code_change")
+	req.Requirements = contracts.RoutingRequirements{MinOutputTokens: 8192}
+	req.Candidates = []string{"codex"}
+	d := mustResolve(t, r, db, req)
+	if d.Selected != "" {
+		t.Fatalf("100 < 8192 required output tokens; expected fail-closed, got %q", d.Selected)
+	}
+	if reason := d.Candidates[0].ExclusionReason; reason != "min_output_tokens required (need >= 8192, have 100)" {
+		t.Fatalf("unexpected exclusion reason %q", reason)
+	}
+}
+
+func TestMinOutputTokensRequirementAdmitsSufficient(t *testing.T) {
+	db := newLedger(t)
+	r := Router{
+		Binary: allPresent,
+		ModelCapability: func(name string, base agents.Capability) agents.Capability {
+			base.OutputTokens = 16384
+			return base
+		},
+	}
+	req := baseReq("code_change")
+	req.Requirements = contracts.RoutingRequirements{MinOutputTokens: 8192}
+	req.Candidates = []string{"codex"}
+	d := mustResolve(t, r, db, req)
+	if d.Selected != "codex" {
+		t.Fatalf("16384 >= 8192; expected selection, got %q\n%s", d.Selected, d.Format())
+	}
+}
+
+// defaultModelCapability's own default path (no ModelCapability override)
+// reads real config.yaml through config.Current() — exercised once here via
+// GOV_CONFIG pointed at a temp file, so the rest of the suite can safely
+// stay isolated from the host's actual config.yaml via explicit injection.
+func TestDefaultModelCapabilityReadsConfigFile(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "config.yaml")
+	if err := os.WriteFile(cfgPath, []byte("backends:\n  claude-code:\n    vision: true\n    context_tokens: 200000\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("GOV_CONFIG", cfgPath)
+	db := newLedger(t)
+	r := Router{Binary: allPresent} // no ModelCapability override
+	req := baseReq("code_change")
+	req.Requirements = contracts.RoutingRequirements{Vision: true, MinContextTokens: 100000}
+	req.Candidates = []string{"claude-code", "codex"}
+	d := mustResolve(t, r, db, req)
+	if d.Selected != "claude-code" {
+		t.Fatalf("config.yaml declares claude-code vision+context_tokens; expected selection, got %q\n%s", d.Selected, d.Format())
 	}
 }
 
@@ -377,5 +571,110 @@ func TestSeverityWeightDefaultsUnknownToMedium(t *testing.T) {
 	}
 	if w := severityWeight("SCOPE_DRIFT"); w != 1.0 {
 		t.Fatalf("SCOPE_DRIFT weight = %v, want 1.0", w)
+	}
+}
+
+// --- Phase 1: RiskClass scoring ---
+
+func weightSum(w weightSet) float64 {
+	return w.validRate + w.severity + w.cost + w.breaker + w.quota + w.affinity
+}
+
+func TestRiskAdjustedWeightsHighMovesCostToReliability(t *testing.T) {
+	base := objectiveWeights("cheapest")
+	adjusted := riskAdjustedWeights(base, "high")
+	if adjusted.cost >= base.cost {
+		t.Fatalf("high risk must reduce cost weight, base=%.4f adjusted=%.4f", base.cost, adjusted.cost)
+	}
+	if adjusted.validRate <= base.validRate || adjusted.severity <= base.severity || adjusted.breaker <= base.breaker {
+		t.Fatalf("high risk must raise validRate/severity/breaker weights, base=%+v adjusted=%+v", base, adjusted)
+	}
+	if adjusted.quota != base.quota || adjusted.affinity != base.affinity {
+		t.Fatalf("high risk must not touch quota/affinity (rule 3), base=%+v adjusted=%+v", base, adjusted)
+	}
+	if sum := weightSum(adjusted); sum < 0.9999 || sum > 1.0001 {
+		t.Fatalf("weights must still sum to 1.0, got %.10f", sum)
+	}
+}
+
+func TestRiskAdjustedWeightsLowAndUnsetAreNoOp(t *testing.T) {
+	base := objectiveWeights("balanced")
+	for _, risk := range []string{"", "low"} {
+		if got := riskAdjustedWeights(base, risk); got != base {
+			t.Fatalf("risk=%q must be a no-op, base=%+v got=%+v", risk, base, got)
+		}
+	}
+}
+
+func TestRiskAdjustedWeightsShiftClampsToAvailableCostWeight(t *testing.T) {
+	// most_reliable already keeps cost weight low (0.05); the nominal 0.15
+	// high-risk shift must clamp to what's actually there rather than driving
+	// cost negative.
+	base := objectiveWeights("most_reliable")
+	adjusted := riskAdjustedWeights(base, "high")
+	if adjusted.cost < 0 {
+		t.Fatalf("cost weight must never go negative, got %.4f", adjusted.cost)
+	}
+	if sum := weightSum(adjusted); sum < 0.9999 || sum > 1.0001 {
+		t.Fatalf("weights must sum to 1.0 even when clamped, got %.10f", sum)
+	}
+}
+
+func TestResolveAppliesRiskClassToScoring(t *testing.T) {
+	// claude-code is reliable but priciest; glm is cheap but unreliable.
+	// Under plain "cheapest" the heavy cost weight lets glm win despite its
+	// poor valid-rate. risk_class: high should raise claude-code's score
+	// (never glm's exclusion status — only soft scores move).
+	db := newLedger(t)
+	seedProfile(t, db, "claude-code", "code_change", 10, 10, 0)
+	seedProfile(t, db, "glm", "code_change", 10, 2, 8)
+	r := Router{Binary: allPresent}
+	req := baseReq("code_change")
+	req.Objective = "cheapest"
+	req.MaxTokens = 1_000_000
+	req.Candidates = []string{"claude-code", "glm"}
+
+	plain := mustResolve(t, r, db, req)
+	req.RiskClass = "high"
+	risky := mustResolve(t, r, db, req)
+
+	if risky.RiskClass != "high" {
+		t.Fatalf("expected RiskClass recorded on the decision, got %q", risky.RiskClass)
+	}
+	if risky.PolicyHash == plain.PolicyHash {
+		t.Fatalf("risk_class must change the effective policy hash")
+	}
+	claudeTotal := func(d Decision) float64 {
+		for _, c := range d.Candidates {
+			if c.Agent == "claude-code" {
+				return c.Total
+			}
+		}
+		t.Fatal("claude-code candidate missing from decision")
+		return 0
+	}
+	if claudeTotal(risky) <= claudeTotal(plain) {
+		t.Fatalf("high risk_class must raise the reliable candidate's score, plain=%.4f risky=%.4f", claudeTotal(plain), claudeTotal(risky))
+	}
+}
+
+// --- Phase 1: policy hash ---
+
+func TestPolicyHashDeterministicAndSensitiveToRequirements(t *testing.T) {
+	db := newLedger(t)
+	r := Router{Binary: allPresent}
+	req := baseReq("code_change")
+	d1 := mustResolve(t, r, db, req)
+	d2 := mustResolve(t, r, db, req)
+	if d1.PolicyHash == "" {
+		t.Fatal("expected a non-empty policy hash")
+	}
+	if d1.PolicyHash != d2.PolicyHash {
+		t.Fatalf("identical policy must hash identically, got %q vs %q", d1.PolicyHash, d2.PolicyHash)
+	}
+	req.Requirements = contracts.RoutingRequirements{NativeSandbox: true}
+	d3 := mustResolve(t, r, db, req)
+	if d3.PolicyHash == d1.PolicyHash {
+		t.Fatal("a different requirement set must change the policy hash")
 	}
 }

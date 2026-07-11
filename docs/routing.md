@@ -19,9 +19,14 @@ These govern every routing decision and every future session of the plan:
 1. **Fail closed.** If a contract requires a capability (sandbox, network
    control, vision) and no healthy candidate satisfies it, the job refuses to
    run with a clear error. The pool is never silently widened.
-2. **Structured signals only.** The broker routes on `job_type`, `mode`,
-   `risk_class`, budgets, capability requirements, and ledger evidence. It
-   never sniffs task text.
+2. **Structured signals only.** The broker routes on `job_type`, `risk_class`,
+   budgets, capability requirements, and ledger evidence. It never sniffs task
+   text. `mode` is carried on every `Request` for downstream context (e.g.
+   `gov route --explain` display) but is deliberately score-neutral: it is not
+   one of the "structured signals" above. `risk_class` is the intended lever
+   for "route this one more conservatively" — see [RiskClass
+   scoring](#risk_class-scoring) — so a second, implicit mode-based nudge would
+   just make decisions harder to explain from the ledger alone (rule 4).
 3. **Infrastructure failures and quality failures are separate metrics.** A
    provider outage must never lower an agent's quality score; bad output must
    never open a circuit breaker.
@@ -47,12 +52,31 @@ routing:               # optional; only valid with agent: auto
   requirements:                           # HARD capability filters — fail closed
     native_sandbox: true
     network_control: false
+    read_only_mode: false     # requires agents.Capability.NativeReadOnly
+    vision: false              # requires config.yaml backends.<name>.vision
+    tool_calling: false        # requires config.yaml backends.<name>.tool_calling
+    local_only: false          # requires config.yaml backends.<name>.local_only
+    min_context_tokens: 0      # requires config.yaml backends.<name>.context_tokens >= N
+    min_output_tokens: 0       # requires config.yaml backends.<name>.output_tokens >= N
+risk_class: low         # low | medium | high; optional, see risk_class scoring below
 ```
 
 A `routing:` block paired with an explicit agent is an **error**, not a warning
 — an explicit agent is the operator overriding the broker, so the combination
 is ambiguous. `agent: auto` without a `routing:` block routes over every
 registered backend under the balanced default.
+
+`requirements` splits into two kinds. `native_sandbox`, `network_control`, and
+`read_only_mode` check fixed properties of the backend's CLI wrapper
+(`agents.Capability`'s static fields, set once per adapter in
+`internal/agents`). `vision`, `tool_calling`, `local_only`,
+`min_context_tokens`, and `min_output_tokens` check the underlying *model* the
+operator has pointed the backend at — Governator never guesses these from a
+binary name, since the same CLI wrapper can run different models over time.
+They default to unsupported/zero and are satisfied only by an explicit
+`backends.<name>` declaration in `config.yaml` (`gov init` scaffolds a
+commented example under each backend's block); an unmet requirement fails
+closed exactly like a missing native capability.
 
 ### Score components
 
@@ -64,11 +88,17 @@ from the ledger alone:
 | valid-output rate | `agent_profiles(agent, job_type)` | soft |
 | failure-taxonomy severity | `runs` failure taxonomy (quality kinds only) | soft |
 | estimated cost | `internal/spend/estimate.go` (`max_tokens` × $/1M-tok) | soft, normalized across the pool |
-| capability fit | `agents.Capability` vs `requirements` | **hard exclusion** |
+| capability fit (`native_sandbox`, `network_control`, `read_only_mode`) | `agents.Capability`'s static fields vs `requirements` | **hard exclusion** |
+| model fit (`vision`, `tool_calling`, `local_only`, `min_context_tokens`, `min_output_tokens`) | `config.yaml` `backends.<name>` vs `requirements` | **hard exclusion** |
 | binary health | `config.BackendBin` + PATH presence (S1 floor) | **hard exclusion** |
 | breaker state | `HealthSource.Breaker` (live via `breaker.Store`) | OPEN = exclusion, DEGRADED = penalty |
 | quota headroom | `HealthSource.Quota` from `quota_windows` | soft when telemetry available |
 | repair-lineage affinity | the backend that ran the root of the lineage | soft (repair jobs only) |
+| `risk_class` | `Contract.RiskClass` (also `gov plan --show`'s risk tier) | soft — shifts weights, see below |
+
+`mode` is **not** a score component: it is carried on `Request` for context
+(e.g. `gov route --explain` display) but never read by `evaluate` or any
+weight function. See standing rule 2.
 
 Cost is min-max normalized across the **non-excluded** candidates: cheapest
 survivor scores 1.0, most expensive 0.0. A single survivor has no peer and
@@ -82,12 +112,47 @@ The `objective` shifts weights but **never bypasses a hard exclusion**:
 | cheapest | 0.20 | 0.10 | 0.55 | 0.05 | 0.05 | 0.05 |
 | most_reliable | 0.35 | 0.30 | 0.05 | 0.20 | 0.05 | 0.05 |
 
-In v1.2 the breaker and quota weights are live when their telemetry exists;
-missing quota telemetry stays neutral rather than penalizing a backend.
+The breaker and quota weights are live when their telemetry exists; missing
+quota telemetry stays neutral rather than penalizing a backend.
 
 A backend with **no ledger evidence** is treated as neutral (0.5 valid rate,
 1.0 severity): a brand-new backend is neither penalized for being unproven nor
 rewarded over a proven one. Ties break by ascending name for reproducibility.
+
+### `risk_class` scoring
+
+`risk_class` (`low`, `medium`, `high`) is optional on every contract —
+`gov plan --show` has always rendered it as a plan-authoring tier, and the
+route broker (`internal/router.riskAdjustedWeights`) now reads it too when
+paired with `agent: auto`. It moves a bounded slice of the objective's cost
+weight onto the three reliability components — valid rate, failure severity,
+and breaker state — split 50/30/20 so the total always still sums to 1.0. It
+never touches quota or affinity (rule 3 keeps infra/quality signals separate
+from anything risk-flavored) and never bypasses a hard exclusion — only soft
+scores among survivors move.
+
+| `risk_class` | cost shift | applied to (validRate / severity / breaker) |
+|---|---|---|
+| unset or `low` | none (no-op) | — |
+| `medium` | up to 0.05 | 50% / 30% / 20% of the shift |
+| `high` | up to 0.15 | 50% / 30% / 20% of the shift |
+
+The shift clamps to whatever cost weight the chosen `objective` actually has
+(e.g. `most_reliable`'s cost weight is already 0.05, so `high` there clamps to
+a 0.05 shift, not the nominal 0.15). An unset `risk_class` is a deliberate
+no-op: every `agent: auto` contract that predates this field routes exactly as
+it did before.
+
+### Policy hash
+
+Every decision carries a `PolicyHash` — a 16-hex-character SHA-256 digest
+(`internal/router.policyHash`) over the exact post-risk-adjustment scoring
+weights and the requirement set used to produce it. Two decisions with the
+same hash used the identical policy even if the ledger evidence they scored
+differed; a changed hash between two otherwise-similar decisions is the
+tripwire for an unnoticed weight or requirement change. `gov route --explain`
+prints it in the header line (`policy_hash=...`), and it is recorded on every
+`route_decisions` row (see Ledger below).
 
 ### Wiring
 
@@ -104,7 +169,7 @@ A new additive `route_decisions` table records one row per candidate per
 decision:
 
 ```
-run_id, job_id, job_type, objective, candidate,
+run_id, job_id, job_type, objective, policy_hash, candidate,
 valid_rate_score, failure_severity_score, cost_score,
 breaker_score, quota_score, repair_affinity_score, total,
 excluded, exclusion_reason, selected, preview, created
@@ -239,6 +304,37 @@ each with a regression test:
 6. **Hazardous dead tail** — the fallback loop's unreachable trailing
    `runOnce` would, if ever reached, have launched an extra unledgered
    attempt; the loop now provably returns from inside.
+
+## Phase 1 — Router contract repair (`v1.3-hardening`, 2026-07-11)
+
+The v1.3 hardening plan's Phase 1 closed a set of doc/implementation gaps a
+benchmark audit found in the v1.2 routing spine (see
+`agents/governator_hardening_plan.md`):
+
+1. **`RoutingRequirements` expanded** from two fields (`native_sandbox`,
+   `network_control`) to eight: `read_only_mode`, `vision`, `tool_calling`,
+   `local_only`, `min_context_tokens`, `min_output_tokens` join them, all
+   fail-closed. See the contract-surface example and score-components table
+   above for the split between CLI-wrapper facts (checked against
+   `agents.Capability`) and model facts (checked against `config.yaml`
+   `backends.<name>`, via the new `agents.WithConfiguredModel` overlay).
+2. **`RiskClass` now feeds scoring.** Previously plan-authoring-only
+   (`gov plan --show`'s risk tier), `Contract.RiskClass` is now also read by
+   the router when paired with `agent: auto` — see [`risk_class`
+   scoring](#risk_class-scoring) above. Unset stays a no-op, so no prior
+   contract routes differently.
+3. **`Mode` confirmed score-neutral**, not wired into scoring. Standing rule 2
+   above and the score-components table now say so explicitly instead of
+   claiming `mode` as a routing signal it never was.
+4. **Policy hash** — every decision now carries `PolicyHash` (see [Policy
+   hash](#policy-hash) above), persisted as a new `policy_hash` column on
+   `route_decisions` (migration: `ALTER TABLE ... ADD COLUMN`, empty-string
+   default on pre-existing rows, since those decisions were never actually
+   fingerprinted).
+5. **Per-candidate exclusion reasons** were already persisted in
+   `route_decisions.exclusion_reason` since Session 1 — the new hard
+   requirements simply add more `excluded(...)` call sites, which flow through
+   the same existing plumbing.
 
 ## Roadmap (subsequent sessions)
 

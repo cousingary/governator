@@ -178,3 +178,26 @@ func TestRecordRouteDecisionPersistsOneRowPerCandidate(t *testing.T) {
 		t.Fatalf("expected exactly one selected row, got %d", selCount)
 	}
 }
+
+func TestRecordRouteDecisionPersistsPolicyHash(t *testing.T) {
+	home := t.TempDir()
+	db, err := Open(home)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := RecordRouteDecision(db, RouteDecisionRecord{
+		RunID: "run-2", JobID: "j", JobType: "code", Objective: "balanced",
+		PolicyHash: "deadbeef01234567", Preview: false, Created: "2026-07-11T00:00:00Z",
+		Rows: []RouteDecisionRow{{Candidate: "claude-code", Total: 0.9, Selected: true}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var got string
+	if err := db.QueryRow(`SELECT policy_hash FROM route_decisions WHERE run_id='run-2'`).Scan(&got); err != nil {
+		t.Fatal(err)
+	}
+	if got != "deadbeef01234567" {
+		t.Fatalf("policy_hash not persisted, got %q", got)
+	}
+}

@@ -101,9 +101,29 @@ func (r *Routing) EffectiveMaxAttempts() int {
 // RoutingRequirements are hard capability filters. Every set field must be
 // satisfied by a candidate's agents.Capability or the candidate is excluded;
 // if none remain the broker fails closed.
+//
+// NativeSandbox, NetworkControl, and ReadOnlyMode check fixed properties of
+// the backend's CLI wrapper (agents.Capability's static fields). Vision,
+// ToolCalling, LocalOnly, MinContextTokens, and MinOutputTokens check the
+// underlying *model* the operator has pointed the backend at — Governator
+// never guesses those from a binary name, since the same CLI wrapper can run
+// different models over time. They are satisfied only by an explicit
+// backends.<name> declaration in config.yaml (see docs/routing.md); absent a
+// declaration every candidate reports unsupported/zero, so an unmet
+// requirement fails closed rather than silently passing.
 type RoutingRequirements struct {
 	NativeSandbox  bool `yaml:"native_sandbox,omitempty" json:"native_sandbox,omitempty"`
 	NetworkControl bool `yaml:"network_control,omitempty" json:"network_control,omitempty"`
+	ReadOnlyMode   bool `yaml:"read_only_mode,omitempty" json:"read_only_mode,omitempty"`
+	Vision         bool `yaml:"vision,omitempty" json:"vision,omitempty"`
+	ToolCalling    bool `yaml:"tool_calling,omitempty" json:"tool_calling,omitempty"`
+	LocalOnly      bool `yaml:"local_only,omitempty" json:"local_only,omitempty"`
+
+	// MinContextTokens and MinOutputTokens are minimum thresholds, not flags:
+	// zero means "no minimum," so a contract with neither set behaves exactly
+	// as before this field existed.
+	MinContextTokens int `yaml:"min_context_tokens,omitempty" json:"min_context_tokens,omitempty"`
+	MinOutputTokens  int `yaml:"min_output_tokens,omitempty" json:"min_output_tokens,omitempty"`
 }
 
 // ArtifactSpec declares a typed handoff artifact a job produces. Artifacts
@@ -157,14 +177,21 @@ type Contract struct {
 	// not part of job YAML, prompts, or ContractHash.
 	ArtifactSources map[string]string `yaml:"-" json:"-"`
 
-	// DependsOn and RiskClass are plan-authoring metadata: a `gov plan`
-	// manifest's sub-contracts use them to declare execution order
-	// (`gov batch run --ordered`) and a coarse risk tier (`gov plan --show`).
-	// Both are optional and additive — absent on every job YAML predating
-	// `gov plan`, so existing contracts keep validating unchanged. DependsOn
-	// entries name other job_ids within the same plan; cross-referencing and
-	// cycle detection happen at the plan level (ValidatePlan), not here,
-	// since a single contract can't see its siblings.
+	// DependsOn is plan-authoring metadata: a `gov plan` manifest's
+	// sub-contracts use it to declare execution order (`gov batch run
+	// --ordered`). Optional and additive — absent on every job YAML predating
+	// `gov plan`, so existing contracts keep validating unchanged. Entries
+	// name other job_ids within the same plan; cross-referencing and cycle
+	// detection happen at the plan level (ValidatePlan), not here, since a
+	// single contract can't see its siblings.
+	//
+	// RiskClass is a coarse operator-declared tier (low, medium, high),
+	// optional on every contract. `gov plan --show` renders it per job, and
+	// (Phase 1) the route broker reads it too: paired with agent: auto it
+	// nudges scoring toward reliability over cost the way `most_reliable`
+	// does for objective, without requiring the operator to give up their
+	// chosen objective to say "but this one is risky." An unset RiskClass is
+	// scoring-neutral, so no prior agent: auto contract routes differently.
 	DependsOn []string `yaml:"depends_on,omitempty" json:"depends_on,omitempty"`
 	RiskClass string   `yaml:"risk_class,omitempty" json:"risk_class,omitempty"`
 
@@ -506,6 +533,12 @@ func validateRouting(c Contract, add func(string, string)) {
 		if !validAgents[trimmed] {
 			add(field, "must name a known backend (claude-code, claude, codex, glm, opencode, pi)")
 		}
+	}
+	if r.Requirements.MinContextTokens < 0 {
+		add("routing.requirements.min_context_tokens", "must be zero or greater")
+	}
+	if r.Requirements.MinOutputTokens < 0 {
+		add("routing.requirements.min_output_tokens", "must be zero or greater")
 	}
 }
 

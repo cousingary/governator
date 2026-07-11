@@ -2,6 +2,48 @@
 
 All notable changes to Governator are documented here.
 
+## [Unreleased] — v1.3 hardening (branch `v1.3-hardening`)
+
+Closing gaps a benchmark audit found in the v1.2 routing spine. See
+`agents/governator_hardening_plan.md` for the full phased plan; this section
+grows per phase.
+
+### Phase 0 — Release hygiene
+
+Replaced `SECURITY.md`'s placeholder contact; synced `README.md`'s command
+list to exactly match `gov --help`; corrected router/docs comments that still
+called the breaker/quota `HealthSource` a Session 2/4 "stub" when
+`breaker.Store` (the real ledger-backed implementation) has been live in both
+`runtime.Run` and `gov route --explain` since those sessions shipped.
+
+### Phase 1 — Router contract repair
+
+- `RoutingRequirements` expanded from two fields to eight: `read_only_mode`,
+  `vision`, `tool_calling`, `local_only`, `min_context_tokens`, and
+  `min_output_tokens` join `native_sandbox`/`network_control`, all fail-closed.
+  The first three check `agents.Capability`'s static CLI-wrapper fields; the
+  model-dependent ones (`vision`/`tool_calling`/`local_only`/
+  `min_context_tokens`/`min_output_tokens`) are satisfied only by an explicit
+  `config.yaml` `backends.<name>` declaration (new `agents.WithConfiguredModel`
+  overlay) — Governator never guesses model facts from a binary name.
+- `Contract.RiskClass` (previously plan-authoring-only, feeding `gov plan
+  --show`'s risk tier) now also feeds the route broker when paired with
+  `agent: auto`: `internal/router.riskAdjustedWeights` shifts a bounded slice
+  of the objective's cost weight onto valid-rate/severity/breaker for
+  `medium`/`high` risk jobs. Unset stays a no-op, so no pre-existing contract
+  routes differently.
+- Every route decision now carries a `PolicyHash` (`internal/router.policyHash`,
+  a SHA-256 digest of the effective scoring weights + requirement set),
+  printed by `gov route --explain` and persisted in a new `route_decisions.
+  policy_hash` column (additive migration, empty default on pre-existing rows).
+- Confirmed and documented that `Mode` is not a router scoring signal (it
+  never was); `docs/routing.md` no longer claims otherwise.
+- Per-candidate exclusion reasons were already ledgered since Session 1; the
+  new hard requirements simply add more callers of the existing mechanism.
+
+See [docs/routing.md](docs/routing.md) for the score-components table,
+`risk_class` scoring, and the policy hash.
+
 ## [Unreleased] — v1.2 routing (branch `v1.2-routing`)
 
 The route broker closes the loop the evidence substrate always supported but
