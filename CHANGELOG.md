@@ -2,6 +2,10 @@
 
 All notable changes to Governator are documented here.
 
+## v1.4-session1
+
+Merge + release-evidence proof landed on commit `2051e9b7`.
+
 ## [Unreleased] — v1.3 hardening (branch `v1.3-hardening`)
 
 Closing gaps a benchmark audit found in the v1.2 routing spine. See
