@@ -205,3 +205,11 @@ session roadmap and standing rules; this section grows per session.
 - Phase 2: policy hardening, preflight enforcement, command classification, and secret rejection.
 - Phase 1: strict contracts, worktree execution, deterministic validation, quarantine, merge, and rollback.
 - Phase 0: initial CLI and repository scaffold.
+
+## v1.4-session1-fallback-test
+
+Safe-pre-mutation-fallback test: the first routed candidate (a stubbed
+backend simulating a real RATE_LIMIT infra failure) failed before touching
+the worktree, exactly matching fallbackEligible's preconditions (infra
+taxonomy, zero tool calls, unchanged worktree); the runtime's fallback loop
+retried the next candidate, which completed this write and was approved.
