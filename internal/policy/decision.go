@@ -3,6 +3,7 @@ package policy
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"sort"
 	"strings"
 )
@@ -121,7 +122,7 @@ func Combine(decisions ...PolicyDecision) PolicyDecision {
 	}
 	out.Sources = uniqueSorted(out.Sources)
 	out.Consulted = uniqueSorted(out.Consulted)
-	out.PolicyHash = Hash(strings.Join(out.Sources, ",") + "|" + strings.Join(out.Reasons, "|"))
+	out.PolicyHash = hashEvaluationDocument(map[string]any{"evaluator": "combine-v2", "verdict": out.Verdict, "sources": out.Sources, "reasons": out.Reasons, "consulted": out.Consulted, "inputs": decisions})
 	return out
 }
 
@@ -131,6 +132,11 @@ func Combine(decisions ...PolicyDecision) PolicyDecision {
 func Hash(material string) string {
 	sum := sha256.Sum256([]byte(material))
 	return hex.EncodeToString(sum[:8])
+}
+
+func hashEvaluationDocument(doc any) string {
+	b, _ := json.Marshal(doc)
+	return Hash(string(b))
 }
 
 // GatePolicyHash fingerprints the exact gate configuration behind an F1-F7

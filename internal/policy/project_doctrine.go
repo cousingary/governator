@@ -46,7 +46,12 @@ func LoadProjectDoctrine(workspaceRoot string) ([]ConditionRule, error) {
 	if err := decoder.Decode(&file); err != nil {
 		return nil, fmt.Errorf("decode project doctrine %s: %w", path, err)
 	}
+	seen := map[string]bool{}
 	for _, r := range file.PolicyRules {
+		if seen[r.ID] {
+			return nil, fmt.Errorf("project doctrine %s: duplicate rule id %q in project_doctrine namespace", path, r.ID)
+		}
+		seen[r.ID] = true
 		if verr := r.Validate(); verr != nil {
 			return nil, fmt.Errorf("project doctrine %s: %w", path, verr)
 		}

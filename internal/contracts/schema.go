@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 )
 
@@ -277,23 +278,24 @@ func (d *DockerRunnerConfig) IsHardened() bool {
 var validRunners = map[string]bool{"": true, "local": true, "docker": true}
 
 type Contract struct {
-	Task        string         `yaml:"task,omitempty" json:"task,omitempty"`
-	JobID       string         `yaml:"job_id" json:"job_id"`
-	JobType     string         `yaml:"job_type" json:"job_type"`
-	Agent       string         `yaml:"agent" json:"agent"`
-	Mode        Mode           `yaml:"mode" json:"mode"`
-	Workspace   Workspace      `yaml:"workspace" json:"workspace"`
-	Allowed     Permissions    `yaml:"allowed" json:"allowed"`
-	Forbidden   Forbidden      `yaml:"forbidden" json:"forbidden"`
-	Budget      Budget         `yaml:"budget" json:"budget"`
-	Preflight   Preflight      `yaml:"preflight" json:"preflight"`
-	Success     Success        `yaml:"success" json:"success"`
-	Output      *OutputPolicy  `yaml:"output,omitempty" json:"output,omitempty"`
-	Repair      *Repair        `yaml:"repair,omitempty" json:"repair,omitempty"`
-	Cleanup     *Cleanup       `yaml:"cleanup,omitempty" json:"cleanup,omitempty"`
-	Produces    []ArtifactSpec `yaml:"produces,omitempty" json:"produces,omitempty"`
-	Consumes    []string       `yaml:"consumes,omitempty" json:"consumes,omitempty"`
-	OnViolation string         `yaml:"on_violation" json:"on_violation"`
+	Task          string         `yaml:"task,omitempty" json:"task,omitempty"`
+	JobID         string         `yaml:"job_id" json:"job_id"`
+	JobType       string         `yaml:"job_type" json:"job_type"`
+	Agent         string         `yaml:"agent" json:"agent"`
+	Mode          Mode           `yaml:"mode" json:"mode"`
+	Workspace     Workspace      `yaml:"workspace" json:"workspace"`
+	Allowed       Permissions    `yaml:"allowed" json:"allowed"`
+	Forbidden     Forbidden      `yaml:"forbidden" json:"forbidden"`
+	Budget        Budget         `yaml:"budget" json:"budget"`
+	TelemetryMode string         `yaml:"telemetry_mode,omitempty" json:"telemetry_mode,omitempty"`
+	Preflight     Preflight      `yaml:"preflight" json:"preflight"`
+	Success       Success        `yaml:"success" json:"success"`
+	Output        *OutputPolicy  `yaml:"output,omitempty" json:"output,omitempty"`
+	Repair        *Repair        `yaml:"repair,omitempty" json:"repair,omitempty"`
+	Cleanup       *Cleanup       `yaml:"cleanup,omitempty" json:"cleanup,omitempty"`
+	Produces      []ArtifactSpec `yaml:"produces,omitempty" json:"produces,omitempty"`
+	Consumes      []string       `yaml:"consumes,omitempty" json:"consumes,omitempty"`
+	OnViolation   string         `yaml:"on_violation" json:"on_violation"`
 
 	// Routing shapes route-broker selection and is only meaningful with
 	// agent: auto. Validate rejects a routing block paired with an explicit
@@ -412,6 +414,15 @@ var policyRuleVerdicts = map[string]bool{"DENY": true, "ASK": true, "FLAG": true
 var policyRuleOps = map[string]bool{
 	"eq": true, "ne": true, "gt": true, "gte": true, "lt": true, "lte": true,
 	"contains": true, "matches_any": true,
+}
+
+var telemetryModes = map[string]bool{"": true, "strict": true, "estimated": true, "advisory": true}
+
+var policyFactTypes = map[string]string{
+	"risk_class": "string", "mode": "string", "backend": "string",
+	"network_enabled": "bool", "write_out_of_scope": "bool",
+	"estimated_cost_usd": "number", "daily_cap_usd": "number",
+	"unusual_infra_retry": "bool", "infra_failure_kind": "string",
 }
 
 // policyRuleFields mirrors internal/policy's validConditionFields (facts.go's
@@ -647,6 +658,9 @@ func (c Contract) Validate() error {
 	if c.Budget.MaxTokens < 0 {
 		add("budget.max_tokens", "must be zero or greater")
 	}
+	if !telemetryModes[c.TelemetryMode] {
+		add("telemetry_mode", "must be one of strict, estimated, advisory when set")
+	}
 
 	if !readOnly && len(c.Success.RequiredFiles) == 0 {
 		add("success.required_files", "must contain at least one path pattern for a write-capable mode")
@@ -852,11 +866,16 @@ func validatePolicy(c Contract, add func(string, string)) {
 	if c.Policy == nil {
 		return
 	}
+	seen := map[string]bool{}
 	for i, r := range c.Policy.Rules {
 		field := fmt.Sprintf("policy.rules[%d]", i)
-		if strings.TrimSpace(r.ID) == "" {
+		id := strings.TrimSpace(r.ID)
+		if id == "" {
 			add(field+".id", "is required")
+		} else if seen[id] {
+			add(field+".id", "duplicates another policy rule id in this source namespace")
 		}
+		seen[id] = true
 		if strings.TrimSpace(r.Reason) == "" {
 			add(field+".reason", "is required")
 		}
@@ -872,12 +891,53 @@ func validatePolicy(c Contract, add func(string, string)) {
 				add(condField+".field", "is required")
 			} else if !policyRuleFields[cond.Field] {
 				add(condField+".field", "is not a known policy fact (an unknown field would silently never match); see docs/contracts.md for the fact vocabulary")
+			} else if msg := validatePolicyConditionValue(cond.Field, cond.Op, cond.Value); msg != "" {
+				add(condField+".value", msg)
 			}
 			if !policyRuleOps[cond.Op] {
 				add(condField+".op", "must be one of eq, ne, gt, gte, lt, lte, contains, matches_any")
 			}
 		}
 	}
+}
+
+func validatePolicyConditionValue(field, op, value string) string {
+	typ := policyFactTypes[field]
+	switch op {
+	case "gt", "gte", "lt", "lte":
+		if typ != "number" {
+			return "numeric operators require a numeric policy fact"
+		}
+		if _, err := strconv.ParseFloat(strings.TrimSpace(value), 64); err != nil {
+			return "numeric operators require a numeric literal"
+		}
+	case "contains":
+		if typ != "string" {
+			return "contains requires a string policy fact"
+		}
+		if value == "" {
+			return "contains requires a non-empty literal"
+		}
+	case "matches_any":
+		if typ != "list" {
+			return "matches_any requires a list policy fact"
+		}
+		if strings.TrimSpace(value) == "" {
+			return "matches_any requires at least one pattern"
+		}
+	case "eq", "ne":
+		if typ == "bool" {
+			if _, err := strconv.ParseBool(strings.TrimSpace(value)); err != nil {
+				return "boolean policy facts require true or false"
+			}
+		}
+		if typ == "number" {
+			if _, err := strconv.ParseFloat(strings.TrimSpace(value), 64); err != nil {
+				return "numeric policy facts require a numeric literal"
+			}
+		}
+	}
+	return ""
 }
 
 // validateRunner enforces the same fail-closed pattern as validateAssay: an

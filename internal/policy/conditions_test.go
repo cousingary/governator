@@ -229,3 +229,35 @@ func TestValidateRejectsUnknownConditionField(t *testing.T) {
 		t.Fatalf("known field must validate: %v", err)
 	}
 }
+
+func TestConditionRuleValidateRejectsTypeMismatchedValues(t *testing.T) {
+	tests := []struct {
+		name string
+		rule ConditionRule
+		want string
+	}{
+		{
+			name: "numeric op with string literal",
+			rule: ConditionRule{ID: "bad-cost", When: []Condition{{Field: FactEstimatedCostUSD, Op: "gt", Value: "ten"}}, Verdict: VerdictAsk, Reason: "r"},
+			want: "numeric literal",
+		},
+		{
+			name: "contains with empty literal",
+			rule: ConditionRule{ID: "empty-backend", When: []Condition{{Field: FactBackend, Op: "contains", Value: ""}}, Verdict: VerdictAsk, Reason: "r"},
+			want: "non-empty literal",
+		},
+		{
+			name: "contains on bool fact",
+			rule: ConditionRule{ID: "bad-bool", When: []Condition{{Field: FactNetworkEnabled, Op: "contains", Value: "true"}}, Verdict: VerdictAsk, Reason: "r"},
+			want: "requires a string fact",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := tt.rule.Validate()
+			if err == nil || !strings.Contains(err.Error(), tt.want) {
+				t.Fatalf("expected error containing %q, got %v", tt.want, err)
+			}
+		})
+	}
+}

@@ -160,6 +160,65 @@ func ActivePolicyOverrides(db *sql.DB, scopeKey, now string) ([]PolicyOverride, 
 	return out, rows.Err()
 }
 
+// ClaimActivePolicyOverrides returns active overrides for scopeKey and atomically
+// claims any one-shot rows before the caller evaluates policy. This closes the
+// select-then-consume race: two concurrent evaluations can no longer both act
+// on the same one-shot approval.
+func ClaimActivePolicyOverrides(db *sql.DB, scopeKey, now string) ([]PolicyOverride, error) {
+	tx, err := db.Begin()
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec(`UPDATE policy_overrides SET consumed_at=consumed_at WHERE id=0`); err != nil {
+		return nil, err
+	}
+	rows, err := tx.Query(`SELECT id,scope_key,target,verdict,reason,created_by,created_at,expires_at,one_shot,consumed_at FROM policy_overrides WHERE scope_key=? AND (expires_at='' OR expires_at>?) AND consumed_at='' ORDER BY created_at DESC, id DESC`, scopeKey, now)
+	if err != nil {
+		return nil, err
+	}
+	var out []PolicyOverride
+	for rows.Next() {
+		var o PolicyOverride
+		var oneShot int
+		if err := rows.Scan(&o.ID, &o.ScopeKey, &o.Target, &o.Verdict, &o.Reason, &o.CreatedBy, &o.CreatedAt, &o.ExpiresAt, &oneShot, &o.ConsumedAt); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		o.OneShot = oneShot != 0
+		out = append(out, o)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	claimed := out[:0]
+	for _, o := range out {
+		if !o.OneShot {
+			claimed = append(claimed, o)
+			continue
+		}
+		res, err := tx.Exec(`UPDATE policy_overrides SET consumed_at=? WHERE id=? AND one_shot=1 AND consumed_at=''`, now, o.ID)
+		if err != nil {
+			return nil, err
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			return nil, err
+		}
+		if n == 1 {
+			o.ConsumedAt = now
+			claimed = append(claimed, o)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return claimed, nil
+}
+
 // ConsumePolicyOverride terminalizes a one-shot override after the single
 // evaluation it authorized. The WHERE clause only matches a still-unconsumed
 // one-shot row, so double-consumption (two racing evaluations) is impossible

@@ -231,7 +231,12 @@ func LoadStrict() (Config, error) {
 			return Config{}, fmt.Errorf("invalid quota window_type %q (want 5h, daily, weekly, or monthly)", q.WindowType)
 		}
 	}
+	seenPolicyRuleIDs := map[string]bool{}
 	for _, rule := range cfg.PolicyRules {
+		if seenPolicyRuleIDs[rule.ID] {
+			return Config{}, fmt.Errorf("invalid policy_rules: duplicate rule id %q in org_policy namespace", rule.ID)
+		}
+		seenPolicyRuleIDs[rule.ID] = true
 		if err := rule.Validate(); err != nil {
 			return Config{}, fmt.Errorf("invalid policy_rules: %w", err)
 		}

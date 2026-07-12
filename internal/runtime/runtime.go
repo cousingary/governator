@@ -635,6 +635,157 @@ func destroyWorkspaceWithOutbox(db *sql.DB, runID string, rn runner.Runner, ws r
 	}
 }
 
+func remainingRunBudget(ctx context.Context) time.Duration {
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		return 0
+	}
+	remaining := time.Until(deadline)
+	if remaining < 0 {
+		return 0
+	}
+	return remaining
+}
+
+func stageTimeout(ctx context.Context, stage string) (context.Context, context.CancelFunc, error) {
+	remaining := remainingRunBudget(ctx)
+	if remaining <= 0 {
+		cancelCtx, cancel := context.WithCancel(ctx)
+		cancel()
+		return cancelCtx, cancel, fmt.Errorf("run deadline exceeded before %s", stage)
+	}
+	stageCtx, cancel := context.WithTimeout(ctx, remaining)
+	return stageCtx, cancel, nil
+}
+
+func effectiveTelemetryMode(c contracts.Contract) string {
+	if c.TelemetryMode != "" {
+		return c.TelemetryMode
+	}
+	if c.Budget.MaxTokens > 0 {
+		return "strict"
+	}
+	return "advisory"
+}
+
+func telemetryViolations(c contracts.Contract, audit transcriptAudit) []string {
+	mode := effectiveTelemetryMode(c)
+	var out []string
+	if c.Budget.MaxTokens > 0 && !audit.Usage.Available {
+		switch mode {
+		case "strict":
+			out = append(out, "strict telemetry unavailable: token usage required for budget.max_tokens")
+		case "estimated":
+			// The quota reservation already used budget.max_tokens conservatively.
+		case "advisory":
+			// Notes only.
+		}
+	}
+	return out
+}
+
+func recordValidatorEvidence(db *sql.DB, runID, command string, exitCode int, output, stage string) {
+	if _, err := db.Exec(`INSERT INTO validators(run_id,command,exit_code,output,stage) VALUES(?,?,?,?,?)`, runID, command, exitCode, output, stage); err != nil {
+		payload, _ := json.Marshal(validatorEvidencePayload{RunID: runID, Command: command, ExitCode: exitCode, Output: output, Stage: stage})
+		noteOperationalFailure(db, runID, opValidatorEvidence, err, string(payload))
+	}
+}
+
+func cleanupCanary(path string) error {
+	var first error
+	if err := os.Chmod(path, 0600); err != nil && !os.IsNotExist(err) {
+		first = fmt.Errorf("chmod canary: %w", err)
+	}
+	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+		if retryErr := os.Remove(path); retryErr != nil && !os.IsNotExist(retryErr) {
+			if first != nil {
+				return fmt.Errorf("%v; remove canary after retry: %w", first, retryErr)
+			}
+			return fmt.Errorf("remove canary after retry: %w", retryErr)
+		}
+	}
+	return first
+}
+
+func gitControlFingerprint(root string) (snapshot, error) {
+	out := snapshot{}
+	addFile := func(label, path string) error {
+		info, err := os.Lstat(path)
+		if os.IsNotExist(err) {
+			out[label] = stamp{Hash: "MISSING"}
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		st := stamp{Size: info.Size(), Mode: info.Mode(), MTime: info.ModTime().UnixNano()}
+		if info.Mode().IsRegular() {
+			f, err := os.Open(path)
+			if err != nil {
+				return err
+			}
+			h := sha256.New()
+			_, err = io.Copy(h, f)
+			f.Close()
+			if err != nil {
+				return err
+			}
+			st.Hash = hex.EncodeToString(h.Sum(nil))
+		}
+		out[label] = st
+		return nil
+	}
+	if err := addFile(".git", filepath.Join(root, ".git")); err != nil {
+		return nil, err
+	}
+	// Sol §6 item 5: hooks and config are the shared control plane, not
+	// per-worktree state. A linked worktree's --git-dir points at its
+	// private worktrees/<name> directory, which has no hooks/config
+	// subdirectory at all — joining onto it would silently fingerprint
+	// nothing and let a hook mutation in the real (shared) .git/hooks pass
+	// undetected. --git-common-dir always resolves to the shared root,
+	// from either the main worktree or a linked one.
+	code, gitDir, err := shell(context.Background(), root, "git rev-parse --git-common-dir")
+	if err != nil || code != 0 {
+		return out, nil
+	}
+	gitDir = strings.TrimSpace(gitDir)
+	if !filepath.IsAbs(gitDir) {
+		gitDir = filepath.Join(root, gitDir)
+	}
+	for _, rel := range []string{"config", "hooks"} {
+		path := filepath.Join(gitDir, rel)
+		info, err := os.Lstat(path)
+		if os.IsNotExist(err) {
+			out["gitdir/"+rel] = stamp{Hash: "MISSING"}
+			continue
+		}
+		if err != nil {
+			return nil, err
+		}
+		if info.IsDir() {
+			err = filepath.Walk(path, func(p string, info os.FileInfo, err error) error {
+				if err != nil {
+					return err
+				}
+				if info.IsDir() {
+					return nil
+				}
+				r, _ := filepath.Rel(path, p)
+				return addFile("gitdir/"+rel+"/"+filepath.ToSlash(r), p)
+			})
+			if err != nil {
+				return nil, err
+			}
+			continue
+		}
+		if err := addFile("gitdir/"+rel, path); err != nil {
+			return nil, err
+		}
+	}
+	return out, nil
+}
+
 func gitStatusPorcelain(ctx context.Context, root string) (string, error) {
 	code, out, err := shell(ctx, root, "git status --porcelain")
 	if err != nil || code != 0 {
@@ -1380,6 +1531,12 @@ func (r *Runner) runOnce(ctx context.Context, c contracts.Contract) (RunRecord, 
 	// ledger), so recording a stage before the runs row itself is inserted is
 	// safe.
 	id := fmt.Sprintf("%s-%d", c.JobID, time.Now().UTC().UnixNano())
+	runStarted := time.Now().UTC()
+	if c.Budget.MaxMinutes > 0 {
+		runCtx, cancel := context.WithTimeout(ctx, time.Duration(c.Budget.MaxMinutes)*time.Minute)
+		defer cancel()
+		ctx = runCtx
+	}
 	rtkAnnotation, err := tokenoptimizer.PromptAnnotation()
 	if err != nil {
 		return RunRecord{}, err
@@ -1682,6 +1839,10 @@ func (r *Runner) runOnce(ctx context.Context, c contracts.Contract) (RunRecord, 
 	if err != nil {
 		return rec, err
 	}
+	gitControlBefore, err := gitControlFingerprint(work)
+	if err != nil {
+		return rec, err
+	}
 	prompt, err := contracts.CompilePrompt(c, work)
 	if err != nil {
 		return rec, err
@@ -1702,11 +1863,19 @@ func (r *Runner) runOnce(ctx context.Context, c contracts.Contract) (RunRecord, 
 	if err := observability.RecordStage(db, id, "AGENT_RUNNING", string(agentRunningDetail), time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
 		return rec, err
 	}
-	ar, aerr := rn.Launch(ctx, ws, runner.LaunchRequest{Agent: agent, Request: agents.Request{
-		Prompt: prompt, Workdir: work, Transcript: transcript,
-		Timeout: time.Duration(c.Budget.MaxMinutes) * time.Minute,
-		Spec:    spec,
-	}})
+	agentTimeout := remainingRunBudget(ctx)
+	var ar agents.Result
+	var aerr error
+	if agentTimeout <= 0 {
+		aerr = context.DeadlineExceeded
+		ar.TimedOut = true
+	} else {
+		ar, aerr = rn.Launch(ctx, ws, runner.LaunchRequest{Agent: agent, Request: agents.Request{
+			Prompt: prompt, Workdir: work, Transcript: transcript,
+			Timeout: agentTimeout,
+			Spec:    spec,
+		}})
+	}
 	// Session 3a: surface runner observations — limits/provenance as notes,
 	// and output truncation as a loud OUTPUT_TRUNCATED ledger event. A run
 	// requiring a complete transcript (docker.require_complete_transcript)
@@ -1726,7 +1895,7 @@ func (r *Runner) runOnce(ctx context.Context, c contracts.Contract) (RunRecord, 
 			rec.Notes = appendNote(rec.Notes, fmt.Sprintf("output_truncated: %d bytes discarded of %d total", obs.BytesDiscarded, obs.BytesAccepted+obs.BytesDiscarded))
 		}
 	}
-	_ = redact(transcript)
+	redactErr := redact(transcript)
 	audit := auditTranscript(transcript, agent.Capabilities().TranscriptFormat, work, c)
 	if err := observability.RecordStage(db, id, "AUDITED", "", time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
 		return rec, err
@@ -1776,7 +1945,12 @@ func (r *Runner) runOnce(ctx context.Context, c contracts.Contract) (RunRecord, 
 	workAfter, werr := fingerprint(work)
 	liveAfter, lerr := fingerprint(root)
 	protectedAfter, perr := protectedFingerprint()
+	gitControlAfter, gcerr := gitControlFingerprint(work)
 	violations := append([]string{}, audit.Violations...)
+	violations = append(violations, telemetryViolations(c, audit)...)
+	if redactErr != nil {
+		violations = append(violations, "transcript redaction failed: "+redactErr.Error())
+	}
 	// Session 3a: a run whose transcript was capped is a blocking violation
 	// when it required a complete (evidence-bearing) transcript — such a run
 	// is quarantined, never approved on an incomplete audit trail. Non-
@@ -1803,10 +1977,12 @@ func (r *Runner) runOnce(ctx context.Context, c contracts.Contract) (RunRecord, 
 	if before, ok := workBefore[canaryName]; !ok || workAfter[canaryName] != before {
 		violations = append(violations, "canary mutation: "+canaryName)
 	}
-	_ = os.Chmod(canaryPath, 0600)
-	_ = os.Remove(canaryPath)
-	delete(workBefore, canaryName)
-	delete(workAfter, canaryName)
+	if err := cleanupCanary(canaryPath); err != nil {
+		violations = append(violations, "canary cleanup failed: "+err.Error())
+	} else {
+		delete(workBefore, canaryName)
+		delete(workAfter, canaryName)
+	}
 	if aerr != nil {
 		// A timeout produces BOTH a non-nil error (context.DeadlineExceeded)
 		// and ExitCode -1 with TimedOut=true. Reporting all three inflates the
@@ -1832,6 +2008,11 @@ func (r *Runner) runOnce(ctx context.Context, c contracts.Contract) (RunRecord, 
 	}
 	if perr != nil {
 		violations = append(violations, "protected fingerprint: "+perr.Error())
+	}
+	if gcerr != nil {
+		violations = append(violations, "git control-plane fingerprint: "+gcerr.Error())
+	} else if snapshotDigest(gitControlBefore) != snapshotDigest(gitControlAfter) {
+		violations = append(violations, "git control-plane mutation")
 	}
 	protectedChanged, protectedDeleted := changes(protectedBefore, protectedAfter)
 	if len(protectedChanged)+len(protectedDeleted) > 0 {
@@ -1888,15 +2069,23 @@ func (r *Runner) runOnce(ctx context.Context, c contracts.Contract) (RunRecord, 
 		return rec, err
 	}
 	for _, v := range c.Success.Validators {
-		vctx, cancel := context.WithTimeout(ctx, time.Duration(c.Budget.MaxMinutes)*time.Minute)
+		vctx, cancel, deadlineErr := stageTimeout(ctx, "success validator")
+		if deadlineErr != nil {
+			violations = append(violations, deadlineErr.Error())
+			break
+		}
 		code, out, e := shell(vctx, work, v)
 		cancel()
 		if e != nil {
 			out += "\n" + e.Error()
 		}
-		_, _ = db.Exec(`INSERT INTO validators(run_id,command,exit_code,output,stage) VALUES(?,?,?,?,'success')`, id, v, code, out)
+		recordValidatorEvidence(db, id, v, code, out, "success")
 		if code != 0 || e != nil {
-			violations = append(violations, fmt.Sprintf("validator failed (%d): %s", code, v))
+			if errors.Is(e, context.DeadlineExceeded) || errors.Is(ctx.Err(), context.DeadlineExceeded) {
+				violations = append(violations, fmt.Sprintf("run deadline exceeded during success validator: %s", v))
+			} else {
+				violations = append(violations, fmt.Sprintf("validator failed (%d): %s", code, v))
+			}
 		}
 	}
 	// Cleanup runs as a distinct pre-merge stage once every success validator
@@ -1907,15 +2096,25 @@ func (r *Runner) runOnce(ctx context.Context, c contracts.Contract) (RunRecord, 
 	// for visibility without gating it.
 	if len(violations) == 0 && c.Cleanup != nil {
 		for _, v := range c.Cleanup.Validators {
-			vctx, cancel := context.WithTimeout(ctx, time.Duration(c.Budget.MaxMinutes)*time.Minute)
+			vctx, cancel, deadlineErr := stageTimeout(ctx, "cleanup validator")
+			if deadlineErr != nil {
+				if c.Cleanup.Required {
+					violations = append(violations, deadlineErr.Error())
+				}
+				break
+			}
 			code, out, e := shell(vctx, work, v)
 			cancel()
 			if e != nil {
 				out += "\n" + e.Error()
 			}
-			_, _ = db.Exec(`INSERT INTO validators(run_id,command,exit_code,output,stage) VALUES(?,?,?,?,'cleanup')`, id, v, code, out)
+			recordValidatorEvidence(db, id, v, code, out, "cleanup")
 			if (code != 0 || e != nil) && c.Cleanup.Required {
-				violations = append(violations, fmt.Sprintf("cleanup validator failed (%d): %s", code, v))
+				if errors.Is(e, context.DeadlineExceeded) || errors.Is(ctx.Err(), context.DeadlineExceeded) {
+					violations = append(violations, fmt.Sprintf("run deadline exceeded during cleanup validator: %s", v))
+				} else {
+					violations = append(violations, fmt.Sprintf("cleanup validator failed (%d): %s", code, v))
+				}
 			}
 		}
 	}
@@ -2101,6 +2300,12 @@ func (r *Runner) runOnce(ctx context.Context, c contracts.Contract) (RunRecord, 
 			return ledgerPending(opRunUpdate, err, string(payload))
 		}
 		return rec, err
+	}
+	remaining := remainingRunBudget(ctx)
+	if remaining > 0 {
+		rec.Notes = appendNote(rec.Notes, fmt.Sprintf("run_wall_time_ms=%d remaining_budget_ms=%d", time.Since(runStarted).Milliseconds(), remaining.Milliseconds()))
+	} else {
+		rec.Notes = appendNote(rec.Notes, fmt.Sprintf("run_wall_time_ms=%d remaining_budget_ms=0", time.Since(runStarted).Milliseconds()))
 	}
 	completion := observability.Completion{
 		RunID:           rec.ID,

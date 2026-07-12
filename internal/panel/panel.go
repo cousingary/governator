@@ -127,10 +127,11 @@ func readOnlyJob(root, id, jobType, agent string, mode contracts.Mode, maxTokens
 		// got exercised — pre-existing (this readOnlyJob predates Phase 2),
 		// caught here because Phase 2 is the first code to run a panel member
 		// end-to-end instead of only validating its generated contract.
-		Budget:    contracts.Budget{MaxMinutes: maxMinutes, MaxCommands: 10, MaxFilesChanged: 1, MaxLinesChanged: 1, MaxNewFiles: 1, MaxDeleted: 0, MaxTokens: maxTokens},
-		Preflight: contracts.Preflight{IntendedWrites: []string{}},
-		Success:   contracts.Success{RequiredFiles: []string{}, Validators: validators},
-		Produces:  produces, Consumes: consumes, DependsOn: depends, RiskClass: "low", OnViolation: "quarantine",
+		Budget:        contracts.Budget{MaxMinutes: maxMinutes, MaxCommands: 10, MaxFilesChanged: 1, MaxLinesChanged: 1, MaxNewFiles: 1, MaxDeleted: 0, MaxTokens: maxTokens},
+		TelemetryMode: "estimated",
+		Preflight:     contracts.Preflight{IntendedWrites: []string{}},
+		Success:       contracts.Success{RequiredFiles: []string{}, Validators: validators},
+		Produces:      produces, Consumes: consumes, DependsOn: depends, RiskClass: "low", OnViolation: "quarantine",
 	}
 }
 

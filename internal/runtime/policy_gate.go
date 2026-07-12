@@ -2,6 +2,7 @@ package runtime
 
 import (
 	"database/sql"
+	"encoding/json"
 	"strconv"
 	"strings"
 	"time"
@@ -65,12 +66,42 @@ func (r *Runner) quarantineForPolicy(db *sql.DB, c contracts.Contract, agent, ro
 	return refused, nil
 }
 
-// policyOverrideScope is the scope key Session 5's session/operator override
-// layer is keyed on: one job_id's overrides never leak into another job's
-// evaluation. A future `gov ask allow --backend` style broader scope can
-// extend this without changing the checkpoint/override schema — ScopeKey is
-// just a string the caller builds and looks up verbatim.
+// policyOverrideScope is the legacy fallback scope for checkpoints created
+// before Sol Session 5 hardened override identity.
 func policyOverrideScope(jobID string) string { return "job_id:" + jobID }
+
+func policyOverrideScopeFor(c contracts.Contract, cfg config.Config, facts map[string]any, orgRules, projectRules, contractRules []policy.ConditionRule) string {
+	contractHash, _ := contracts.ContractHash(c)
+	doc := map[string]any{
+		"version": "override-scope-v2", "job_id": c.JobID, "contract_hash": contractHash,
+		"config_hash": cfg.Hash(), "org_rules": orgRules, "project_rules": projectRules,
+		"contract_rules": contractRules, "facts": facts,
+	}
+	b, _ := json.Marshal(doc)
+	return "policy_identity:" + policy.Hash(string(b))
+}
+
+func policyHashForGate(facts map[string]any, orgRules, projectRules, contractRules []policy.ConditionRule, resolved []policy.LayerResult, overrideRows []observability.PolicyOverride) string {
+	doc := map[string]any{
+		"evaluator": "layered-policy-v2", "layer_order": []string{policy.SourceOrgPolicy, policy.SourceProjectDoctrine, policy.SourceJobContract, policy.SourceSessionOverride},
+		"facts": facts, "org_rules": orgRules, "project_rules": projectRules, "contract_rules": contractRules,
+		"resolved_results": resolved, "overrides": overrideRows,
+	}
+	b, _ := json.Marshal(doc)
+	return policy.Hash(string(b))
+}
+
+func checkpointDetail(scope, target, policyHash string) string {
+	b, _ := json.Marshal(map[string]string{"scope_key": scope, "override_target": target, "policy_hash": policyHash})
+	return string(b)
+}
+
+func overrideTargetForResult(res policy.LayerResult) string {
+	if res.OverrideTarget != "" {
+		return res.OverrideTarget
+	}
+	return res.RuleID
+}
 
 // evaluatePolicyGate runs the Session 5 (Sol Phase 4) layered policy engine
 // for one gate call: organization (config.PolicyRules) -> project doctrine
@@ -99,8 +130,8 @@ func evaluatePolicyGate(db *sql.DB, cfg config.Config, c contracts.Contract, wor
 	results = append(results, policy.EvaluateConditionRules(policy.SourceJobContract, contractRules, facts)...)
 
 	now := time.Now().UTC().Format(time.RFC3339Nano)
-	scope := policyOverrideScope(c.JobID)
-	overrideRows, err := observability.ActivePolicyOverrides(db, scope, now)
+	scope := policyOverrideScopeFor(c, cfg, facts, cfg.PolicyRules, projectRules, contractRules)
+	overrideRows, err := observability.ClaimActivePolicyOverrides(db, scope, now)
 	if err != nil {
 		return policy.PolicyDecision{}, nil, err
 	}
@@ -110,6 +141,7 @@ func evaluatePolicyGate(db *sql.DB, cfg config.Config, c contracts.Contract, wor
 	}
 	resolved, applied := policy.ResolveOverrides(results, overrides)
 	decision := policy.EvaluateLayers(resolved...)
+	decision.PolicyHash = policyHashForGate(facts, cfg.PolicyRules, projectRules, contractRules, resolved, overrideRows)
 
 	// Consume applied one-shot overrides (a bare `gov ask approve/deny`,
 	// no --rule): an ALLOW one-shot is spent only when the whole gate stops
@@ -140,7 +172,7 @@ func evaluatePolicyGate(db *sql.DB, cfg config.Config, c contracts.Contract, wor
 		}
 		cp := observability.PolicyCheckpoint{
 			RunID: runID, JobID: c.JobID, Target: res.RuleID, Reason: res.Reason,
-			Sources: res.Source, PolicyHash: decision.PolicyHash, CostUSD: costUSD, CreatedAt: now,
+			Sources: res.Source, PolicyHash: decision.PolicyHash, CostUSD: costUSD, Detail: checkpointDetail(scope, overrideTargetForResult(res), decision.PolicyHash), CreatedAt: now,
 		}
 		id, err := observability.RecordPolicyCheckpoint(db, cp)
 		if err != nil {

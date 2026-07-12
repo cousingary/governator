@@ -1,10 +1,12 @@
 package runtime
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/cousingary/governator/internal/agents"
 	"github.com/cousingary/governator/internal/contracts"
@@ -62,5 +64,33 @@ func TestAuditTranscriptEnforcesMaxTokens(t *testing.T) {
 	}
 	if len(audit.Violations) != 1 || !strings.Contains(audit.Violations[0], "max_tokens exceeded: 110 > 100") {
 		t.Fatalf("expected token violation, got %v", audit.Violations)
+	}
+}
+
+func TestTelemetryModesHandleUnavailableUsage(t *testing.T) {
+	strict := contracts.Contract{Budget: contracts.Budget{MaxTokens: 100}}
+	got := telemetryViolations(strict, transcriptAudit{})
+	if len(got) != 1 || !strings.Contains(got[0], "strict telemetry unavailable") {
+		t.Fatalf("strict max_tokens contract must fail closed on unavailable usage, got %v", got)
+	}
+
+	for _, mode := range []string{"estimated", "advisory"} {
+		c := contracts.Contract{TelemetryMode: mode, Budget: contracts.Budget{MaxTokens: 100}}
+		if got := telemetryViolations(c, transcriptAudit{}); len(got) != 0 {
+			t.Fatalf("%s telemetry should not block unavailable usage, got %v", mode, got)
+		}
+	}
+}
+
+func TestStageTimeoutFailsWhenRunBudgetExpired(t *testing.T) {
+	ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+	defer cancel()
+	stageCtx, stageCancel, err := stageTimeout(ctx, "validator")
+	defer stageCancel()
+	if err == nil || !strings.Contains(err.Error(), "run deadline exceeded before validator") {
+		t.Fatalf("expected expired run budget error, got %v", err)
+	}
+	if stageCtx.Err() == nil {
+		t.Fatal("expected returned stage context to already be canceled")
 	}
 }

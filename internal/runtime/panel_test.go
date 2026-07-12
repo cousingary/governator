@@ -169,13 +169,14 @@ func panelExecContract(root, id, jobType, agent string, produces []contracts.Art
 	validators := []string{"test -f " + produces[0].Path}
 	return contracts.Contract{
 		JobID: id, JobType: jobType, Agent: agent, Mode: contracts.ModeArchitect,
-		Workspace: contracts.Workspace{Root: root, Worktree: "auto"},
-		Allowed:   contracts.Permissions{Read: []string{"**"}, Write: []string{}, Execute: []string{"test -f *"}},
-		Forbidden: contracts.Forbidden{Paths: []string{".git/**"}, Commands: []string{"rm -rf"}, Behaviors: []string{"network"}},
-		Budget:    contracts.Budget{MaxMinutes: 5, MaxCommands: 5, MaxFilesChanged: 1, MaxLinesChanged: 1, MaxNewFiles: 1, MaxTokens: 1000},
-		Preflight: contracts.Preflight{IntendedWrites: []string{}},
-		Success:   contracts.Success{RequiredFiles: []string{}, Validators: validators},
-		Produces:  produces, Consumes: consumes, DependsOn: dependsOn, ArtifactSources: artifactSources,
+		Workspace:     contracts.Workspace{Root: root, Worktree: "auto"},
+		Allowed:       contracts.Permissions{Read: []string{"**"}, Write: []string{}, Execute: []string{"test -f *"}},
+		Forbidden:     contracts.Forbidden{Paths: []string{".git/**"}, Commands: []string{"rm -rf"}, Behaviors: []string{"network"}},
+		Budget:        contracts.Budget{MaxMinutes: 5, MaxCommands: 5, MaxFilesChanged: 1, MaxLinesChanged: 1, MaxNewFiles: 1, MaxTokens: 1000},
+		TelemetryMode: "estimated",
+		Preflight:     contracts.Preflight{IntendedWrites: []string{}},
+		Success:       contracts.Success{RequiredFiles: []string{}, Validators: validators},
+		Produces:      produces, Consumes: consumes, DependsOn: dependsOn, ArtifactSources: artifactSources,
 		RiskClass: "low", OnViolation: "quarantine",
 	}
 }

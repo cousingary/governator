@@ -3,7 +3,6 @@ package policy
 import (
 	"fmt"
 	"sort"
-	"strings"
 )
 
 // Verdict is the Session 5 (Sol Phase 4) four-way policy outcome. DENY and
@@ -58,6 +57,10 @@ type LayerResult struct {
 	// ResolveOverrides — so the same job's rules can be individually
 	// approved without approving every other ASK the job might trigger.
 	RuleID string
+	// OverrideTarget binds operator overrides to source layer and rule definition,
+	// not just a human-readable rule ID that may recur elsewhere.
+	OverrideTarget string
+	RuleHash       string
 }
 
 // layerPrecedence is the Session 5 deterministic evaluation order:
@@ -117,7 +120,7 @@ func EvaluateLayers(results ...LayerResult) PolicyDecision {
 	out.Allowed = out.Verdict == VerdictAllow || out.Verdict == VerdictFlag
 	out.Consulted = uniqueSorted(consulted)
 	out.Sources = uniqueSorted(out.Sources)
-	out.PolicyHash = Hash(string(out.Verdict) + "|" + strings.Join(out.Sources, ",") + "|" + strings.Join(out.Reasons, "|"))
+	out.PolicyHash = hashEvaluationDocument(map[string]any{"evaluator": "layers-v2", "verdict": out.Verdict, "sources": out.Sources, "reasons": out.Reasons, "consulted": out.Consulted, "ordered_results": sorted})
 	return out
 }
 
@@ -165,12 +168,15 @@ func ResolveOverrides(results []LayerResult, overrides []Override) ([]LayerResul
 		if r.Verdict != VerdictAsk || r.RuleID == "" {
 			continue
 		}
-		if o, ok := byRule[r.RuleID]; ok {
+		key := r.OverrideTarget
+		if key == "" {
+			key = r.RuleID
+		}
+		if o, ok := byRule[key]; ok {
 			out[i] = LayerResult{
-				Source:  SourceSessionOverride,
-				Verdict: o.Verdict,
-				Reason:  fmt.Sprintf("%s: resolved by session/operator override to %s", r.RuleID, o.Verdict),
-				RuleID:  r.RuleID,
+				Source: SourceSessionOverride, Verdict: o.Verdict,
+				Reason: fmt.Sprintf("%s: resolved by session/operator override to %s", r.RuleID, o.Verdict),
+				RuleID: r.RuleID, OverrideTarget: key, RuleHash: r.RuleHash,
 			}
 			if !appliedIDs[o.ID] {
 				appliedIDs[o.ID] = true

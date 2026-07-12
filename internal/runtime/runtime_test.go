@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -1544,5 +1545,199 @@ exit 0
 	}
 	if _, statErr := os.Stat(marker); !os.IsNotExist(statErr) {
 		t.Fatalf("fake codex executable launched despite missing attestation, stat err=%v", statErr)
+	}
+}
+
+// TestGitControlFingerprintDetectsHookMutationThroughWorktree reproduces Sol
+// §6 item 5: a local backend runs inside a linked worktree, not the main
+// working directory. gitControlFingerprint used to resolve hooks/config via
+// plain `git rev-parse --git-dir`, which for a linked worktree returns the
+// private per-worktree gitdir (worktrees/<name>) — a directory that never
+// contains a hooks/config subdirectory at all, so a mutation to the real
+// (shared) .git/hooks went completely undetected. Fixed by resolving via
+// --git-common-dir, which always points at the shared control plane.
+func TestGitControlFingerprintDetectsHookMutationThroughWorktree(t *testing.T) {
+	root, _ := fixture(t)
+	wt := filepath.Join(t.TempDir(), "wt")
+	git(t, root, "worktree", "add", wt, "-b", "gitctrl-test")
+
+	before, err := gitControlFingerprint(wt)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	hooksDir := filepath.Join(root, ".git", "hooks")
+	if err := os.MkdirAll(hooksDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(hooksDir, "pre-commit"), []byte("#!/bin/sh\necho pwned\n"), 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	after, err := gitControlFingerprint(wt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snapshotDigest(before) == snapshotDigest(after) {
+		t.Fatal("expected a fingerprint taken from a linked worktree to detect a mutation to the shared .git/hooks directory")
+	}
+}
+
+// TestWallClockBudgetExhaustionQuarantinesSlowValidators reproduces High 1:
+// the run-level deadline must bound total wall time across the agent AND
+// every validator, not just the agent's own per-launch timeout. Two
+// validators that would otherwise sleep 5s each must not be allowed to run
+// to completion once the run's overall budget is spent — the run fails
+// closed with a deadline violation and total wall time tracks the budget,
+// not the sum of the slow validators.
+func TestWallClockBudgetExhaustionQuarantinesSlowValidators(t *testing.T) {
+	root, bin := fixture(t)
+	t.Setenv("GOV_HOME", t.TempDir())
+	t.Setenv("GOV_CLAUDE_BIN", bin)
+	c := contract(root)
+	// Budget.MaxMinutes must stay >=1 for contract validation, but a
+	// context.WithTimeout wrapping a caller ctx that already has an
+	// earlier deadline keeps that earlier deadline (context.WithDeadline
+	// never extends a parent's deadline) — so the 800ms deadline below,
+	// not the 1-minute budget, is what actually governs remainingRunBudget.
+	c.Budget.MaxMinutes = 1
+	c.Success.Validators = []string{"sleep 5", "sleep 5"}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 800*time.Millisecond)
+	defer cancel()
+
+	started := time.Now()
+	r, err := New().Run(ctx, c)
+	elapsed := time.Since(started)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r.Status != "QUARANTINED" || !strings.Contains(r.Message, "run deadline exceeded") {
+		t.Fatalf("status=%s message=%s", r.Status, r.Message)
+	}
+	if elapsed > 4*time.Second {
+		t.Fatalf("wall time should track the run budget (~800ms), not the sum of slow validators (10s): %s", elapsed)
+	}
+}
+
+// TestClaimActivePolicyOverridesConcurrentClaimsExactlyOne reproduces High 5:
+// two concurrent policy evaluations racing to consume the same one-shot
+// operator override must not both succeed. ClaimActivePolicyOverrides claims
+// the row inside a transaction via an UPDATE ... WHERE consumed_at=”
+// pattern, so exactly one of N concurrent callers may claim it.
+func TestClaimActivePolicyOverridesConcurrentClaimsExactlyOne(t *testing.T) {
+	home := t.TempDir()
+	db, err := observability.Open(home)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	if err := observability.RecordPolicyOverride(db, observability.PolicyOverride{
+		ScopeKey: "policy_identity:race", Target: "network-enablement", Verdict: "ALLOW", Reason: "one-shot approval",
+		CreatedBy: "operator", CreatedAt: "2026-07-12T00:00:00Z", OneShot: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	const n = 8
+	var wg sync.WaitGroup
+	claims := make([]int, n)
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			claimed, err := observability.ClaimActivePolicyOverrides(db, "policy_identity:race", "2026-07-12T00:01:00Z")
+			if err != nil {
+				t.Errorf("claim %d: %v", i, err)
+				return
+			}
+			claims[i] = len(claimed)
+		}(i)
+	}
+	wg.Wait()
+
+	total := 0
+	for _, c := range claims {
+		total += c
+	}
+	if total != 1 {
+		t.Fatalf("expected exactly one of %d concurrent evaluations to claim the one-shot override, got total claims=%d (%v)", n, total, claims)
+	}
+}
+
+// TestValidatorEvidenceInsertFailureEntersOutbox reproduces Sol §6 item 3:
+// a failed validator ledger insert must never just vanish — it must be
+// captured in operational_errors and queued in maintenance_outbox for
+// `gov reconcile` to finish, so an approved run can never silently lose the
+// evidence a validator produced.
+func TestValidatorEvidenceInsertFailureEntersOutbox(t *testing.T) {
+	home := t.TempDir()
+	db, err := observability.Open(home)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := db.Exec(`DROP TABLE validators`); err != nil {
+		t.Fatal(err)
+	}
+
+	recordValidatorEvidence(db, "run-1", "test -f output/result.txt", 1, "not found", "success")
+
+	pending, err := observability.PendingOutbox(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, item := range pending {
+		if item.OpKind == opValidatorEvidence && item.RunID == "run-1" {
+			found = true
+			if !strings.Contains(item.Payload, "test -f output/result.txt") {
+				t.Fatalf("outbox payload missing validator command: %s", item.Payload)
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("expected a validator_evidence outbox entry after insert failure, got %+v", pending)
+	}
+}
+
+// TestCleanupCanarySucceedsAndClearsFile is the happy-path companion to
+// TestCleanupCanaryFailurePermanentlyIsReported: chmod+remove on a normal
+// writable canary must return nil and actually remove the file.
+func TestCleanupCanarySucceedsAndClearsFile(t *testing.T) {
+	dir := t.TempDir()
+	canary := filepath.Join(dir, ".governator-canary")
+	if err := os.WriteFile(canary, []byte("id\n"), 0400); err != nil {
+		t.Fatal(err)
+	}
+	if err := cleanupCanary(canary); err != nil {
+		t.Fatalf("expected cleanup of a normal canary to succeed, got %v", err)
+	}
+	if _, statErr := os.Stat(canary); !os.IsNotExist(statErr) {
+		t.Fatalf("expected canary removed, stat err=%v", statErr)
+	}
+}
+
+// TestCleanupCanaryFailurePermanentlyIsReported reproduces Sol §6 item 2: the
+// previous fire-and-forget `_ = os.Chmod` / `_ = os.Remove` silently dropped
+// the canary from further snapshot comparisons on any failure. cleanupCanary
+// must instead surface a non-nil error (which runOnce turns into a
+// violation) when removal is not possible even after a retry.
+// when both the initial attempt and the retry fail, cleanupCanary returns a
+// non-nil error (which runOnce turns into a violation) instead of silently
+// swallowing it.
+func TestCleanupCanaryFailurePermanentlyIsReported(t *testing.T) {
+	dir := t.TempDir()
+	canary := filepath.Join(dir, ".governator-canary")
+	if err := os.WriteFile(canary, []byte("id\n"), 0400); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(dir, 0555); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chmod(dir, 0755)
+	if err := cleanupCanary(canary); err == nil {
+		t.Fatal("expected a permanently non-writable parent directory to produce a non-nil error")
 	}
 }

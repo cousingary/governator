@@ -1,6 +1,7 @@
 package runtime
 
 import (
+	"encoding/json"
 	"fmt"
 	"time"
 
@@ -63,24 +64,39 @@ func AskResolve(id int64, res AskResolution) (observability.PolicyCheckpoint, er
 	}
 	defer db.Close()
 
-	cp, err := observability.PolicyCheckpointByID(db, id)
+	tx, err := db.Begin()
 	if err != nil {
+		return observability.PolicyCheckpoint{}, err
+	}
+	defer tx.Rollback()
+
+	var cp observability.PolicyCheckpoint
+	row := tx.QueryRow(`SELECT id,run_id,job_id,target,reason,sources,policy_hash,cost_usd,detail,status,resolved_by,resolution,created_at,resolved_at FROM policy_checkpoints WHERE id=?`, id)
+	if err := row.Scan(&cp.ID, &cp.RunID, &cp.JobID, &cp.Target, &cp.Reason, &cp.Sources, &cp.PolicyHash, &cp.CostUSD, &cp.Detail, &cp.Status, &cp.ResolvedBy, &cp.Resolution, &cp.CreatedAt, &cp.ResolvedAt); err != nil {
 		return observability.PolicyCheckpoint{}, err
 	}
 	if cp.Status != "pending" {
 		return cp, fmt.Errorf("ask resolve: checkpoint %d is already %s (resolved_by=%q at %s)", id, cp.Status, cp.ResolvedBy, cp.ResolvedAt)
 	}
 
+	scopeKey, overrideTarget, err := checkpointOverrideIdentity(cp)
+	if err != nil {
+		return observability.PolicyCheckpoint{}, err
+	}
 	now := time.Now().UTC().Format(time.RFC3339Nano)
 	status := "denied"
 	if res.Verdict == "ALLOW" {
 		status = "approved"
 	}
-	rows, err := observability.ResolvePolicyCheckpoint(db, id, status, res.ResolvedBy, res.Note, now)
+	rows, err := tx.Exec(`UPDATE policy_checkpoints SET status=?, resolved_by=?, resolution=?, resolved_at=? WHERE id=? AND status='pending'`, status, res.ResolvedBy, res.Note, now, id)
 	if err != nil {
 		return observability.PolicyCheckpoint{}, err
 	}
-	if rows == 0 {
+	affected, err := rows.RowsAffected()
+	if err != nil {
+		return observability.PolicyCheckpoint{}, err
+	}
+	if affected == 0 {
 		return observability.PolicyCheckpoint{}, fmt.Errorf("ask resolve: checkpoint %d was already resolved by another caller", id)
 	}
 
@@ -88,11 +104,15 @@ func AskResolve(id int64, res AskResolution) (observability.PolicyCheckpoint, er
 	if res.CreateRule && res.TTL > 0 {
 		expiresAt = time.Now().UTC().Add(res.TTL).Format(time.RFC3339Nano)
 	}
-	if err := observability.RecordPolicyOverride(db, observability.PolicyOverride{
-		ScopeKey: policyOverrideScope(cp.JobID), Target: cp.Target, Verdict: res.Verdict,
-		Reason: res.Note, CreatedBy: res.ResolvedBy, CreatedAt: now, ExpiresAt: expiresAt,
-		OneShot: !res.CreateRule,
-	}); err != nil {
+	oneShot := 0
+	if !res.CreateRule {
+		oneShot = 1
+	}
+	if _, err := tx.Exec(`INSERT INTO policy_overrides(scope_key,target,verdict,reason,created_by,created_at,expires_at,one_shot) VALUES(?,?,?,?,?,?,?,?)`,
+		scopeKey, overrideTarget, res.Verdict, res.Note, res.ResolvedBy, now, expiresAt, oneShot); err != nil {
+		return observability.PolicyCheckpoint{}, err
+	}
+	if err := tx.Commit(); err != nil {
 		return observability.PolicyCheckpoint{}, err
 	}
 	cp.Status = status
@@ -100,4 +120,26 @@ func AskResolve(id int64, res AskResolution) (observability.PolicyCheckpoint, er
 	cp.Resolution = res.Note
 	cp.ResolvedAt = now
 	return cp, nil
+}
+
+func checkpointOverrideIdentity(cp observability.PolicyCheckpoint) (scopeKey, overrideTarget string, err error) {
+	scopeKey = policyOverrideScope(cp.JobID)
+	overrideTarget = cp.Target
+	if cp.Detail == "" {
+		return scopeKey, overrideTarget, nil
+	}
+	var detail map[string]string
+	if err := json.Unmarshal([]byte(cp.Detail), &detail); err != nil {
+		return "", "", fmt.Errorf("ask resolve: invalid checkpoint policy identity detail: %w", err)
+	}
+	if ph := detail["policy_hash"]; ph != "" && ph != cp.PolicyHash {
+		return "", "", fmt.Errorf("ask resolve: checkpoint policy identity mismatch: detail policy_hash=%s row policy_hash=%s", ph, cp.PolicyHash)
+	}
+	if v := detail["scope_key"]; v != "" {
+		scopeKey = v
+	}
+	if v := detail["override_target"]; v != "" {
+		overrideTarget = v
+	}
+	return scopeKey, overrideTarget, nil
 }

@@ -1,6 +1,9 @@
 package policy
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"strconv"
 	"strings"
@@ -63,6 +66,12 @@ var validConditionFields = map[string]bool{
 	FactUnusualInfraRetry: true, FactInfraFailureKind: true,
 }
 
+var conditionFieldTypes = map[string]string{
+	FactRiskClass: "string", FactMode: "string", FactBackend: "string", FactInfraFailureKind: "string",
+	FactNetworkEnabled: "bool", FactWriteOutOfScope: "bool", FactUnusualInfraRetry: "bool",
+	FactEstimatedCostUSD: "number", FactDailyCapUSD: "number",
+}
+
 // Validate reports every structural problem with r: empty ID, empty When,
 // an unrecognized Verdict/Op, or a request for VerdictAllow (see the
 // ConditionRule doc comment). Called at load time (config decode, project
@@ -95,8 +104,60 @@ func (r ConditionRule) Validate() error {
 		if !validConditionOps[c.Op] {
 			return fmt.Errorf("policy rule %q: when[%d].op %q is not one of eq, ne, gt, gte, lt, lte, contains, matches_any", r.ID, i, c.Op)
 		}
+		if err := validateConditionValue(c); err != nil {
+			return fmt.Errorf("policy rule %q: when[%d].value: %w", r.ID, i, err)
+		}
 	}
 	return nil
+}
+
+func validateConditionValue(c Condition) error {
+	typ := conditionFieldTypes[c.Field]
+	switch c.Op {
+	case "gt", "gte", "lt", "lte":
+		if typ != "number" {
+			return fmt.Errorf("numeric operator %q requires a numeric fact, got %s", c.Op, typ)
+		}
+		if _, ok := ToFloat(c.Value); !ok {
+			return fmt.Errorf("numeric operator %q requires a numeric literal, got %q", c.Op, c.Value)
+		}
+	case "contains":
+		if typ != "string" {
+			return fmt.Errorf("contains requires a string fact, got %s", typ)
+		}
+		if c.Value == "" {
+			return fmt.Errorf("contains requires a non-empty literal")
+		}
+	case "matches_any":
+		if typ != "list" {
+			return fmt.Errorf("matches_any requires a list fact, got %s", typ)
+		}
+		if strings.TrimSpace(c.Value) == "" {
+			return fmt.Errorf("matches_any requires at least one pattern")
+		}
+	case "eq", "ne":
+		if typ == "bool" {
+			if _, err := strconv.ParseBool(strings.TrimSpace(c.Value)); err != nil {
+				return fmt.Errorf("boolean fact requires true or false, got %q", c.Value)
+			}
+		}
+		if typ == "number" {
+			if _, ok := ToFloat(c.Value); !ok {
+				return fmt.Errorf("numeric fact requires a numeric literal, got %q", c.Value)
+			}
+		}
+	}
+	return nil
+}
+
+func RuleDefinitionHash(rule ConditionRule) string {
+	b, _ := json.Marshal(rule)
+	h := sha256.Sum256(b)
+	return hex.EncodeToString(h[:])
+}
+
+func overrideTarget(source string, rule ConditionRule) string {
+	return source + ":" + rule.ID + ":" + RuleDefinitionHash(rule)
 }
 
 // ToFloat parses s as a float64 for numeric condition comparisons.
@@ -226,7 +287,7 @@ func EvaluateConditionRules(source string, rules []ConditionRule, facts map[stri
 	var out []LayerResult
 	for _, rule := range rules {
 		if rule.Fires(facts) {
-			out = append(out, LayerResult{Source: source, Verdict: rule.Verdict, Reason: fmt.Sprintf("%s: %s", rule.ID, rule.Reason), RuleID: rule.ID})
+			out = append(out, LayerResult{Source: source, Verdict: rule.Verdict, Reason: fmt.Sprintf("%s: %s", rule.ID, rule.Reason), RuleID: rule.ID, OverrideTarget: overrideTarget(source, rule), RuleHash: RuleDefinitionHash(rule)})
 		}
 	}
 	return out

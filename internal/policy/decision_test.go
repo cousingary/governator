@@ -61,3 +61,26 @@ func TestSourcesForFinding(t *testing.T) {
 		t.Errorf("SourcesForFinding(default) = %v, want nil (no policy layer consulted)", got)
 	}
 }
+
+func TestEvaluateLayersPolicyHashIncludesResolvedRuleIdentity(t *testing.T) {
+	base := []LayerResult{
+		{Source: SourceOrgPolicy, RuleID: "same-visible-id", OverrideTarget: "target-a", RuleHash: "hash-a", Verdict: VerdictAsk, Reason: "needs approval"},
+	}
+	changedHash := []LayerResult{
+		{Source: SourceOrgPolicy, RuleID: "same-visible-id", OverrideTarget: "target-a", RuleHash: "hash-b", Verdict: VerdictAsk, Reason: "needs approval"},
+	}
+	changedTarget := []LayerResult{
+		{Source: SourceOrgPolicy, RuleID: "same-visible-id", OverrideTarget: "target-b", RuleHash: "hash-a", Verdict: VerdictAsk, Reason: "needs approval"},
+	}
+
+	baseEval := EvaluateLayers(base...)
+	if baseEval.PolicyHash == "" {
+		t.Fatal("expected policy hash")
+	}
+	if got := EvaluateLayers(changedHash...).PolicyHash; got == baseEval.PolicyHash {
+		t.Fatalf("policy hash must change when the fired rule definition hash changes; both were %s", got)
+	}
+	if got := EvaluateLayers(changedTarget...).PolicyHash; got == baseEval.PolicyHash {
+		t.Fatalf("policy hash must change when the override target identity changes; both were %s", got)
+	}
+}

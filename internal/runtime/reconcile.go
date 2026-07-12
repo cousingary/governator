@@ -25,20 +25,21 @@ import (
 // These op_kind constants name every operation `gov reconcile` knows how to
 // retry from a durable maintenance_outbox row.
 const (
-	opBreakerFailure   = "breaker_record_failure"
-	opBreakerSuccess   = "breaker_record_success"
-	opQuotaResetHint   = "quota_reset_hint"
-	opQuotaRelease     = "quota_release"
-	opSpendHaltCheck   = "spend_halt_check"
-	opWorkspaceDestroy = "workspace_destroy"
-	opPolicyRuleEvents = "policy_rule_events"
-	opStageEvent       = "stage_event"
-	opPanelMembers     = "panel_members"
-	opAssayEvaluation  = "assay_evaluation"
-	opRunUpdate        = "run_update"
-	opRunCompletion    = "run_completion"
-	opRunArtifacts     = "run_artifacts"
-	opQuotaSettle      = "quota_settle"
+	opBreakerFailure    = "breaker_record_failure"
+	opBreakerSuccess    = "breaker_record_success"
+	opQuotaResetHint    = "quota_reset_hint"
+	opQuotaRelease      = "quota_release"
+	opSpendHaltCheck    = "spend_halt_check"
+	opWorkspaceDestroy  = "workspace_destroy"
+	opPolicyRuleEvents  = "policy_rule_events"
+	opStageEvent        = "stage_event"
+	opPanelMembers      = "panel_members"
+	opAssayEvaluation   = "assay_evaluation"
+	opRunUpdate         = "run_update"
+	opRunCompletion     = "run_completion"
+	opRunArtifacts      = "run_artifacts"
+	opQuotaSettle       = "quota_settle"
+	opValidatorEvidence = "validator_evidence"
 )
 
 type breakerFeedbackPayload struct {
@@ -101,6 +102,14 @@ type completionPayload struct {
 type artifactsPayload struct {
 	Records []observability.ArtifactRecord `json:"records"`
 	Created string                         `json:"created"`
+}
+
+type validatorEvidencePayload struct {
+	RunID    string `json:"run_id"`
+	Command  string `json:"command"`
+	ExitCode int    `json:"exit_code"`
+	Output   string `json:"output"`
+	Stage    string `json:"stage"`
 }
 
 // noteOperationalFailure ensures a best-effort operation's error is never
@@ -263,6 +272,13 @@ func dispatchReconcile(ctx context.Context, db *sql.DB, cfg config.Config, item 
 			return err
 		}
 		return observability.RecordArtifacts(db, p.Records, p.Created)
+	case opValidatorEvidence:
+		var p validatorEvidencePayload
+		if err := json.Unmarshal([]byte(item.Payload), &p); err != nil {
+			return err
+		}
+		_, err := db.Exec(`INSERT INTO validators(run_id,command,exit_code,output,stage) VALUES(?,?,?,?,?)`, p.RunID, p.Command, p.ExitCode, p.Output, p.Stage)
+		return err
 	default:
 		return fmt.Errorf("reconcile: unknown op_kind %q", item.OpKind)
 	}

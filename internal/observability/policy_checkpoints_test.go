@@ -133,3 +133,35 @@ func TestActivePolicyOverridesExpiry(t *testing.T) {
 		t.Fatalf("expected no overrides for an unrelated scope key, got %+v", active)
 	}
 }
+
+func TestClaimActivePolicyOverridesConsumesOneShotExactlyOnce(t *testing.T) {
+	home := t.TempDir()
+	db, err := Open(home)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	if err := RecordPolicyOverride(db, PolicyOverride{
+		ScopeKey: "policy_identity:abc", Target: "network-enablement", Verdict: "ALLOW", Reason: "approved once",
+		CreatedBy: "operator", CreatedAt: "2026-07-12T00:00:00Z", OneShot: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	claimed, err := ClaimActivePolicyOverrides(db, "policy_identity:abc", "2026-07-12T00:01:00Z")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(claimed) != 1 || !claimed[0].OneShot || claimed[0].ConsumedAt != "2026-07-12T00:01:00Z" {
+		t.Fatalf("expected first claim to return and consume the one-shot override, got %+v", claimed)
+	}
+
+	claimed, err = ClaimActivePolicyOverrides(db, "policy_identity:abc", "2026-07-12T00:02:00Z")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(claimed) != 0 {
+		t.Fatalf("expected consumed one-shot override to disappear on second claim, got %+v", claimed)
+	}
+}
