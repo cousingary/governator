@@ -42,8 +42,34 @@ penalized for lacking acceptance evidence it never promised.
 ## Usage
 
 ```
-gov claims verify [--file <path>] [--repo <path>]
+gov claims verify [--file <path>] [--repo <path>] [--artifact <path>] [--manifest <path>]
 ```
 
 Defaults to `docs/claims.yaml` against the current directory. Exits non-zero
 if any claim's computed maturity falls short of its claimed maturity.
+
+## Release artifact provenance
+
+Session 4 adds a canonical release builder:
+
+```
+scripts/release.sh
+```
+
+The script refuses a dirty tree, runs `go test ./...`, builds exactly one
+artifact from the current commit with `-ldflags` embedding version, source
+commit, build timestamp, claims hash, and adapter protocol version, then writes
+`dist/build-manifest-<version>-<commit>.json`. The manifest records the
+artifact path and SHA-256, Go version/build flags/buildinfo, the claims hash,
+a concrete test run ID/result, and a concrete acceptance self-check ID/result
+from running the built artifact's `gov version --json`.
+
+`gov claims verify --artifact <path> --manifest <path>` uses that manifest to
+inspect the exact binary. A binary that self-reports `1.0.0-rc1` while the
+claim/manifest expects `v1.4.1` fails verification even if all symbols and YAML
+keys exist.
+
+If `GOV_RELEASE_HMAC_KEY` is present, `scripts/release.sh` adds a
+`manifest_hmac_sha256` over the unsigned manifest JSON. That local environment
+variable is the current trust root for CI summary signing until dedicated
+signing infrastructure exists; do not commit the key.

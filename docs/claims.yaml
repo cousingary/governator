@@ -305,3 +305,86 @@ claims:
       evidence_file: evidence/release-v1.4.json
       commit: 226dc1eea68da217c25aa2c10ff66a6f22cd9913
       platform: linux_amd64
+
+  - id: sol-s1-replay-execution-identity
+    title: "Replay approvals are keyed by full ExecutionIdentity, so policy/config/prompt/backend drift cannot reuse an old APPROVED run"
+    first_shipped_version: v1.5.0-sol-repair-s1
+    claimed_maturity: tested
+    implementation:
+      - file: internal/runtime/identity.go
+        symbols: [ExecutionIdentity, Hash, computeExecutionIdentity, replayMatch]
+    tests:
+      - file: internal/runtime/identity_test.go
+        funcs:
+          - TestExecutionIdentityHashSensitiveToEveryField
+          - TestReplayPositiveIdenticalEnvironmentReplays
+          - TestReplayInvalidatedByBackendBinaryChange
+          - TestReplayInvalidatedByPromptVersionChange
+          - TestReplayInvalidatedByConfigChange
+          - TestReplayInvalidatedByOrgPolicyDeny
+
+  - id: sol-s1-strict-config
+    title: "Malformed or unknown configuration fails closed at startup and gov validate reports CONFIG INVALID instead of silently using defaults"
+    first_shipped_version: v1.5.0-sol-repair-s1
+    claimed_maturity: tested
+    implementation:
+      - file: internal/config/config.go
+        symbols: [LoadStrict, Current]
+      - file: cmd/gov/main.go
+        symbols: [guardConfig]
+    tests:
+      - file: internal/config/config_test.go
+        funcs:
+          - TestLoadStrictRejectsMalformedYAML
+          - TestLoadStrictRejectsUnknownField
+          - TestLoadStrictRejectsInvalidPolicyValue
+      - file: cmd/gov/doctrine_test.go
+        funcs:
+          - TestGovValidateReportsMalformedConfigAsInvalid
+          - TestGovValidateAcceptsMissingConfig
+
+  - id: sol-s2-transactional-lifecycle
+    title: "Live-root merge, workspace cleanup, and workspace locking are transactional and symlink-canonicalized"
+    first_shipped_version: v1.5.0-sol-repair-s2
+    claimed_maturity: tested
+    implementation:
+      - file: internal/runtime/runtime.go
+        symbols: [canonicalLockIdentity, lock, requireCleanLiveRoot, rollbackLiveRoot, destroyWorkspaceWithOutbox]
+    tests:
+      - file: internal/runtime/runtime_test.go
+        funcs:
+          - TestLockCanonicalizesSymlinkAlias
+          - TestMergeCommitHookRejectionRollsBackLiveRoot
+          - TestWorkspaceCleanupGuardRemovesGraphPrepareFailureResources
+
+  - id: sol-s3-host-containment-attestation
+    title: "Local worktrees are not host containment: symlink escapes fail before launch and high-risk native local runs require a current capability attestation"
+    first_shipped_version: v1.5.0-sol-repair-s3
+    claimed_maturity: tested
+    implementation:
+      - file: internal/runtime/runtime.go
+        symbols: [writeFileNoFollow, validateNoLocalSymlinkEscape, enforceContainment]
+      - file: internal/attest/attest.go
+        symbols: [Generate, Store, Current, VerifyHighRiskNative]
+    cli:
+      command: "gov attest"
+    tests:
+      - file: internal/runtime/runtime_test.go
+        funcs:
+          - TestEnforceContainmentHighRiskAcceptanceCriterion
+          - TestRunRejectsTrackedSymlinkBeforeLaunch
+          - TestRunRejectsSymlinkedWriteParentBeforeLaunch
+          - TestRunRejectsHighRiskCodexWithoutCapabilityAttestation
+
+  - id: sol-s3-json-transcript-integrity
+    title: "Declared JSON transcript formats reject all-plaintext output and unrecognized startup noise instead of approving schema drift"
+    first_shipped_version: v1.5.0-sol-repair-s3
+    claimed_maturity: tested
+    implementation:
+      - file: internal/runtime/runtime.go
+        symbols: [allowedStartupNotice, recognizedTranscriptEvent, auditTranscript]
+    tests:
+      - file: internal/runtime/transcript_test.go
+        funcs:
+          - TestAuditTranscriptRejectsAllPlaintextPiJSON
+          - TestAuditTranscriptRejectsUnrecognizedStartupNoise

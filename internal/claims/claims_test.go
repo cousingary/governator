@@ -324,6 +324,121 @@ func TestVerifyRealClaimsFileIsFullyConsistent(t *testing.T) {
 	}
 }
 
+func TestVerifyReleaseArtifactChecksExactBinaryAndSelfReportedVersion(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	if _, err := exec.LookPath("go"); err != nil {
+		t.Skip("go not available")
+	}
+	root := t.TempDir()
+	runGit(t, root, "init")
+	runGit(t, root, "config", "user.email", "test@example.com")
+	runGit(t, root, "config", "user.name", "test")
+	writeFile(t, root, "go.mod", "module example.com/releaseclaim\n\ngo 1.22\n")
+	writeFile(t, root, "pkg/foo.go", "package pkg\n\nfunc RealFunc() {}\n")
+	writeFile(t, root, "docs/claims.yaml", "version: 1\nclaims: []\n")
+	writeFile(t, root, "cmd/gov/main.go", `package main
+
+import (
+	"encoding/json"
+	"fmt"
+	"os"
+)
+
+var version = "dev"
+var sourceCommit = "unknown"
+var claimsHash = "unknown"
+
+func main() {
+	if len(os.Args) == 3 && os.Args[1] == "version" && os.Args[2] == "--json" {
+		_ = json.NewEncoder(os.Stdout).Encode(map[string]string{"version": version, "source_commit": sourceCommit, "claims_hash": claimsHash})
+		return
+	}
+	fmt.Println("gov", version)
+}
+`)
+	runGit(t, root, "add", ".")
+	runGit(t, root, "commit", "-m", "seed")
+	commit := runGitOutput(t, root, "rev-parse", "HEAD")
+	claimsHash, err := fileSHA256(filepath.Join(root, "docs", "claims.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	build := func(name, version string) string {
+		t.Helper()
+		out := filepath.Join(root, name)
+		cmd := exec.Command("go", "build", "-o", out, "-ldflags", "-X main.version="+version+" -X main.sourceCommit="+commit+" -X main.claimsHash="+claimsHash, "./cmd/gov")
+		cmd.Dir = root
+		if data, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("go build %s: %v\n%s", name, err, data)
+		}
+		return out
+	}
+	artifact := build("gov-good", "v1.4.1")
+	artifactHash, err := fileSHA256(artifact)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest := filepath.Join(root, "evidence", "release.json")
+	writeFile(t, root, "evidence/release.json", `{
+  "version": "v1.4.1",
+  "source_commit": "`+commit+`",
+  "go_version": "",
+  "build_flags": "test ldflags",
+  "artifact_path": "`+filepath.ToSlash(artifact)+`",
+  "artifact_sha256": "`+artifactHash+`",
+  "build_info": {},
+  "claims_hash": "`+claimsHash+`",
+  "test_run_id": "unit-test",
+  "test_result": "PASS",
+  "acceptance_run_id": "acceptance-test",
+  "acceptance_result": "PASS",
+  "binaries": {"targets": [{"platform": "linux_amd64", "sha256": "`+artifactHash+`"}]}
+}`)
+	claim := Claim{
+		ID:                  "release-artifact",
+		Title:               "release artifact",
+		FirstShippedVersion: "v1.4.1",
+		ClaimedMaturity:     MaturityShipped,
+		Implementation:      []FileSymbols{{File: "pkg/foo.go", Symbols: []string{"RealFunc"}}},
+		Tests:               []FileFuncs{{File: "pkg/foo.go", Funcs: nil}},
+		AcceptanceArtifacts: []ArtifactRef{{Path: "evidence/release.json"}},
+		BinaryBuildEvidence: &BinaryEvidence{EvidenceFile: "evidence/release.json", Commit: commit, Platform: "linux_amd64", ArtifactPath: artifact, ManifestPath: manifest, Version: "v1.4.1"},
+	}
+	results, err := Verify(root, Document{Claims: []Claim{claim}})
+	if err != nil {
+		t.Fatalf("Verify: %v", err)
+	}
+	if r := results[0]; !r.OK() || r.ComputedMaturity != MaturityShipped {
+		t.Fatalf("expected artifact-backed shipped claim, got %+v", r)
+	}
+
+	badArtifact := build("gov-rc1", "1.0.0-rc1")
+	badHash, err := fileSHA256(badArtifact)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, err := os.ReadFile(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body = []byte(strings.ReplaceAll(string(body), filepath.ToSlash(artifact), filepath.ToSlash(badArtifact)))
+	body = []byte(strings.ReplaceAll(string(body), artifactHash, badHash))
+	if err := os.WriteFile(manifest, body, 0644); err != nil {
+		t.Fatal(err)
+	}
+	claim.BinaryBuildEvidence.ArtifactPath = badArtifact
+	results, err = Verify(root, Document{Claims: []Claim{claim}})
+	if err != nil {
+		t.Fatalf("Verify bad artifact: %v", err)
+	}
+	if r := results[0]; r.OK() || !containsSubstring(r.Problems, "artifact version 1.0.0-rc1") {
+		t.Fatalf("expected rc1 self-reporting binary to fail verification, got %+v", r)
+	}
+}
+
 // --- test helpers ---
 
 func writeFile(t *testing.T, root, rel, content string) string {

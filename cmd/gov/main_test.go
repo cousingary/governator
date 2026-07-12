@@ -125,6 +125,26 @@ func captureRunInput(t *testing.T, args []string, input string) (int, string) {
 	return code, string(data)
 }
 
+func TestVersionJSONReportsBuildIdentityFields(t *testing.T) {
+	code, output := captureRunInput(t, []string{"version", "--json"}, "")
+	if code != 0 {
+		t.Fatalf("exit=%d output=%s", code, output)
+	}
+	var got struct {
+		Version                string `json:"version"`
+		SourceCommit           string `json:"source_commit"`
+		BuildTimestamp         string `json:"build_timestamp"`
+		ClaimsHash             string `json:"claims_hash"`
+		AdapterProtocolVersion string `json:"adapter_protocol_version"`
+	}
+	if err := json.Unmarshal([]byte(output), &got); err != nil {
+		t.Fatalf("version JSON %q: %v", output, err)
+	}
+	if got.Version == "" || got.SourceCommit == "" || got.BuildTimestamp == "" || got.ClaimsHash == "" || got.AdapterProtocolVersion == "" {
+		t.Fatalf("missing build identity field: %+v", got)
+	}
+}
+
 func TestBatchRunRejectsWholeBatchOnInvalidContract(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("GOV_HOME", home)

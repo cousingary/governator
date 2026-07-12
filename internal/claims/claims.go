@@ -12,6 +12,9 @@ package claims
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"debug/buildinfo"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"go/ast"
@@ -92,6 +95,31 @@ type BinaryEvidence struct {
 	EvidenceFile string `yaml:"evidence_file"`
 	Commit       string `yaml:"commit"`
 	Platform     string `yaml:"platform,omitempty"`
+	ArtifactPath string `yaml:"artifact_path,omitempty"`
+	ManifestPath string `yaml:"manifest_path,omitempty"`
+	Version      string `yaml:"version,omitempty"`
+}
+
+// VerifyOptions lets the CLI bind a claims verification run to the exact
+// release artifact under inspection without editing docs/claims.yaml.
+type VerifyOptions struct {
+	ArtifactPath string
+	ManifestPath string
+}
+
+type BuildManifest struct {
+	Version          string            `json:"version"`
+	SourceCommit     string            `json:"source_commit"`
+	GoVersion        string            `json:"go_version"`
+	BuildFlags       string            `json:"build_flags"`
+	ArtifactPath     string            `json:"artifact_path"`
+	ArtifactSHA256   string            `json:"artifact_sha256"`
+	BuildInfo        map[string]string `json:"build_info"`
+	ClaimsHash       string            `json:"claims_hash"`
+	TestRunID        string            `json:"test_run_id"`
+	TestResult       string            `json:"test_result"`
+	AcceptanceRunID  string            `json:"acceptance_run_id"`
+	AcceptanceResult string            `json:"acceptance_result"`
 }
 
 // Claim is one docs/claims.yaml entry.
@@ -161,9 +189,26 @@ func (r Result) OK() bool {
 // governator repository root) and returns one Result per claim, in the same
 // order as doc.Claims.
 func Verify(repoRoot string, doc Document) ([]Result, error) {
-	results := make([]Result, 0, len(doc.Claims))
+	return VerifyWithOptions(repoRoot, doc, VerifyOptions{})
+}
+
+func VerifyWithOptions(repoRoot string, doc Document, opts VerifyOptions) ([]Result, error) {
+	results := make([]Result, 0, len(doc.Claims)+1)
+	if opts.ArtifactPath != "" || opts.ManifestPath != "" {
+		artifactResult := Result{
+			ID:               "release-artifact",
+			Title:            "release artifact provenance",
+			ClaimedMaturity:  MaturityShipped,
+			ComputedMaturity: MaturityShipped,
+		}
+		if ok, problems := verifyArtifactManifest(repoRoot, opts.ArtifactPath, opts.ManifestPath); !ok {
+			artifactResult.ComputedMaturity = MaturityAccepted
+			artifactResult.Problems = problems
+		}
+		results = append(results, artifactResult)
+	}
 	for _, c := range doc.Claims {
-		results = append(results, verifyOne(repoRoot, c))
+		results = append(results, verifyOne(repoRoot, c, opts))
 	}
 	return results, nil
 }
@@ -173,7 +218,7 @@ func Verify(repoRoot string, doc Document) ([]Result, error) {
 // It never probes (or reports problems for) a tier the claim doesn't assert
 // it has reached — a claim that only claims "tested" is not penalized for
 // lacking acceptance evidence it never promised.
-func verifyOne(repoRoot string, c Claim) Result {
+func verifyOne(repoRoot string, c Claim, opts VerifyOptions) Result {
 	res := Result{ID: c.ID, Title: c.Title, ClaimedMaturity: c.ClaimedMaturity, ComputedMaturity: MaturityUnimplemented}
 	claimedRank := maturityRank[c.ClaimedMaturity]
 
@@ -207,7 +252,7 @@ func verifyOne(repoRoot string, c Claim) Result {
 		return res
 	}
 
-	shipped, problems := verifyShipped(repoRoot, c)
+	shipped, problems := verifyShipped(repoRoot, c, opts)
 	res.Problems = append(res.Problems, problems...)
 	if !shipped {
 		return res
@@ -358,7 +403,7 @@ func resolvePointer(data any, dotPath string) bool {
 // contained every declared implementation symbol at that historical commit
 // — i.e. the symbol was actually present in the code the evidence's binary
 // was built from, not added afterward.
-func verifyShipped(repoRoot string, c Claim) (bool, []string) {
+func verifyShipped(repoRoot string, c Claim, opts VerifyOptions) (bool, []string) {
 	if c.BinaryBuildEvidence == nil {
 		return false, []string{"absent from shipped binary: claim declares no binary_build_evidence"}
 	}
@@ -372,6 +417,14 @@ func verifyShipped(repoRoot string, c Claim) (bool, []string) {
 	if err := gitCheck(repoRoot, "merge-base", "--is-ancestor", be.Commit, "HEAD"); err != nil {
 		ok = false
 		problems = append(problems, fmt.Sprintf("absent from shipped binary: commit %s is not an ancestor of HEAD", be.Commit))
+	}
+
+	if be.ManifestPath != "" || be.ArtifactPath != "" {
+		artifactOK, artifactProblems := verifyReleaseArtifact(repoRoot, c, opts)
+		if !artifactOK {
+			ok = false
+			problems = append(problems, artifactProblems...)
+		}
 	}
 
 	evPath := filepath.Join(repoRoot, be.EvidenceFile)
@@ -406,6 +459,196 @@ func verifyShipped(repoRoot string, c Claim) (bool, []string) {
 		}
 	}
 	return ok, problems
+}
+
+func verifyReleaseArtifact(repoRoot string, c Claim, opts VerifyOptions) (bool, []string) {
+	be := c.BinaryBuildEvidence
+	if be == nil {
+		return false, []string{"absent from shipped binary: claim declares no binary_build_evidence"}
+	}
+	manifestPath := firstNonEmpty(opts.ManifestPath, be.ManifestPath, be.EvidenceFile)
+	artifactPath := firstNonEmpty(opts.ArtifactPath, be.ArtifactPath)
+	ok, problems := verifyArtifactManifest(repoRoot, artifactPath, manifestPath)
+	if !ok {
+		return ok, problems
+	}
+	manifest, _, artifactLabel, err := loadBuildManifest(repoRoot, artifactPath, manifestPath)
+	if err != nil {
+		return false, []string{err.Error()}
+	}
+	if manifest.SourceCommit != be.Commit {
+		return false, []string{fmt.Sprintf("absent from shipped binary: manifest source_commit %s does not match claim commit %s", manifest.SourceCommit, be.Commit)}
+	}
+	expectedVersion := firstNonEmpty(be.Version, manifest.Version, c.FirstShippedVersion)
+	if expectedVersion == "" {
+		return false, []string{"absent from shipped binary: no expected version recorded"}
+	}
+	self, err := runArtifactVersionJSON(absOrRepo(repoRoot, artifactLabel))
+	if err != nil {
+		return false, []string{fmt.Sprintf("absent from shipped binary: artifact version --json failed: %v", err)}
+	}
+	if self.Version != expectedVersion {
+		return false, []string{fmt.Sprintf("absent from shipped binary: artifact version %s does not match expected %s", self.Version, expectedVersion)}
+	}
+	return true, nil
+}
+
+func verifyArtifactManifest(repoRoot, artifactPath, manifestPath string) (bool, []string) {
+	manifest, artifactFull, artifactLabel, err := loadBuildManifest(repoRoot, artifactPath, manifestPath)
+	if err != nil {
+		return false, []string{err.Error()}
+	}
+	var problems []string
+	ok := true
+
+	artifactHash, err := fileSHA256(artifactFull)
+	if err != nil {
+		ok = false
+		problems = append(problems, fmt.Sprintf("absent from shipped binary: artifact %s: %v", artifactLabel, err))
+	} else if !strings.EqualFold(artifactHash, strings.TrimSpace(manifest.ArtifactSHA256)) {
+		ok = false
+		problems = append(problems, fmt.Sprintf("absent from shipped binary: artifact sha256 mismatch: manifest=%s actual=%s", manifest.ArtifactSHA256, artifactHash))
+	}
+
+	if !passingResult(manifest.TestResult) || strings.TrimSpace(manifest.TestRunID) == "" {
+		ok = false
+		problems = append(problems, "absent from shipped binary: manifest lacks a passing test_run_id/test_result")
+	}
+	if !passingResult(manifest.AcceptanceResult) || strings.TrimSpace(manifest.AcceptanceRunID) == "" {
+		ok = false
+		problems = append(problems, "absent from shipped binary: manifest lacks a passing acceptance_run_id/acceptance_result")
+	}
+
+	claimsPath := filepath.Join(repoRoot, "docs", "claims.yaml")
+	if actualClaimsHash, err := fileSHA256(claimsPath); err != nil {
+		ok = false
+		problems = append(problems, fmt.Sprintf("absent from shipped binary: docs/claims.yaml: %v", err))
+	} else if manifest.ClaimsHash != actualClaimsHash {
+		ok = false
+		problems = append(problems, fmt.Sprintf("absent from shipped binary: manifest claims_hash %s does not match docs/claims.yaml %s", manifest.ClaimsHash, actualClaimsHash))
+	}
+
+	bi, err := buildinfo.ReadFile(artifactFull)
+	if err != nil {
+		ok = false
+		problems = append(problems, fmt.Sprintf("absent from shipped binary: cannot read Go buildinfo from %s: %v", artifactLabel, err))
+	} else {
+		if manifest.GoVersion != "" && bi.GoVersion != "" && manifest.GoVersion != bi.GoVersion {
+			ok = false
+			problems = append(problems, fmt.Sprintf("absent from shipped binary: manifest go_version %s does not match artifact %s", manifest.GoVersion, bi.GoVersion))
+		}
+		settings := map[string]string{}
+		for _, setting := range bi.Settings {
+			settings[setting.Key] = setting.Value
+		}
+		if rev := firstNonEmpty(settings["vcs.revision"], manifest.BuildInfo["vcs_revision"]); rev != "" && rev != manifest.SourceCommit {
+			ok = false
+			problems = append(problems, fmt.Sprintf("absent from shipped binary: artifact vcs revision %s does not match manifest source_commit %s", rev, manifest.SourceCommit))
+		}
+	}
+
+	self, err := runArtifactVersionJSON(artifactFull)
+	if err != nil {
+		ok = false
+		problems = append(problems, fmt.Sprintf("absent from shipped binary: artifact version --json failed: %v", err))
+	} else {
+		if self.Version != manifest.Version {
+			ok = false
+			problems = append(problems, fmt.Sprintf("absent from shipped binary: artifact version %s does not match manifest %s", self.Version, manifest.Version))
+		}
+		if self.SourceCommit != manifest.SourceCommit {
+			ok = false
+			problems = append(problems, fmt.Sprintf("absent from shipped binary: artifact source_commit %s does not match manifest %s", self.SourceCommit, manifest.SourceCommit))
+		}
+		if manifest.ClaimsHash != "" && self.ClaimsHash != manifest.ClaimsHash {
+			ok = false
+			problems = append(problems, fmt.Sprintf("absent from shipped binary: artifact claims_hash %s does not match manifest %s", self.ClaimsHash, manifest.ClaimsHash))
+		}
+	}
+	return ok, problems
+}
+
+func loadBuildManifest(repoRoot, artifactPath, manifestPath string) (BuildManifest, string, string, error) {
+	var manifest BuildManifest
+	if manifestPath == "" {
+		return manifest, "", "", fmt.Errorf("absent from shipped binary: no build manifest path provided")
+	}
+	manifestFull := absOrRepo(repoRoot, manifestPath)
+	data, err := os.ReadFile(manifestFull)
+	if err != nil {
+		return manifest, "", "", fmt.Errorf("absent from shipped binary: build manifest %s: %v", manifestPath, err)
+	}
+	if err := json.Unmarshal(data, &manifest); err != nil {
+		return manifest, "", "", fmt.Errorf("absent from shipped binary: build manifest %s is not valid JSON: %v", manifestPath, err)
+	}
+	artifactLabel := firstNonEmpty(artifactPath, manifest.ArtifactPath)
+	if artifactLabel == "" {
+		return manifest, "", "", fmt.Errorf("absent from shipped binary: no artifact path provided by CLI or manifest")
+	}
+	return manifest, absOrRepo(repoRoot, artifactLabel), artifactLabel, nil
+}
+
+type artifactVersion struct {
+	Version                string `json:"version"`
+	SourceCommit           string `json:"source_commit"`
+	BuildTimestamp         string `json:"build_timestamp"`
+	ClaimsHash             string `json:"claims_hash"`
+	AdapterProtocolVersion string `json:"adapter_protocol_version"`
+}
+
+func runArtifactVersionJSON(path string) (artifactVersion, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), probeTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, path, "version", "--json")
+	var out, stderr bytes.Buffer
+	cmd.Stdout = &out
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		msg := strings.TrimSpace(stderr.String())
+		if msg != "" {
+			return artifactVersion{}, fmt.Errorf("%w: %s", err, msg)
+		}
+		return artifactVersion{}, err
+	}
+	var v artifactVersion
+	if err := json.Unmarshal(out.Bytes(), &v); err != nil {
+		return artifactVersion{}, err
+	}
+	return v, nil
+}
+
+func fileSHA256(path string) (string, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return "", err
+	}
+	sum := sha256.Sum256(data)
+	return hex.EncodeToString(sum[:]), nil
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return strings.TrimSpace(value)
+		}
+	}
+	return ""
+}
+
+func absOrRepo(repoRoot, path string) string {
+	if filepath.IsAbs(path) {
+		return path
+	}
+	return filepath.Join(repoRoot, path)
+}
+
+func passingResult(value string) bool {
+	switch strings.ToUpper(strings.TrimSpace(value)) {
+	case "PASS", "PASSED", "OK", "SUCCESS":
+		return true
+	default:
+		return false
+	}
 }
 
 // evidenceRecordsCommit reports whether the parsed evidence JSON, anywhere in

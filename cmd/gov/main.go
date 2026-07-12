@@ -36,7 +36,13 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-var version = "1.0.0-rc1"
+var (
+	version                = "1.5.0-dev"
+	sourceCommit           = "unknown"
+	buildTimestamp         = "unknown"
+	claimsHash             = "unknown"
+	adapterProtocolVersion = "adapter-protocol-v1"
+)
 
 func main() { os.Exit(run(os.Args[1:])) }
 
@@ -393,9 +399,10 @@ func run(args []string) int {
 		return healthCmd(args[1:])
 	case "claims":
 		return claimsCmd(args[1:])
-	case "version", "--version", "-version":
-		fmt.Printf("gov %s\n", version)
-		return 0
+	case "version":
+		return versionCmd(args[1:])
+	case "--version", "-version":
+		return versionCmd(nil)
 	case "help", "--help", "-h":
 		usage()
 		return 0
@@ -1833,34 +1840,76 @@ func healthCmd(args []string) int {
 	return 0
 }
 
+func versionCmd(args []string) int {
+	if len(args) > 1 || (len(args) == 1 && args[0] != "--json") {
+		return bad("usage: gov version [--json]")
+	}
+	if len(args) == 1 && args[0] == "--json" {
+		payload := struct {
+			Version                string `json:"version"`
+			SourceCommit           string `json:"source_commit"`
+			BuildTimestamp         string `json:"build_timestamp"`
+			ClaimsHash             string `json:"claims_hash"`
+			AdapterProtocolVersion string `json:"adapter_protocol_version"`
+		}{
+			Version:                version,
+			SourceCommit:           sourceCommit,
+			BuildTimestamp:         buildTimestamp,
+			ClaimsHash:             claimsHash,
+			AdapterProtocolVersion: adapterProtocolVersion,
+		}
+		if err := json.NewEncoder(os.Stdout).Encode(payload); err != nil {
+			fmt.Fprintln(os.Stderr, "version:", err)
+			return 1
+		}
+		return 0
+	}
+	fmt.Printf("gov %s\n", version)
+	return 0
+}
+
 // claimsCmd handles `gov claims verify`: re-derives every docs/claims.yaml
 // entry's maturity from the repository (internal/claims) instead of trusting
 // a hand-written status field (plan v1.4 Session 6 / Sol Phase 11 — CI must
 // fail when a claim is unwired, untested, stale, missing its acceptance
 // artifact, or absent from the shipped binary).
 func claimsCmd(args []string) int {
+	usage := "usage: gov claims verify [--file <path>] [--repo <path>] [--artifact <path>] [--manifest <path>]"
 	if len(args) < 1 || args[0] != "verify" {
-		return bad("usage: gov claims verify [--file <path>] [--repo <path>]")
+		return bad(usage)
 	}
 	file := "docs/claims.yaml"
 	repo := "."
+	opts := claims.VerifyOptions{}
 	rest := args[1:]
 	for len(rest) > 0 {
 		switch rest[0] {
 		case "--file":
 			if len(rest) < 2 {
-				return bad("usage: gov claims verify [--file <path>] [--repo <path>]")
+				return bad(usage)
 			}
 			file = rest[1]
 			rest = rest[2:]
 		case "--repo":
 			if len(rest) < 2 {
-				return bad("usage: gov claims verify [--file <path>] [--repo <path>]")
+				return bad(usage)
 			}
 			repo = rest[1]
 			rest = rest[2:]
+		case "--artifact":
+			if len(rest) < 2 {
+				return bad(usage)
+			}
+			opts.ArtifactPath = rest[1]
+			rest = rest[2:]
+		case "--manifest":
+			if len(rest) < 2 {
+				return bad(usage)
+			}
+			opts.ManifestPath = rest[1]
+			rest = rest[2:]
 		default:
-			return bad("usage: gov claims verify [--file <path>] [--repo <path>]")
+			return bad(usage)
 		}
 	}
 	doc, err := claims.Load(file)
@@ -1868,7 +1917,7 @@ func claimsCmd(args []string) int {
 		fmt.Fprintln(os.Stderr, "claims:", err)
 		return 1
 	}
-	results, err := claims.Verify(repo, doc)
+	results, err := claims.VerifyWithOptions(repo, doc, opts)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "claims:", err)
 		return 1
@@ -2271,6 +2320,6 @@ Usage:
   gov attest <backend>
   gov doctor
   gov health [reset <backend>]
-  gov claims verify [--file <path>]
+  gov claims verify [--file <path>] [--repo <path>] [--artifact <path>] [--manifest <path>]
   gov version`)
 }
