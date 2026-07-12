@@ -65,8 +65,17 @@ func TestEvaluateAgainstRealCLIPassAndFail(t *testing.T) {
 	if v.Verdict != VerdictPass {
 		t.Fatalf("expected pass verdict against real assayer CLI, got %+v", v)
 	}
-	if v.ChecksHash == "" {
-		t.Fatal("expected a non-empty checks_hash")
+	if v.ChecksResultHash == "" {
+		t.Fatal("expected a non-empty checks_result_hash")
+	}
+	if v.ProfileDefinitionHash == "" {
+		t.Fatal("expected a non-empty profile_definition_hash")
+	}
+	if v.ValidatorImplementationHash == "" {
+		t.Fatal("expected a non-empty validator_implementation_hash")
+	}
+	if v.ValidatorConfigHash == "" {
+		t.Fatal("expected a non-empty validator_config_hash")
 	}
 
 	// Now a payload missing the required field -> fail.

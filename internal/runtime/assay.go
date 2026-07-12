@@ -42,16 +42,19 @@ func runAssayStep(ctx context.Context, db *sql.DB, cfg config.Config, c contract
 	// above (INSERT INTO validators ...). Since Session 4 a failure is no
 	// longer simply swallowed: noteOperationalFailure durably queues the
 	// write for `gov reconcile`.
-	record := func(verdict, policyVersion, checksHash string, failedChecks []string, durationMS int64) {
+	record := func(verdict, policyVersion string, v assay.Verdict, durationMS int64) {
+		failedChecks := v.FailedChecks
 		if failedChecks == nil {
 			failedChecks = []string{}
 		}
 		evalRec := observability.AssayEvaluationRecord{
 			RunID: runID, AttemptID: runID, JobID: c.JobID, Profile: c.Assay.Profile,
 			PolicyVersion: policyVersion, Verdict: verdict, FailedChecks: failedChecks,
-			ChecksHash: checksHash, DurationMS: durationMS, Created: created,
+			ChecksHash: v.ChecksResultHash, DurationMS: durationMS, Created: created,
 			AssayerCommit: env.AssayerCommit, ProfileHash: env.ProfileHash,
 			ValidatorsHash: env.ValidatorsHash, PythonVersion: env.PythonVersion,
+			ProfileDefinitionHash: v.ProfileDefinitionHash, ValidatorImplementationHash: v.ValidatorImplementationHash,
+			ValidatorConfigHash: v.ValidatorConfigHash,
 		}
 		if err := observability.RecordAssayEvaluation(db, evalRec); err != nil {
 			payload, _ := json.Marshal(assayEvaluationPayload{Record: evalRec})
@@ -71,7 +74,7 @@ func runAssayStep(ctx context.Context, db *sql.DB, cfg config.Config, c contract
 		// waving every run through would be fail-open — the same reason
 		// runner: docker errors rather than quietly running local. Quarantine
 		// instead, with the remediation in the reason.
-		record(assay.VerdictSkipped, "", "", nil, 0)
+		record(assay.VerdictSkipped, "", assay.Verdict{}, 0)
 		if c.Assay.Enforcement == assay.EnforcementBlocking {
 			*violations = append(*violations, "assay: blocking enforcement declared but no assayer is configured (set assay.repo in config.yaml or GOV_ASSAY_REPO)")
 		}
@@ -83,7 +86,7 @@ func runAssayStep(ctx context.Context, db *sql.DB, cfg config.Config, c contract
 		// is a configuration mismatch, not a silent pass. Only a blocking
 		// contract turns it into a violation; advisory/telemetry just
 		// record it.
-		record(assay.VerdictError, "", "", nil, 0)
+		record(assay.VerdictError, "", assay.Verdict{}, 0)
 		if c.Assay.Enforcement == assay.EnforcementBlocking {
 			*violations = append(*violations, "assay: no artifact produced to evaluate")
 		}
@@ -120,7 +123,7 @@ func runAssayStep(ctx context.Context, db *sql.DB, cfg config.Config, c contract
 	verdict := assay.Evaluate(ctx, assayCfg, req, artifact.Path)
 	duration := time.Since(start)
 
-	record(verdict.Verdict, verdict.PolicyVersion, verdict.ChecksHash, verdict.FailedChecks, duration.Milliseconds())
+	record(verdict.Verdict, verdict.PolicyVersion, verdict, duration.Milliseconds())
 
 	if assay.Blocks(verdict.Verdict, c.Assay.Enforcement) {
 		reason := verdict.Reason

@@ -11,6 +11,7 @@ import re
 import sys
 import uuid
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 try:
     from dotenv import load_dotenv
@@ -19,6 +20,7 @@ try:
 except ImportError:
     pass
 
+from assayer import checks as checks_mod
 from assayer import profiles as profiles_mod
 from assayer import verify_scored
 from assayer.store import Store
@@ -29,7 +31,12 @@ _SINCE_RE = re.compile(r"^(\d+)([dh])$")
 # Governator<->Assayer bridge). Bump only if the JSON fields themselves
 # change in an incompatible way; profile-content changes do not need a bump
 # here (each profile can carry its own semver later, in 3B).
-EVALUATE_PROTOCOL_VERSION = "gov-assay-evaluate-v1"
+#
+# v2 (Sol audit Assayer v2 repair, weaknesses 3/4): response field renames
+# (checks_hash -> checks_result_hash) and semantics changes (trace_id now
+# null instead of always a random uuid; evaluation_id added) are exactly the
+# "incompatible JSON field change" this constant exists to flag.
+EVALUATE_PROTOCOL_VERSION = "gov-assay-evaluate-v2"
 
 
 def parse_since(value: str) -> str:
@@ -211,26 +218,64 @@ def _cmd_stats(store, args):
         )
 
 
-def _checks_hash(checks: dict) -> str:
-    """sha256 of the canonical (sorted-key) JSON of a verify() checks dict.
-    Deterministic for a given check set + outcome, independent of any
-    randomly-generated id (trace_id), so a caller can detect "same checks,
-    same result" across two evaluations without re-diffing."""
-    canonical = json.dumps(checks, sort_keys=True, default=str)
+def _hash_obj(obj) -> str:
+    """sha256 of the canonical (sorted-key) JSON of any JSON-serializable
+    object. Deterministic for identical content."""
+    canonical = json.dumps(obj, sort_keys=True, default=str)
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
-def _verdict_payload(verdict, failed_checks, had_error, checks_hash, policy_version, reason=None):
+# checks_result_hash (renamed from checks_hash, Sol audit Assayer weakness 3:
+# "checks_hash is an outcome hash... cannot prove which validator
+# implementation or configuration produced the result") is kept as its own
+# function name for clarity at call sites, but is just _hash_obj under the
+# hood — a hash of the *outcome* (verify() results), never of the checks
+# that produced it. See _profile_definition_hash/_validator_config_hash/
+# _validator_implementation_hash below for the other three.
+_checks_result_hash = _hash_obj
+
+
+def _validator_implementation_hash() -> str:
+    """sha256 of assayer/checks.py's own source bytes — "which validator
+    implementation" produced a result, independent of the outcome and of
+    which profile/config selected which checks. Computed once per process,
+    not per evaluation: the module's source doesn't change mid-run."""
+    source_path = Path(checks_mod.__file__)
+    return hashlib.sha256(source_path.read_bytes()).hexdigest()
+
+
+_VALIDATOR_IMPLEMENTATION_HASH = _validator_implementation_hash()
+
+
+def _verdict_payload(
+    verdict,
+    failed_checks,
+    had_error,
+    *,
+    checks_result_hash,
+    profile_definition_hash="",
+    validator_config_hash="",
+    policy_version,
+    reason=None,
+):
     payload = {
         "verdict": verdict,
         "failed_checks": failed_checks,
         "had_error": had_error,
-        # trace_id/quarantine_id: locally-generated identifiers only. 3A has
-        # no async persistence wired up (no Store calls on this offline
-        # path) — a real trace/quarantine row is 3B/3C work, not this one's.
-        "trace_id": str(uuid.uuid4()),
+        # evaluation_id: a real per-call identifier for *this* evaluation
+        # (Sol audit Assayer weakness 4: "trace_id is not a real trace" —
+        # the old field emitted a random UUID while creating no trace row).
+        # trace_id stays null here: 3A has no async persistence wired up (no
+        # Store call on this offline path), so there is genuinely no
+        # persisted trace row yet for this evaluation_id to point at. A
+        # caller that later persists one (3B/3C) can set trace_id then.
+        "evaluation_id": str(uuid.uuid4()),
+        "trace_id": None,
         "quarantine_id": "",
-        "checks_hash": checks_hash,
+        "checks_result_hash": checks_result_hash,
+        "profile_definition_hash": profile_definition_hash,
+        "validator_implementation_hash": _VALIDATOR_IMPLEMENTATION_HASH,
+        "validator_config_hash": validator_config_hash,
         "policy_version": policy_version,
     }
     if reason is not None:
@@ -262,14 +307,16 @@ def _cmd_evaluate(args, stdin_text=None):
         request = json.loads(raw)
     except Exception as exc:
         _emit(_verdict_payload(
-            "error", [], True, _checks_hash({}), None,
+            "error", [], True,
+            checks_result_hash=_checks_result_hash({}), policy_version=None,
             reason=f"malformed JSON on stdin: {exc}",
         ))
         return 0
 
     if not isinstance(request, dict):
         _emit(_verdict_payload(
-            "error", [], True, _checks_hash({}), None,
+            "error", [], True,
+            checks_result_hash=_checks_result_hash({}), policy_version=None,
             reason="request must be a JSON object",
         ))
         return 0
@@ -281,7 +328,8 @@ def _cmd_evaluate(args, stdin_text=None):
     profile = profiles_mod.get_profile(profile_name)
     if profile is None:
         _emit(_verdict_payload(
-            "error", [], True, _checks_hash({}), policy_version,
+            "error", [], True,
+            checks_result_hash=_checks_result_hash({}), policy_version=policy_version,
             reason=f"unknown or empty check_profile: {profile_name!r}",
         ))
         return 0
@@ -295,10 +343,13 @@ def _cmd_evaluate(args, stdin_text=None):
 
     live_checks = profiles_mod.build_checks(profile)
     result = verify_scored(item, live_checks, enforcement=profile["enforcement"])
-    checks_hash = _checks_hash(result.checks)
 
     _emit(_verdict_payload(
-        result.verdict, result.failed, result.had_error, checks_hash, policy_version,
+        result.verdict, result.failed, result.had_error,
+        checks_result_hash=_checks_result_hash(result.checks),
+        profile_definition_hash=profiles_mod.profile_definition_hash(profile_name, profile),
+        validator_config_hash=_hash_obj(profiles_mod.resolved_check_configs(profile)),
+        policy_version=policy_version,
     ))
     return 0
 

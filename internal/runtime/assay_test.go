@@ -39,11 +39,11 @@ func writeAssayerStub(t *testing.T, body string) string {
 }
 
 const stubPassVerdict = `import json
-print(json.dumps({"verdict":"pass","failed_checks":[],"had_error":False,"trace_id":"t","quarantine_id":"","checks_hash":"h-pass","policy_version":"v1"}))
+print(json.dumps({"verdict":"pass","failed_checks":[],"had_error":False,"evaluation_id":"e","trace_id":None,"quarantine_id":"","checks_result_hash":"h-pass","profile_definition_hash":"p-pass","validator_implementation_hash":"vi-pass","validator_config_hash":"vc-pass","policy_version":"v1"}))
 `
 
 const stubFailVerdict = `import json
-print(json.dumps({"verdict":"fail","failed_checks":["no_boilerplate:content"],"had_error":False,"trace_id":"t","quarantine_id":"","checks_hash":"h-fail","policy_version":"v1"}))
+print(json.dumps({"verdict":"fail","failed_checks":["no_boilerplate:content"],"had_error":False,"evaluation_id":"e","trace_id":None,"quarantine_id":"","checks_result_hash":"h-fail","profile_definition_hash":"p-fail","validator_implementation_hash":"vi-fail","validator_config_hash":"vc-fail","policy_version":"v1"}))
 `
 
 const stubCrash = `import sys

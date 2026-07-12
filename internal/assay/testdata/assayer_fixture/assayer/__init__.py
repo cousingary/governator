@@ -8,6 +8,8 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Callable, Optional
 
+from assayer.outbox import Outbox, OutboxError
+
 
 @dataclass
 class VerifyResult:
@@ -127,8 +129,17 @@ def trace(
             pass
 
 
-def quarantine_item(store, *, pipeline, item_hash, payload, input_ref, reasons) -> Optional[int]:
-    """Build a quarantine row, persist it, return the new row id or None."""
+def quarantine_item(store, *, pipeline, item_hash, payload, input_ref, reasons, outbox=None) -> Optional[int]:
+    """Build a quarantine row, persist it, return the new row id or None.
+
+    Quarantine evidence is blocking, not optional telemetry (see
+    assayer.outbox's module doc, Sol audit weakness 5): when the primary
+    Store.insert_quarantine() fails, this durably queues the row into a
+    local Outbox instead of the old best-effort/swallowing
+    Store.fallback(). If even the durable outbox can't be written (disk
+    full, permissions), that IS evidence loss and must not be silently
+    absorbed — OutboxError propagates.
+    """
     row = {
         "ts": _utc_now_iso(),
         "pipeline": pipeline,
@@ -142,10 +153,6 @@ def quarantine_item(store, *, pipeline, item_hash, payload, input_ref, reasons) 
     try:
         return store.insert_quarantine(row)
     except Exception:
-        try:
-            fallback = getattr(store, "fallback", None)
-            if fallback is not None:
-                fallback(row)
-        except Exception:
-            pass
+        ob = outbox if outbox is not None else Outbox()
+        ob.enqueue("assayer_quarantine", row)
         return None

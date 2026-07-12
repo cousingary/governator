@@ -244,6 +244,22 @@ CREATE TABLE IF NOT EXISTS policy_overrides(id INTEGER PRIMARY KEY AUTOINCREMENT
 			return nil, alterErr
 		}
 	}
+	// profile_definition_hash/validator_implementation_hash/validator_config_hash
+	// (Assayer v2, Sol audit weakness 3) separate "which profile declared
+	// these checks" and "which check implementation + which resolved config
+	// actually ran" from checks_hash's pure outcome hash. Empty defaults on
+	// pre-existing rows are honest — those evaluations predate the hash
+	// separation and were never fingerprinted this precisely.
+	for _, column := range []string{
+		"profile_definition_hash TEXT NOT NULL DEFAULT ''",
+		"validator_implementation_hash TEXT NOT NULL DEFAULT ''",
+		"validator_config_hash TEXT NOT NULL DEFAULT ''",
+	} {
+		if _, alterErr := db.Exec("ALTER TABLE assay_evaluations ADD COLUMN " + column); alterErr != nil && !strings.Contains(strings.ToLower(alterErr.Error()), "duplicate column") {
+			db.Close()
+			return nil, alterErr
+		}
+	}
 	// one_shot/consumed_at make a bare `gov ask approve` (no --rule) a real
 	// single-use override: applied to exactly one subsequent evaluation of
 	// the same job+rule, then marked consumed. Zero/empty defaults on
@@ -415,6 +431,16 @@ type AssayEvaluationRecord struct {
 	ProfileHash    string
 	ValidatorsHash string
 	PythonVersion  string
+	// ProfileDefinitionHash/ValidatorImplementationHash/ValidatorConfigHash
+	// (Assayer v2, Sol audit weakness 3) separately identify which profile
+	// declaration, which check-implementation source, and which resolved
+	// check config produced this row's verdict — ChecksHash alone is only
+	// an outcome hash and cannot prove any of that. Empty-string default on
+	// pre-existing rows is honest: those evaluations predate this
+	// separation and were never fingerprinted this precisely.
+	ProfileDefinitionHash       string
+	ValidatorImplementationHash string
+	ValidatorConfigHash         string
 }
 
 // RecordAssayEvaluation appends one assay_evaluations row. Append-only, like
@@ -430,16 +456,17 @@ func RecordAssayEvaluation(db *sql.DB, rec AssayEvaluationRecord) error {
 	if err != nil {
 		return err
 	}
-	_, err = db.Exec(`INSERT INTO assay_evaluations(run_id,attempt_id,job_id,profile,policy_version,verdict,failed_checks,checks_hash,duration_ms,created,assayer_commit,profile_hash,validators_hash,python_version) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+	_, err = db.Exec(`INSERT INTO assay_evaluations(run_id,attempt_id,job_id,profile,policy_version,verdict,failed_checks,checks_hash,duration_ms,created,assayer_commit,profile_hash,validators_hash,python_version,profile_definition_hash,validator_implementation_hash,validator_config_hash) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		rec.RunID, rec.AttemptID, rec.JobID, rec.Profile, rec.PolicyVersion, rec.Verdict, string(failedJSON), rec.ChecksHash, rec.DurationMS, rec.Created,
-		rec.AssayerCommit, rec.ProfileHash, rec.ValidatorsHash, rec.PythonVersion)
+		rec.AssayerCommit, rec.ProfileHash, rec.ValidatorsHash, rec.PythonVersion,
+		rec.ProfileDefinitionHash, rec.ValidatorImplementationHash, rec.ValidatorConfigHash)
 	return err
 }
 
 // AssayEvaluationsForRun returns every assay_evaluations row for one run,
 // oldest first — for tests and CLI inspection.
 func AssayEvaluationsForRun(db *sql.DB, runID string) ([]AssayEvaluationRecord, error) {
-	rows, err := db.Query(`SELECT run_id,attempt_id,job_id,profile,policy_version,verdict,failed_checks,checks_hash,duration_ms,created,assayer_commit,profile_hash,validators_hash,python_version FROM assay_evaluations WHERE run_id=? ORDER BY id ASC`, runID)
+	rows, err := db.Query(`SELECT run_id,attempt_id,job_id,profile,policy_version,verdict,failed_checks,checks_hash,duration_ms,created,assayer_commit,profile_hash,validators_hash,python_version,profile_definition_hash,validator_implementation_hash,validator_config_hash FROM assay_evaluations WHERE run_id=? ORDER BY id ASC`, runID)
 	if err != nil {
 		return nil, err
 	}
@@ -449,7 +476,8 @@ func AssayEvaluationsForRun(db *sql.DB, runID string) ([]AssayEvaluationRecord, 
 		var rec AssayEvaluationRecord
 		var failedJSON string
 		if err := rows.Scan(&rec.RunID, &rec.AttemptID, &rec.JobID, &rec.Profile, &rec.PolicyVersion, &rec.Verdict, &failedJSON, &rec.ChecksHash, &rec.DurationMS, &rec.Created,
-			&rec.AssayerCommit, &rec.ProfileHash, &rec.ValidatorsHash, &rec.PythonVersion); err != nil {
+			&rec.AssayerCommit, &rec.ProfileHash, &rec.ValidatorsHash, &rec.PythonVersion,
+			&rec.ProfileDefinitionHash, &rec.ValidatorImplementationHash, &rec.ValidatorConfigHash); err != nil {
 			return nil, err
 		}
 		if failedJSON != "" {

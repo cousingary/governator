@@ -55,7 +55,13 @@ const (
 // (Assayer's cli.py falls back to the same constant on its side when a
 // request omits policy_version, so the two independently agree on a default
 // rather than one silently dictating to the other).
-const BridgePolicyVersion = "gov-assay-evaluate-v1"
+//
+// v2 (Sol audit Assayer v2 repair): Assayer's evaluate response renamed
+// checks_hash -> checks_result_hash and added profile_definition_hash /
+// validator_implementation_hash / validator_config_hash / evaluation_id,
+// with trace_id now null instead of always populated — an incompatible
+// wire-shape change, hence the version bump.
+const BridgePolicyVersion = "gov-assay-evaluate-v2"
 
 const defaultTimeout = 60 * time.Second
 
@@ -78,15 +84,29 @@ type Request struct {
 }
 
 // Verdict is the JSON object read from the Assayer subprocess's stdout.
+//
+// Field names/hashes follow Assayer v2's evaluate response shape (Sol audit
+// Assayer weaknesses 3/4): ChecksResultHash (renamed from ChecksHash) is an
+// outcome hash only; ProfileDefinitionHash/ValidatorImplementationHash/
+// ValidatorConfigHash separately identify which profile, which check
+// implementation, and which resolved check config produced that outcome.
+// EvaluationID is a real per-call id; TraceID stays empty (Assayer sends
+// JSON null, which unmarshals into a Go string as its zero value) until a
+// trace row is actually persisted somewhere — this bridge never persists
+// one itself (3A is synchronous/offline, no Store call on this path).
 type Verdict struct {
-	Verdict       string   `json:"verdict"`
-	FailedChecks  []string `json:"failed_checks"`
-	HadError      bool     `json:"had_error"`
-	TraceID       string   `json:"trace_id"`
-	QuarantineID  string   `json:"quarantine_id"`
-	ChecksHash    string   `json:"checks_hash"`
-	PolicyVersion string   `json:"policy_version"`
-	Reason        string   `json:"reason,omitempty"`
+	Verdict                     string   `json:"verdict"`
+	FailedChecks                []string `json:"failed_checks"`
+	HadError                    bool     `json:"had_error"`
+	EvaluationID                string   `json:"evaluation_id"`
+	TraceID                     string   `json:"trace_id"`
+	QuarantineID                string   `json:"quarantine_id"`
+	ChecksResultHash            string   `json:"checks_result_hash"`
+	ProfileDefinitionHash       string   `json:"profile_definition_hash"`
+	ValidatorImplementationHash string   `json:"validator_implementation_hash"`
+	ValidatorConfigHash         string   `json:"validator_config_hash"`
+	PolicyVersion               string   `json:"policy_version"`
+	Reason                      string   `json:"reason,omitempty"`
 }
 
 // errorVerdict builds a locally-produced ERROR verdict for a failure this
