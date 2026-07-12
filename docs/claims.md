@@ -11,6 +11,14 @@ This is what makes "implemented," "tested," "accepted," and "shipped"
 mechanically distinct instead of overlapping English words: each is a gate
 that requires the one below it, plus its own additional evidence.
 
+The ledger also now carries the Sol redteam repair program's claims (`sol-s1-*`
+through `sol-s7-*`), added by each repair session as its fixes landed. Those
+entries are deliberately capped at `claimed_maturity: tested` rather than
+`shipped` — none of them yet has a `binary_build_evidence` entry pointing at a
+rebuilt-and-verified artifact for the v1.5.0 release; see [docs/security.md](security.md)
+for the full Sol-finding-to-commit-to-test register, which is the audit-closure
+artifact this ladder feeds.
+
 ## The maturity ladder
 
 | Level | Requires | Additional check |

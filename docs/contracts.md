@@ -26,6 +26,7 @@ A job contract is strict YAML: unknown fields, multiple documents, malformed pat
 | `budget.max_new_files` | Nonnegative new-file limit, not above changed files. |
 | `budget.max_deleted` | Nonnegative deleted-file limit. |
 | `budget.max_tokens` | Optional nonnegative token ceiling. Exceeding reported usage quarantines the run; unavailable usage is recorded without guessing. |
+| `telemetry_mode` | Optional. `strict`, `estimated`, or `advisory` — governs what happens when `budget.max_tokens` is set but the backend's transcript doesn't expose usage. Defaults to `strict` when `budget.max_tokens > 0`, else `advisory`. See [Telemetry modes](#telemetry-modes) below. |
 | `preflight.intended_writes` | Declared write patterns; required in write modes and empty in read-only modes. |
 | `preflight.scout_completed` | Records that reconnaissance preceded a high-risk write. |
 | `preflight.approve_high_risk` | Explicit operator approval for policy-classified high-risk work. |
@@ -63,6 +64,18 @@ A job contract is strict YAML: unknown fields, multiple documents, malformed pat
 | `policy.rules` | Optional (Session 5). Job-contract-layer declarative policy rules — see [Layered policy engine and checkpointed ASK](#layered-policy-engine-and-checkpointed-ask). |
 
 All path patterns are repository-relative and may not escape with `..`. Read-only modes are `scout`, `verifier`, and `architect`. `planner` writes only inside its own `gov plan --out` directory, never the target repository. Governator rejects direct-root execution and unimplemented violation actions rather than accepting policy it cannot enforce.
+
+## Global wall-clock budget
+
+`budget.max_minutes` is a single deadline for the whole run, not a per-stage allowance: at launch, Governator derives a run context bounded by `context.WithTimeout(ctx, max_minutes)` anchored to the run's start time, and every later stage draws only the **remaining** time from that same deadline rather than getting a fresh clock. The agent launch itself receives whatever is left when it starts (an already-exhausted budget fails closed before launching); each success validator and each cleanup validator gets `stageTimeout(ctx, stage)`, which fails immediately if no time remains; the Assayer bridge inherits the same deadline-bearing context, so its own `timeout_seconds` and the run's remaining budget both apply, whichever is shorter. Total wall time and remaining budget at completion are recorded in the run's notes so a deadline exhausted mid-validator is distinguishable after the fact from one exhausted mid-agent-run.
+
+## Telemetry modes
+
+See [docs/backends.md#telemetry-modes](backends.md#telemetry-modes) for the full behavior of `strict`/`estimated`/`advisory`. In short: a contract with a hard `budget.max_tokens` ceiling defaults to `strict`, which quarantines the run if the backend's transcript format doesn't expose token usage — an unmeasurable budget is never silently treated as "under budget."
+
+## Local-runner symlink containment
+
+Regardless of `risk_class`, any `runner: local` job rejects the run outright if the worktree contains **any** symlink (or, on Windows, a junction) anywhere under the tree, excluding `.git/` and `.codegraph/`. This is a whole-tree check, not scoped to the declared write envelope — a tracked symlink pointing outside the worktree, or a symlinked parent directory of a declared write path, both fail the same way, before any quota reservation or workspace side effect. This closes the path a "read-only" verifier or a scoped writer could otherwise use to write through a symlink to an arbitrary host path while the fingerprint diff still looked clean. See [docs/containment.md](containment.md) for why this is repository-level hygiene, not host containment, and does not substitute for hardened Docker or a verified native sandbox on `risk_class: high` work.
 
 ## Containment and risk-class
 

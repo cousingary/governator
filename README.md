@@ -133,11 +133,27 @@ gov version
 - [Contracts and `RESULT.json`](docs/contracts.md)
 - [F1-F7 gate and hook integration](docs/gate.md)
 - [Backend projections](docs/backends.md)
+- [Containment model](docs/containment.md)
 - [Migration and deliberate divergences](docs/migration.md)
 - [Ledger, routing, evaluation, and repair packets](docs/ledger.md)
 - [Route broker](docs/routing.md)
 - [Machine-verified documentation claims](docs/claims.md)
+- [Sol redteam findings register](docs/security.md)
 - [Publishing checklist](docs/publishing.md)
 - [Security policy](SECURITY.md) and [contributing guide](CONTRIBUTING.md)
+
+## v1.5.0 — Sol redteam repair program
+
+An independent redteam review reproduced eight Critical and twelve High-severity gaps in v1.4.1 (replay bypasses, symlink escapes, unattested backend trust, non-atomic live-root merges, and more). All were repaired across seven sessions; see [docs/security.md](docs/security.md) for the full finding-by-finding register and [CHANGELOG.md](CHANGELOG.md) for the per-session summary. `gov version` reports the build's real semantic version, source commit, and claims hash, embedded at build time by `scripts/release.sh` — there is exactly one version story now, not the source/archive/repo-claim divergence Sol found. One item, local-runner output capping (Sol High 11), remains open; it is called out explicitly in the register rather than claimed as done.
+
+## Roadmap (not built)
+
+These items from the Sol audit's strategic-enhancements list (§9/P3) are deliberately out of scope for the repair program and are not implemented:
+
+- An external backend adapter protocol (adapters beyond the five built-in CLIs).
+- A versioned harness profile registry (today's harness/eval fixtures are not versioned as a registry).
+- Panel independence across provider, account, model lineage, prompt, and policy (today's panel mode anonymizes labels but doesn't enforce cross-panelist independence on these axes).
+- An offline Governator Evolver Lab.
+- Profile drift detection with champion/challenger promotion.
 
 Governator is licensed under the [MIT License](LICENSE).

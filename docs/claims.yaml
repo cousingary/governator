@@ -439,3 +439,86 @@ claims:
         funcs:
           - TestAuditTranscriptRejectsAllPlaintextPiJSON
           - TestAuditTranscriptRejectsUnrecognizedStartupNoise
+
+  - id: sol-s4-release-claims-provenance
+    title: "gov claims verify inspects the exact built artifact (SHA-256, Go buildinfo, self-reported gov version --json) against a release build manifest, failing a version-mismatched binary even when every symbol and YAML key exists"
+    first_shipped_version: v1.5.0-sol-repair-s4
+    claimed_maturity: tested
+    implementation:
+      - file: internal/claims/claims.go
+        symbols: [verifyReleaseArtifact, verifyArtifactManifest, fileSHA256, runArtifactVersionJSON, passingResult]
+    tests:
+      - file: internal/claims/claims_test.go
+        funcs:
+          - TestVerifyReleaseArtifactChecksExactBinaryAndSelfReportedVersion
+          - TestVerifyRealClaimsFileIsFullyConsistent
+          - TestReportFlagsOverclaimAsFail
+
+  - id: sol-s5-governance-hardening
+    title: "A single run-level wall-clock deadline bounds agent+validators+Assayer; telemetry_mode governs unavailable-usage behavior; policy override identity is bound to the exact rule definition, AskResolve is one transaction, one-shot overrides are claimed atomically, and EvaluateLayers hashes the full ordered per-layer result set"
+    first_shipped_version: v1.5.0-sol-repair-s5
+    claimed_maturity: tested
+    implementation:
+      - file: internal/runtime/runtime.go
+        symbols: [remainingRunBudget, stageTimeout, effectiveTelemetryMode, telemetryViolations]
+      - file: internal/policy/conditions.go
+        symbols: [overrideTarget, RuleDefinitionHash, validateConditionValue]
+      - file: internal/runtime/ask.go
+        symbols: [AskResolve]
+      - file: internal/observability/policy_checkpoints.go
+        symbols: [ClaimActivePolicyOverrides, ConsumePolicyOverride]
+      - file: internal/policy/verdict.go
+        symbols: [EvaluateLayers]
+    tests:
+      - file: internal/runtime/runtime_test.go
+        funcs:
+          - TestWallClockBudgetExhaustionQuarantinesSlowValidators
+      - file: internal/runtime/usage_test.go
+        funcs:
+          - TestStageTimeoutFailsWhenRunBudgetExpired
+          - TestTelemetryModesHandleUnavailableUsage
+      - file: internal/policy/conditions_test.go
+        funcs:
+          - TestConditionRuleValidateRejectsTypeMismatchedValues
+          - TestValidateRejectsUnknownConditionField
+      - file: internal/observability/policy_checkpoints_test.go
+        funcs:
+          - TestClaimActivePolicyOverridesConsumesOneShotExactlyOnce
+          - TestPolicyCheckpointLifecycle
+      - file: internal/policy/decision_test.go
+        funcs:
+          - TestEvaluateLayersPolicyHashIncludesResolvedRuleIdentity
+          - TestGatePolicyHashStableAcrossPatternOrder
+
+  - id: sol-s5-audit-recovery-weaknesses
+    title: "Redaction failure blocks export, canary chmod/remove failures retry and are reported, validator-ledger insert failures enter the outbox, final workspace Destroy() is bounded, and the git control plane (.git/hooks, .git/config) is fingerprinted independently of contract declarations"
+    first_shipped_version: v1.5.0-sol-repair-s5
+    claimed_maturity: tested
+    implementation:
+      - file: internal/runtime/runtime.go
+        symbols: [redact, cleanupCanary, recordValidatorEvidence, destroyWorkspaceWithOutbox, gitControlFingerprint]
+    tests:
+      - file: internal/runtime/runtime_test.go
+        funcs:
+          - TestApprovedReplayRedactionAndRollback
+          - TestCanaryMutationIsQuarantined
+          - TestCleanupCanarySucceedsAndClearsFile
+          - TestCleanupCanaryFailurePermanentlyIsReported
+          - TestValidatorEvidenceInsertFailureEntersOutbox
+          - TestGitControlFingerprintDetectsHookMutationThroughWorktree
+      - file: internal/runtime/reconcile_test.go
+        funcs:
+          - TestReconcileWorkspaceDestroyRemovesLeftoverWorktree
+
+  - id: sol-s7-assayer-v2-bridge
+    title: "Governator's Assayer bridge speaks the v2 wire protocol (gov-assay-evaluate-v2): checks_result_hash/profile_definition_hash/validator_implementation_hash/validator_config_hash are separately verified, matching Assayer's coding-output-v2 profile, advisory verdicts, real evaluation_id, and durable quarantine outbox"
+    first_shipped_version: v1.5.0-sol-repair-s7
+    claimed_maturity: tested
+    implementation:
+      - file: internal/assay/assay.go
+        symbols: [Verdict, Evaluate, BridgePolicyVersion]
+    tests:
+      - file: internal/assay/assay_integration_test.go
+        funcs:
+          - TestEvaluateAgainstRealCLIPassAndFail
+        build_tag: integration

@@ -2,6 +2,8 @@
 
 Governator exposes one decision core through a Claude Code dialect and a harness-neutral dialect. The gate complements, but does not replace, the contract runtime's worktree, fingerprint, budget, and validator checks.
 
+The runtime underneath the gate is transactional: live-root merges progress through durable `MERGE_INTENT → MERGE_APPLIED → ROOT_COMMITTED → LEDGER_FINALIZING → COMPLETE` stages (with a distinct `MERGED_LEDGER_PENDING` recovery status), workspace creation is guarded so a mid-run crash can never leak a worktree or branch, and workspace locks are held on the canonical (symlink- and device/inode-resolved) identity of the repository rather than a raw path string. See [docs/ledger.md](ledger.md#merge-transaction-and-workspace-lifecycle) for the state machine and [docs/containment.md](containment.md) for how lock/merge safety relates (and does not amount) to host containment.
+
 ## F1-F7 model
 
 | Finding | Governator control |
