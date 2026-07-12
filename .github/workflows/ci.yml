@@ -44,6 +44,33 @@ jobs:
             exit 1
           fi
 
+  assay-integration:
+    name: assay integration (real Assayer CLI, mandatory)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
+      # This is the blocking Assayer boundary (plan v1.4 Session 2): the real
+      # `cli.py evaluate` subcommand run against the pinned fixture checked
+      # into internal/assay/testdata/assayer_fixture/. Unlike the fast tier
+      # above, there is no t.Skip path left in this test — a missing/broken
+      # fixture or a missing python3 interpreter is a hard test failure
+      # (t.Fatal), so this step fails the job rather than silently passing
+      # green on a boundary that never actually executed.
+      - name: Real Assayer CLI integration test
+        run: go test -tags=integration -run TestEvaluateAgainstRealCLIPassAndFail -v ./internal/assay/...
+
   lint:
     name: golangci-lint
     runs-on: ubuntu-latest

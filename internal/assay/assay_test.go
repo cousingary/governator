@@ -13,39 +13,6 @@ import (
 	"time"
 )
 
-// realAssayerRepo is the sibling Python repo built alongside this package
-// for Phase 3A. Tests that exercise the real `evaluate` subcommand copy its
-// cli.py + assayer/ package into a t.TempDir() (hermetic: nothing here
-// mutates the real checkout) and skip if it isn't present on the machine.
-const realAssayerRepo = "/mnt/e/downloads/assayer"
-
-func setupRealAssayerRepo(t *testing.T) string {
-	t.Helper()
-	if _, err := os.Stat(filepath.Join(realAssayerRepo, "cli.py")); err != nil {
-		t.Skipf("real assayer repo not found at %s: %v", realAssayerRepo, err)
-	}
-	dst := t.TempDir()
-	copyFileForTest(t, filepath.Join(realAssayerRepo, "cli.py"), filepath.Join(dst, "cli.py"))
-	if err := os.MkdirAll(filepath.Join(dst, "assayer"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	for _, name := range []string{"__init__.py", "checks.py", "profiles.py", "store.py"} {
-		copyFileForTest(t, filepath.Join(realAssayerRepo, "assayer", name), filepath.Join(dst, "assayer", name))
-	}
-	return dst
-}
-
-func copyFileForTest(t *testing.T, src, dst string) {
-	t.Helper()
-	data, err := os.ReadFile(src)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(dst, data, 0o644); err != nil {
-		t.Fatal(err)
-	}
-}
-
 func requirePython3(t *testing.T) {
 	t.Helper()
 	if _, err := exec.LookPath("python3"); err != nil {
@@ -187,39 +154,6 @@ func TestEvaluateUnparseableStdoutIsError(t *testing.T) {
 	}
 }
 
-func TestEvaluateAgainstRealCLIPassAndFail(t *testing.T) {
-	requirePython3(t)
-	repo := setupRealAssayerRepo(t)
-
-	dir := t.TempDir()
-	content := `{"content":"This is a real, sufficiently long piece of generated content."}`
-	path, sha := writeArtifact(t, dir, content)
-	req := baseRequest(sha)
-	req.Payload = json.RawMessage(`{"content":"This is a real, sufficiently long piece of generated content."}`)
-
-	v := Evaluate(context.Background(), Config{Repo: repo, Python: "python3"}, req, path)
-	if v.Verdict != VerdictPass {
-		t.Fatalf("expected pass verdict against real assayer CLI, got %+v", v)
-	}
-	if v.ChecksHash == "" {
-		t.Fatal("expected a non-empty checks_hash")
-	}
-
-	// Now a payload missing the required field -> fail.
-	badContent := `{}`
-	badPath, badSHA := writeArtifact(t, dir, badContent)
-	badReq := baseRequest(badSHA)
-	badReq.Payload = json.RawMessage(`{}`)
-
-	badV := Evaluate(context.Background(), Config{Repo: repo, Python: "python3"}, badReq, badPath)
-	if badV.Verdict != VerdictFail {
-		t.Fatalf("expected fail verdict for missing required field, got %+v", badV)
-	}
-	if len(badV.FailedChecks) == 0 {
-		t.Fatal("expected at least one failed check name")
-	}
-}
-
 func TestConfiguredReflectsRepoField(t *testing.T) {
 	if (Config{}).Configured() {
 		t.Fatal("empty Config must report Configured()==false")
@@ -259,5 +193,56 @@ func TestBlocks(t *testing.T) {
 		if got != c.want {
 			t.Errorf("Blocks(%q,%q) = %v, want %v", c.verdict, c.enforcement, got, c.want)
 		}
+	}
+}
+
+// TestDescribeEnvironmentUnconfiguredIsZeroValue proves an unconfigured
+// Config (no Repo, the "assay not configured" case runtime.runAssayStep
+// already handles) never runs any probe — a zero-value Environment, not a
+// half-populated one from a stray git/file lookup with an empty path.
+func TestDescribeEnvironmentUnconfiguredIsZeroValue(t *testing.T) {
+	if got := DescribeEnvironment(Config{}); got != (Environment{}) {
+		t.Fatalf("expected zero-value Environment for unconfigured cfg, got %+v", got)
+	}
+}
+
+// TestDescribeEnvironmentAgainstFixture is the load-bearing regression for
+// the "git -C walks up to the enclosing repo" bug: testdata/assayer_fixture
+// has no .git of its own and lives inside governator's own git working
+// tree, so a naive `git -C <fixture> rev-parse HEAD` would silently report
+// *governator's* commit as "the Assayer commit" — wrong and misleading
+// metadata, worse than reporting none. AssayerCommit must fall back to the
+// fixture's checked-in PINNED_COMMIT marker instead.
+func TestDescribeEnvironmentAgainstFixture(t *testing.T) {
+	repo := filepath.Join("testdata", "assayer_fixture")
+	env := DescribeEnvironment(Config{Repo: repo, Python: "python3"})
+
+	pinned, err := os.ReadFile(filepath.Join(repo, "PINNED_COMMIT"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantCommit := strings.TrimSpace(string(pinned))
+	if env.AssayerCommit != wantCommit {
+		t.Fatalf("AssayerCommit = %q, want pinned fixture commit %q (did it fall through to governator's own git repo instead?)", env.AssayerCommit, wantCommit)
+	}
+
+	if len(env.ProfileHash) != 64 {
+		t.Fatalf("expected a 64-hex-char sha256 ProfileHash, got %q", env.ProfileHash)
+	}
+	if len(env.ValidatorsHash) != 64 {
+		t.Fatalf("expected a 64-hex-char sha256 ValidatorsHash, got %q", env.ValidatorsHash)
+	}
+	if env.ProfileHash == env.ValidatorsHash {
+		t.Fatalf("profiles.py and checks.py must not hash identically, got %q for both", env.ProfileHash)
+	}
+}
+
+// TestDescribeEnvironmentPythonVersion proves PythonVersion is populated
+// from a real interpreter invocation, not just echoed from cfg.Python.
+func TestDescribeEnvironmentPythonVersion(t *testing.T) {
+	requirePython3(t)
+	env := DescribeEnvironment(Config{Repo: filepath.Join("testdata", "assayer_fixture"), Python: "python3"})
+	if !strings.Contains(strings.ToLower(env.PythonVersion), "python") {
+		t.Fatalf("expected PythonVersion to mention python, got %q", env.PythonVersion)
 	}
 }

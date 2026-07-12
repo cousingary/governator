@@ -4,8 +4,11 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+	"time"
 
+	"github.com/cousingary/governator/internal/breaker"
 	"github.com/cousingary/governator/internal/contracts"
 	"github.com/cousingary/governator/internal/observability"
 )
@@ -324,5 +327,169 @@ printf '{"type":"result","total_cost_usd":0.05}\n'
 	}
 	if len(rows) != 1 || rows[0].Verdict != "pass" || rows[0].ChecksHash != "h-pass" {
 		t.Fatalf("expected one pass assay_evaluations row, got %+v", rows)
+	}
+}
+
+// TestAssayEvaluationRecordsEnvironmentMetadata proves plan Session 2 item 3
+// ("record in every evaluation: Assayer commit, profile hash, validator
+// versions, Python environment") end to end through the real runtime call
+// site, not just internal/assay's own unit tests. It points GOV_ASSAY_REPO
+// at the real pinned fixture (not a stub) so ProfileHash/ValidatorsHash come
+// from real assayer/profiles.py and assayer/checks.py bytes, and
+// AssayerCommit comes from the fixture's PINNED_COMMIT marker (the fixture
+// has no .git of its own).
+func TestAssayEvaluationRecordsEnvironmentMetadata(t *testing.T) {
+	root, _ := fixture(t)
+	writeArtifactSchema(t, root)
+	home := t.TempDir()
+	t.Setenv("GOV_HOME", home)
+	fixtureRepo, err := filepath.Abs(filepath.Join("..", "assay", "testdata", "assayer_fixture"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	setAssayEnv(t, fixtureRepo)
+	bin := writeFakeBackend(t, `mkdir -p output .governator/artifacts
+printf 'ok\n' > output/result.txt
+printf '{"summary":"ok"}' > .governator/artifacts/scout.json
+printf '{"status":"complete","files_changed":["output/result.txt"],"commands_run":0,"validation":{"self_checked":true},"violations":[],"blockers":[],"next_recommended_action":"none"}\n' > RESULT.json
+printf '{"type":"result","total_cost_usd":0.05}\n'
+`)
+	t.Setenv("GOV_CLAUDE_BIN", bin)
+	promptRoot := t.TempDir()
+	writePrompt(t, promptRoot, "claude-code", "surgeon")
+	t.Setenv("GOV_PROMPTS", promptRoot)
+
+	rec, err := New().Run(context.Background(), assayProducerContract(root, "blocking"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rec.Status != "APPROVED" {
+		t.Fatalf("expected the real fixture to pass and approve, got status=%s message=%s", rec.Status, rec.Message)
+	}
+
+	db, err := observability.Open(home)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	rows, err := observability.AssayEvaluationsForRun(db, rec.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("expected exactly one assay_evaluations row, got %+v", rows)
+	}
+	row := rows[0]
+	pinned, err := os.ReadFile(filepath.Join(fixtureRepo, "PINNED_COMMIT"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := strings.TrimSpace(string(pinned)); row.AssayerCommit != want {
+		t.Fatalf("AssayerCommit = %q, want pinned fixture commit %q", row.AssayerCommit, want)
+	}
+	if len(row.ProfileHash) != 64 {
+		t.Fatalf("expected a 64-hex-char ProfileHash, got %q", row.ProfileHash)
+	}
+	if len(row.ValidatorsHash) != 64 {
+		t.Fatalf("expected a 64-hex-char ValidatorsHash, got %q", row.ValidatorsHash)
+	}
+	if !strings.Contains(strings.ToLower(row.PythonVersion), "python") {
+		t.Fatalf("expected PythonVersion to mention python, got %q", row.PythonVersion)
+	}
+}
+
+// TestAssayBlockingFailNeverOpensBreaker is the plan Session 2 item 5
+// regression: a quality-only failure (a blocking assay FAIL verdict) must
+// never open or degrade the infra circuit breaker for the backend that
+// produced it. The fake backend in this test "ran fine" — it exited 0,
+// produced its artifact, wrote a clean RESULT.json — so infraKind stays
+// agents.InfraNone; only the artifact *content* failed assay's checks. Rule
+// 3 (internal/breaker's own doc comment: "bad output must never open a
+// breaker") says the breaker must read this exactly like an ordinary
+// approved run, not like an outage.
+func TestAssayBlockingFailNeverOpensBreaker(t *testing.T) {
+	root, _ := fixture(t)
+	writeArtifactSchema(t, root)
+	home := t.TempDir()
+	t.Setenv("GOV_HOME", home)
+	setAssayEnv(t, writeAssayerStub(t, stubFailVerdict))
+	bin := writeFakeBackend(t, `mkdir -p output .governator/artifacts
+printf 'ok\n' > output/result.txt
+printf '{"summary":"ok"}' > .governator/artifacts/scout.json
+printf '{"status":"complete","files_changed":["output/result.txt"],"commands_run":0,"validation":{"self_checked":true},"violations":[],"blockers":[],"next_recommended_action":"none"}\n' > RESULT.json
+printf '{"type":"result","total_cost_usd":0.05}\n'
+`)
+	t.Setenv("GOV_CLAUDE_BIN", bin)
+	promptRoot := t.TempDir()
+	writePrompt(t, promptRoot, "claude-code", "surgeon")
+	t.Setenv("GOV_PROMPTS", promptRoot)
+
+	rec, err := New().Run(context.Background(), assayProducerContract(root, "blocking"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rec.Status != "QUARANTINED" || rec.FailureTaxonomy != "ASSAY_FAILED" {
+		t.Fatalf("expected a quality-only ASSAY_FAILED quarantine, got status=%s taxonomy=%s", rec.Status, rec.FailureTaxonomy)
+	}
+	if rec.Agent == "" {
+		t.Fatal("expected the run to record which backend ran it")
+	}
+
+	db, err := observability.Open(home)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	snap := breaker.Snapshot(db, rec.Agent, time.Now().UTC())
+	if snap.EffectiveState != breaker.Closed {
+		t.Fatalf("a quality-only assay failure must never move the breaker off CLOSED, got %s (failure_kind=%q)", snap.EffectiveState, snap.FailureKind)
+	}
+	if snap.FailureKind != "" || snap.ConsecutiveFailures != 0 {
+		t.Fatalf("expected no infra failure ever recorded for this backend, got failure_kind=%q consecutive_failures=%d", snap.FailureKind, snap.ConsecutiveFailures)
+	}
+}
+
+// TestAssayBlockingErrorNeverOpensBreaker is the ERROR-verdict twin of
+// TestAssayBlockingFailNeverOpensBreaker: the Assayer subprocess itself
+// crashing is still an assay-boundary (quality-pipeline) failure, not an
+// infra failure of the coding backend — agents.ClassifyInfra never even
+// looks at assay verdicts, only at the coding backend's own exit
+// code/launch error/transcript. The breaker must stay untouched here too.
+func TestAssayBlockingErrorNeverOpensBreaker(t *testing.T) {
+	root, _ := fixture(t)
+	writeArtifactSchema(t, root)
+	home := t.TempDir()
+	t.Setenv("GOV_HOME", home)
+	setAssayEnv(t, writeAssayerStub(t, stubCrash))
+	bin := writeFakeBackend(t, `mkdir -p output .governator/artifacts
+printf 'ok\n' > output/result.txt
+printf '{"summary":"ok"}' > .governator/artifacts/scout.json
+printf '{"status":"complete","files_changed":["output/result.txt"],"commands_run":0,"validation":{"self_checked":true},"violations":[],"blockers":[],"next_recommended_action":"none"}\n' > RESULT.json
+printf '{"type":"result","total_cost_usd":0.05}\n'
+`)
+	t.Setenv("GOV_CLAUDE_BIN", bin)
+	promptRoot := t.TempDir()
+	writePrompt(t, promptRoot, "claude-code", "surgeon")
+	t.Setenv("GOV_PROMPTS", promptRoot)
+
+	rec, err := New().Run(context.Background(), assayProducerContract(root, "blocking"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rec.Status != "QUARANTINED" || rec.FailureTaxonomy != "ASSAY_FAILED" {
+		t.Fatalf("expected a quality-only ASSAY_FAILED quarantine, got status=%s taxonomy=%s", rec.Status, rec.FailureTaxonomy)
+	}
+
+	db, err := observability.Open(home)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	snap := breaker.Snapshot(db, rec.Agent, time.Now().UTC())
+	if snap.EffectiveState != breaker.Closed {
+		t.Fatalf("an assay subprocess crash must never move the breaker off CLOSED, got %s (failure_kind=%q)", snap.EffectiveState, snap.FailureKind)
+	}
+	if snap.FailureKind != "" || snap.ConsecutiveFailures != 0 {
+		t.Fatalf("expected no infra failure ever recorded for this backend, got failure_kind=%q consecutive_failures=%d", snap.FailureKind, snap.ConsecutiveFailures)
 	}
 }

@@ -126,6 +126,21 @@ type Request struct {
 // ScoredCandidate is one evaluated backend in a decision. Every component is
 // recorded separately so the decision is fully explainable from the ledger
 // alone (rule 4).
+//
+// AssayQualityScore (plan v1.4 Session 2 item 4, closing the gap Phase 7
+// deliberately left open — see observability/phase7.go's package doc:
+// "Nothing here feeds back into routing... that boundary is Phase 3C's job")
+// is the one component this evidence feeds into Total. It blends four
+// evidence-backed rate signals — assay pass rate, validator pass rate,
+// repair success rate, and panel agreement rate — each neutral (0.5) when
+// there is no evidence yet, same idiom as ValidRateScore. AssayPassRate,
+// ValidatorPassRate, RepairSuccessRate, PanelAgreementRate, and
+// CostPerAcceptedUSD are the underlying raw evidence, recorded separately
+// and unweighted (rule 4) so `gov route --explain` shows exactly what fed
+// the blended score instead of only the blend itself. CostPerAcceptedUSD is
+// informational only (0 = no evidence) — cost preference is already fully
+// handled by CostScore's own estimate-based mechanism below; this field
+// exists for visibility, not to double-count cost in Total.
 type ScoredCandidate struct {
 	Agent                string
 	ValidRateScore       float64
@@ -134,6 +149,12 @@ type ScoredCandidate struct {
 	BreakerScore         float64
 	QuotaScore           float64
 	RepairAffinityScore  float64
+	AssayQualityScore    float64
+	AssayPassRate        float64
+	ValidatorPassRate    float64
+	RepairSuccessRate    float64
+	PanelAgreementRate   float64
+	CostPerAcceptedUSD   float64
 	Total                float64
 	Excluded             bool
 	ExclusionReason      string
@@ -347,6 +368,13 @@ func (r Router) evaluate(db *sql.DB, name string, req Request, w weightSet, line
 	candidate.QuotaScore = quotaScore(quota)
 	candidate.RepairAffinityScore = affinityScore(req.RepairLineage, lineageAgent, name)
 	candidate.CostScore = 0 // finalizeCosts fills this in the pool pass.
+	assayEvidence := assayEvidenceFor(db, name, req.JobType)
+	candidate.AssayPassRate = assayEvidence.assayPassRate
+	candidate.ValidatorPassRate = assayEvidence.validatorPassRate
+	candidate.RepairSuccessRate = assayEvidence.repairSuccessRate
+	candidate.PanelAgreementRate = assayEvidence.panelAgreementRate
+	candidate.CostPerAcceptedUSD = assayEvidence.costPerAcceptedUSD
+	candidate.AssayQualityScore = assayQualityComponent(assayEvidence)
 	candidate.Total = totalScore(candidate, w)
 	return candidate
 }
@@ -382,35 +410,46 @@ func reasonSuffix(reason string) string {
 // breaker and quota weights are live and discriminating whenever
 // breaker.Store has telemetry (production callers always inject it).
 type weightSet struct {
-	validRate float64
-	severity  float64
-	cost      float64
-	breaker   float64
-	quota     float64
-	affinity  float64
+	validRate    float64
+	severity     float64
+	cost         float64
+	breaker      float64
+	quota        float64
+	affinity     float64
+	assayQuality float64
 }
 
+// objectiveWeights' three presets each gained a modest assayQuality slice
+// (plan Session 2 item 4), taken mainly from cost/validRate so every preset
+// still sums to exactly 1.0. assayQuality is neutral (0.5, see
+// assayQualityComponent) for any candidate with no assay/validator/repair/
+// panel evidence yet, so a ledger with none of that evidence recorded routes
+// identically to how it did before this field existed.
 func objectiveWeights(objective string) weightSet {
 	switch objective {
 	case "cheapest":
-		return weightSet{validRate: 0.20, severity: 0.10, cost: 0.55, breaker: 0.05, quota: 0.05, affinity: 0.05}
+		return weightSet{validRate: 0.18, severity: 0.10, cost: 0.50, breaker: 0.05, quota: 0.05, affinity: 0.05, assayQuality: 0.07}
 	case "most_reliable":
-		return weightSet{validRate: 0.35, severity: 0.30, cost: 0.05, breaker: 0.20, quota: 0.05, affinity: 0.05}
+		return weightSet{validRate: 0.30, severity: 0.28, cost: 0.05, breaker: 0.18, quota: 0.05, affinity: 0.05, assayQuality: 0.09}
 	default: // "balanced" and any unrecognized value (validation rejects those)
-		return weightSet{validRate: 0.30, severity: 0.15, cost: 0.25, breaker: 0.10, quota: 0.05, affinity: 0.15}
+		return weightSet{validRate: 0.27, severity: 0.15, cost: 0.22, breaker: 0.10, quota: 0.05, affinity: 0.15, assayQuality: 0.06}
 	}
 }
 
 // riskAdjustedWeights nudges the objective's weights toward reliability for a
 // risky job by moving a bounded slice of the cost weight onto valid-rate,
-// severity, and breaker — the three reliability components — split
-// proportionally (50/30/20) so the total stays exactly 1.0. It never touches
-// quota or affinity (rule 3: infra/quality signals stay separate from
-// anything risk-flavored) and never bypasses a hard exclusion — only soft
-// scores among survivors move. "low" and an unset RiskClass are a deliberate
-// no-op: unset keeps every prior agent: auto contract routing exactly as it
-// did before RiskClass existed, and "low" means "score this the way the
-// chosen objective already would."
+// severity, breaker, and assay quality — the four reliability components —
+// split proportionally (40/25/20/15) so the total stays exactly 1.0.
+// assayQuality joined this split in Session 2: an evidence-backed quality
+// signal is exactly as much a "reliability component" as valid rate or
+// breaker state, and gets a smaller slice than valid rate/severity because it
+// is a blend of several second-order rates rather than the run's own direct
+// outcome. It never touches quota or affinity (rule 3: infra/quality signals
+// stay separate from anything risk-flavored) and never bypasses a hard
+// exclusion — only soft scores among survivors move. "low" and an unset
+// RiskClass are a deliberate no-op: unset keeps every prior agent: auto
+// contract routing exactly as it did before RiskClass existed, and "low"
+// means "score this the way the chosen objective already would."
 func riskAdjustedWeights(w weightSet, risk string) weightSet {
 	var shift float64
 	switch risk {
@@ -425,9 +464,10 @@ func riskAdjustedWeights(w weightSet, risk string) weightSet {
 		shift = w.cost
 	}
 	w.cost -= shift
-	w.validRate += shift * 0.5
-	w.severity += shift * 0.3
-	w.breaker += shift * 0.2
+	w.validRate += shift * 0.40
+	w.severity += shift * 0.25
+	w.breaker += shift * 0.20
+	w.assayQuality += shift * 0.15
 	return w
 }
 
@@ -440,9 +480,9 @@ func riskAdjustedWeights(w weightSet, risk string) weightSet {
 func policyHash(w weightSet, req Request) string {
 	r := req.Requirements
 	material := fmt.Sprintf(
-		"weights:valid=%.4f,severity=%.4f,cost=%.4f,breaker=%.4f,quota=%.4f,affinity=%.4f|"+
+		"weights:valid=%.4f,severity=%.4f,cost=%.4f,breaker=%.4f,quota=%.4f,affinity=%.4f,assay_quality=%.4f|"+
 			"requirements:native_sandbox=%t,network_control=%t,read_only_mode=%t,vision=%t,tool_calling=%t,local_only=%t,min_context_tokens=%d,min_output_tokens=%d",
-		w.validRate, w.severity, w.cost, w.breaker, w.quota, w.affinity,
+		w.validRate, w.severity, w.cost, w.breaker, w.quota, w.affinity, w.assayQuality,
 		r.NativeSandbox, r.NetworkControl, r.ReadOnlyMode, r.Vision, r.ToolCalling, r.LocalOnly,
 		r.MinContextTokens, r.MinOutputTokens,
 	)
@@ -456,7 +496,8 @@ func totalScore(c ScoredCandidate, w weightSet) float64 {
 		c.CostScore*w.cost +
 		c.BreakerScore*w.breaker +
 		c.QuotaScore*w.quota +
-		c.RepairAffinityScore*w.affinity
+		c.RepairAffinityScore*w.affinity +
+		c.AssayQualityScore*w.assayQuality
 }
 
 func recomputeTotals(scored []ScoredCandidate, w weightSet) {
@@ -696,6 +737,166 @@ func evidenceFor(db *sql.DB, agent, jobType string) (runs, valid int, severityRa
 	return runs, valid, severityRateOf(counts, runs)
 }
 
+// assayEvidence is the raw per-(agent, job_type) quality-feedback evidence
+// plan v1.4 Session 2 item 4 asks the router to consult: assay pass rate,
+// validator pass rate, repair success rate, panel agreement rate (the
+// inverse of disagreement — observability.PanelDisagreementRate's global
+// analog), and cost per accepted result. Every rate field already carries
+// its own neutral default (0.5 = "no evidence yet," the same idiom
+// evidenceFor uses for valid rate) so callers never need a separate
+// has-evidence flag. costPerAcceptedUSD defaults to 0 (no evidence) since a
+// real accepted run always costs more than $0.
+type assayEvidence struct {
+	assayPassRate      float64
+	validatorPassRate  float64
+	repairSuccessRate  float64
+	panelAgreementRate float64
+	costPerAcceptedUSD float64
+}
+
+// assayEvidenceFor reads four independent rate queries plus one cost query,
+// every one scoped to (agent, job_type) via a join through runs — the same
+// scoping evidenceFor uses for valid rate and severity. A read error on any
+// one query degrades only that query to its neutral default rather than
+// failing the whole decision (a partial ledger should not make routing
+// impossible — same tolerance evidenceFor already has).
+func assayEvidenceFor(db *sql.DB, agent, jobType string) assayEvidence {
+	return assayEvidence{
+		assayPassRate: rateQuery(db,
+			`SELECT ae.verdict FROM assay_evaluations ae JOIN runs r ON r.id=ae.run_id WHERE r.agent=? AND r.job_type=? AND ae.verdict<>'skipped'`,
+			agent, jobType, isAssayPass),
+		validatorPassRate: rateQuery(db,
+			`SELECT CASE WHEN v.exit_code=0 THEN 'pass' ELSE 'fail' END FROM validators v JOIN runs r ON r.id=v.run_id WHERE r.agent=? AND r.job_type=?`,
+			agent, jobType, isPass),
+		repairSuccessRate: rateQuery(db,
+			`SELECT status FROM runs WHERE agent=? AND job_type=? AND repair_of<>''`,
+			agent, jobType, isApproved),
+		panelAgreementRate: panelAgreementRateFor(db, agent, jobType),
+		costPerAcceptedUSD: costPerAcceptedFor(db, agent, jobType),
+	}
+}
+
+func isAssayPass(verdict string) bool {
+	return verdict == assayVerdictPass || verdict == assayVerdictAdvisory
+}
+func isPass(status string) bool     { return status == "pass" }
+func isApproved(status string) bool { return status == "APPROVED" }
+
+// assayVerdictPass/assayVerdictAdvisory mirror internal/assay's VerdictPass/
+// VerdictAdvisory string constants. router intentionally does not import
+// internal/assay for two literal strings — the same reasoning breaker.Config
+// uses to avoid an internal/config dependency (avoids growing an import
+// graph for a value that will never itself change independently: Assayer's
+// four verdict strings are a stable wire contract both sides already commit
+// to via internal/assay's own doc comments).
+const (
+	assayVerdictPass     = "pass"
+	assayVerdictAdvisory = "advisory"
+)
+
+// rateQuery runs a single-string-column query and returns the fraction of
+// rows for which isHit reports true, or the neutral 0.5 default when the
+// query errors or returns zero rows (no evidence).
+func rateQuery(db *sql.DB, query, agent, jobType string, isHit func(string) bool) float64 {
+	rows, err := db.Query(query, agent, jobType)
+	if err != nil {
+		return 0.5
+	}
+	defer rows.Close()
+	total, hits := 0, 0
+	for rows.Next() {
+		var v string
+		if err := rows.Scan(&v); err != nil {
+			return 0.5
+		}
+		total++
+		if isHit(v) {
+			hits++
+		}
+	}
+	if rows.Err() != nil || total == 0 {
+		return 0.5
+	}
+	return clampUnit(float64(hits) / float64(total))
+}
+
+// panelAgreementRateFor is the per-(agent, job_type) analog of
+// observability.PanelDisagreementRate: same query shape (join panel_members
+// to the newest run per (panel_id, job_id), count panels with more than one
+// distinct terminal status), scoped to panels this agent was a member of and
+// returning agreement (1 - disagreement rate) rather than disagreement, so it
+// composes directly into assayQualityComponent alongside the other rates
+// (higher = better, like every other component here).
+func panelAgreementRateFor(db *sql.DB, agent, jobType string) float64 {
+	rows, err := db.Query(`
+SELECT pm.panel_id, pm.job_id, r.status
+FROM panel_members pm
+JOIN runs r ON r.job_id = pm.job_id
+WHERE pm.agent = ? AND r.job_type = ?
+ORDER BY pm.panel_id ASC, pm.job_id ASC, r.created DESC`, agent, jobType)
+	if err != nil {
+		return 0.5
+	}
+	defer rows.Close()
+	seenJob := map[[2]string]bool{}
+	statuses := map[string]map[string]bool{}
+	for rows.Next() {
+		var panelID, jobID, status string
+		if err := rows.Scan(&panelID, &jobID, &status); err != nil {
+			return 0.5
+		}
+		jobKey := [2]string{panelID, jobID}
+		if seenJob[jobKey] {
+			continue
+		}
+		seenJob[jobKey] = true
+		if statuses[panelID] == nil {
+			statuses[panelID] = map[string]bool{}
+		}
+		statuses[panelID][status] = true
+	}
+	if rows.Err() != nil {
+		return 0.5
+	}
+	panels, disagreements := 0, 0
+	for _, distinct := range statuses {
+		panels++
+		if len(distinct) > 1 {
+			disagreements++
+		}
+	}
+	if panels == 0 {
+		return 0.5
+	}
+	return clampUnit(1 - float64(disagreements)/float64(panels))
+}
+
+// costPerAcceptedFor averages cost_usd across this agent's APPROVED runs for
+// job_type. 0 means no evidence (no approved run recorded yet), same as
+// every other "no evidence" default in this file being the value that can
+// never occur naturally (a real approved run always costs > $0).
+func costPerAcceptedFor(db *sql.DB, agent, jobType string) float64 {
+	var cost sql.NullFloat64
+	if err := db.QueryRow(`SELECT AVG(cost_usd) FROM runs WHERE agent=? AND job_type=? AND status='APPROVED'`, agent, jobType).Scan(&cost); err != nil {
+		return 0
+	}
+	if !cost.Valid {
+		return 0
+	}
+	return cost.Float64
+}
+
+// assayQualityComponent blends the four evidence-backed rate signals into
+// one [0,1] score for Total. Each input already carries its own neutral
+// default (assayEvidenceFor), so a candidate with zero quality evidence
+// anywhere scores exactly 0.5 — identical to how ValidRateScore treats an
+// unproven backend: neither penalized nor rewarded. costPerAcceptedUSD is
+// deliberately excluded from the blend (see ScoredCandidate's doc comment):
+// cost preference already has its own weighted component (CostScore).
+func assayQualityComponent(e assayEvidence) float64 {
+	return clampUnit((e.assayPassRate + e.validatorPassRate + e.repairSuccessRate + e.panelAgreementRate) / 4)
+}
+
 // ErrNoCandidate is returned by the runtime layer (not Resolve) when a
 // decision fail-closes — Resolve expresses the same outcome as Selected==""
 // so the CLI can print the table without treating it as an error.
@@ -706,15 +907,16 @@ func (d Decision) Format() string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "objective=%s risk_class=%s job_type=%s policy_hash=%s selected=%s\n",
 		d.Objective, orDash(d.RiskClass), d.JobType, d.PolicyHash, orDash(d.Selected))
-	b.WriteString("agent\ttotal\tvalid_rate\tseverity\tcost\tbreaker\tquota\taffinity\texcluded\treason\n")
+	b.WriteString("agent\ttotal\tvalid_rate\tseverity\tcost\tbreaker\tquota\taffinity\tassay_quality\tassay_pass\tvalidator_pass\trepair_success\tpanel_agreement\tcost_per_accepted\texcluded\treason\n")
 	for _, c := range d.Candidates {
 		selected := ""
 		if c.Selected {
 			selected = " *"
 		}
-		fmt.Fprintf(&b, "%s%s\t%.4f\t%.4f\t%.4f\t%.4f\t%.4f\t%.4f\t%.4f\t%t\t%s\n",
+		fmt.Fprintf(&b, "%s%s\t%.4f\t%.4f\t%.4f\t%.4f\t%.4f\t%.4f\t%.4f\t%.4f\t%.4f\t%.4f\t%.4f\t%.4f\t%.4f\t%t\t%s\n",
 			c.Agent, selected, c.Total, c.ValidRateScore, c.FailureSeverityScore,
 			c.CostScore, c.BreakerScore, c.QuotaScore, c.RepairAffinityScore,
+			c.AssayQualityScore, c.AssayPassRate, c.ValidatorPassRate, c.RepairSuccessRate, c.PanelAgreementRate, c.CostPerAcceptedUSD,
 			c.Excluded, orDash(c.ExclusionReason))
 	}
 	return b.String()

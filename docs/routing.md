@@ -95,6 +95,7 @@ from the ledger alone:
 | quota headroom | `HealthSource.Quota` from `quota_windows` | soft when telemetry available |
 | repair-lineage affinity | the backend that ran the root of the lineage | soft (repair jobs only) |
 | `risk_class` | `Contract.RiskClass` (also `gov plan --show`'s risk tier) | soft — shifts weights, see below |
+| assay quality | blend of assay/validator/repair/panel evidence (`internal/router.assayEvidenceFor`) | soft, see [Assayer quality evidence](#assayer-quality-evidence-into-routing-v14-session-2) below |
 
 `mode` is **not** a score component: it is carried on `Request` for context
 (e.g. `gov route --explain` display) but never read by `evaluate` or any
@@ -106,11 +107,15 @@ scores 1.0.
 
 The `objective` shifts weights but **never bypasses a hard exclusion**:
 
-| Objective | valid | severity | cost | breaker | quota | affinity |
-|---|---|---|---|---|---|---|
-| balanced | 0.30 | 0.15 | 0.25 | 0.10 | 0.05 | 0.15 |
-| cheapest | 0.20 | 0.10 | 0.55 | 0.05 | 0.05 | 0.05 |
-| most_reliable | 0.35 | 0.30 | 0.05 | 0.20 | 0.05 | 0.05 |
+| Objective | valid | severity | cost | breaker | quota | affinity | assay_quality |
+|---|---|---|---|---|---|---|---|
+| balanced | 0.27 | 0.15 | 0.22 | 0.10 | 0.05 | 0.15 | 0.06 |
+| cheapest | 0.18 | 0.10 | 0.50 | 0.05 | 0.05 | 0.05 | 0.07 |
+| most_reliable | 0.30 | 0.28 | 0.05 | 0.18 | 0.05 | 0.05 | 0.09 |
+
+(v1.4 Session 2 took the `assay_quality` slice mainly from `valid`/`cost` so
+every preset still sums to exactly 1.0; see [Assayer quality
+evidence](#assayer-quality-evidence-into-routing-v14-session-2) below.)
 
 The breaker and quota weights are live when their telemetry exists; missing
 quota telemetry stays neutral rather than penalizing a backend.
@@ -125,17 +130,17 @@ rewarded over a proven one. Ties break by ascending name for reproducibility.
 `gov plan --show` has always rendered it as a plan-authoring tier, and the
 route broker (`internal/router.riskAdjustedWeights`) now reads it too when
 paired with `agent: auto`. It moves a bounded slice of the objective's cost
-weight onto the three reliability components — valid rate, failure severity,
-and breaker state — split 50/30/20 so the total always still sums to 1.0. It
-never touches quota or affinity (rule 3 keeps infra/quality signals separate
-from anything risk-flavored) and never bypasses a hard exclusion — only soft
-scores among survivors move.
+weight onto the four reliability components — valid rate, failure severity,
+breaker state, and (since v1.4 Session 2) assay quality — split 40/25/20/15
+so the total always still sums to 1.0. It never touches quota or affinity
+(rule 3 keeps infra/quality signals separate from anything risk-flavored) and
+never bypasses a hard exclusion — only soft scores among survivors move.
 
-| `risk_class` | cost shift | applied to (validRate / severity / breaker) |
+| `risk_class` | cost shift | applied to (validRate / severity / breaker / assay_quality) |
 |---|---|---|
 | unset or `low` | none (no-op) | — |
-| `medium` | up to 0.05 | 50% / 30% / 20% of the shift |
-| `high` | up to 0.15 | 50% / 30% / 20% of the shift |
+| `medium` | up to 0.05 | 40% / 25% / 20% / 15% of the shift |
+| `high` | up to 0.15 | 40% / 25% / 20% / 15% of the shift |
 
 The shift clamps to whatever cost weight the chosen `objective` actually has
 (e.g. `most_reliable`'s cost weight is already 0.05, so `high` there clamps to
@@ -171,9 +176,22 @@ decision:
 ```
 run_id, job_id, job_type, objective, policy_hash, candidate,
 valid_rate_score, failure_severity_score, cost_score,
-breaker_score, quota_score, repair_affinity_score, total,
+breaker_score, quota_score, repair_affinity_score, assay_quality_score, total,
 excluded, exclusion_reason, selected, preview, created
 ```
+
+`assay_quality_score` (v1.4 Session 2) is the only piece of the new Assayer
+evidence persisted here — it is the blended component `totalScore` folds into
+`total`. The raw per-metric evidence it blends (assay pass rate, validator
+pass rate, repair success rate, panel agreement rate, cost per accepted
+result) is *not* duplicated into `route_decisions`; it lives in, and stays
+queryable from, the tables that are already its source of truth
+(`assay_evaluations`, `validators`, `runs`, `panel_members`) — the same
+reason `agent_profiles`' raw run/valid counts were never duplicated into
+`route_decisions` either. `gov route --explain`'s printed table still shows
+the raw per-metric numbers (see [Assayer quality
+evidence](#assayer-quality-evidence-into-routing-v14-session-2)) even though
+only the blend is ledgered.
 
 Excluded candidates are included with their reason. `preview=1` marks dry-run
 decisions; real launches always record `preview=0`.
@@ -346,9 +364,63 @@ benchmark audit found in the v1.2 routing spine (see
    requirements simply add more `excluded(...)` call sites, which flow through
    the same existing plumbing.
 
-## Roadmap (subsequent sessions)
+## Assayer quality evidence into routing (v1.4 Session 2)
 
-- **Session 7** — Assayer quality feedback loop (gated on Assayer acceptance).
+Closes the gap `internal/observability/phase7.go`'s own package doc left
+explicitly open ("Nothing here feeds back into routing, the breaker, or
+quota... that boundary is Phase 3C's job") — the Assayer bridge (Phase 3A)
+now feeds a quality-evidence component into the same router Phase 3A never
+touched.
+
+`internal/router.assayEvidenceFor(db, agent, jobType)` reads five read-only
+queries, each scoped to `(agent, job_type)` via a join through `runs` (the
+same scoping `evidenceFor` already uses for valid rate/severity):
+
+| Evidence | Source | No-evidence default |
+|---|---|---|
+| assay pass rate | `assay_evaluations` (verdict `pass`/`advisory` over non-`skipped` rows) | 0.5 |
+| validator pass rate | `validators` (`exit_code=0`) | 0.5 |
+| repair success rate | `runs` where `repair_of<>''`, `status='APPROVED'` | 0.5 |
+| panel agreement rate | `panel_members` joined to `runs.status` (the per-agent analog of `observability.PanelDisagreementRate`, inverted) | 0.5 |
+| cost per accepted result | `AVG(cost_usd)` over `status='APPROVED'` | 0 |
+
+`assayQualityComponent` blends the first four (equal-weighted mean) into
+`ScoredCandidate.AssayQualityScore`, the only one of the five `totalScore`
+folds into `Total` — a new `assay_quality` slot in `weightSet`, populated in
+every `objectiveWeights` preset and included in `riskAdjustedWeights`'
+reliability shift (see the updated tables above) and in `policyHash`'s
+fingerprint material. `CostPerAcceptedUSD` is deliberately excluded from the
+blend: cost preference already has its own estimate-based `CostScore`
+component, so folding actual cost in again would double-count it. All five
+raw values are still recorded on `ScoredCandidate` and printed by
+`Decision.Format()` (`gov route --explain`) for full explainability (rule
+4), even though only the blend is persisted to `route_decisions` (see
+Ledger above).
+
+A candidate with none of this evidence yet scores exactly 0.5 — identical to
+how `ValidRateScore` already treats an unproven backend — so a ledger with no
+assay/validator/repair/panel history routes exactly as it did before this
+component existed.
+
+Every evaluation's ledger row (`assay_evaluations`) also gained four
+provenance columns this session: `assayer_commit`, `profile_hash`,
+`validators_hash`, `python_version` (`internal/assay.DescribeEnvironment`,
+computed once per `runAssayStep` call and stamped onto every verdict —
+pass, fail, error, *and* skipped alike). `assayer_commit` is `git rev-parse
+HEAD` inside the configured Assayer checkout when it owns a `.git` of its
+own, or the checked-in fixture's `PINNED_COMMIT` marker when it doesn't —
+never a naive `git -C <repo>`, which would silently walk up to and report
+*governator's own* commit for a fixture nested inside this repo.
+
+Quality and infrastructure evidence remain separate metrics (rule 3,
+unchanged): `assayEvidenceFor`/`AssayQualityScore` never touch
+`internal/breaker`, and a blocking assay FAIL/ERROR quarantine — a
+quality-only failure — never opens or degrades the breaker for the backend
+that produced it (`internal/runtime`'s
+`TestAssayBlockingFailNeverOpensBreaker`/`TestAssayBlockingErrorNeverOpensBreaker`
+regression-test this end to end).
+
+## Roadmap (subsequent sessions)
 
 Explicit anti-goals: no OmniRoute fork, no fail-open capability filtering, no
 keyword task classification, no mid-run agent swapping, no lossy validator

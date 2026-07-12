@@ -131,6 +131,31 @@ gov analytics export [--out <path>]
 
 `summary` prints tab-separated tables (backend valid-output rate, failure type by backend, fallback frequency, quota utilization, repair depth, validator and assay failure clusters, panel disagreement, cost by outcome). `export` writes the same snapshot as line-delimited JSON, one object per metric row tagged with a `metric` field — the format any external system (a spreadsheet, `jq`, an OpenTelemetry or Langfuse adapter) can consume. Phase 3A's assay bridge stays deliberately network-free, so JSONL export (to a file or stdout) is the whole shipping mechanism for now — it does not go through the Session 4 `maintenance_outbox` below (that outbox exists for post-run operational side effects, not for this read-only projection; a future session may route `export`/telemetry through it, but this one intentionally left analytics unchanged). An export failure never affects a run outcome — it runs after the fact, outside any governed job's lifecycle.
 
+## Hermetic Assayer boundary + quality feedback (v1.4 Session 2)
+
+`internal/assay/assay_test.go`'s real-CLI integration test no longer depends
+on a sibling checkout at `/mnt/e/downloads/assayer` (which had no `t.Skipf`-
+free way to fail in CI when absent). It now runs against a pinned fixture
+checked into `internal/assay/testdata/assayer_fixture/` — `cli.py` +
+`assayer/{__init__,checks,profiles,store}.py` copied verbatim from the real
+Assayer repo at commit `ed7b06b873ddba77dc9d1d98724b21864ba394d1` (recorded in
+the fixture's own `PINNED_COMMIT` file), sufficient because Assayer's
+`evaluate` subcommand is fully offline/stdlib-only (`supabase` is a lazy
+import inside `Store.client`, never reached by `evaluate`). The test moved to
+its own build-tag-gated file (`assay_integration_test.go`, `//go:build
+integration`) so it is a separate, mandatory CI tier
+(`.github/workflows/ci.yml`'s `assay-integration` job) rather than part of
+the default `go test ./...` unit run — a missing/broken fixture is now a
+hard `t.Fatal`, never a skip.
+
+`assay_evaluations` gained four provenance columns this session:
+`assayer_commit`, `profile_hash`, `validators_hash`, `python_version`
+(`internal/assay.DescribeEnvironment`, computed once per `runAssayStep` call
+and stamped onto every verdict row — pass, fail, error, and skipped alike).
+See [routing.md's Assayer quality evidence
+section](routing.md#assayer-quality-evidence-into-routing-v14-session-2) for
+how the same evidence now also feeds the route broker.
+
 ## Durable operational reconciliation (Session 4 / Sol Phase 3)
 
 A run's decided outcome (`APPROVED`/`QUARANTINED`/...) must never be blocked by a handful of post-run secondary operations — breaker feedback, quota reset hints, spend-halt recalculation, workspace/container destruction, and a few audit-row writes (`policy_rule_events`, `OUTPUT_TRUNCATED`, `panel_members`, `assay_evaluations`) that share the same "must not block an already-decided run" design. Before this session, a failure in any of these was simply swallowed (`_ = ...`). It no longer vanishes:

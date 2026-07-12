@@ -1961,6 +1961,7 @@ func routeDecisionRecord(d router.Decision, runID, created string) observability
 			BreakerScore:         c.BreakerScore,
 			QuotaScore:           c.QuotaScore,
 			RepairAffinityScore:  c.RepairAffinityScore,
+			AssayQualityScore:    c.AssayQualityScore,
 			Total:                c.Total,
 			Excluded:             c.Excluded,
 			ExclusionReason:      c.ExclusionReason,

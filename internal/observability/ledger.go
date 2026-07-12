@@ -205,6 +205,14 @@ CREATE TABLE IF NOT EXISTS policy_overrides(id INTEGER PRIMARY KEY AUTOINCREMENT
 		db.Close()
 		return nil, alterErr
 	}
+	// assay_quality_score (Session 2 item 4) is the blended assay/validator/
+	// repair/panel evidence component router.totalScore now folds into
+	// Total. Zero default on pre-existing rows is honest: those decisions
+	// predate the component and never actually scored it.
+	if _, alterErr := db.Exec("ALTER TABLE route_decisions ADD COLUMN assay_quality_score REAL NOT NULL DEFAULT 0"); alterErr != nil && !strings.Contains(strings.ToLower(alterErr.Error()), "duplicate column") {
+		db.Close()
+		return nil, alterErr
+	}
 	// sources/policy_hash (Phase 6) attach provenance to every interactive-hook
 	// gate decision: which policy layer (job contract / project doctrine / org
 	// policy) produced the Finding, and a fingerprint of the exact protected-
@@ -213,6 +221,19 @@ CREATE TABLE IF NOT EXISTS policy_overrides(id INTEGER PRIMARY KEY AUTOINCREMENT
 	// layer and were genuinely never attributed to a source.
 	for _, column := range []string{"sources TEXT NOT NULL DEFAULT ''", "policy_hash TEXT NOT NULL DEFAULT ''"} {
 		if _, alterErr := db.Exec("ALTER TABLE hook_events ADD COLUMN " + column); alterErr != nil && !strings.Contains(strings.ToLower(alterErr.Error()), "duplicate column") {
+			db.Close()
+			return nil, alterErr
+		}
+	}
+	// assayer_commit/profile_hash/validators_hash/python_version (Session 2
+	// item 3) fingerprint exactly what Assayer code + interpreter produced
+	// each verdict. Empty defaults on pre-existing rows are honest — those
+	// evaluations predate this metadata and were genuinely never fingerprinted.
+	for _, column := range []string{
+		"assayer_commit TEXT NOT NULL DEFAULT ''", "profile_hash TEXT NOT NULL DEFAULT ''",
+		"validators_hash TEXT NOT NULL DEFAULT ''", "python_version TEXT NOT NULL DEFAULT ''",
+	} {
+		if _, alterErr := db.Exec("ALTER TABLE assay_evaluations ADD COLUMN " + column); alterErr != nil && !strings.Contains(strings.ToLower(alterErr.Error()), "duplicate column") {
 			db.Close()
 			return nil, alterErr
 		}
@@ -279,6 +300,7 @@ type RouteDecisionRow struct {
 	BreakerScore         float64
 	QuotaScore           float64
 	RepairAffinityScore  float64
+	AssayQualityScore    float64
 	Total                float64
 	Excluded             bool
 	ExclusionReason      string
@@ -312,10 +334,10 @@ func RecordRouteDecision(db *sql.DB, rec RouteDecisionRecord) error {
 	}
 	defer tx.Rollback()
 	for _, row := range rec.Rows {
-		if _, err = tx.Exec(`INSERT INTO route_decisions(run_id,job_id,job_type,objective,policy_hash,candidate,valid_rate_score,failure_severity_score,cost_score,breaker_score,quota_score,repair_affinity_score,total,excluded,exclusion_reason,selected,preview,created) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		if _, err = tx.Exec(`INSERT INTO route_decisions(run_id,job_id,job_type,objective,policy_hash,candidate,valid_rate_score,failure_severity_score,cost_score,breaker_score,quota_score,repair_affinity_score,assay_quality_score,total,excluded,exclusion_reason,selected,preview,created) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 			rec.RunID, rec.JobID, rec.JobType, rec.Objective, rec.PolicyHash, row.Candidate,
 			row.ValidRateScore, row.FailureSeverityScore, row.CostScore,
-			row.BreakerScore, row.QuotaScore, row.RepairAffinityScore, row.Total,
+			row.BreakerScore, row.QuotaScore, row.RepairAffinityScore, row.AssayQualityScore, row.Total,
 			boolInt(row.Excluded), row.ExclusionReason, boolInt(row.Selected),
 			boolInt(rec.Preview), rec.Created); err != nil {
 			return err
@@ -353,17 +375,29 @@ func RecordArtifacts(db *sql.DB, artifacts []ArtifactRecord, created string) err
 // one of pass|advisory|fail|error|skipped ("skipped" is a Governator-only
 // pseudo-verdict for a run where assay was not configured — see
 // internal/assay — Assayer itself never returns it).
+//
+// AssayerCommit/ProfileHash/ValidatorsHash/PythonVersion (plan v1.4 Session 2
+// item 3) are internal/assay.Environment's fields, computed once per
+// evaluation by runAssayStep via assay.DescribeEnvironment and stamped onto
+// every row — including a "skipped" one, where they are empty because
+// DescribeEnvironment never had a configured Repo to introspect. They let a
+// later investigation trace a verdict back to exactly what Assayer code,
+// check profile, and Python interpreter produced it.
 type AssayEvaluationRecord struct {
-	RunID         string
-	AttemptID     string
-	JobID         string
-	Profile       string
-	PolicyVersion string
-	Verdict       string
-	FailedChecks  []string
-	ChecksHash    string
-	DurationMS    int64
-	Created       string
+	RunID          string
+	AttemptID      string
+	JobID          string
+	Profile        string
+	PolicyVersion  string
+	Verdict        string
+	FailedChecks   []string
+	ChecksHash     string
+	DurationMS     int64
+	Created        string
+	AssayerCommit  string
+	ProfileHash    string
+	ValidatorsHash string
+	PythonVersion  string
 }
 
 // RecordAssayEvaluation appends one assay_evaluations row. Append-only, like
@@ -379,15 +413,16 @@ func RecordAssayEvaluation(db *sql.DB, rec AssayEvaluationRecord) error {
 	if err != nil {
 		return err
 	}
-	_, err = db.Exec(`INSERT INTO assay_evaluations(run_id,attempt_id,job_id,profile,policy_version,verdict,failed_checks,checks_hash,duration_ms,created) VALUES(?,?,?,?,?,?,?,?,?,?)`,
-		rec.RunID, rec.AttemptID, rec.JobID, rec.Profile, rec.PolicyVersion, rec.Verdict, string(failedJSON), rec.ChecksHash, rec.DurationMS, rec.Created)
+	_, err = db.Exec(`INSERT INTO assay_evaluations(run_id,attempt_id,job_id,profile,policy_version,verdict,failed_checks,checks_hash,duration_ms,created,assayer_commit,profile_hash,validators_hash,python_version) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		rec.RunID, rec.AttemptID, rec.JobID, rec.Profile, rec.PolicyVersion, rec.Verdict, string(failedJSON), rec.ChecksHash, rec.DurationMS, rec.Created,
+		rec.AssayerCommit, rec.ProfileHash, rec.ValidatorsHash, rec.PythonVersion)
 	return err
 }
 
 // AssayEvaluationsForRun returns every assay_evaluations row for one run,
 // oldest first — for tests and CLI inspection.
 func AssayEvaluationsForRun(db *sql.DB, runID string) ([]AssayEvaluationRecord, error) {
-	rows, err := db.Query(`SELECT run_id,attempt_id,job_id,profile,policy_version,verdict,failed_checks,checks_hash,duration_ms,created FROM assay_evaluations WHERE run_id=? ORDER BY id ASC`, runID)
+	rows, err := db.Query(`SELECT run_id,attempt_id,job_id,profile,policy_version,verdict,failed_checks,checks_hash,duration_ms,created,assayer_commit,profile_hash,validators_hash,python_version FROM assay_evaluations WHERE run_id=? ORDER BY id ASC`, runID)
 	if err != nil {
 		return nil, err
 	}
@@ -396,7 +431,8 @@ func AssayEvaluationsForRun(db *sql.DB, runID string) ([]AssayEvaluationRecord, 
 	for rows.Next() {
 		var rec AssayEvaluationRecord
 		var failedJSON string
-		if err := rows.Scan(&rec.RunID, &rec.AttemptID, &rec.JobID, &rec.Profile, &rec.PolicyVersion, &rec.Verdict, &failedJSON, &rec.ChecksHash, &rec.DurationMS, &rec.Created); err != nil {
+		if err := rows.Scan(&rec.RunID, &rec.AttemptID, &rec.JobID, &rec.Profile, &rec.PolicyVersion, &rec.Verdict, &failedJSON, &rec.ChecksHash, &rec.DurationMS, &rec.Created,
+			&rec.AssayerCommit, &rec.ProfileHash, &rec.ValidatorsHash, &rec.PythonVersion); err != nil {
 			return nil, err
 		}
 		if failedJSON != "" {

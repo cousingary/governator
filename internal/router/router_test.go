@@ -452,6 +452,119 @@ func TestQualityEvidencePrefersHigherValidRate(t *testing.T) {
 	}
 }
 
+// --- Session 2: Assayer quality evidence into routing ---
+
+func seedAssayEvaluation(t *testing.T, db *sql.DB, runID, agent, jobType, verdict string) {
+	t.Helper()
+	if _, err := db.Exec(`INSERT INTO runs(id,job_id,job_type,agent,status) VALUES(?,?,?,?,'QUARANTINED')`, runID, runID, jobType, agent); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO assay_evaluations(run_id,verdict,failed_checks) VALUES(?,?,'[]')`, runID, verdict); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func seedValidator(t *testing.T, db *sql.DB, runID, agent, jobType string, exitCode int) {
+	t.Helper()
+	if _, err := db.Exec(`INSERT OR IGNORE INTO runs(id,job_id,job_type,agent,status) VALUES(?,?,?,?,'QUARANTINED')`, runID, runID, jobType, agent); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO validators(run_id,command,exit_code,output) VALUES(?,?,?,?)`, runID, "gofmt -l .", exitCode, ""); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func seedRepairRun(t *testing.T, db *sql.DB, runID, agent, jobType, status string) {
+	t.Helper()
+	if _, err := db.Exec(`INSERT INTO runs(id,job_id,job_type,agent,status,repair_of) VALUES(?,?,?,?,?,'root-1')`, runID, runID, jobType, agent, status); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func seedPanelMember(t *testing.T, db *sql.DB, panelID, memberLabel, jobID, agent string) {
+	t.Helper()
+	if _, err := db.Exec(`INSERT INTO panel_members(panel_id,member_label,job_id,agent) VALUES(?,?,?,?)`, panelID, memberLabel, jobID, agent); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestAssayQualityComponentNeutralWithNoEvidence(t *testing.T) {
+	db := newLedger(t)
+	got := assayEvidenceFor(db, "claude-code", "code_change")
+	want := assayEvidence{assayPassRate: 0.5, validatorPassRate: 0.5, repairSuccessRate: 0.5, panelAgreementRate: 0.5, costPerAcceptedUSD: 0}
+	if got != want {
+		t.Fatalf("expected all-neutral evidence with an empty ledger, got %+v", got)
+	}
+	if score := assayQualityComponent(got); score != 0.5 {
+		t.Fatalf("expected neutral 0.5 blended score, got %.4f", score)
+	}
+}
+
+func TestAssayEvidenceForComputesRates(t *testing.T) {
+	db := newLedger(t)
+	seedAssayEvaluation(t, db, "a-pass", "claude-code", "code_change", "pass")
+	seedAssayEvaluation(t, db, "a-fail", "claude-code", "code_change", "fail")
+	seedValidator(t, db, "v-pass", "claude-code", "code_change", 0)
+	seedValidator(t, db, "v-fail", "claude-code", "code_change", 1)
+	seedRepairRun(t, db, "r-ok", "claude-code", "code_change", "APPROVED")
+	seedRepairRun(t, db, "r-bad", "claude-code", "code_change", "QUARANTINED")
+	seedPanelMember(t, db, "panel-1", "m1", "job-a", "claude-code")
+	if _, err := db.Exec(`INSERT INTO runs(id,job_id,job_type,agent,status) VALUES('job-a','job-a','code_change','claude-code','APPROVED')`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`UPDATE runs SET cost_usd=2.0 WHERE id='job-a'`); err != nil {
+		t.Fatal(err)
+	}
+
+	got := assayEvidenceFor(db, "claude-code", "code_change")
+	if got.assayPassRate != 0.5 {
+		t.Fatalf("expected assayPassRate=0.5 (1 pass of 2), got %.4f", got.assayPassRate)
+	}
+	if got.validatorPassRate != 0.5 {
+		t.Fatalf("expected validatorPassRate=0.5 (1 pass of 2), got %.4f", got.validatorPassRate)
+	}
+	if got.repairSuccessRate != 0.5 {
+		t.Fatalf("expected repairSuccessRate=0.5 (1 approved of 2), got %.4f", got.repairSuccessRate)
+	}
+	// The one seeded panel (panel-1) has a single member whose run landed on
+	// a single status (APPROVED) — one panel, zero disagreements — so
+	// agreement is a real, evidence-backed 1.0, not the no-evidence neutral.
+	if got.panelAgreementRate != 1.0 {
+		t.Fatalf("expected panelAgreementRate=1.0 (1 panel, 0 disagreements), got %.4f", got.panelAgreementRate)
+	}
+	// Two APPROVED rows exist for claude-code/code_change: job-a ($2.00) and
+	// the repair run r-ok (cost_usd defaults to $0) — AVG = $1.00.
+	if got.costPerAcceptedUSD != 1.0 {
+		t.Fatalf("expected costPerAcceptedUSD=1.0 (avg of $2.00 and $0.00 across 2 approved runs), got %.4f", got.costPerAcceptedUSD)
+	}
+
+	// A backend with zero evidence stays fully neutral.
+	other := assayEvidenceFor(db, "glm", "code_change")
+	want := assayEvidence{assayPassRate: 0.5, validatorPassRate: 0.5, repairSuccessRate: 0.5, panelAgreementRate: 0.5, costPerAcceptedUSD: 0}
+	if other != want {
+		t.Fatalf("expected an unrelated backend to see no evidence, got %+v", other)
+	}
+}
+
+func TestAssayQualityEvidencePrefersHigherAssayPassRate(t *testing.T) {
+	// Seed opposing assay evidence only — no valid-rate/severity/cost
+	// evidence differentiates claude-code from glm, so only AssayQualityScore
+	// can be responsible for the winner.
+	db := newLedger(t)
+	seedAssayEvaluation(t, db, "cc-pass-1", "claude-code", "code_change", "pass")
+	seedAssayEvaluation(t, db, "cc-pass-2", "claude-code", "code_change", "pass")
+	seedAssayEvaluation(t, db, "glm-fail-1", "glm", "code_change", "fail")
+	seedAssayEvaluation(t, db, "glm-fail-2", "glm", "code_change", "fail")
+	r := Router{Binary: allPresent}
+	req := baseReq("code_change")
+	req.Objective = "most_reliable" // largest assayQuality weight (0.09)
+	req.Candidates = []string{"claude-code", "glm"}
+	d := mustResolve(t, r, db, req)
+	if d.Selected != "claude-code" {
+		t.Fatalf("higher assay pass rate should win when nothing else differentiates, got %q\n%s", d.Selected, d.Format())
+	}
+}
+
 func TestRepairAffinityPrefersLineageAgent(t *testing.T) {
 	// A repair job whose root lineage ran on codex should prefer codex. With
 	// equal cost (MaxTokens=0) and no evidence, only affinity differentiates.
@@ -586,6 +699,7 @@ func toRows(d Decision) []observability.RouteDecisionRow {
 			BreakerScore:         c.BreakerScore,
 			QuotaScore:           c.QuotaScore,
 			RepairAffinityScore:  c.RepairAffinityScore,
+			AssayQualityScore:    c.AssayQualityScore,
 			Total:                c.Total,
 			Excluded:             c.Excluded,
 			ExclusionReason:      c.ExclusionReason,
@@ -609,7 +723,7 @@ func TestSeverityWeightDefaultsUnknownToMedium(t *testing.T) {
 // --- Phase 1: RiskClass scoring ---
 
 func weightSum(w weightSet) float64 {
-	return w.validRate + w.severity + w.cost + w.breaker + w.quota + w.affinity
+	return w.validRate + w.severity + w.cost + w.breaker + w.quota + w.affinity + w.assayQuality
 }
 
 func TestRiskAdjustedWeightsHighMovesCostToReliability(t *testing.T) {

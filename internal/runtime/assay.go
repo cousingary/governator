@@ -30,6 +30,12 @@ func runAssayStep(ctx context.Context, db *sql.DB, cfg config.Config, c contract
 		Python:  cfg.Assay.Python,
 		Timeout: time.Duration(cfg.Assay.TimeoutSeconds) * time.Second,
 	}
+	// Computed once per step (not once per record() call) since Repo/Python
+	// don't change mid-run; stamped onto every row below — pass, fail,
+	// error, AND skipped alike — per plan Session 2 item 3 ("record in
+	// every evaluation"). Zero-value (all fields empty) when assay isn't
+	// configured: DescribeEnvironment has nothing to introspect.
+	env := assay.DescribeEnvironment(assayCfg)
 
 	// A ledger write failure here must not itself quarantine an otherwise
 	// fine run, matching the existing pattern for validator rows a few lines
@@ -44,6 +50,8 @@ func runAssayStep(ctx context.Context, db *sql.DB, cfg config.Config, c contract
 			RunID: runID, AttemptID: runID, JobID: c.JobID, Profile: c.Assay.Profile,
 			PolicyVersion: policyVersion, Verdict: verdict, FailedChecks: failedChecks,
 			ChecksHash: checksHash, DurationMS: durationMS, Created: created,
+			AssayerCommit: env.AssayerCommit, ProfileHash: env.ProfileHash,
+			ValidatorsHash: env.ValidatorsHash, PythonVersion: env.PythonVersion,
 		}
 		if err := observability.RecordAssayEvaluation(db, evalRec); err != nil {
 			payload, _ := json.Marshal(assayEvaluationPayload{Record: evalRec})
