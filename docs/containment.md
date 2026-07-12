@@ -1,6 +1,6 @@
 # Containment model
 
-This is the single place that states what "containment" means in Governator, after the Sol redteam repair program (v1.5.0). Related detail lives in [docs/contracts.md](contracts.md#containment-and-risk-class) (the contract-facing `risk_class`/`docker.*`/`containment.*` fields), [docs/backends.md](backends.md#capability-attestation) (attestation mechanics), and [docs/security.md](security.md) (the finding-by-finding register this model closes).
+This is the single place that states what "containment" means in Governator, after the Sol redteam repair program (v1.0.0, the first release). Related detail lives in [docs/contracts.md](contracts.md#containment-and-risk-class) (the contract-facing `risk_class`/`docker.*`/`containment.*` fields), [docs/backends.md](backends.md#capability-attestation) (attestation mechanics), and [docs/security.md](security.md) (the finding-by-finding register this model closes).
 
 ## The rule
 

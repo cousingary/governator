@@ -9,7 +9,7 @@ if ! git diff --quiet || ! git diff --cached --quiet; then
   exit 1
 fi
 
-VERSION=${VERSION:-1.5.0-dev}
+VERSION=${VERSION:-1.0.0-dev}
 GOOS_VALUE=${GOOS:-$(go env GOOS)}
 GOARCH_VALUE=${GOARCH:-$(go env GOARCH)}
 COMMIT=$(git rev-parse HEAD)
