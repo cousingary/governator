@@ -964,7 +964,7 @@ func (r *Runner) Run(ctx context.Context, c contracts.Contract) (RunRecord, erro
 			rootRunID = rec.ID
 		}
 		fallbackReason := ""
-		eligible, reason, eligErr := r.fallbackEligible(rec)
+		eligible, reason, eligErr := r.fallbackEligible(current, rec)
 		if eligErr != nil {
 			return rec, eligErr
 		}
@@ -1045,7 +1045,7 @@ func withExcludedRoutingCandidates(c contracts.Contract, failed map[string]bool)
 	return clone
 }
 
-func (r *Runner) fallbackEligible(rec RunRecord) (bool, string, error) {
+func (r *Runner) fallbackEligible(c contracts.Contract, rec RunRecord) (bool, string, error) {
 	if rec.ID == "" || !observability.IsInfraFailure(rec.FailureTaxonomy) {
 		return false, "", nil
 	}
@@ -1066,6 +1066,30 @@ func (r *Runner) fallbackEligible(rec RunRecord) (bool, string, error) {
 	}
 	if touched != 0 {
 		return false, "", nil
+	}
+	// Session 5 candidate ASK target: "fallback after unusual infra
+	// failure". Routine backpressure (rate limit, quota, auth expiry) keeps
+	// auto-falling-back exactly as unattended as before this session —
+	// only the rarer BINARY_MISSING/FLAG_DRIFT/TRANSIENT_UPSTREAM kinds
+	// consult the policy gate, since those often mean something is
+	// structurally wrong rather than a backend being routinely busy.
+	if observability.IsUnusualInfraFailure(rec.FailureTaxonomy) {
+		root, err := filepath.Abs(c.Workspace.Root)
+		if err != nil {
+			return false, "", err
+		}
+		cfg := config.Current()
+		facts := policy.MergeFacts(policy.BuildContractFacts(c, rec.Agent), map[string]any{
+			policy.FactUnusualInfraRetry: true,
+			policy.FactInfraFailureKind:  rec.FailureTaxonomy,
+		})
+		decision, _, gerr := evaluatePolicyGate(db, cfg, c, root, rec.ID, facts)
+		if gerr != nil {
+			return false, "", gerr
+		}
+		if decision.Blocks() {
+			return false, "", nil
+		}
 	}
 	return true, rec.FailureTaxonomy, nil
 }
@@ -1227,6 +1251,25 @@ func (r *Runner) runOnce(ctx context.Context, c contracts.Contract) (RunRecord, 
 	// behind — exactly the "fails before launch" acceptance for high-risk.
 	if err := enforceContainment(c, resolved.Agent, cfg); err != nil {
 		return RunRecord{}, err
+	}
+	// Session 5 (Sol Phase 4) layered policy gate: evaluated after routing/
+	// containment (so the resolved backend and its native-sandbox status are
+	// known) and before any quota/workspace side effect (so a DENY or a
+	// pending ASK leaves nothing behind — same "fails before launch" posture
+	// as enforceContainment above). Candidate targets checked here: network
+	// enablement, write outside the contract's declared read scope, and a
+	// pre-launch cost estimate versus the operator's daily cap.
+	policyFacts := policy.MergeFacts(policy.BuildContractFacts(c, resolved.Agent), map[string]any{
+		policy.FactEstimatedCostUSD: spend.EstimateCostUSD(resolved.Agent, c.Budget.MaxTokens, nil),
+		policy.FactDailyCapUSD:      cfg.Spend.DailyCapUSD,
+	})
+	gateDecision, pendingAsks, gerr := evaluatePolicyGate(db, cfg, c, root, id, policyFacts)
+	if gerr != nil {
+		return RunRecord{}, gerr
+	}
+	if gateDecision.Blocks() {
+		refused, err := r.quarantineForPolicy(db, c, resolved.Agent, root, id, hash, head, gateDecision, pendingAsks)
+		return refused, err
 	}
 	quotaUsageEstimate := quota.EstimateUsage(c.Budget.MaxTokens)
 	quotaTTL := time.Duration(c.Budget.MaxMinutes+5) * time.Minute

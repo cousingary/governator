@@ -339,6 +339,8 @@ func run(args []string) int {
 		return gateCmd(args[1:])
 	case "reconcile":
 		return reconcileCmd(args[1:])
+	case "ask":
+		return askCmd(args[1:])
 	case "cleanup":
 		return cleanupCmd(args[1:])
 	case "doctor":
@@ -681,6 +683,121 @@ func reconcileCmd(args []string) int {
 	if report.Retried > 0 {
 		return 1
 	}
+	return 0
+}
+
+// askCmd is the Session 5 (Sol Phase 4) uniform operator interface for a
+// checkpointed ASK, regardless of which candidate target (network
+// enablement, write outside intended scope, cost threshold, fallback after
+// an unusual infra failure, or a custom contract/project-doctrine rule)
+// produced it — the same list/show/approve/deny mechanism works across
+// every backend, since every checkpoint lives in the one policy_checkpoints
+// ledger table.
+func askCmd(args []string) int {
+	usage := "usage: gov ask list|show <id>|approve <id> [--rule] [--ttl <duration>] [--by <name>] [--note <text>]|deny <id> [--rule] [--ttl <duration>] [--by <name>] [--note <text>]"
+	if len(args) == 0 {
+		return bad(usage)
+	}
+	switch args[0] {
+	case "list":
+		if len(args) != 1 {
+			return bad("usage: gov ask list")
+		}
+		items, err := govruntime.AskList()
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "ask:", err)
+			return 1
+		}
+		for _, cp := range items {
+			fmt.Printf("%d\t%s\t%s\t%s\t%s\n", cp.ID, cp.JobID, cp.Target, cp.CreatedAt, cp.Reason)
+		}
+		return 0
+	case "show":
+		if len(args) != 2 {
+			return bad("usage: gov ask show <id>")
+		}
+		id, err := strconv.ParseInt(args[1], 10, 64)
+		if err != nil {
+			return bad("gov ask show: id must be an integer")
+		}
+		cp, err := govruntime.AskShow(id)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "ask:", err)
+			return 1
+		}
+		return printJSON("ask", cp)
+	case "approve", "deny":
+		return askResolveCmd(args)
+	default:
+		return bad(usage)
+	}
+}
+
+func askResolveCmd(args []string) int {
+	verb := args[0]
+	usage := fmt.Sprintf("usage: gov ask %s <id> [--rule] [--ttl <duration>] [--by <name>] [--note <text>]", verb)
+	if len(args) < 2 {
+		return bad(usage)
+	}
+	id, err := strconv.ParseInt(args[1], 10, 64)
+	if err != nil {
+		return bad("gov ask " + verb + ": id must be an integer")
+	}
+	res := govruntime.AskResolution{ResolvedBy: "operator", Verdict: "DENY"}
+	if verb == "approve" {
+		res.Verdict = "ALLOW"
+	}
+	rest := args[2:]
+	for len(rest) > 0 {
+		switch rest[0] {
+		case "--rule":
+			res.CreateRule = true
+			rest = rest[1:]
+		case "--ttl":
+			if len(rest) < 2 {
+				return bad("gov ask " + verb + ": --ttl requires a duration (e.g. 24h)")
+			}
+			d, err := time.ParseDuration(rest[1])
+			if err != nil {
+				return bad("gov ask " + verb + ": invalid --ttl duration: " + err.Error())
+			}
+			res.TTL = d
+			rest = rest[2:]
+		case "--by":
+			if len(rest) < 2 {
+				return bad("gov ask " + verb + ": --by requires a name")
+			}
+			res.ResolvedBy = rest[1]
+			rest = rest[2:]
+		case "--note":
+			if len(rest) < 2 {
+				return bad("gov ask " + verb + ": --note requires text")
+			}
+			res.Note = rest[1]
+			rest = rest[2:]
+		default:
+			return bad(usage)
+		}
+	}
+	cp, err := govruntime.AskResolve(id, res)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "ask:", err)
+		return 1
+	}
+	return printJSON("ask", cp)
+}
+
+// printJSON marshals v as indented JSON to stdout, the common tail of every
+// gov subcommand that reports a single structured result (reconcileCmd,
+// cleanupCmd, ...). label prefixes the stderr line on a marshal error only —
+// callers already own their own error message for the operation itself.
+func printJSON(label string, v any) int {
+	output, err := json.MarshalIndent(v, "", "  ")
+	if err != nil {
+		fmt.Fprintln(os.Stderr, label+":", err)
+		return 1
+	}
+	fmt.Println(string(output))
 	return 0
 }
 
@@ -1977,6 +2094,10 @@ Usage:
   gov parity report
   gov reconcile
   gov cleanup --stale [--max-attempts N]
+  gov ask list
+  gov ask show <id>
+  gov ask approve <id> [--rule] [--ttl <duration>] [--by <name>] [--note <text>]
+  gov ask deny <id> [--rule] [--ttl <duration>] [--by <name>] [--note <text>]
   gov doctor
   gov health [reset <backend>]
   gov version`)

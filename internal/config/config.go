@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/cousingary/governator/internal/policy"
 	"gopkg.in/yaml.v3"
 )
 
@@ -115,6 +116,14 @@ type Config struct {
 	Defaults          Defaults           `yaml:"defaults"`
 	Assay             Assay              `yaml:"assay"`
 	Containment       Containment        `yaml:"containment"`
+	// PolicyRules is the Session 5 (Sol Phase 4) organization layer of the
+	// layered policy engine: declarative rules evaluated first and with the
+	// most authority — no lower layer (project doctrine, job contract,
+	// session override) can loosen a DENY an org rule produces. Empty by
+	// default (BuiltIn leaves it nil) so every existing config.yaml keeps
+	// behaving exactly as it did before this field existed; see
+	// docs/contracts.md for the condition language and example rules.
+	PolicyRules []policy.ConditionRule `yaml:"policy_rules"`
 }
 
 // Env is the single environment lookup seam used by Governator packages.
@@ -207,6 +216,11 @@ func Load() (Config, error) {
 			return Config{}, fmt.Errorf("invalid quota window_type %q (want 5h, daily, weekly, or monthly)", q.WindowType)
 		}
 	}
+	for _, rule := range cfg.PolicyRules {
+		if err := rule.Validate(); err != nil {
+			return Config{}, fmt.Errorf("invalid policy_rules: %w", err)
+		}
+	}
 	return cfg, nil
 }
 
@@ -284,6 +298,9 @@ func merge(dst *Config, src Config) {
 	}
 	if src.Quotas != nil {
 		dst.Quotas = append([]QuotaWindow(nil), src.Quotas...)
+	}
+	if src.PolicyRules != nil {
+		dst.PolicyRules = append([]policy.ConditionRule(nil), src.PolicyRules...)
 	}
 	if src.Doctrine.RequireCleanup {
 		dst.Doctrine.RequireCleanup = true

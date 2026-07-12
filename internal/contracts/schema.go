@@ -350,6 +350,19 @@ type Contract struct {
 	// so existing contracts keep validating unchanged. See the Containment type.
 	Containment *Containment `yaml:"containment,omitempty" json:"containment,omitempty"`
 
+	// Policy is the Session 5 (Sol Phase 4) job-contract layer of the
+	// layered policy engine: declarative rules this specific job wants
+	// evaluated in addition to organization policy and project doctrine
+	// (e.g. tightening an otherwise-ASK default to a hard DENY for this job
+	// only). A plain data mirror lives here rather than the real
+	// internal/policy.ConditionRule type to avoid an import cycle —
+	// internal/policy already depends on internal/contracts for
+	// Contract/Mode, so this type can't depend back on internal/policy.
+	// internal/policy.ContractRules converts it at evaluation time. Optional
+	// and additive — absent on every prior job YAML, so existing contracts
+	// keep validating unchanged.
+	Policy *Policy `yaml:"policy,omitempty" json:"policy,omitempty"`
+
 	// PostRunValidate, when set, runs in-process after Success.Validators
 	// pass but before the run merges to the live root — an extra pre-merge
 	// gate for checks too structured for a shell one-liner (e.g. `gov plan`'s
@@ -381,6 +394,44 @@ func (c Contract) EffectiveRunner() string {
 type Containment struct {
 	OverrideReason    string `yaml:"override_reason,omitempty" json:"override_reason,omitempty"`
 	OverrideSignature string `yaml:"override_signature,omitempty" json:"override_signature,omitempty"`
+}
+
+// policyRuleVerdicts and policyRuleOps mirror internal/policy's Verdict
+// constants and validConditionOps map (duplicated, not imported, for the
+// same reason Policy itself is a plain data mirror — see Contract.Policy).
+// Session 5's ContractRules converter is the single place a drift between
+// these two lists would surface, since it round-trips every value through
+// policy.ConditionRule.Validate.
+var policyRuleVerdicts = map[string]bool{"DENY": true, "ASK": true, "FLAG": true}
+var policyRuleOps = map[string]bool{
+	"eq": true, "ne": true, "gt": true, "gte": true, "lt": true, "lte": true,
+	"contains": true, "matches_any": true,
+}
+
+// PolicyConditionSpec is one condition in a PolicyRuleSpec's When list: Field
+// is a well-known fact name (internal/policy.Fact* constants — see
+// docs/contracts.md), Op one of eq/ne/gt/gte/lt/lte/contains/matches_any, Value
+// the literal to compare against.
+type PolicyConditionSpec struct {
+	Field string `yaml:"field" json:"field"`
+	Op    string `yaml:"op" json:"op"`
+	Value string `yaml:"value" json:"value"`
+}
+
+// PolicyRuleSpec is the job-contract layer's declarative policy rule shape
+// (Session 5 / Sol Phase 4): every When condition must match (AND) for the
+// rule to fire and contribute Verdict/Reason to the layered evaluation.
+type PolicyRuleSpec struct {
+	ID      string                `yaml:"id" json:"id"`
+	When    []PolicyConditionSpec `yaml:"when" json:"when"`
+	Verdict string                `yaml:"verdict" json:"verdict"`
+	Reason  string                `yaml:"reason" json:"reason"`
+}
+
+// Policy carries the job-contract layer of the Session 5 declarative policy
+// engine (see Contract.Policy).
+type Policy struct {
+	Rules []PolicyRuleSpec `yaml:"rules,omitempty" json:"rules,omitempty"`
 }
 
 type Workspace struct {
@@ -630,6 +681,7 @@ func (c Contract) Validate() error {
 	validateAssay(c, add)
 	validateRunner(c, add)
 	validateContainment(c, add)
+	validatePolicy(c, add)
 
 	// Quarantine is the implemented fail-closed action. Halt and rollback were
 	// previously accepted but ignored; rollback also cannot restore arbitrary
@@ -772,6 +824,40 @@ func validateAssay(c Contract, add func(string, string)) {
 	}
 	if !AssayEnforcements[c.Assay.Enforcement] {
 		add("assay.enforcement", "must be one of blocking, advisory, telemetry")
+	}
+}
+
+// validatePolicy enforces the same fail-closed pattern as validateAssay: an
+// absent Policy block is fine (every prior job YAML), but a present rule
+// must be structurally complete and name a recognized verdict/op — a typo
+// must never be silently treated as "this rule never fires."
+func validatePolicy(c Contract, add func(string, string)) {
+	if c.Policy == nil {
+		return
+	}
+	for i, r := range c.Policy.Rules {
+		field := fmt.Sprintf("policy.rules[%d]", i)
+		if strings.TrimSpace(r.ID) == "" {
+			add(field+".id", "is required")
+		}
+		if strings.TrimSpace(r.Reason) == "" {
+			add(field+".reason", "is required")
+		}
+		if !policyRuleVerdicts[r.Verdict] {
+			add(field+".verdict", "must be one of DENY, ASK, FLAG")
+		}
+		if len(r.When) == 0 {
+			add(field+".when", "must contain at least one condition")
+		}
+		for j, cond := range r.When {
+			condField := fmt.Sprintf("%s.when[%d]", field, j)
+			if strings.TrimSpace(cond.Field) == "" {
+				add(condField+".field", "is required")
+			}
+			if !policyRuleOps[cond.Op] {
+				add(condField+".op", "must be one of eq, ne, gt, gte, lt, lte, contains, matches_any")
+			}
+		}
 	}
 }
 

@@ -60,6 +60,7 @@ A job contract is strict YAML: unknown fields, multiple documents, malformed pat
 | `docker.require_complete_transcript` | Optional. Makes output truncation a blocking violation — a run whose transcript was capped is quarantined. Defaults false (truncation recorded but non-blocking); high-risk hardened contracts should set it true. |
 | `containment.override_reason` / `containment.override_signature` | Optional. A signed operator escape hatch for `risk_class: high` jobs that can't meet hardened Docker or a native sandbox. The signature is ed25519 (hex) over `<job_id>:<override_reason>`, verified against `containment.override_public_key` in config. Both fields must appear together or not at all; with no key configured, no override is ever accepted (fail-closed). |
 | `on_violation` | `quarantine`; unsupported actions are rejected during validation. |
+| `policy.rules` | Optional (Session 5). Job-contract-layer declarative policy rules — see [Layered policy engine and checkpointed ASK](#layered-policy-engine-and-checkpointed-ask). |
 
 All path patterns are repository-relative and may not escape with `..`. Read-only modes are `scout`, `verifier`, and `architect`. `planner` writes only inside its own `gov plan --out` directory, never the target repository. Governator rejects direct-root execution and unimplemented violation actions rather than accepting policy it cannot enforce.
 
@@ -72,6 +73,45 @@ A `risk_class: high` contract must not silently resolve to local execution (Sess
 - **A signed operator override** (`containment.override_signature`), verified against `containment.override_public_key` in config (or `GOV_CONTAINMENT_OVERRIDE_PUBLIC_KEY`). With no key configured, no override is accepted — high-risk local jobs without qualifying containment simply fail before launch.
 
 Everything else passes through untouched: `low`/`medium`/unset risk classes are scoring-only and never containment-gated, and a non-hardened docker config is still valid for ordinary jobs. To sign an override, the operator signs `<job_id>:<override_reason>` with their ed25519 private key; the binding to `job_id` prevents an override minted for one high-risk job being replayed against another.
+
+## Layered policy engine and checkpointed ASK
+
+Session 5 extends `internal/policy` from a single boolean allow/deny gate into four verdicts — **ALLOW**, **DENY**, **ASK**, **FLAG** — evaluated across four layers, in this fixed precedence order:
+
+1. **Organization** — `policy_rules` in `~/.governator/config.yaml` (or `GOV_CONFIG`). Most authoritative: no lower layer can loosen a DENY an org rule produces.
+2. **Project doctrine** — `policy_rules` in a `.governator-doctrine.yaml` file at the job's `workspace.root`. Missing is not an error; an unconfigured project contributes no rules.
+3. **Job contract** — this contract's own `policy.rules` block (see the Fields table above).
+4. **Session/operator override** — durable, expiring rows an operator creates while resolving a checkpoint (`gov ask approve --rule`), scoped to one `job_id` and one rule id.
+
+All three data-driven layers share the same rule shape:
+
+```yaml
+policy_rules:
+  - id: network-enablement        # required, referenced by checkpoints/overrides
+    when:                          # AND of conditions; a rule with no "when" never fires
+      - field: network_enabled    # a well-known fact name (see below)
+        op: eq                    # eq, ne, gt, gte, lt, lte, contains, matches_any
+        value: "true"
+    verdict: ASK                   # DENY, ASK, or FLAG — never ALLOW (nothing firing already means allow)
+    reason: network access needs operator review
+```
+
+There is no in-process rule-evaluator escape hatch: rules stay plain data (field/op/value/verdict/reason), matching Sol's non-goal "no arbitrary in-process Go/Python policy code."
+
+**Facts** a rule's `when` can reference (`internal/policy.Fact*` constants): `risk_class`, `mode`, `backend`, `network_enabled` (a docker `network: allow` or an `allowed.execute` entry that looks like a network command), `write_out_of_scope` (an intended write outside `allowed.read`), `estimated_cost_usd` / `daily_cap_usd` (a pre-launch worst-case cost estimate vs. the operator's `spend.daily_cap_usd`), and `unusual_infra_retry` / `infra_failure_kind` (set only when deciding whether to auto-launch a fallback attempt after a `BINARY_MISSING`/`FLAG_DRIFT`/`TRANSIENT_UPSTREAM` infra failure — routine `RATE_LIMIT`/`QUOTA_EXHAUSTED`/`AUTH_EXPIRED` never consult the policy gate, so unattended fallback for those is unchanged).
+
+**Verdicts and blocking:** DENY is terminal — fail-closed, no operator escape hatch within one evaluation. ASK pauses the run at a durable checkpoint. FLAG never blocks (same advisory posture as the Phase 6 temporal-rule engine's `flag` verdict) — it is recorded but the run proceeds. A run is quarantined (`FailureTaxonomy: POLICY_DENIED` or `POLICY_ASK_PENDING`) *before* quota reservation or workspace creation — nothing expensive has happened yet, so "resolve and resume" just means running the job again.
+
+**Checkpointed ASK:** every rule that fires ASK (after any active override resolves it) gets a `policy_checkpoints` ledger row recording the reason, contributing sources, policy hash, and (when relevant) the cost estimate. Resolve it with:
+
+```
+gov ask list
+gov ask show <id>
+gov ask approve <id> [--rule] [--ttl 24h] [--by <name>] [--note "..."]
+gov ask deny    <id> [--rule] [--ttl 24h] [--by <name>] [--note "..."]
+```
+
+`--rule` additionally persists a `policy_overrides` row scoped to that job and rule id — an expiring (`--ttl`) or permanent temporary rule, so the next run of the same job resolves the same ASK automatically instead of pausing again. Without `--rule`, the approval/denial is one-shot: the ledger remembers it happened, but the next run re-evaluates from scratch. One mechanism (`gov ask`) works identically regardless of which layer or candidate target produced the ASK, and regardless of backend.
 
 ## Task decomposition (`gov plan`)
 

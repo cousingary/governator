@@ -154,6 +154,21 @@ func IsInfraFailure(taxonomy string) bool {
 	return false
 }
 
+// IsUnusualInfraFailure reports whether taxonomy is one of the less-common
+// infra failure kinds Session 5's policy gate treats as worth an operator's
+// attention before auto-retrying: BINARY_MISSING, FLAG_DRIFT, or
+// TRANSIENT_UPSTREAM. RATE_LIMIT/QUOTA_EXHAUSTED/AUTH_EXPIRED are routine
+// backpressure the existing breaker/quota machinery already handles, and
+// are deliberately excluded — auto-fallback for those stays exactly as
+// unattended as it was before Session 5.
+func IsUnusualInfraFailure(taxonomy string) bool {
+	switch taxonomy {
+	case InfraBinaryMissing, InfraFlagDrift, InfraTransientUpstream:
+		return true
+	}
+	return false
+}
+
 func ClassifyFailure(violations []string) string {
 	lower := strings.ToLower(strings.Join(violations, "\n"))
 	switch {
