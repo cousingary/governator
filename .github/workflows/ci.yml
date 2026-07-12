@@ -71,6 +71,34 @@ jobs:
       - name: Real Assayer CLI integration test
         run: go test -tags=integration -run TestEvaluateAgainstRealCLIPassAndFail -v ./internal/assay/...
 
+  claims:
+    name: claims ledger (docs/claims.yaml)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # internal/claims' "shipped" check runs `git merge-base
+          # --is-ancestor` and `git show <historical-commit>:<file>` against
+          # commits that may predate a shallow clone's default depth-1
+          # history; full history is required for those checks to resolve
+          # correctly rather than false-failing on every CI run.
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      # v1.4 Session 6 (Sol Phase 11): every docs/claims.yaml entry is
+      # re-derived from the repository by internal/claims, never trusted
+      # from a hand-written status field. This fails the build the moment a
+      # claim overclaims what it can currently prove — unwired, untested,
+      # missing its acceptance artifact, or absent from the rebuilt/shipped
+      # binary evidence.
+      - name: gov claims verify
+        run: go run ./cmd/gov claims verify
+
   lint:
     name: golangci-lint
     runs-on: ubuntu-latest

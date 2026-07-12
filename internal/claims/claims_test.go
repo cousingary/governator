@@ -1,0 +1,387 @@
+package claims
+
+import (
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
+	"testing"
+)
+
+func TestLoadRejectsUnknownFields(t *testing.T) {
+	path := writeFile(t, t.TempDir(), "claims.yaml", `
+version: 1
+claims:
+  - id: x
+    title: t
+    claimed_maturity: implemented
+    implementation: []
+    tests: []
+    not_a_real_field: oops
+`)
+	if _, err := Load(path); err == nil {
+		t.Fatal("expected error for unknown field, got nil")
+	}
+}
+
+func TestLoadRejectsDuplicateID(t *testing.T) {
+	path := writeFile(t, t.TempDir(), "claims.yaml", `
+version: 1
+claims:
+  - id: dup
+    title: a
+    claimed_maturity: implemented
+    implementation: []
+    tests: []
+  - id: dup
+    title: b
+    claimed_maturity: implemented
+    implementation: []
+    tests: []
+`)
+	if _, err := Load(path); err == nil || !strings.Contains(err.Error(), "duplicate id") {
+		t.Fatalf("expected duplicate id error, got %v", err)
+	}
+}
+
+func TestLoadRejectsInvalidClaimedMaturity(t *testing.T) {
+	path := writeFile(t, t.TempDir(), "claims.yaml", `
+version: 1
+claims:
+  - id: x
+    title: t
+    claimed_maturity: definitely-shipped
+    implementation: []
+    tests: []
+`)
+	if _, err := Load(path); err == nil || !strings.Contains(err.Error(), "claimed_maturity") {
+		t.Fatalf("expected claimed_maturity validation error, got %v", err)
+	}
+}
+
+func TestVerifyImplementedMissingSymbolCapsAtUnimplemented(t *testing.T) {
+	root := t.TempDir()
+	writeFile(t, root, "pkg/foo.go", "package pkg\n\nfunc RealFunc() {}\n")
+
+	doc := Document{Claims: []Claim{{
+		ID:              "missing-symbol",
+		ClaimedMaturity: MaturityImplemented,
+		Implementation:  []FileSymbols{{File: "pkg/foo.go", Symbols: []string{"DoesNotExist"}}},
+		Tests:           []FileFuncs{{File: "pkg/foo.go", Funcs: nil}},
+	}}}
+
+	results, err := Verify(root, doc)
+	if err != nil {
+		t.Fatalf("Verify: %v", err)
+	}
+	r := results[0]
+	if r.ComputedMaturity != MaturityUnimplemented {
+		t.Fatalf("computed = %s, want unimplemented", r.ComputedMaturity)
+	}
+	if r.OK() {
+		t.Fatal("expected OK() to be false when claim overclaims implemented")
+	}
+	if !containsSubstring(r.Problems, "DoesNotExist") {
+		t.Fatalf("expected a problem naming the missing symbol, got %v", r.Problems)
+	}
+}
+
+func TestVerifyTestedMissingFuncCapsAtImplemented(t *testing.T) {
+	root := t.TempDir()
+	writeFile(t, root, "pkg/foo.go", "package pkg\n\nfunc RealFunc() {}\n")
+	writeFile(t, root, "pkg/foo_test.go", "package pkg\n\nfunc TestSomethingElse(t *testing.T) {}\n")
+
+	doc := Document{Claims: []Claim{{
+		ID:              "missing-test",
+		ClaimedMaturity: MaturityTested,
+		Implementation:  []FileSymbols{{File: "pkg/foo.go", Symbols: []string{"RealFunc"}}},
+		Tests:           []FileFuncs{{File: "pkg/foo_test.go", Funcs: []string{"TestRealFunc"}}},
+	}}}
+
+	results, err := Verify(root, doc)
+	if err != nil {
+		t.Fatalf("Verify: %v", err)
+	}
+	r := results[0]
+	if r.ComputedMaturity != MaturityImplemented {
+		t.Fatalf("computed = %s, want implemented", r.ComputedMaturity)
+	}
+	if r.OK() {
+		t.Fatal("expected OK() false: claim asserts tested but func is missing")
+	}
+}
+
+func TestVerifyAcceptedMissingArtifactCapsAtTested(t *testing.T) {
+	root := t.TempDir()
+	writeFile(t, root, "pkg/foo.go", "package pkg\n\nfunc RealFunc() {}\n")
+	writeFile(t, root, "pkg/foo_test.go", "package pkg\n\nfunc TestRealFunc(t *testing.T) {}\n")
+
+	doc := Document{Claims: []Claim{{
+		ID:                  "missing-acceptance",
+		ClaimedMaturity:     MaturityAccepted,
+		Implementation:      []FileSymbols{{File: "pkg/foo.go", Symbols: []string{"RealFunc"}}},
+		Tests:               []FileFuncs{{File: "pkg/foo_test.go", Funcs: []string{"TestRealFunc"}}},
+		AcceptanceArtifacts: []ArtifactRef{{Path: "evidence/nope.json"}},
+	}}}
+
+	results, err := Verify(root, doc)
+	if err != nil {
+		t.Fatalf("Verify: %v", err)
+	}
+	r := results[0]
+	if r.ComputedMaturity != MaturityTested {
+		t.Fatalf("computed = %s, want tested", r.ComputedMaturity)
+	}
+	if r.OK() {
+		t.Fatal("expected OK() false: claim asserts accepted but artifact is missing")
+	}
+}
+
+// TestVerifyTestedClaimIsUnaffectedByMissingAcceptanceEvidence confirms a
+// claim that only asserts "tested" is not penalized for lacking acceptance
+// artifacts it never promised to have (the early-stop behavior in
+// verifyOne).
+func TestVerifyTestedClaimIsUnaffectedByMissingAcceptanceEvidence(t *testing.T) {
+	root := t.TempDir()
+	writeFile(t, root, "pkg/foo.go", "package pkg\n\nfunc RealFunc() {}\n")
+	writeFile(t, root, "pkg/foo_test.go", "package pkg\n\nfunc TestRealFunc(t *testing.T) {}\n")
+
+	doc := Document{Claims: []Claim{{
+		ID:              "tested-only",
+		ClaimedMaturity: MaturityTested,
+		Implementation:  []FileSymbols{{File: "pkg/foo.go", Symbols: []string{"RealFunc"}}},
+		Tests:           []FileFuncs{{File: "pkg/foo_test.go", Funcs: []string{"TestRealFunc"}}},
+	}}}
+
+	results, err := Verify(root, doc)
+	if err != nil {
+		t.Fatalf("Verify: %v", err)
+	}
+	r := results[0]
+	if !r.OK() || r.ComputedMaturity != MaturityTested {
+		t.Fatalf("expected OK tested result, got %+v", r)
+	}
+	if len(r.Problems) != 0 {
+		t.Fatalf("expected no problems for a claim that never asserted acceptance, got %v", r.Problems)
+	}
+}
+
+func TestVerifyShippedRequiresAncestorCommitEvidenceAndHistoricalSymbol(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	root := t.TempDir()
+	runGit(t, root, "init")
+	runGit(t, root, "config", "user.email", "test@example.com")
+	runGit(t, root, "config", "user.name", "test")
+
+	writeFile(t, root, "pkg/foo.go", "package pkg\n\nfunc OldFunc() {}\n")
+	runGit(t, root, "add", ".")
+	runGit(t, root, "commit", "-m", "first")
+	firstCommit := runGitOutput(t, root, "rev-parse", "HEAD")
+
+	writeFile(t, root, "pkg/foo.go", "package pkg\n\nfunc OldFunc() {}\n\nfunc NewFunc() {}\n")
+	runGit(t, root, "add", ".")
+	runGit(t, root, "commit", "-m", "second")
+
+	writeFile(t, root, "evidence/release.json", `{
+		"release": {"source_commit": "`+firstCommit+`"},
+		"binaries": {"targets": [{"platform": "linux_amd64", "sha256": "deadbeef"}]}
+	}`)
+
+	base := Claim{
+		Implementation: []FileSymbols{{File: "pkg/foo.go", Symbols: []string{"OldFunc"}}},
+		Tests:          []FileFuncs{{File: "pkg/foo.go", Funcs: nil}},
+	}
+
+	t.Run("shipped when commit is ancestor with matching evidence and symbol present historically", func(t *testing.T) {
+		c := base
+		c.ID = "shipped-ok"
+		c.ClaimedMaturity = MaturityShipped
+		c.AcceptanceArtifacts = []ArtifactRef{{Path: "evidence/release.json"}}
+		c.BinaryBuildEvidence = &BinaryEvidence{EvidenceFile: "evidence/release.json", Commit: firstCommit, Platform: "linux_amd64"}
+
+		results, err := Verify(root, Document{Claims: []Claim{c}})
+		if err != nil {
+			t.Fatalf("Verify: %v", err)
+		}
+		if r := results[0]; !r.OK() || r.ComputedMaturity != MaturityShipped {
+			t.Fatalf("expected shipped OK, got %+v", r)
+		}
+	})
+
+	t.Run("not shipped when symbol only exists after the evidenced commit", func(t *testing.T) {
+		c := base
+		c.ID = "shipped-symbol-too-new"
+		c.ClaimedMaturity = MaturityShipped
+		c.Implementation = []FileSymbols{{File: "pkg/foo.go", Symbols: []string{"NewFunc"}}}
+		c.AcceptanceArtifacts = []ArtifactRef{{Path: "evidence/release.json"}}
+		c.BinaryBuildEvidence = &BinaryEvidence{EvidenceFile: "evidence/release.json", Commit: firstCommit, Platform: "linux_amd64"}
+
+		results, err := Verify(root, Document{Claims: []Claim{c}})
+		if err != nil {
+			t.Fatalf("Verify: %v", err)
+		}
+		r := results[0]
+		if r.OK() {
+			t.Fatal("expected OK() false: NewFunc did not exist at the evidenced commit")
+		}
+		if r.ComputedMaturity != MaturityAccepted {
+			t.Fatalf("computed = %s, want accepted (capped below shipped)", r.ComputedMaturity)
+		}
+	})
+
+	t.Run("not shipped when commit is unknown to the repository", func(t *testing.T) {
+		c := base
+		c.ID = "shipped-unknown-commit"
+		c.ClaimedMaturity = MaturityShipped
+		c.AcceptanceArtifacts = []ArtifactRef{{Path: "evidence/release.json"}}
+		c.BinaryBuildEvidence = &BinaryEvidence{EvidenceFile: "evidence/release.json", Commit: strings.Repeat("a", 40), Platform: "linux_amd64"}
+
+		results, err := Verify(root, Document{Claims: []Claim{c}})
+		if err != nil {
+			t.Fatalf("Verify: %v", err)
+		}
+		if r := results[0]; r.OK() {
+			t.Fatal("expected OK() false: commit does not exist in repo history")
+		}
+	})
+}
+
+func TestCLIReachableFindsDispatchCasesAcrossFiles(t *testing.T) {
+	root := t.TempDir()
+	writeFile(t, root, "cmd/gov/main.go", `package main
+
+func run(args []string) int {
+	switch args[0] {
+	case "run":
+		return runCmd(args[1:])
+	case "ask":
+		return askCmd(args[1:])
+	}
+	return 2
+}
+`)
+	writeFile(t, root, "cmd/gov/ask.go", `package main
+
+func askCmd(args []string) int {
+	switch args[0] {
+	case "approve", "deny":
+		return 0
+	}
+	return 2
+}
+`)
+
+	reachable, err := cliReachable(root, "gov ask approve")
+	if err != nil {
+		t.Fatalf("cliReachable: %v", err)
+	}
+	if !reachable {
+		t.Fatal("expected \"gov ask approve\" to be reachable")
+	}
+
+	reachable, err = cliReachable(root, "gov ask reject")
+	if err != nil {
+		t.Fatalf("cliReachable: %v", err)
+	}
+	if reachable {
+		t.Fatal("expected \"gov ask reject\" to be unreachable (no such case label)")
+	}
+}
+
+func TestReportFlagsOverclaimAsFail(t *testing.T) {
+	results := []Result{
+		{ID: "a", ClaimedMaturity: MaturityShipped, ComputedMaturity: MaturityTested, Problems: []string{"absent from shipped binary: x"}},
+		{ID: "b", ClaimedMaturity: MaturityTested, ComputedMaturity: MaturityTested},
+	}
+	out, exit := Report(results)
+	if exit != 1 {
+		t.Fatalf("exit = %d, want 1", exit)
+	}
+	if !strings.Contains(out, "[FAIL] a") || !strings.Contains(out, "[OK] b") {
+		t.Fatalf("unexpected report:\n%s", out)
+	}
+}
+
+func TestVerifyRealClaimsFileIsFullyConsistent(t *testing.T) {
+	repoRoot := findRepoRoot(t)
+	doc, err := Load(filepath.Join(repoRoot, "docs", "claims.yaml"))
+	if err != nil {
+		t.Fatalf("Load real docs/claims.yaml: %v", err)
+	}
+	if len(doc.Claims) == 0 {
+		t.Fatal("expected docs/claims.yaml to declare at least one claim")
+	}
+	results, err := Verify(repoRoot, doc)
+	if err != nil {
+		t.Fatalf("Verify: %v", err)
+	}
+	for _, r := range results {
+		if !r.OK() {
+			t.Errorf("claim %s overclaims: claimed=%s computed=%s problems=%v", r.ID, r.ClaimedMaturity, r.ComputedMaturity, r.Problems)
+		}
+	}
+}
+
+// --- test helpers ---
+
+func writeFile(t *testing.T, root, rel, content string) string {
+	t.Helper()
+	full := filepath.Join(root, rel)
+	if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.WriteFile(full, []byte(content), 0o644); err != nil {
+		t.Fatalf("write %s: %v", rel, err)
+	}
+	return full
+}
+
+func runGit(t *testing.T, dir string, args ...string) {
+	t.Helper()
+	cmd := exec.Command("git", append([]string{"-C", dir}, args...)...)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("git %v: %v\n%s", args, err, out)
+	}
+}
+
+func runGitOutput(t *testing.T, dir string, args ...string) string {
+	t.Helper()
+	cmd := exec.Command("git", append([]string{"-C", dir}, args...)...)
+	out, err := cmd.Output()
+	if err != nil {
+		t.Fatalf("git %v: %v", args, err)
+	}
+	return strings.TrimSpace(string(out))
+}
+
+func containsSubstring(items []string, sub string) bool {
+	for _, s := range items {
+		if strings.Contains(s, sub) {
+			return true
+		}
+	}
+	return false
+}
+
+// findRepoRoot walks up from the current package directory to the
+// governator repository root (identified by go.mod), so this test works
+// regardless of the working directory `go test` is invoked from.
+func findRepoRoot(t *testing.T) string {
+	t.Helper()
+	dir, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("Getwd: %v", err)
+	}
+	for {
+		if _, err := os.Stat(filepath.Join(dir, "go.mod")); err == nil {
+			return dir
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			t.Fatal("could not find repository root (no go.mod found)")
+		}
+		dir = parent
+	}
+}

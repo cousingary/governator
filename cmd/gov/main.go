@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/cousingary/governator/internal/breaker"
+	"github.com/cousingary/governator/internal/claims"
 	"github.com/cousingary/governator/internal/config"
 	"github.com/cousingary/governator/internal/contextgraph"
 	"github.com/cousingary/governator/internal/contracts"
@@ -365,6 +366,8 @@ func run(args []string) int {
 		return 0
 	case "health":
 		return healthCmd(args[1:])
+	case "claims":
+		return claimsCmd(args[1:])
 	case "version", "--version", "-version":
 		fmt.Printf("gov %s\n", version)
 		return 0
@@ -1709,6 +1712,51 @@ func healthCmd(args []string) int {
 	return 0
 }
 
+// claimsCmd handles `gov claims verify`: re-derives every docs/claims.yaml
+// entry's maturity from the repository (internal/claims) instead of trusting
+// a hand-written status field (plan v1.4 Session 6 / Sol Phase 11 — CI must
+// fail when a claim is unwired, untested, stale, missing its acceptance
+// artifact, or absent from the shipped binary).
+func claimsCmd(args []string) int {
+	if len(args) < 1 || args[0] != "verify" {
+		return bad("usage: gov claims verify [--file <path>] [--repo <path>]")
+	}
+	file := "docs/claims.yaml"
+	repo := "."
+	rest := args[1:]
+	for len(rest) > 0 {
+		switch rest[0] {
+		case "--file":
+			if len(rest) < 2 {
+				return bad("usage: gov claims verify [--file <path>] [--repo <path>]")
+			}
+			file = rest[1]
+			rest = rest[2:]
+		case "--repo":
+			if len(rest) < 2 {
+				return bad("usage: gov claims verify [--file <path>] [--repo <path>]")
+			}
+			repo = rest[1]
+			rest = rest[2:]
+		default:
+			return bad("usage: gov claims verify [--file <path>] [--repo <path>]")
+		}
+	}
+	doc, err := claims.Load(file)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "claims:", err)
+		return 1
+	}
+	results, err := claims.Verify(repo, doc)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "claims:", err)
+		return 1
+	}
+	report, exit := claims.Report(results)
+	fmt.Print(report)
+	return exit
+}
+
 // recoverDoctorGatedBreakers runs the backend doctor probes and closes any
 // breaker that is OPEN on a doctor-gated kind whose check now passes. It is
 // best-effort: a doctor failure never blocks the health view, it just leaves
@@ -2100,5 +2148,6 @@ Usage:
   gov ask deny <id> [--rule] [--ttl <duration>] [--by <name>] [--note <text>]
   gov doctor
   gov health [reset <backend>]
+  gov claims verify [--file <path>]
   gov version`)
 }

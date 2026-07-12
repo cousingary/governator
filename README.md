@@ -119,8 +119,12 @@ gov hook pre-tool-use [--run <id>] [--shadow <python-gate>]
 gov panel compare --out <artifact.json> <input.json>...
 gov gate check
 gov parity report
+gov reconcile
+gov cleanup --stale [--max-attempts N]
+gov ask list|show <id>|approve <id>|deny <id> [--rule] [--ttl <duration>] [--by <name>] [--note <text>]
 gov doctor
 gov health [reset <backend>]
+gov claims verify [--file <path>] [--repo <path>]
 gov version
 ```
 
@@ -131,6 +135,8 @@ gov version
 - [Backend projections](docs/backends.md)
 - [Migration and deliberate divergences](docs/migration.md)
 - [Ledger, routing, evaluation, and repair packets](docs/ledger.md)
+- [Route broker](docs/routing.md)
+- [Machine-verified documentation claims](docs/claims.md)
 - [Publishing checklist](docs/publishing.md)
 - [Security policy](SECURITY.md) and [contributing guide](CONTRIBUTING.md)
 

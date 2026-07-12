@@ -1,0 +1,250 @@
+# Machine-verified documentation claims (v1.4 Session 6 / Sol Phase 11).
+#
+# Every entry here is re-derived from the repository by `gov claims verify`
+# (internal/claims), not hand-asserted: `claimed_maturity` is the only field
+# a human writes as an opinion, and CI fails the moment the computed maturity
+# (implemented < tested < accepted < shipped, each requiring the one before
+# it) falls short of what's claimed. See docs/claims.md for the schema and
+# how to add an entry.
+#
+# "shipped" specifically means: the binary_build_evidence commit is an
+# ancestor of HEAD, that commit is recorded in the named evidence file
+# alongside a real binary hash, and every implementation symbol actually
+# existed in the code at that historical commit — i.e. the evidence's
+# rebuilt binary really contains this feature, not just the current worktree.
+version: 1
+claims:
+  - id: pre-mutation-only-fallback
+    title: "agent: auto backend fallback retries only pre-mutation infra failures, never after a mutation"
+    first_shipped_version: v1.2-routing
+    claimed_maturity: shipped
+    implementation:
+      - file: internal/runtime/runtime.go
+        symbols: [fallbackEligible, recordFallbackAttempt, routingFallbackEnabled]
+    cli:
+      command: "gov run"
+    tests:
+      - file: internal/runtime/runtime_test.go
+        funcs:
+          - TestAgentAutoFallbackRetriesNextCandidateOnInfraPreMutation
+          - TestAgentAutoFallbackBlockedWhenWorktreeChanged
+    acceptance_artifacts:
+      - path: evidence/release-v1.4.json
+        pointer: acceptance_evidence.4_safe_pre_mutation_fallback
+      - path: evidence/release-v1.4.json
+        pointer: acceptance_evidence.5_fallback_refusal_after_mutation
+    binary_build_evidence:
+      evidence_file: evidence/release-v1.4.json
+      commit: 226dc1eea68da217c25aa2c10ff66a6f22cd9913
+      platform: linux_amd64
+
+  - id: backend-circuit-breakers
+    title: "Backend infra-failure circuit breakers (CLOSED/DEGRADED/OPEN/HALF_OPEN) hard-exclude unhealthy backends from agent: auto routing"
+    first_shipped_version: v1.2-routing
+    claimed_maturity: shipped
+    implementation:
+      - file: internal/breaker/breaker.go
+        symbols: [RecordFailure, RecordSuccess, Snapshot, applyPolicy, Reset]
+    cli:
+      command: "gov health"
+    tests:
+      - file: internal/breaker/breaker_test.go
+        funcs:
+          - TestRateLimitOpensWithBaseCooldownThenExponential
+          - TestRateLimitCooldownCapped
+          - TestQuotaExhaustedOpensLong
+          - TestRecordFailurePersistsAndAudits
+    acceptance_artifacts:
+      - path: evidence/release-v1.4.json
+        pointer: breaker_state_at_session_end
+    binary_build_evidence:
+      evidence_file: evidence/release-v1.4.json
+      commit: 226dc1eea68da217c25aa2c10ff66a6f22cd9913
+      platform: linux_amd64
+
+  - id: quota-windows-reservations
+    title: "Provider-plan quota headroom (windows + reservations) gates launch before worktree creation and feeds route scoring"
+    first_shipped_version: v1.2-routing
+    claimed_maturity: shipped
+    implementation:
+      - file: internal/quota/quota.go
+        symbols: [Reserve, Settle, Release, ExpireStale, Headroom]
+    cli:
+      command: "gov quota"
+    tests:
+      - file: internal/quota/quota_test.go
+        funcs:
+          - TestReservationLifecycleAndHeadroom
+          - TestReserveFailsWhenHeadroomInsufficient
+          - TestStaleReservationExpires
+    acceptance_artifacts:
+      - path: evidence/release-v1.4.json
+        pointer: total_real_gov_run_invocations
+    binary_build_evidence:
+      evidence_file: evidence/release-v1.4.json
+      commit: 226dc1eea68da217c25aa2c10ff66a6f22cd9913
+      platform: linux_amd64
+
+  - id: assayer-synchronous-bridge
+    title: "Governator<->Assayer synchronous blocking bridge: contracts can require a passing assay evaluation before merge, with pre/post artifact hash re-checks"
+    first_shipped_version: v1.3-hardening
+    claimed_maturity: shipped
+    implementation:
+      - file: internal/assay/assay.go
+        symbols: [Evaluate, Blocks, Config, Configured]
+    cli:
+      command: "gov run"
+    tests:
+      - file: internal/assay/assay_test.go
+        funcs:
+          - TestEvaluateShaMismatchBeforeEvaluationIsError
+          - TestEvaluateShaMismatchAfterEvaluationIsError
+          - TestBlocks
+    acceptance_artifacts:
+      - path: evidence/release-v1.4.json
+        pointer: acceptance_evidence.3_blocking_assayer_quarantine
+    binary_build_evidence:
+      evidence_file: evidence/release-v1.4.json
+      commit: 226dc1eea68da217c25aa2c10ff66a6f22cd9913
+      platform: linux_amd64
+
+  - id: hermetic-assayer-ci-boundary
+    title: "The real-Assayer-CLI integration test runs against a pinned fixture (no external path) and is a mandatory CI job, never a silent skip; every evaluation records Assayer commit/profile hash/validator hashes/Python version"
+    first_shipped_version: v1.4-session2
+    claimed_maturity: tested
+    implementation:
+      - file: internal/assay/environment.go
+        symbols: [DescribeEnvironment, Environment, assayerCommit, fileSHA256]
+    tests:
+      - file: internal/assay/assay_test.go
+        funcs:
+          - TestDescribeEnvironmentUnconfiguredIsZeroValue
+          - TestDescribeEnvironmentAgainstFixture
+          - TestDescribeEnvironmentPythonVersion
+      - file: internal/assay/assay_integration_test.go
+        funcs:
+          - TestEvaluateAgainstRealCLIPassAndFail
+        build_tag: integration
+
+  - id: docker-hardening
+    title: "DockerRunner enforces non-root user, read-only rootfs, cap-drop=ALL, no-new-privileges, seccomp/AppArmor, tmpfs, digest-pinned images, canonicalized mounts, and default-deny network egress"
+    first_shipped_version: v1.4-session3
+    claimed_maturity: tested
+    implementation:
+      - file: internal/runner/docker.go
+        symbols: [runArgs, canonicalMount]
+    tests:
+      - file: internal/runner/docker_test.go
+        funcs:
+          - TestDockerRunArgsHardeningFlags
+          - TestDockerRunArgsDefaultDenyNoHardening
+          - TestDockerRunArgsCredentialMounts
+          - TestDockerRunArgsCanonicalizesMounts
+
+  - id: loud-output-truncation
+    title: "Output truncation is recorded (bytes accepted/discarded), emits an OUTPUT_TRUNCATED ledger event, and blocks/quarantines runs whose complete transcript was required"
+    first_shipped_version: v1.4-session3
+    claimed_maturity: tested
+    implementation:
+      - file: internal/runner/docker.go
+        symbols: [cappedWriter]
+      - file: internal/runtime/runtime.go
+        symbols: [runOnce]
+    tests:
+      - file: internal/runner/docker_test.go
+        funcs:
+          - TestCappedWriterAccounting
+          - TestDockerObserveSurfacesTruncationAndProvenance
+          - TestDockerObserveNoTruncationByDefault
+
+  - id: high-risk-containment-gating
+    title: "risk_class: high contracts must resolve to hardened Docker, a verified native sandbox, or a signed operator override — never a silent local run"
+    first_shipped_version: v1.4-session3
+    claimed_maturity: tested
+    implementation:
+      - file: internal/containment/containment.go
+        symbols: [Enforce, VerifyOverride, OverrideMessage]
+    tests:
+      - file: internal/containment/containment_test.go
+        funcs:
+          - TestEnforceHighRiskLocalWithoutContainmentFailsClosed
+          - TestEnforceHighRiskDockerHardenedPasses
+          - TestEnforceHighRiskDockerNotHardenedFails
+          - TestEnforceHighRiskLocalWithValidOverridePasses
+          - TestEnforceOverrideNotReplayableAcrossJobs
+
+  - id: durable-operational-reconciliation
+    title: "Post-run best-effort operations (breaker feedback, quota reset hints, workspace/container destruction, audit writes) never vanish on failure: they land in operational_errors + maintenance_outbox, drained by gov reconcile and terminalized by gov cleanup --stale"
+    first_shipped_version: v1.4-session4
+    claimed_maturity: tested
+    implementation:
+      - file: internal/observability/outbox.go
+        symbols: [RecordOperationalError, EnqueueOutbox, PendingOutbox, StaleOutbox, MarkOutboxDone, MarkOutboxDead]
+      - file: internal/runtime/reconcile.go
+        symbols: [Reconcile, dispatchReconcile, CleanupStale]
+    cli:
+      command: "gov reconcile"
+    tests:
+      - file: internal/observability/outbox_test.go
+        funcs:
+          - TestOperationalErrorAndOutboxLifecycle
+          - TestMarkOutboxDoneRemovesFromPending
+      - file: internal/runtime/reconcile_test.go
+        funcs:
+          - TestReconcileDrainsBreakerFeedback
+          - TestReconcileRetriesUnknownOpKind
+          - TestReconcileWorkspaceDestroyRemovesLeftoverWorktree
+          - TestCleanupStaleMarksDeadAfterMaxAttempts
+
+  - id: layered-ask-policy
+    title: "Four-way policy verdicts (ALLOW/DENY/ASK/FLAG) across org -> project doctrine -> job contract -> session/operator layers, with checkpointed ASK resolved via gov ask approve|deny (optionally as an expiring override) that resumes from checkpoint rather than restarting the agent"
+    first_shipped_version: v1.4-session5
+    claimed_maturity: tested
+    implementation:
+      - file: internal/policy/verdict.go
+        symbols: [Verdict, EvaluateLayers, ResolveOverrides, LayerResult]
+      - file: internal/policy/decision.go
+        symbols: [PolicyDecision]
+      - file: internal/observability/policy_checkpoints.go
+        symbols: [RecordPolicyCheckpoint, ResolvePolicyCheckpoint, RecordPolicyOverride, ActivePolicyOverrides]
+    cli:
+      command: "gov ask approve"
+    tests:
+      - file: internal/policy/verdict_test.go
+        funcs:
+          - TestEvaluateLayersOrgDenyIsFinalOverAnyLaterLayer
+          - TestEvaluateLayersAskWithNoDenyStaysAsk
+          - TestEvaluateLayersFlagNeverBlocks
+          - TestResolveOverridesOnlyResolvesMatchingAskRuleID
+          - TestResolveOverridesNeverResolvesDeny
+      - file: internal/runtime/policy_gate_test.go
+        funcs:
+          - TestPolicyGateOrgAskQuarantinesBeforeLaunchAndRecordsCheckpoint
+          - TestPolicyGateApprovedOverrideLetsSubsequentRunProceed
+          - TestFallbackEligibleConsultsPolicyGateForUnusualInfraFailure
+
+  - id: stale-run-recovery
+    title: "gov run recover --stale distinguishes a crashed run that never touched its worktree (safe resume) from one that did (fail-closed quarantine), via the worktree fingerprint recorded at AGENT_RUNNING"
+    first_shipped_version: v1.3-hardening
+    claimed_maturity: shipped
+    implementation:
+      - file: internal/runtime/recovery.go
+        symbols: [InspectRun, ResumeRun, AbandonRun, RecoverStaleRuns, recoverInterruptedRun]
+      - file: cmd/gov/main.go
+        symbols: [runRecoveryDispatch]
+    cli:
+      command: "gov run recover"
+    tests:
+      - file: internal/runtime/recovery_test.go
+        funcs:
+          - TestRecoverInterruptedRun_PreAgentRunningIsSafe
+          - TestRecoverInterruptedRun_AgentRunningUnchangedIsSafe
+          - TestRecoverInterruptedRun_AgentRunningChangedIsQuarantined
+          - TestRecoverStaleRuns_ReportsEachInterruptedRunAndIsIdempotent
+    acceptance_artifacts:
+      - path: evidence/release-v1.4.json
+        pointer: acceptance_evidence.7_stale_run_recovery
+    binary_build_evidence:
+      evidence_file: evidence/release-v1.4.json
+      commit: 226dc1eea68da217c25aa2c10ff66a6f22cd9913
+      platform: linux_amd64
