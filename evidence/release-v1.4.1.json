@@ -1,0 +1,130 @@
+{
+  "session": "v1.4.1 — red-team review + acceptance proof for the six Session 2-5 features",
+  "plan": "agents/governator_v1.4_plan.md — closes the merged-vs-proven gap Session 6's claims ledger surfaced: only 5 of 11 claims were honestly shipped because the Session 2-5 features had tests but no real acceptance run and no rebuilt binary",
+  "executed_by": "Fable (review, fixes, and acceptance runs in one session)",
+  "date": "2026-07-12",
+  "release": {
+    "source_commit": "9c25e43e56d02b0f1b679ccd99b66813648bdd91",
+    "commit_subject": "Fable red-team review of v1.4 Sessions 2-5: 6 defects fixed w/ regression tests",
+    "go_version": "go1.26.4",
+    "build_flags": "canonical .goreleaser.yml snapshot (CGO_ENABLED=0, -s -w)",
+    "vcs_modified": false,
+    "note": "binaries were cut AFTER the review fixes, so every acceptance scenario below exercises the fixed code — including the four fixes (contract-hash-bound override, one-shot ask approve, blocking-assay transcript completeness, tolerance-checked container removal) that changed the very behaviors being proven"
+  },
+  "review_pass": {
+    "scope": "full red-team of Session 2 (8e282bb), Session 3 (d369f9a), Session 4 (d2b42e0), Session 5 (4ee29b1), Session 6 (1675c32)",
+    "defects_found_and_fixed": [
+      "containment override signature bound only job_id:reason — survived arbitrary edits to the contract body; now binds the contract hash (containment block cleared), new `gov containment message` prints the exact bytes to sign",
+      "complete-transcript enforcement was fail-open: blocking-assay (evidence-bearing) runs needed the explicit opt-in flag, and an Observe error skipped the check even WITH the flag",
+      "DockerRunner.Destroy and the workspace_destroy reconcile dispatch swallowed every docker rm failure — a daemon-down retry marked the teardown done while the container lived; runner.RemoveContainer now tolerates only the already-gone case",
+      "bare `gov ask approve` (approve once) was a functional no-op — resolved the checkpoint, wrote no override, the re-run re-ASKed; now a real single-use override (policy_overrides.one_shot/consumed_at)",
+      "policy rule condition fields were never validated against the fact vocabulary — a typo'd DENY rule silently never fired, forever",
+      "docker.egress_allowlist was a silently-unenforced security control (documented as a restriction, mapped to no docker flag) and IsHardened ignored network entirely — allowlist now rejected fail-closed, hardened requires network: deny"
+    ],
+    "additional_sweep": "deferred quota.Release failure now queued as quota_release outbox work",
+    "gate": "go build/vet/test -race green repo-wide, gofmt clean, at 9c25e43"
+  },
+  "binaries": {
+    "goreleaser_config": ".goreleaser.yml (canonical)",
+    "targets": [
+      {"platform": "linux_amd64", "archive": "gov_0.0.0-SNAPSHOT-none_linux_amd64.tar.gz", "sha256": "a6f70996cda254a7f3462bc4d59cbb2ab093c60989837439a8b34c0df9b6ed37"},
+      {"platform": "linux_arm64", "archive": "gov_0.0.0-SNAPSHOT-none_linux_arm64.tar.gz", "sha256": "8a6045e156d24fb6da3955dde5a5a272e5d12dedd3340926fd637c93c9215d2d"},
+      {"platform": "darwin_amd64", "archive": "gov_0.0.0-SNAPSHOT-none_darwin_amd64.tar.gz", "sha256": "0d028087866ceaa9182a035d5849fadd21bc3aa511d9a0d605eb96bd27ce21a6"},
+      {"platform": "darwin_arm64", "archive": "gov_0.0.0-SNAPSHOT-none_darwin_arm64.tar.gz", "sha256": "abea6f209c5695d2ad82686fe1ab05e6491939b7f3cc012f3fed9f9d0c3d366a"}
+    ],
+    "sbom_lite_linux_amd64": {
+      "go": "go1.26.4",
+      "vcs_revision": "9c25e43e56d02b0f1b679ccd99b66813648bdd91",
+      "vcs_modified": false,
+      "vcs_time": "2026-07-12T05:11:03Z"
+    }
+  },
+  "environment": {
+    "gov_binary": "bin/gov rebuilt from 9c25e43 (the same code the release archives contain)",
+    "gov_home": "disposable acceptance GOV_HOME (fresh ledger)",
+    "workspace_root": "disposable git repo, NOT the governator repo",
+    "docker_image": "gov-fake-pi:accept — FROM busybox:1.36 plus a deterministic /usr/local/bin/pi shell script standing in for the pi CLI (no real backend CLI ships inside a base image); every run around it (gate, worktree, docker flags, transcript audit, validators, merge) is the real pipeline",
+    "real_llm_backend": "claude-code (subscription CLI) for the ASK-policy approved run",
+    "assayer": "real Assayer subprocess at /mnt/e/downloads/assayer, profile coding-output-v1"
+  },
+  "acceptance_evidence": {
+    "1_containment_high_risk_local_denied": {
+      "job_id": "v141-accept-highrisk-local-denied",
+      "backend": "glm (declares no native sandbox)",
+      "outcome": "gov run exited 1 BEFORE launch with 'containment: risk_class: high with runner: local requires a backend with a verified native sandbox or a signed operator override'",
+      "side_effects": "zero runs rows, no worktree, no quota reservation — the plan's exact 'fails before launch' acceptance criterion"
+    },
+    "2_containment_signed_override_passes_gate": {
+      "job_id": "v141-accept-highrisk-signed-override",
+      "mechanism": "operator ed25519 keypair; `gov containment message <job.yaml> --reason ...` printed `<job_id>:<contract_hash>:<reason>`; signature placed in containment.override_signature; config containment.override_public_key set",
+      "run_id": "v141-accept-highrisk-signed-override-1783833439439678819",
+      "outcome": "containment gate PASSED (run proceeded to launch and failed later as BINARY_MISSING on a deliberately nonexistent glm bin — an infra failure, not a containment refusal), proving the override verified",
+      "bonus_organic_evidence": "this BINARY_MISSING failure opened the glm circuit breaker, observed on the next run as 'warning: backend glm breaker is OPEN'"
+    },
+    "3_containment_override_tamper_refused": {
+      "job_id": "v141-accept-highrisk-signed-override",
+      "mutation": "budget.max_minutes 5 -> 9 (a single innocuous field) after signing",
+      "outcome": "gov run exited 1 pre-launch with the containment error again — the signature binds the contract hash, so ANY body edit invalidates the override (the review-pass fix, proven live in the rebuilt binary)"
+    },
+    "4_docker_hardened_run": {
+      "job_id": "v141-accept-docker-hardened",
+      "run_id_commit": "merged as 'Governator job v141-accept-docker-hardened' in the disposable root",
+      "risk_class": "high — satisfied containment via IsHardened (non-root user 1000:1000, read_only_rootfs, cap_drop_all, no_new_privileges, tmpfs /tmp, network deny by default, allow_mutable_tag exception recorded for the locally-built image)",
+      "status": "APPROVED",
+      "notes": "runs.notes carries docker_limits_observed (Observe inspected the container's applied HostConfig); accept.txt genuinely written from inside the hardened container and merged to the root"
+    },
+    "5_truncation_loud_nonblocking": {
+      "job_id": "v141-accept-truncation-loud",
+      "output_cap_bytes": 5497,
+      "status": "APPROVED",
+      "notes": "output_truncated: 212596 bytes discarded of 218093 total — recorded loudly in runs.notes and as an OUTPUT_TRUNCATED run stage; run not blocked because no complete transcript was required"
+    },
+    "6_truncation_blocking_quarantine": {
+      "job_id": "v141-accept-truncation-blocking",
+      "docker_require_complete_transcript": true,
+      "status": "QUARANTINED",
+      "violation": "output truncated: 212596 of 218093 transcript bytes discarded (complete transcript required) — an evidence-bearing run is never approved on a capped trail"
+    },
+    "7_reconciliation": {
+      "seeded_state": "a REAL running container (gov-accept-reconcile, busybox sleep 600) and a REAL leftover worktree dir, with the matching operational_errors + maintenance_outbox rows inserted exactly as runtime.noteOperationalFailure writes them (the in-process failure that would organically enqueue them cannot outlive a SIGKILL, so the durable rows ARE the recorded failure state); plus one deliberately unrecoverable op_kind row",
+      "gov_reconcile_pass1": "processed=2 done=1 retried=1 — the workspace_destroy row genuinely removed the live container (docker ps confirms gone) and the worktree dir; the unrecoverable row stayed pending with attempts incremented",
+      "gov_cleanup_stale": "after a second reconcile pass, `gov cleanup --stale --max-attempts 2` terminalized the unrecoverable row: status=dead, attempts=2, last_error preserved, row NOT deleted",
+      "final_outbox": "row1 workspace_destroy done; row2 dead ('gave up after 2 attempts')"
+    },
+    "8_ask_policy_lifecycle": {
+      "org_rule": "config policy_rules: network-enablement ASK when network_enabled eq true",
+      "pause": "run 1 QUARANTINED POLICY_ASK_PENDING, checkpoint id 1 persisted, ZERO backend launch (no spend)",
+      "bare_approve": "`gov ask approve 1 --by jeremy-acceptance --note 'approve this once'` (NO --rule)",
+      "unblocked_real_run": {
+        "backend": "claude-code (real subscription CLI)",
+        "status": "APPROVED",
+        "cost_usd": 0.360917,
+        "tool_calls": 4,
+        "proof": "hello.txt with the contracted content merged into the root repo"
+      },
+      "one_shot_consumed": "third run (same job_id, varied task) QUARANTINED POLICY_ASK_PENDING again on a FRESH checkpoint (id 2); ledger shows policy_overrides row one_shot=1 consumed=1 — 'approve once' means exactly once (the review-pass fix, proven live)",
+      "close_out": "checkpoint 2 resolved via `gov ask deny 2`"
+    },
+    "9_assay_provenance": {
+      "job_id": "v141-accept-assay-blocking",
+      "enforcement": "blocking",
+      "assayer": "real subprocess, real repo",
+      "status": "APPROVED (verdict pass)",
+      "assay_evaluations_row": {
+        "profile": "coding-output-v1",
+        "verdict": "pass",
+        "assayer_commit": "ed7b06b873dd…",
+        "profile_hash": "28adf1b35fe3…",
+        "validators_hash": "5b3d21439919…",
+        "python_version": "Python 3.12.3"
+      },
+      "note": "every evaluation now carries the full environment fingerprint (Session 2 item 3), live in the rebuilt binary; the blocking-FAIL quarantine path was separately proven in Session 1's evidence and by TestAssayBlocking* regression tests"
+    },
+    "10_hermetic_ci_boundary_flip": {
+      "with_fixture": "go test -tags integration ./internal/assay/ -> PASS (TestEvaluateAgainstRealCLIPassAndFail, TestDescribeEnvironmentAgainstFixture)",
+      "without_fixture": "fixture dir moved aside -> the same invocation FAILs (t.Fatal 'open testdata/assayer_fixture/PINNED_COMMIT: no such file or directory') — a missing Assayer is a hard failure, NEVER a skip; fixture restored, tree clean",
+      "ci_wiring": ".github/workflows/ci.yml mandatory assay-integration job runs exactly this invocation"
+    }
+  },
+  "acceptance": "all six previously-tested-only features (docker hardening, loud truncation, containment gating, reconciliation, ASK policy, hermetic Assayer boundary) now have real acceptance evidence AND a rebuilt, hashed binary at the same commit (9c25e43) their code, tests, and fixes live at — the bar Session 1 set and docs/claims.yaml enforces"
+}

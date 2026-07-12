@@ -111,7 +111,7 @@ claims:
   - id: hermetic-assayer-ci-boundary
     title: "The real-Assayer-CLI integration test runs against a pinned fixture (no external path) and is a mandatory CI job, never a silent skip; every evaluation records Assayer commit/profile hash/validator hashes/Python version"
     first_shipped_version: v1.4-session2
-    claimed_maturity: tested
+    claimed_maturity: shipped
     implementation:
       - file: internal/assay/environment.go
         symbols: [DescribeEnvironment, Environment, assayerCommit, fileSHA256]
@@ -125,14 +125,23 @@ claims:
         funcs:
           - TestEvaluateAgainstRealCLIPassAndFail
         build_tag: integration
+    acceptance_artifacts:
+      - path: evidence/release-v1.4.1.json
+        pointer: acceptance_evidence.9_assay_provenance
+      - path: evidence/release-v1.4.1.json
+        pointer: acceptance_evidence.10_hermetic_ci_boundary_flip
+    binary_build_evidence:
+      evidence_file: evidence/release-v1.4.1.json
+      commit: 9c25e43e56d02b0f1b679ccd99b66813648bdd91
+      platform: linux_amd64
 
   - id: docker-hardening
     title: "DockerRunner enforces non-root user, read-only rootfs, cap-drop=ALL, no-new-privileges, seccomp/AppArmor, tmpfs, digest-pinned images, canonicalized mounts, and default-deny network egress"
     first_shipped_version: v1.4-session3
-    claimed_maturity: tested
+    claimed_maturity: shipped
     implementation:
       - file: internal/runner/docker.go
-        symbols: [runArgs, canonicalMount]
+        symbols: [runArgs, canonicalMount, RemoveContainer]
     tests:
       - file: internal/runner/docker_test.go
         funcs:
@@ -140,30 +149,52 @@ claims:
           - TestDockerRunArgsDefaultDenyNoHardening
           - TestDockerRunArgsCredentialMounts
           - TestDockerRunArgsCanonicalizesMounts
+          - TestContainerAlreadyGoneMatching
+    acceptance_artifacts:
+      - path: evidence/release-v1.4.1.json
+        pointer: acceptance_evidence.4_docker_hardened_run
+    binary_build_evidence:
+      evidence_file: evidence/release-v1.4.1.json
+      commit: 9c25e43e56d02b0f1b679ccd99b66813648bdd91
+      platform: linux_amd64
 
   - id: loud-output-truncation
     title: "Output truncation is recorded (bytes accepted/discarded), emits an OUTPUT_TRUNCATED ledger event, and blocks/quarantines runs whose complete transcript was required"
     first_shipped_version: v1.4-session3
-    claimed_maturity: tested
+    claimed_maturity: shipped
     implementation:
       - file: internal/runner/docker.go
         symbols: [cappedWriter]
       - file: internal/runtime/runtime.go
-        symbols: [runOnce]
+        symbols: [runOnce, requiresCompleteTranscript]
     tests:
       - file: internal/runner/docker_test.go
         funcs:
           - TestCappedWriterAccounting
           - TestDockerObserveSurfacesTruncationAndProvenance
           - TestDockerObserveNoTruncationByDefault
+      - file: internal/runtime/runtime_test.go
+        funcs:
+          - TestRequiresCompleteTranscript
+    acceptance_artifacts:
+      - path: evidence/release-v1.4.1.json
+        pointer: acceptance_evidence.5_truncation_loud_nonblocking
+      - path: evidence/release-v1.4.1.json
+        pointer: acceptance_evidence.6_truncation_blocking_quarantine
+    binary_build_evidence:
+      evidence_file: evidence/release-v1.4.1.json
+      commit: 9c25e43e56d02b0f1b679ccd99b66813648bdd91
+      platform: linux_amd64
 
   - id: high-risk-containment-gating
     title: "risk_class: high contracts must resolve to hardened Docker, a verified native sandbox, or a signed operator override — never a silent local run"
     first_shipped_version: v1.4-session3
-    claimed_maturity: tested
+    claimed_maturity: shipped
     implementation:
       - file: internal/containment/containment.go
-        symbols: [Enforce, VerifyOverride, OverrideMessage]
+        symbols: [Enforce, VerifyOverride, OverrideMessage, SigningMessage]
+    cli:
+      command: "gov containment"
     tests:
       - file: internal/containment/containment_test.go
         funcs:
@@ -172,11 +203,21 @@ claims:
           - TestEnforceHighRiskDockerNotHardenedFails
           - TestEnforceHighRiskLocalWithValidOverridePasses
           - TestEnforceOverrideNotReplayableAcrossJobs
+          - TestEnforceOverrideInvalidatedByContractMutation
+    acceptance_artifacts:
+      - path: evidence/release-v1.4.1.json
+        pointer: acceptance_evidence.1_containment_high_risk_local_denied
+      - path: evidence/release-v1.4.1.json
+        pointer: acceptance_evidence.2_containment_signed_override_passes_gate
+    binary_build_evidence:
+      evidence_file: evidence/release-v1.4.1.json
+      commit: 9c25e43e56d02b0f1b679ccd99b66813648bdd91
+      platform: linux_amd64
 
   - id: durable-operational-reconciliation
     title: "Post-run best-effort operations (breaker feedback, quota reset hints, workspace/container destruction, audit writes) never vanish on failure: they land in operational_errors + maintenance_outbox, drained by gov reconcile and terminalized by gov cleanup --stale"
     first_shipped_version: v1.4-session4
-    claimed_maturity: tested
+    claimed_maturity: shipped
     implementation:
       - file: internal/observability/outbox.go
         symbols: [RecordOperationalError, EnqueueOutbox, PendingOutbox, StaleOutbox, MarkOutboxDone, MarkOutboxDead]
@@ -195,18 +236,26 @@ claims:
           - TestReconcileRetriesUnknownOpKind
           - TestReconcileWorkspaceDestroyRemovesLeftoverWorktree
           - TestCleanupStaleMarksDeadAfterMaxAttempts
+          - TestReconcileDrainsQuotaRelease
+    acceptance_artifacts:
+      - path: evidence/release-v1.4.1.json
+        pointer: acceptance_evidence.7_reconciliation
+    binary_build_evidence:
+      evidence_file: evidence/release-v1.4.1.json
+      commit: 9c25e43e56d02b0f1b679ccd99b66813648bdd91
+      platform: linux_amd64
 
   - id: layered-ask-policy
     title: "Four-way policy verdicts (ALLOW/DENY/ASK/FLAG) across org -> project doctrine -> job contract -> session/operator layers, with checkpointed ASK resolved via gov ask approve|deny (optionally as an expiring override) that resumes from checkpoint rather than restarting the agent"
     first_shipped_version: v1.4-session5
-    claimed_maturity: tested
+    claimed_maturity: shipped
     implementation:
       - file: internal/policy/verdict.go
         symbols: [Verdict, EvaluateLayers, ResolveOverrides, LayerResult]
       - file: internal/policy/decision.go
         symbols: [PolicyDecision]
       - file: internal/observability/policy_checkpoints.go
-        symbols: [RecordPolicyCheckpoint, ResolvePolicyCheckpoint, RecordPolicyOverride, ActivePolicyOverrides]
+        symbols: [RecordPolicyCheckpoint, ResolvePolicyCheckpoint, RecordPolicyOverride, ActivePolicyOverrides, ConsumePolicyOverride]
     cli:
       command: "gov ask approve"
     tests:
@@ -221,7 +270,15 @@ claims:
         funcs:
           - TestPolicyGateOrgAskQuarantinesBeforeLaunchAndRecordsCheckpoint
           - TestPolicyGateApprovedOverrideLetsSubsequentRunProceed
+          - TestPolicyGateBareApproveUnblocksExactlyOnce
           - TestFallbackEligibleConsultsPolicyGateForUnusualInfraFailure
+    acceptance_artifacts:
+      - path: evidence/release-v1.4.1.json
+        pointer: acceptance_evidence.8_ask_policy_lifecycle
+    binary_build_evidence:
+      evidence_file: evidence/release-v1.4.1.json
+      commit: 9c25e43e56d02b0f1b679ccd99b66813648bdd91
+      platform: linux_amd64
 
   - id: stale-run-recovery
     title: "gov run recover --stale distinguishes a crashed run that never touched its worktree (safe resume) from one that did (fail-closed quarantine), via the worktree fingerprint recorded at AGENT_RUNNING"

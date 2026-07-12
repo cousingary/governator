@@ -51,6 +51,20 @@ Also swept per Session 4's own rule: the deferred `quota.Release` in
 `runOnce` no longer swallows its error — a failed release is queued as
 `quota_release` outbox work so headroom returns before the TTL heals it.
 
+## v1.4.1 acceptance — all 11 claims shipped
+
+Real acceptance runs (evidence/release-v1.4.1.json) + rebuilt goreleaser
+binaries at the review-fix commit close the merged-vs-proven gap Session 6's
+claims ledger surfaced: containment gating (deny / signed-override /
+tamper-refusal, live), hardened Docker run (docker_limits_observed, merged
+from inside the container), loud + blocking truncation, `gov reconcile`
+destroying a real leftover container + worktree and `gov cleanup --stale`
+terminalizing an unrecoverable row, the full ASK lifecycle with a real
+claude-code run (pause -> bare approve -> approved run -> one-shot consumed
+-> re-ASK), real-Assayer evaluation with full environment provenance, and
+the hermetic CI boundary flipping PASS -> FAIL (never SKIP) without its
+fixture. `gov claims verify`: 11/11 shipped.
+
 ## v1.4-session1-validator-test
 
 Deterministic-validator-quarantine test: a deliberately-unsatisfiable
