@@ -25,6 +25,7 @@ import (
 
 	"github.com/cousingary/governator/internal/agents"
 	"github.com/cousingary/governator/internal/assay"
+	"github.com/cousingary/governator/internal/attest"
 	"github.com/cousingary/governator/internal/breaker"
 	"github.com/cousingary/governator/internal/config"
 	"github.com/cousingary/governator/internal/containment"
@@ -410,6 +411,19 @@ func fingerprint(root string) (snapshot, error) {
 	return out, err
 }
 
+func writeFileNoFollow(path string, data []byte, perm os.FileMode) error {
+	fd, err := syscall.Open(path, syscall.O_WRONLY|syscall.O_CREAT|syscall.O_EXCL|syscall.O_NOFOLLOW, uint32(perm))
+	if err != nil {
+		return err
+	}
+	f := os.NewFile(uintptr(fd), path)
+	defer f.Close()
+	if _, err := f.Write(data); err != nil {
+		return err
+	}
+	return f.Chmod(perm)
+}
+
 func protectedFingerprint() (snapshot, error) {
 	patterns, err := protectedpaths.Patterns()
 	if err != nil {
@@ -543,21 +557,57 @@ func isGit(root string) bool {
 	return c == 0
 }
 
+func validateNoLocalSymlinkEscape(root string) error {
+	return filepath.WalkDir(root, func(p string, d os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		rel, relErr := filepath.Rel(root, p)
+		if relErr != nil {
+			return relErr
+		}
+		rel = filepath.ToSlash(rel)
+		if rel == ".git" || strings.HasPrefix(rel, ".git/") || rel == ".codegraph" || strings.HasPrefix(rel, ".codegraph/") {
+			if d.IsDir() {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if d.Type()&os.ModeSymlink != 0 {
+			return fmt.Errorf("local containment: symlink/junction paths are not allowed in local worktrees: %s", rel)
+		}
+		return nil
+	})
+}
+
 // enforceContainment applies the Session 3 (Phase 2) risk-class containment
 // policy. It resolves the backend's native-sandbox capability (a verified
 // agent-layer fact, not a contract claim) and the operator override key from
 // config, then delegates to containment.Enforce. Non-high-risk contracts are
 // a no-op. The check runs before quota/workspace acquisition so a denied
 // high-risk run leaves no side effects.
-func enforceContainment(c contracts.Contract, agent string, cfg config.Config) error {
+func enforceContainment(db *sql.DB, c contracts.Contract, agent string, cfg config.Config) (string, error) {
 	if strings.TrimSpace(c.RiskClass) != "high" {
-		return nil
+		return "", nil
 	}
 	nativeSandbox := false
+	var attestationID string
 	if a, err := agents.New(agent); err == nil {
 		nativeSandbox = a.Capabilities().NativeSandbox
 	}
-	return containment.Enforce(c, nativeSandbox, cfg.Containment.OverridePublicKey)
+	// Sol Critical 4 / Phase E: a backend name is never sufficient evidence of
+	// native host containment. High-risk local jobs may count a native sandbox
+	// only when the current executable hash/config/model has a fresh ledgered
+	// capability attestation whose probes passed. Docker and signed overrides
+	// keep their existing paths inside containment.Enforce.
+	if c.EffectiveRunner() == "local" && nativeSandbox && !containment.VerifyOverride(c, cfg.Containment.OverridePublicKey) {
+		id, err := attest.VerifyHighRiskNative(db, cfg, agent)
+		if err != nil {
+			return "", err
+		}
+		attestationID = id
+	}
+	return attestationID, containment.Enforce(c, nativeSandbox, cfg.Containment.OverridePublicKey)
 }
 
 // requiresCompleteTranscript reports whether c may never be approved on an
@@ -844,6 +894,50 @@ func relUnderWork(work, subject string) (string, bool) {
 	return filepath.ToSlash(rel), true
 }
 
+func allowedStartupNotice(format, line string) bool {
+	trimmed := strings.TrimSpace(line)
+	return format == agents.TranscriptCodex && trimmed == "Reading additional input from stdin..."
+}
+
+func recognizedTranscriptEvent(format string, v any) bool {
+	m, ok := v.(map[string]any)
+	if !ok {
+		if items, ok := v.([]any); ok {
+			for _, item := range items {
+				if recognizedTranscriptEvent(format, item) {
+					return true
+				}
+			}
+		}
+		return false
+	}
+	typeName, _ := m["type"].(string)
+	switch format {
+	case agents.TranscriptClaude, agents.TranscriptGLM:
+		if typeName == "tool_use" || typeName == "tool_result" || typeName == "result" || typeName == "message_start" || typeName == "message_stop" {
+			return true
+		}
+	case agents.TranscriptCodex:
+		if strings.HasPrefix(typeName, "item.") || typeName == "command_execution" || typeName == "result" || typeName == "agent_message" || typeName == "turn.completed" {
+			return true
+		}
+	case agents.TranscriptOpenCode:
+		if typeName == "tool" || typeName == "result" || typeName == "message" || m["tool"] != nil || m["name"] != nil {
+			return true
+		}
+	case agents.TranscriptPi:
+		if strings.HasPrefix(typeName, "tool_execution") || typeName == "result" || typeName == "done" || m["toolName"] != nil || m["tool_name"] != nil {
+			return true
+		}
+	}
+	for _, child := range m {
+		if recognizedTranscriptEvent(format, child) {
+			return true
+		}
+	}
+	return false
+}
+
 func auditTranscript(path, format, work string, c contracts.Contract) transcriptAudit {
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -892,30 +986,41 @@ func auditTranscript(path, format, work string, c contracts.Contract) transcript
 		}
 	}
 	sawValidJSON := false
+	sawRecognizedEvent := false
+	startupLines := 0
+	startupBytes := 0
 	for lineNumber, line := range strings.Split(string(data), "\n") {
 		if strings.TrimSpace(line) == "" {
 			continue
 		}
 		var v any
 		if err := json.Unmarshal([]byte(line), &v); err != nil {
-			// A line before the JSON stream has started is CLI startup
-			// noise (e.g. codex's `exec --json` prints a plain-text
-			// "Reading additional input from stdin..." notice on stdout
-			// before its first JSON event) rather than stream corruption:
-			// it can't have encoded a tool_use/tool_result event either
-			// way, so skipping it costs no audit signal. A malformed line
-			// AFTER at least one valid JSON line has already been seen is
-			// still treated as corruption and fails closed exactly as
-			// before (see TestAuditTranscriptRejectsMalformedJSONL).
 			if sawValidJSON {
 				audit.Violations = append(audit.Violations,
 					fmt.Sprintf("transcript audit: malformed JSON on line %d", lineNumber+1))
+				continue
+			}
+			startupLines++
+			startupBytes += len(line)
+			if startupLines > 3 || startupBytes > 512 || !allowedStartupNotice(format, line) {
+				audit.Violations = append(audit.Violations,
+					fmt.Sprintf("TRANSCRIPT_FORMAT_INVALID: unrecognized non-JSON startup line %d", lineNumber+1))
 			}
 			continue
 		}
 		sawValidJSON = true
+		if recognizedTranscriptEvent(format, v) {
+			sawRecognizedEvent = true
+		}
 		usage.walk(format, v)
 		walk(v)
+	}
+	if known[format] {
+		if !sawValidJSON {
+			audit.Violations = append(audit.Violations, "TRANSCRIPT_FORMAT_INVALID: no valid JSON events")
+		} else if !sawRecognizedEvent {
+			audit.Violations = append(audit.Violations, "TRANSCRIPT_FORMAT_INVALID: no recognizable "+format+" events")
+		}
 	}
 	audit.Usage, audit.ToolCalls = usage.result()
 	if !audit.CostAvailable {
@@ -1404,8 +1509,18 @@ func (r *Runner) runOnce(ctx context.Context, c contracts.Contract) (RunRecord, 
 	// (native sandbox is a backend capability, not a contract claim) and
 	// before any quota/workspace side effect, so a failure leaves nothing
 	// behind — exactly the "fails before launch" acceptance for high-risk.
-	if err := enforceContainment(c, resolved.Agent, cfg); err != nil {
+	capabilityAttestID, err := enforceContainment(db, c, resolved.Agent, cfg)
+	if err != nil {
 		return RunRecord{}, err
+	}
+	// Sol Critical 3 / Phase D: a local worktree is repository isolation only,
+	// not host containment. Reject symlinks before launch so a backend cannot
+	// write through a tracked link or symlinked write-parent into the host and
+	// still present a clean repository fingerprint.
+	if c.EffectiveRunner() == "local" {
+		if err := validateNoLocalSymlinkEscape(root); err != nil {
+			return RunRecord{}, err
+		}
 	}
 	// Session 5 (Sol Phase 4) layered policy gate: evaluated after routing/
 	// containment (so the resolved backend and its native-sandbox status are
@@ -1497,7 +1612,7 @@ func (r *Runner) runOnce(ctx context.Context, c contracts.Contract) (RunRecord, 
 	if err != nil {
 		return RunRecord{}, err
 	}
-	identity := computeExecutionIdentity(cfg, c, agent, root, head, hash, promptVersion)
+	identity := computeExecutionIdentity(cfg, c, agent, root, head, hash, promptVersion, capabilityAttestID)
 	if priorID, perr := replayMatch(db, identity.Hash()); perr != nil {
 		return RunRecord{}, perr
 	} else if priorID != "" {

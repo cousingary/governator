@@ -139,3 +139,29 @@ func TestAuditGLMGoldenTranscript(t *testing.T) {
 		t.Fatalf("expected no violations from the golden transcript, got: %v", audit.Violations)
 	}
 }
+
+func TestAuditTranscriptRejectsAllPlaintextPiJSON(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "pi.jsonl")
+	if err := os.WriteFile(path, []byte("THIS IS PLAIN TEXT, NOT JSON\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	audit := auditTranscript(path, agents.TranscriptPi, "", contracts.Contract{})
+	joined := strings.Join(audit.Violations, "; ")
+	if !strings.Contains(joined, "TRANSCRIPT_FORMAT_INVALID") || !strings.Contains(joined, "no valid JSON events") {
+		t.Fatalf("all-plaintext pi-json must fail closed as transcript format invalid: %v", audit.Violations)
+	}
+}
+
+func TestAuditTranscriptRejectsUnrecognizedStartupNoise(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "codex.jsonl")
+	data := []byte("unexpected banner\n" +
+		`{"type":"item.completed","item":{"type":"command_execution","command":"go test ./..."}}` + "\n")
+	if err := os.WriteFile(path, data, 0600); err != nil {
+		t.Fatal(err)
+	}
+	c := contracts.Contract{Allowed: contracts.Permissions{Execute: []string{"go test ./..."}}, Budget: contracts.Budget{MaxCommands: 10}}
+	audit := auditTranscript(path, agents.TranscriptCodex, "", c)
+	if len(audit.Violations) == 0 || !strings.Contains(strings.Join(audit.Violations, "; "), "TRANSCRIPT_FORMAT_INVALID") {
+		t.Fatalf("unrecognized startup plaintext must fail closed: %v", audit.Violations)
+	}
+}

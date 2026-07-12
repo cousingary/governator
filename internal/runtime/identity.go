@@ -17,14 +17,6 @@ import (
 	"github.com/cousingary/governator/internal/prompts"
 )
 
-// capabilityAttestationPending is the placeholder wired into ExecutionIdentity
-// until Session 3b ships the real attestation system (Sol §11 Phase E). It is a
-// constant so every run in the interim mints the same value — a real
-// attestation ID will vary per backend executable and make the identity
-// strictly tighter once available. The constant (rather than "") keeps the
-// field visible in the canonical material so the placeholder is honest.
-const capabilityAttestationPending = "pending-attestation-s3"
-
 // ExecutionIdentity captures every trust-bearing input that must remain
 // identical for a prior APPROVED run to be safely replayed. Per Sol's Critical
 // 1 finding and §11 Phase A: the old replay key (contract_hash + approved_head
@@ -94,7 +86,7 @@ func (id ExecutionIdentity) Hash() string {
 // or re-checks them. Project doctrine is re-read (it is also read inside
 // evaluatePolicyGate) so the identity captures exactly the doctrine file the
 // policy gate consulted — a doctrine change between runs mints a new identity.
-func computeExecutionIdentity(cfg config.Config, c contracts.Contract, agent agents.Agent, root, head, hash string, promptVer prompts.Version) ExecutionIdentity {
+func computeExecutionIdentity(cfg config.Config, c contracts.Contract, agent agents.Agent, root, head, hash string, promptVer prompts.Version, capabilityAttestID string) ExecutionIdentity {
 	doctrine, _ := policy.LoadProjectDoctrine(root)
 	bin := config.BackendBin(agent.Name())
 	return ExecutionIdentity{
@@ -113,7 +105,7 @@ func computeExecutionIdentity(cfg config.Config, c contracts.Contract, agent age
 		BackendBinaryPath:     bin,
 		BackendBinarySHA256:   hashFileContent(bin),
 		ModelID:               agent.Name(),
-		CapabilityAttestID:    capabilityAttestationPending,
+		CapabilityAttestID:    capabilityAttestID,
 		RunnerConfigHash:      hashJSON(runnerConfig(c)),
 		GovernatorVersion:     governatorBuildID(),
 	}

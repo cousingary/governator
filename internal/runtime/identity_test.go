@@ -289,9 +289,9 @@ func TestComputeIdentityCapturesBackendBinary(t *testing.T) {
 		t.Fatal(err)
 	}
 	pv := prompts.Version{ID: "builtin"}
-	idA := computeExecutionIdentity(config.BuiltIn(), c, agent, t.TempDir(), "dead", "ch", pv)
+	idA := computeExecutionIdentity(config.BuiltIn(), c, agent, t.TempDir(), "dead", "ch", pv, "attest-1")
 	t.Setenv("GOV_CLAUDE_BIN", binB)
-	idB := computeExecutionIdentity(config.BuiltIn(), c, agent, t.TempDir(), "dead", "ch", pv)
+	idB := computeExecutionIdentity(config.BuiltIn(), c, agent, t.TempDir(), "dead", "ch", pv, "attest-1")
 	if idA.BackendBinarySHA256 == idB.BackendBinarySHA256 {
 		t.Fatal("different backend binaries produced the same identity binary hash")
 	}

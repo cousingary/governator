@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/cousingary/governator/internal/agents"
+	"github.com/cousingary/governator/internal/attest"
 	"github.com/cousingary/governator/internal/config"
 	"github.com/cousingary/governator/internal/containment"
 	"github.com/cousingary/governator/internal/contracts"
@@ -1274,15 +1275,42 @@ func TestEnforceContainmentHighRiskAcceptanceCriterion(t *testing.T) {
 	// glm declares no native sandbox capability → high-risk local must fail.
 	c := base
 	c.Agent = "glm"
-	if err := enforceContainment(c, "glm", config.Config{}); err == nil {
+	db, err := observability.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := enforceContainment(db, c, "glm", config.Config{}); err == nil {
 		t.Fatal("expected high-risk local glm (no native sandbox, no override) to fail closed, got nil")
 	}
 
-	// claude-code declares a native sandbox → high-risk local passes.
+	// claude-code declares a native sandbox, but Sol Critical 4 requires a
+	// current executable attestation before that static capability can satisfy
+	// high-risk host containment.
 	c = base
 	c.Agent = "claude-code"
-	if err := enforceContainment(c, "claude-code", config.Config{}); err != nil {
-		t.Fatalf("native-sandbox-capable backend should pass high-risk local: %v", err)
+	bin := writeFakeBackend(t, `if [ "${1:-}" = "--version" ]; then echo "claude fake 1.0"; exit 0; fi
+`)
+	t.Setenv("GOV_CLAUDE_BIN", bin)
+	if _, err := enforceContainment(db, c, "claude-code", config.BuiltIn()); err == nil || !strings.Contains(err.Error(), "attestation") {
+		t.Fatalf("native backend without attestation must fail closed, got %v", err)
+	}
+	shaData, err := os.ReadFile(bin)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sha := sha256.Sum256(shaData)
+	if err := attest.Store(db, attest.Attestation{
+		ID: "test-attest", Backend: "claude-code", AdapterVersion: "claude-code-adapter-v1",
+		ExecutablePath: bin, ExecutableSHA256: hex.EncodeToString(sha[:]), ModelID: "claude-code", ConfigHash: config.BuiltIn().Hash(),
+		SupportedFlags: true, SandboxProbe: true, NetworkProbe: true, TranscriptProbe: true,
+		CreatedAt: time.Now().UTC().Format(time.RFC3339Nano), ExpiresAt: time.Now().UTC().Add(time.Hour).Format(time.RFC3339Nano),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	attID, err := enforceContainment(db, c, "claude-code", config.BuiltIn())
+	if err != nil || attID != "test-attest" {
+		t.Fatalf("attested native-sandbox backend should pass high-risk local: id=%q err=%v", attID, err)
 	}
 
 	// A signed override rescues a non-sandbox high-risk local run. The
@@ -1300,7 +1328,7 @@ func TestEnforceContainmentHighRiskAcceptanceCriterion(t *testing.T) {
 	}
 	sig := ed25519.Sign(priv, msg)
 	c.Containment.OverrideSignature = hex.EncodeToString(sig)
-	if err := enforceContainment(c, "glm", config.Config{Containment: config.Containment{OverridePublicKey: hex.EncodeToString(pub)}}); err != nil {
+	if _, err := enforceContainment(db, c, "glm", config.Config{Containment: config.Containment{OverridePublicKey: hex.EncodeToString(pub)}}); err != nil {
 		t.Fatalf("valid signed override should rescue high-risk local glm: %v", err)
 	}
 
@@ -1308,7 +1336,7 @@ func TestEnforceContainmentHighRiskAcceptanceCriterion(t *testing.T) {
 	c = base
 	c.RiskClass = "low"
 	c.Agent = "glm"
-	if err := enforceContainment(c, "glm", config.Config{}); err != nil {
+	if _, err := enforceContainment(db, c, "glm", config.Config{}); err != nil {
 		t.Fatalf("low-risk must be a containment no-op: %v", err)
 	}
 }
@@ -1450,5 +1478,71 @@ func TestWorkspaceCleanupGuardRemovesGraphPrepareFailureResources(t *testing.T) 
 	}
 	if strings.TrimSpace(string(branches)) != "" {
 		t.Fatalf("cleanup guard left job branch: %s", branches)
+	}
+}
+
+func TestRunRejectsTrackedSymlinkBeforeLaunch(t *testing.T) {
+	root, _ := fixture(t)
+	external := filepath.Join(t.TempDir(), "outside.txt")
+	if err := os.WriteFile(external, []byte("secret\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(external, filepath.Join(root, "escape")); err != nil {
+		t.Skipf("symlink unavailable: %v", err)
+	}
+	git(t, root, "add", "escape")
+	git(t, root, "commit", "-m", "tracked symlink")
+	t.Setenv("GOV_HOME", t.TempDir())
+	c := contract(root)
+	_, err := New().Run(context.Background(), c)
+	if err == nil || !strings.Contains(err.Error(), "symlink/junction") {
+		t.Fatalf("tracked symlink must be rejected before local launch, got %v", err)
+	}
+	data, err := os.ReadFile(external)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "secret\n" {
+		t.Fatalf("external symlink target was modified before rejection: %q", data)
+	}
+}
+
+func TestRunRejectsSymlinkedWriteParentBeforeLaunch(t *testing.T) {
+	root, _ := fixture(t)
+	outside := filepath.Join(t.TempDir(), "outside-output")
+	if err := os.MkdirAll(outside, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, filepath.Join(root, "output")); err != nil {
+		t.Skipf("symlink unavailable: %v", err)
+	}
+	t.Setenv("GOV_HOME", t.TempDir())
+	c := contract(root)
+	_, err := New().Run(context.Background(), c)
+	if err == nil || !strings.Contains(err.Error(), "symlink/junction") {
+		t.Fatalf("symlinked write parent must be rejected before local launch, got %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(outside, "result.txt")); !os.IsNotExist(err) {
+		t.Fatalf("backend wrote through symlinked write parent before rejection, stat err=%v", err)
+	}
+}
+
+func TestRunRejectsHighRiskCodexWithoutCapabilityAttestation(t *testing.T) {
+	root, _ := fixture(t)
+	marker := filepath.Join(t.TempDir(), "launched")
+	fake := writeFakeBackend(t, `touch "`+marker+`"
+exit 0
+`)
+	t.Setenv("GOV_HOME", t.TempDir())
+	t.Setenv("GOV_CODEX_BIN", fake)
+	c := contract(root)
+	c.Agent = "codex"
+	c.RiskClass = "high"
+	_, err := New().Run(context.Background(), c)
+	if err == nil || !strings.Contains(err.Error(), "attestation") {
+		t.Fatalf("high-risk codex with arbitrary executable must reject before launch, got %v", err)
+	}
+	if _, statErr := os.Stat(marker); !os.IsNotExist(statErr) {
+		t.Fatalf("fake codex executable launched despite missing attestation, stat err=%v", statErr)
 	}
 }

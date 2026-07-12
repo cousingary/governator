@@ -15,6 +15,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/cousingary/governator/internal/attest"
 	"github.com/cousingary/governator/internal/breaker"
 	"github.com/cousingary/governator/internal/claims"
 	"github.com/cousingary/governator/internal/config"
@@ -364,6 +365,8 @@ func run(args []string) int {
 		return askCmd(args[1:])
 	case "containment":
 		return containmentCmd(args[1:])
+	case "attest":
+		return attestCmd(args[1:])
 	case "cleanup":
 		return cleanupCmd(args[1:])
 	case "doctor":
@@ -769,6 +772,34 @@ func askCmd(args []string) int {
 // signing because a contract with a reason but no signature fails validation
 // (half-declared overrides are rejected); a contract that already carries a
 // complete override may omit it to re-derive the message for verification.
+func attestCmd(args []string) int {
+	if len(args) != 1 {
+		return bad("usage: gov attest <backend>")
+	}
+	cfg := config.Current()
+	db, err := observability.Open(cfg.LedgerDir)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "attest:", err)
+		return 1
+	}
+	defer db.Close()
+	a, err := attest.Generate(context.Background(), cfg, args[0])
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "attest:", err)
+		return 1
+	}
+	if err := attest.Store(db, a); err != nil {
+		fmt.Fprintln(os.Stderr, "attest:", err)
+		return 1
+	}
+	_ = json.NewEncoder(os.Stdout).Encode(a)
+	if !a.SupportedFlags || !a.SandboxProbe || !a.TranscriptProbe {
+		fmt.Fprintln(os.Stderr, "attest: required capability probe failed")
+		return 1
+	}
+	return 0
+}
+
 func containmentCmd(args []string) int {
 	usage := "usage: gov containment message <job.yaml> [--reason <text>]"
 	if len(args) < 2 || args[0] != "message" {
@@ -2237,6 +2268,7 @@ Usage:
   gov ask approve <id> [--rule] [--ttl <duration>] [--by <name>] [--note <text>]
   gov ask deny <id> [--rule] [--ttl <duration>] [--by <name>] [--note <text>]
   gov containment message <job.yaml> [--reason <text>]
+  gov attest <backend>
   gov doctor
   gov health [reset <backend>]
   gov claims verify [--file <path>]
