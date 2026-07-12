@@ -199,11 +199,12 @@ type DockerRunnerConfig struct {
 	// set, and the choice is recorded in provenance. Without it, IsHardened
 	// requires Image to be pinned by digest (image@sha256:...).
 	AllowMutableTag bool `yaml:"allow_mutable_tag,omitempty" json:"allow_mutable_tag,omitempty"`
-	// EgressAllowlist declares the only host:port destinations a network:
-	// allow container may reach. Recorded for provenance; the docker-level
-	// enforcement combines metadata/local-network denial with the operator's
-	// network policy. An empty list under network: allow is the pre-Session-3
-	// full-egress opt-in and is NOT hardened.
+	// EgressAllowlist is reserved for a future runner that can actually
+	// enforce host:port egress filtering. Validation currently REJECTS a
+	// non-empty list (fail-closed): the docker runner has no mechanism to
+	// enforce it, and an unenforced allowlist reading as a restriction is
+	// worse than no field at all. Use network: deny (default), or network:
+	// allow with deny_metadata_and_local_net: true.
 	EgressAllowlist []string `yaml:"egress_allowlist,omitempty" json:"egress_allowlist,omitempty"`
 	// DenyMetadataAndLocalNet sinkholes cloud-metadata endpoints when network
 	// is allowed (--add-host redirection to loopback). The safe default remains
@@ -255,15 +256,20 @@ func (d *DockerRunnerConfig) imagePinned() bool {
 
 // IsHardened reports whether every Session 3 (Phase 2) containment control is
 // in place: non-root user, read-only root filesystem, cap-drop=ALL,
-// no-new-privileges, and a pinned (digest) image. A risk_class: high contract
-// requires an IsHardened docker config — or a verified native sandbox / signed
-// override (see internal/containment) — and must never silently resolve to
-// local execution. A nil receiver (no docker config) is never hardened.
+// no-new-privileges, a pinned (digest) image, and network deny. A risk_class:
+// high contract requires an IsHardened docker config — or a verified native
+// sandbox / signed override (see internal/containment) — and must never
+// silently resolve to local execution. Network deny is part of hardened
+// because unrestricted egress is a data-exfiltration path no filesystem or
+// capability control compensates for; a high-risk job that genuinely needs
+// the network goes through the signed operator override instead. A nil
+// receiver (no docker config) is never hardened.
 func (d *DockerRunnerConfig) IsHardened() bool {
 	if d == nil {
 		return false
 	}
-	return d.User != "" && d.ReadOnlyRootfs && d.CapDropAll && d.NoNewPrivileges && d.imagePinned()
+	return d.User != "" && d.ReadOnlyRootfs && d.CapDropAll && d.NoNewPrivileges &&
+		d.imagePinned() && d.EffectiveNetwork() == "deny"
 }
 
 // validRunners are the valid Contract.Runner values; "" defers to
@@ -406,6 +412,17 @@ var policyRuleVerdicts = map[string]bool{"DENY": true, "ASK": true, "FLAG": true
 var policyRuleOps = map[string]bool{
 	"eq": true, "ne": true, "gt": true, "gte": true, "lt": true, "lte": true,
 	"contains": true, "matches_any": true,
+}
+
+// policyRuleFields mirrors internal/policy's validConditionFields (facts.go's
+// Fact* constants) the same way policyRuleVerdicts/policyRuleOps mirror their
+// lists — ContractRules' round-trip through policy.ConditionRule.Validate is
+// where any drift surfaces.
+var policyRuleFields = map[string]bool{
+	"risk_class": true, "mode": true, "backend": true,
+	"network_enabled": true, "write_out_of_scope": true,
+	"estimated_cost_usd": true, "daily_cap_usd": true,
+	"unusual_infra_retry": true, "infra_failure_kind": true,
 }
 
 // PolicyConditionSpec is one condition in a PolicyRuleSpec's When list: Field
@@ -853,6 +870,8 @@ func validatePolicy(c Contract, add func(string, string)) {
 			condField := fmt.Sprintf("%s.when[%d]", field, j)
 			if strings.TrimSpace(cond.Field) == "" {
 				add(condField+".field", "is required")
+			} else if !policyRuleFields[cond.Field] {
+				add(condField+".field", "is not a known policy fact (an unknown field would silently never match); see docs/contracts.md for the fact vocabulary")
 			}
 			if !policyRuleOps[cond.Op] {
 				add(condField+".op", "must be one of eq, ne, gt, gte, lt, lte, contains, matches_any")
@@ -916,11 +935,16 @@ func validateRunner(c Contract, add func(string, string)) {
 			add(field, "must not be blank")
 		}
 	}
-	for i, e := range c.Docker.EgressAllowlist {
-		field := fmt.Sprintf("docker.egress_allowlist[%d]", i)
-		if strings.TrimSpace(e) == "" {
-			add(field, "must not be blank")
-		}
+	// Fail-closed on egress_allowlist: DockerRunner has no mechanism that
+	// actually restricts egress to a host:port list (docker alone cannot do
+	// domain/port filtering without extra network infrastructure), so
+	// accepting the field would ship a silently-unenforced security control —
+	// the contract READS as restricted while the container has full egress.
+	// Until a real enforcement mechanism exists, declaring it is an error:
+	// use network: deny (the default), or an explicit network: allow with
+	// deny_metadata_and_local_net: true for the enforceable narrowing.
+	if len(c.Docker.EgressAllowlist) > 0 {
+		add("docker.egress_allowlist", "declared but not enforceable by the docker runner in this build; remove it and use network: deny, or network: allow with deny_metadata_and_local_net: true (fail-closed: an unenforced allowlist must not read as a restriction)")
 	}
 }
 

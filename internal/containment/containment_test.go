@@ -84,15 +84,24 @@ func TestEnforceHighRiskLocalWithoutSandboxWithBadOverrideFails(t *testing.T) {
 	}
 }
 
+// signOverride signs c's containment override in place: it computes
+// SigningMessage over the contract exactly as VerifyOverride will (containment
+// block cleared for the hash) and fills in OverrideSignature.
+func signOverride(t *testing.T, priv ed25519.PrivateKey, c *contracts.Contract) {
+	t.Helper()
+	msg, err := SigningMessage(*c)
+	if err != nil {
+		t.Fatalf("SigningMessage: %v", err)
+	}
+	c.Containment.OverrideSignature = hex.EncodeToString(ed25519.Sign(priv, msg))
+}
+
 func TestEnforceHighRiskLocalWithValidOverridePasses(t *testing.T) {
 	// A real signed override for this job_id, verified against the configured
 	// public key, is the explicit operator escape hatch.
 	pub, priv, _ := ed25519.GenerateKey(nil)
-	reason := "trusted isolated host"
-	sig := ed25519.Sign(priv, OverrideMessage("high-risk-1", reason))
-	c := highRiskContract("local", nil, &contracts.Containment{
-		OverrideReason: reason, OverrideSignature: hex.EncodeToString(sig),
-	})
+	c := highRiskContract("local", nil, &contracts.Containment{OverrideReason: "trusted isolated host"})
+	signOverride(t, priv, &c)
 	if err := Enforce(c, false, hex.EncodeToString(pub)); err != nil {
 		t.Fatalf("valid signed override should pass: %v", err)
 	}
@@ -101,24 +110,36 @@ func TestEnforceHighRiskLocalWithValidOverridePasses(t *testing.T) {
 func TestEnforceOverrideNotReplayableAcrossJobs(t *testing.T) {
 	// An override minted for one job_id must not authorize a different job.
 	pub, priv, _ := ed25519.GenerateKey(nil)
-	reason := "ok"
-	sig := ed25519.Sign(priv, OverrideMessage("high-risk-1", reason))
-	c := highRiskContract("local", nil, &contracts.Containment{
-		OverrideReason: reason, OverrideSignature: hex.EncodeToString(sig),
-	})
+	c := highRiskContract("local", nil, &contracts.Containment{OverrideReason: "ok"})
+	signOverride(t, priv, &c)
 	c.JobID = "high-risk-2"
 	if err := Enforce(c, false, hex.EncodeToString(pub)); err == nil {
 		t.Fatal("override signed for a different job_id must not authorize this run")
 	}
 }
 
+func TestEnforceOverrideInvalidatedByContractMutation(t *testing.T) {
+	// The sharper replay: same job_id, same reason, but the contract BODY is
+	// edited after the operator signed — e.g. the docker network is opened.
+	// The signature binds the contract hash, so any content edit must refuse.
+	pub, priv, _ := ed25519.GenerateKey(nil)
+	c := highRiskContract("local", nil, &contracts.Containment{OverrideReason: "trusted isolated host"})
+	signOverride(t, priv, &c)
+	if err := Enforce(c, false, hex.EncodeToString(pub)); err != nil {
+		t.Fatalf("pre-mutation override should verify: %v", err)
+	}
+	c.Docker = &contracts.DockerRunnerConfig{Image: "agent:latest", Network: "allow"}
+	if err := Enforce(c, false, hex.EncodeToString(pub)); err == nil {
+		t.Fatal("override signed for a different contract body must not authorize this run")
+	}
+}
+
 func TestEnforceHighRiskDockerNotHardenedWithOverridePasses(t *testing.T) {
 	pub, priv, _ := ed25519.GenerateKey(nil)
-	reason := "staging image"
-	sig := ed25519.Sign(priv, OverrideMessage("high-risk-1", reason))
 	c := highRiskContract("docker", &contracts.DockerRunnerConfig{Image: "agent:latest"}, &contracts.Containment{
-		OverrideReason: reason, OverrideSignature: hex.EncodeToString(sig),
+		OverrideReason: "staging image",
 	})
+	signOverride(t, priv, &c)
 	if err := Enforce(c, false, hex.EncodeToString(pub)); err != nil {
 		t.Fatalf("override should rescue non-hardened high-risk docker: %v", err)
 	}
@@ -136,9 +157,28 @@ func TestVerifyOverrideNoKeyRefuses(t *testing.T) {
 }
 
 func TestOverrideMessageFormat(t *testing.T) {
-	got := string(OverrideMessage("job-1", "because"))
-	if got != "job-1:because" {
-		t.Fatalf("OverrideMessage = %q, want %q", got, "job-1:because")
+	got := string(OverrideMessage("job-1", "deadbeef", "because"))
+	if got != "job-1:deadbeef:because" {
+		t.Fatalf("OverrideMessage = %q, want %q", got, "job-1:deadbeef:because")
+	}
+}
+
+func TestSigningMessageStableAcrossSignatureField(t *testing.T) {
+	// SigningMessage must not change when the signature itself is filled in —
+	// otherwise nothing could ever be signed (the signature would invalidate
+	// its own message).
+	c := highRiskContract("local", nil, &contracts.Containment{OverrideReason: "r"})
+	before, err := SigningMessage(c)
+	if err != nil {
+		t.Fatalf("SigningMessage: %v", err)
+	}
+	c.Containment.OverrideSignature = "aabbcc"
+	after, err := SigningMessage(c)
+	if err != nil {
+		t.Fatalf("SigningMessage: %v", err)
+	}
+	if string(before) != string(after) {
+		t.Fatalf("SigningMessage changed when signature was added:\n%q\n%q", before, after)
 	}
 }
 

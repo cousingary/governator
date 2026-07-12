@@ -200,7 +200,10 @@ func TestValidateRunnerHardeningFieldsStructural(t *testing.T) {
 	}{
 		{"relative seccomp profile", DockerRunnerConfig{Image: "img:latest", SeccompProfile: "rel/seccomp.json"}, "docker.seccomp_profile"},
 		{"blank tmpfs entry", DockerRunnerConfig{Image: "img:latest", Tmpfs: []string{"/tmp", "  "}}, "docker.tmpfs[1]"},
-		{"blank egress entry", DockerRunnerConfig{Image: "img:latest", EgressAllowlist: []string{"  "}}, "docker.egress_allowlist[0]"},
+		// Any non-empty egress_allowlist is rejected outright (fail-closed):
+		// the docker runner has no mechanism to enforce it, and an unenforced
+		// allowlist reading as a restriction is a silently-broken control.
+		{"egress allowlist rejected as unenforceable", DockerRunnerConfig{Image: "img:latest", EgressAllowlist: []string{"api.example.com:443"}}, "docker.egress_allowlist"},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -218,5 +221,27 @@ func TestValidateRunnerHardeningFieldsStructural(t *testing.T) {
 				t.Fatalf("expected field %q in errors, got %+v", c.field, errs)
 			}
 		})
+	}
+}
+
+func TestIsHardenedRequiresNetworkDeny(t *testing.T) {
+	// Unrestricted egress is a data-exfiltration path no filesystem or
+	// capability control compensates for: a config with every other control
+	// set but network: allow must NOT count as hardened. A high-risk job
+	// that genuinely needs the network goes through the signed override.
+	d := &DockerRunnerConfig{
+		Image: "ghcr.io/acme/agent@sha256:" + strings.Repeat("a", 64),
+		User:  "65532:65532", ReadOnlyRootfs: true, CapDropAll: true, NoNewPrivileges: true,
+	}
+	if !d.IsHardened() {
+		t.Fatal("fully-hardened config with default (deny) network should be hardened")
+	}
+	d.Network = "allow"
+	if d.IsHardened() {
+		t.Fatal("network: allow must disqualify a config from hardened")
+	}
+	d.Network = "deny"
+	if !d.IsHardened() {
+		t.Fatal("explicit network: deny should be hardened")
 	}
 }

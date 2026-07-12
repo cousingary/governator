@@ -126,9 +126,13 @@ func EvaluateLayers(results ...LayerResult) PolicyDecision {
 // internal/observability's PolicyOverride without this package depending on
 // that package's Go types or database/sql — internal/runtime is what
 // actually loads active overrides from the ledger and converts them here.
+// ID and OneShot carry the ledger row's identity and single-use marker
+// through resolution so the caller can consume an applied one-shot.
 type Override struct {
+	ID      int64
 	RuleID  string
 	Verdict Verdict
+	OneShot bool
 }
 
 // ResolveOverrides substitutes an active session/operator override for any
@@ -140,10 +144,12 @@ type Override struct {
 // via Deny/Ask/Flag rather than a rule set) passes through unchanged. Pass
 // overrides newest-first (ActivePolicyOverrides already orders this way) so
 // the most recent operator decision wins when more than one exists for the
-// same rule.
-func ResolveOverrides(results []LayerResult, overrides []Override) []LayerResult {
+// same rule. The second return value lists every override that was actually
+// applied to some result — the caller uses it to consume one-shots; an
+// override that matched nothing is not "applied" and must not be consumed.
+func ResolveOverrides(results []LayerResult, overrides []Override) ([]LayerResult, []Override) {
 	if len(overrides) == 0 {
-		return results
+		return results, nil
 	}
 	byRule := make(map[string]Override, len(overrides))
 	for _, o := range overrides {
@@ -152,6 +158,8 @@ func ResolveOverrides(results []LayerResult, overrides []Override) []LayerResult
 		}
 	}
 	out := make([]LayerResult, len(results))
+	var applied []Override
+	appliedIDs := map[int64]bool{}
 	for i, r := range results {
 		out[i] = r
 		if r.Verdict != VerdictAsk || r.RuleID == "" {
@@ -164,7 +172,11 @@ func ResolveOverrides(results []LayerResult, overrides []Override) []LayerResult
 				Reason:  fmt.Sprintf("%s: resolved by session/operator override to %s", r.RuleID, o.Verdict),
 				RuleID:  r.RuleID,
 			}
+			if !appliedIDs[o.ID] {
+				appliedIDs[o.ID] = true
+				applied = append(applied, o)
+			}
 		}
 	}
-	return out
+	return out, applied
 }

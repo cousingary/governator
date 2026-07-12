@@ -167,7 +167,7 @@ CREATE TABLE IF NOT EXISTS policy_rule_events(id INTEGER PRIMARY KEY AUTOINCREME
 CREATE TABLE IF NOT EXISTS operational_errors(id INTEGER PRIMARY KEY AUTOINCREMENT, run_id TEXT NOT NULL DEFAULT '', op_kind TEXT NOT NULL, detail TEXT NOT NULL DEFAULT '', created TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS maintenance_outbox(id INTEGER PRIMARY KEY AUTOINCREMENT, run_id TEXT NOT NULL DEFAULT '', op_kind TEXT NOT NULL, payload TEXT NOT NULL DEFAULT '', status TEXT NOT NULL DEFAULT 'pending', attempts INTEGER NOT NULL DEFAULT 0, last_error TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS policy_checkpoints(id INTEGER PRIMARY KEY AUTOINCREMENT, run_id TEXT NOT NULL DEFAULT '', job_id TEXT NOT NULL DEFAULT '', target TEXT NOT NULL, reason TEXT NOT NULL DEFAULT '', sources TEXT NOT NULL DEFAULT '', policy_hash TEXT NOT NULL DEFAULT '', cost_usd REAL NOT NULL DEFAULT 0, detail TEXT NOT NULL DEFAULT '', status TEXT NOT NULL DEFAULT 'pending', resolved_by TEXT NOT NULL DEFAULT '', resolution TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL, resolved_at TEXT NOT NULL DEFAULT '');
-CREATE TABLE IF NOT EXISTS policy_overrides(id INTEGER PRIMARY KEY AUTOINCREMENT, scope_key TEXT NOT NULL, target TEXT NOT NULL, verdict TEXT NOT NULL, reason TEXT NOT NULL DEFAULT '', created_by TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL, expires_at TEXT NOT NULL DEFAULT '');`
+CREATE TABLE IF NOT EXISTS policy_overrides(id INTEGER PRIMARY KEY AUTOINCREMENT, scope_key TEXT NOT NULL, target TEXT NOT NULL, verdict TEXT NOT NULL, reason TEXT NOT NULL DEFAULT '', created_by TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL, expires_at TEXT NOT NULL DEFAULT '', one_shot INTEGER NOT NULL DEFAULT 0, consumed_at TEXT NOT NULL DEFAULT '');`
 	if _, err = db.Exec(schema); err != nil {
 		db.Close()
 		return nil, err
@@ -234,6 +234,16 @@ CREATE TABLE IF NOT EXISTS policy_overrides(id INTEGER PRIMARY KEY AUTOINCREMENT
 		"validators_hash TEXT NOT NULL DEFAULT ''", "python_version TEXT NOT NULL DEFAULT ''",
 	} {
 		if _, alterErr := db.Exec("ALTER TABLE assay_evaluations ADD COLUMN " + column); alterErr != nil && !strings.Contains(strings.ToLower(alterErr.Error()), "duplicate column") {
+			db.Close()
+			return nil, alterErr
+		}
+	}
+	// one_shot/consumed_at make a bare `gov ask approve` (no --rule) a real
+	// single-use override: applied to exactly one subsequent evaluation of
+	// the same job+rule, then marked consumed. Zero/empty defaults on
+	// pre-existing rows are honest — durable rules are never consumed.
+	for _, column := range []string{"one_shot INTEGER NOT NULL DEFAULT 0", "consumed_at TEXT NOT NULL DEFAULT ''"} {
+		if _, alterErr := db.Exec("ALTER TABLE policy_overrides ADD COLUMN " + column); alterErr != nil && !strings.Contains(strings.ToLower(alterErr.Error()), "duplicate column") {
 			db.Close()
 			return nil, alterErr
 		}

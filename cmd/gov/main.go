@@ -18,6 +18,7 @@ import (
 	"github.com/cousingary/governator/internal/breaker"
 	"github.com/cousingary/governator/internal/claims"
 	"github.com/cousingary/governator/internal/config"
+	"github.com/cousingary/governator/internal/containment"
 	"github.com/cousingary/governator/internal/contextgraph"
 	"github.com/cousingary/governator/internal/contracts"
 	"github.com/cousingary/governator/internal/doctor"
@@ -342,6 +343,8 @@ func run(args []string) int {
 		return reconcileCmd(args[1:])
 	case "ask":
 		return askCmd(args[1:])
+	case "containment":
+		return containmentCmd(args[1:])
 	case "cleanup":
 		return cleanupCmd(args[1:])
 	case "doctor":
@@ -734,6 +737,58 @@ func askCmd(args []string) int {
 	default:
 		return bad(usage)
 	}
+}
+
+// containmentCmd prints the exact bytes an operator signs (ed25519, hex
+// signature) to authorize a risk-class containment override for one
+// contract. The message binds job_id, the contract-content hash (containment
+// block cleared — the signature can't cover itself), and the override
+// reason, so an override can't be replayed against another job OR against an
+// edited contract body. Workflow: `gov containment message job.yaml --reason
+// "why" | <sign>`, then put both override_reason and the hex signature into
+// the contract's containment block. --reason is required for first-time
+// signing because a contract with a reason but no signature fails validation
+// (half-declared overrides are rejected); a contract that already carries a
+// complete override may omit it to re-derive the message for verification.
+func containmentCmd(args []string) int {
+	usage := "usage: gov containment message <job.yaml> [--reason <text>]"
+	if len(args) < 2 || args[0] != "message" {
+		return bad(usage)
+	}
+	path := args[1]
+	reason := ""
+	rest := args[2:]
+	for len(rest) > 0 {
+		switch rest[0] {
+		case "--reason":
+			if len(rest) < 2 {
+				return bad("gov containment message: --reason requires text")
+			}
+			reason = rest[1]
+			rest = rest[2:]
+		default:
+			return bad(usage)
+		}
+	}
+	c, err := contracts.ParseFile(path)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "containment:", err)
+		return 1
+	}
+	if reason != "" {
+		c.Containment = &contracts.Containment{OverrideReason: reason}
+	}
+	if c.Containment == nil || strings.TrimSpace(c.Containment.OverrideReason) == "" {
+		fmt.Fprintln(os.Stderr, "containment: no override reason — pass --reason <text> (the reason is part of what gets signed)")
+		return 1
+	}
+	msg, err := containment.SigningMessage(*c)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "containment:", err)
+		return 1
+	}
+	fmt.Print(string(msg))
+	return 0
 }
 
 func askResolveCmd(args []string) int {
@@ -2146,6 +2201,7 @@ Usage:
   gov ask show <id>
   gov ask approve <id> [--rule] [--ttl <duration>] [--by <name>] [--note <text>]
   gov ask deny <id> [--rule] [--ttl <duration>] [--by <name>] [--note <text>]
+  gov containment message <job.yaml> [--reason <text>]
   gov doctor
   gov health [reset <backend>]
   gov claims verify [--file <path>]

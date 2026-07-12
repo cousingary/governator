@@ -40,14 +40,19 @@ type AskResolution struct {
 	TTL        time.Duration // zero = never expires; only meaningful with CreateRule
 }
 
-// AskResolve marks checkpoint id resolved and, when res.CreateRule is set,
-// persists a matching expiring policy_overrides row scoped to the
-// checkpoint's job — so a subsequent run of the same job re-evaluates the
-// same rule as an immediate ALLOW/DENY instead of pausing again. This is the
-// durable form of the session/operator override policy layer (see
-// internal/policy.SourceSessionOverride / EvaluateLayers / ResolveOverrides):
-// "resume from the checkpoint" here means re-running the job — nothing
-// expensive happened before the checkpoint, so there is nothing to replay.
+// AskResolve marks checkpoint id resolved and persists the operator's
+// decision as a policy_overrides row scoped to the checkpoint's job, so a
+// subsequent run of the same job re-evaluates the same rule as an immediate
+// ALLOW/DENY instead of pausing again. With res.CreateRule the override is
+// durable (optionally expiring via TTL); without it the override is
+// one-shot: it authorizes exactly one subsequent evaluation and is then
+// consumed (see observability.ConsumePolicyOverride) — this is what makes a
+// bare "approve once" actually unblock the re-run instead of the same rule
+// immediately re-ASKing. This is the session/operator override policy layer
+// (see internal/policy.SourceSessionOverride / EvaluateLayers /
+// ResolveOverrides): "resume from the checkpoint" here means re-running the
+// job — nothing expensive happened before the checkpoint, so there is
+// nothing to replay.
 func AskResolve(id int64, res AskResolution) (observability.PolicyCheckpoint, error) {
 	if res.Verdict != "ALLOW" && res.Verdict != "DENY" {
 		return observability.PolicyCheckpoint{}, fmt.Errorf("ask resolve: verdict must be ALLOW or DENY, got %q", res.Verdict)
@@ -79,17 +84,16 @@ func AskResolve(id int64, res AskResolution) (observability.PolicyCheckpoint, er
 		return observability.PolicyCheckpoint{}, fmt.Errorf("ask resolve: checkpoint %d was already resolved by another caller", id)
 	}
 
-	if res.CreateRule {
-		expiresAt := ""
-		if res.TTL > 0 {
-			expiresAt = time.Now().UTC().Add(res.TTL).Format(time.RFC3339Nano)
-		}
-		if err := observability.RecordPolicyOverride(db, observability.PolicyOverride{
-			ScopeKey: policyOverrideScope(cp.JobID), Target: cp.Target, Verdict: res.Verdict,
-			Reason: res.Note, CreatedBy: res.ResolvedBy, CreatedAt: now, ExpiresAt: expiresAt,
-		}); err != nil {
-			return observability.PolicyCheckpoint{}, err
-		}
+	expiresAt := ""
+	if res.CreateRule && res.TTL > 0 {
+		expiresAt = time.Now().UTC().Add(res.TTL).Format(time.RFC3339Nano)
+	}
+	if err := observability.RecordPolicyOverride(db, observability.PolicyOverride{
+		ScopeKey: policyOverrideScope(cp.JobID), Target: cp.Target, Verdict: res.Verdict,
+		Reason: res.Note, CreatedBy: res.ResolvedBy, CreatedAt: now, ExpiresAt: expiresAt,
+		OneShot: !res.CreateRule,
+	}); err != nil {
+		return observability.PolicyCheckpoint{}, err
 	}
 	cp.Status = status
 	cp.ResolvedBy = res.ResolvedBy

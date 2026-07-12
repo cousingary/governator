@@ -206,3 +206,79 @@ func TestFallbackEligibleSkipsPolicyGateForRoutineInfraFailure(t *testing.T) {
 		t.Fatal("expected routine RATE_LIMIT fallback to stay unattended (never consults the policy gate)")
 	}
 }
+
+func TestPolicyGateBareApproveUnblocksExactlyOnce(t *testing.T) {
+	// The "approve once" contract (plan Session 5 item 3): a bare `gov ask
+	// approve` (no --rule) must actually let the NEXT run of the job proceed
+	// — before this worked, only --rule ever unblocked anything and a bare
+	// approve was a silent no-op (the re-run just re-ASKed) — and must
+	// authorize exactly ONE run: the one-shot override is consumed by the
+	// evaluation it unblocks, so a third run pauses on a fresh checkpoint.
+	root, bin := fixture(t)
+	home := t.TempDir()
+	t.Setenv("GOV_HOME", home)
+	t.Setenv("GOV_CLAUDE_BIN", bin)
+	cfgPath := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(cfgPath, []byte(`policy_rules:
+  - id: network-enablement
+    when:
+      - field: network_enabled
+        op: eq
+        value: "true"
+    verdict: ASK
+    reason: network access needs operator review
+`), 0644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("GOV_CONFIG", cfgPath)
+
+	c := networkContract(root)
+	first, err := New().Run(context.Background(), c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.Status != "QUARANTINED" || first.FailureTaxonomy != policyAskPendingTaxonomy {
+		t.Fatalf("expected the first run to pause on a policy ASK, got status=%s taxonomy=%s", first.Status, first.FailureTaxonomy)
+	}
+	checkpoints, err := AskList()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(checkpoints) != 1 {
+		t.Fatalf("expected exactly 1 pending checkpoint, got %d", len(checkpoints))
+	}
+
+	// Bare approve: no --rule, no TTL.
+	if _, err := AskResolve(checkpoints[0].ID, AskResolution{Verdict: "ALLOW", ResolvedBy: "operator", Note: "this once"}); err != nil {
+		t.Fatal(err)
+	}
+
+	second, err := New().Run(context.Background(), c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.Status != "APPROVED" {
+		t.Fatalf("bare approve must unblock the re-run, got status=%s taxonomy=%s message=%s", second.Status, second.FailureTaxonomy, second.Message)
+	}
+
+	// Vary the task so the third run isn't served by the "already approved
+	// this exact contract at this head" memoization — the point is that the
+	// policy gate itself, when re-evaluated, no longer sees the consumed
+	// one-shot. Same job_id, so the override scope is identical.
+	c3 := c
+	c3.Task = c.Task + " (third attempt)"
+	third, err := New().Run(context.Background(), c3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if third.Status != "QUARANTINED" || third.FailureTaxonomy != policyAskPendingTaxonomy {
+		t.Fatalf("the one-shot must be consumed after one run — third run should ASK again, got status=%s taxonomy=%s", third.Status, third.FailureTaxonomy)
+	}
+	remaining, err := AskList()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(remaining) != 1 {
+		t.Fatalf("expected a fresh pending checkpoint from the third run, got %d", len(remaining))
+	}
+}

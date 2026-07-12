@@ -2,6 +2,55 @@
 
 All notable changes to Governator are documented here.
 
+## v1.4 review pass (Fable red-team of Sessions 2–5)
+
+Six real defects found and fixed, each with regression tests, before the
+v1.4 feature set was allowed to claim `shipped`:
+
+1. **Containment override replay via contract edit** — the signed operator
+   override bound only `job_id:reason`, so after the operator signed, the
+   contract BODY could be freely edited (network enablement, widened scope,
+   different image) and the old signature kept verifying. The message now
+   binds the contract hash (containment block cleared): any content edit
+   invalidates the signature. New `gov containment message <job.yaml>
+   --reason "..."` prints the exact bytes to sign.
+2. **Truncation check was fail-open for evidence-bearing runs** — quarantine
+   on a capped transcript required the `require_complete_transcript` opt-in
+   even for blocking-assay runs (evidence-bearing by definition), and an
+   `Observe` error skipped the check entirely even WITH the flag set.
+   Blocking-assay runs now always require a complete transcript, and an
+   unverifiable transcript (Observe failure) blocks the same as a truncated
+   one.
+3. **Reconcile marked container teardowns done while the container lived** —
+   both `DockerRunner.Destroy` and the reconciler's `workspace_destroy`
+   dispatch swallowed every `docker rm -f` failure. New
+   `runner.RemoveContainer` tolerates only "No such container"; daemon-down /
+   permission failures propagate so the outbox row stays pending.
+4. **Bare `gov ask approve` ("approve once") was a functional no-op** — it
+   resolved the checkpoint but wrote no override, so the re-run re-ASKed and
+   quarantined again; only `--rule` ever unblocked anything (and the docs
+   described this as intended). A bare approve/deny now writes a single-use
+   override (`policy_overrides.one_shot`/`consumed_at`): it authorizes
+   exactly one subsequent evaluation of that job+rule, then is consumed. An
+   ALLOW one-shot is spent only when the gate stops blocking; a DENY
+   one-shot is spent the moment it denies its one run.
+5. **A typo'd policy-rule field silently disarmed the rule forever** — an
+   unresolvable condition field never matches (by design), but nothing
+   validated field names, so `risk_clas` in a DENY rule loaded clean and
+   never fired. Rule validation (all three layers + contract mirror) now
+   rejects fields outside the closed fact vocabulary.
+6. **`docker.egress_allowlist` was a silently-unenforced security control** —
+   documented as "the only destinations the container may reach" but never
+   mapped to any docker flag, and `IsHardened()` ignored network entirely (a
+   "hardened" high-risk container could run with wide-open egress).
+   Validation now rejects a non-empty allowlist outright (fail-closed:
+   unenforceable must not read as enforced), and hardened additionally
+   requires `network: deny`.
+
+Also swept per Session 4's own rule: the deferred `quota.Release` in
+`runOnce` no longer swallows its error — a failed release is queued as
+`quota_release` outbox work so headroom returns before the TTL heals it.
+
 ## v1.4-session1-validator-test
 
 Deterministic-validator-quarantine test: a deliberately-unsatisfiable

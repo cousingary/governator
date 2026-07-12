@@ -106,10 +106,28 @@ func evaluatePolicyGate(db *sql.DB, cfg config.Config, c contracts.Contract, wor
 	}
 	overrides := make([]policy.Override, 0, len(overrideRows))
 	for _, o := range overrideRows {
-		overrides = append(overrides, policy.Override{RuleID: o.Target, Verdict: policy.Verdict(o.Verdict)})
+		overrides = append(overrides, policy.Override{ID: o.ID, RuleID: o.Target, Verdict: policy.Verdict(o.Verdict), OneShot: o.OneShot})
 	}
-	resolved := policy.ResolveOverrides(results, overrides)
+	resolved, applied := policy.ResolveOverrides(results, overrides)
 	decision := policy.EvaluateLayers(resolved...)
+
+	// Consume applied one-shot overrides (a bare `gov ask approve/deny`,
+	// no --rule): an ALLOW one-shot is spent only when the whole gate stops
+	// blocking — if another rule still ASKs or DENYs, the run never proceeded
+	// and the operator's single approval must survive for the retry that
+	// actually goes through. A DENY one-shot is spent the moment it is
+	// applied: its entire purpose ("deny this one") is fulfilled by denying
+	// this evaluation, after which the job returns to ASKing.
+	for _, o := range applied {
+		if !o.OneShot {
+			continue
+		}
+		if o.Verdict == policy.VerdictDeny || !decision.Blocks() {
+			if err := observability.ConsumePolicyOverride(db, o.ID, now); err != nil {
+				return policy.PolicyDecision{}, nil, err
+			}
+		}
+	}
 
 	var checkpoints []observability.PolicyCheckpoint
 	if decision.Verdict != policy.VerdictAsk {

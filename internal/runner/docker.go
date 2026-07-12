@@ -294,14 +294,41 @@ func (d *DockerRunner) Stop(ctx context.Context, ws Workspace) error {
 	return exec.CommandContext(ctx, "docker", "stop", "-t", "5", ws.Container).Run()
 }
 
-// Destroy removes the container (best-effort — an already-stopped-and-gone
-// container is not an error) and then the worktree, identically to
-// LocalWorktreeRunner.
+// Destroy removes the container and then the worktree, identically to
+// LocalWorktreeRunner. An already-stopped-and-gone container is not an error
+// (see RemoveContainer), but any other removal failure — daemon down,
+// permission — is surfaced so the runtime's Session 4 outbox can retry it: a
+// silently-leaked live container is exactly the vanishing failure that
+// session exists to prevent.
 func (d *DockerRunner) Destroy(ctx context.Context, ws Workspace, approved bool) error {
 	if ws.Container != "" {
-		_ = exec.CommandContext(ctx, "docker", "rm", "-f", ws.Container).Run()
+		if err := RemoveContainer(ctx, ws.Container); err != nil {
+			return err
+		}
 	}
 	return destroyWorktree(ctx, ws, approved)
+}
+
+// RemoveContainer force-removes a container, tolerating only the
+// already-gone case: `docker rm -f` on a missing container exits nonzero
+// with "No such container", which for teardown purposes is success. Every
+// other failure is returned so callers (Destroy, `gov reconcile`'s
+// workspace-destroy retry) never mark a teardown done while the container
+// may still be alive. Exposed so internal/runtime's reconciler and this
+// runner cannot drift on what counts as tolerable.
+func RemoveContainer(ctx context.Context, name string) error {
+	out, err := exec.CommandContext(ctx, "docker", "rm", "-f", name).CombinedOutput()
+	if err != nil && !containerAlreadyGone(string(out)) {
+		return fmt.Errorf("docker rm -f %s: %v: %s", name, err, trimmed(out))
+	}
+	return nil
+}
+
+// containerAlreadyGone reports whether docker rm's combined output indicates
+// the container simply no longer exists (idempotent-success), as opposed to
+// a real failure like an unreachable daemon or a permission error.
+func containerAlreadyGone(out string) bool {
+	return strings.Contains(strings.ToLower(out), "no such container")
 }
 
 // cappedWriter forwards at most `remaining` bytes to w, and since Session 3a

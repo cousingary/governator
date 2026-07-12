@@ -339,3 +339,18 @@ func TestDockerObserveNoTruncationByDefault(t *testing.T) {
 		t.Fatalf("fresh runner must report no truncation, got %+v", obs)
 	}
 }
+
+func TestContainerAlreadyGoneMatching(t *testing.T) {
+	// RemoveContainer tolerates ONLY the already-gone case; everything else
+	// (daemon down, permission denied) must propagate so `gov reconcile`
+	// never marks a teardown done while the container may still be alive.
+	if !containerAlreadyGone("Error response from daemon: No such container: gov-x") {
+		t.Fatal("missing-container output must count as already gone")
+	}
+	if containerAlreadyGone("Cannot connect to the Docker daemon at unix:///var/run/docker.sock") {
+		t.Fatal("daemon-unreachable must NOT count as already gone")
+	}
+	if containerAlreadyGone("permission denied while trying to connect to the Docker daemon socket") {
+		t.Fatal("permission failure must NOT count as already gone")
+	}
+}

@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"github.com/cousingary/governator/internal/agents"
+	"github.com/cousingary/governator/internal/assay"
 	"github.com/cousingary/governator/internal/breaker"
 	"github.com/cousingary/governator/internal/config"
 	"github.com/cousingary/governator/internal/containment"
@@ -481,6 +482,18 @@ func enforceContainment(c contracts.Contract, agent string, cfg config.Config) e
 		nativeSandbox = a.Capabilities().NativeSandbox
 	}
 	return containment.Enforce(c, nativeSandbox, cfg.Containment.OverridePublicKey)
+}
+
+// requiresCompleteTranscript reports whether c may never be approved on an
+// incomplete (capped or unverifiable) transcript: either the operator opted
+// in explicitly (docker.require_complete_transcript) or the run is
+// evidence-bearing by construction — a blocking assay's verdict gates the
+// merge, so the audit trail behind that verdict must be whole.
+func requiresCompleteTranscript(c contracts.Contract) bool {
+	if c.Docker != nil && c.Docker.RequireCompleteTranscript {
+		return true
+	}
+	return c.Assay != nil && c.Assay.Enforcement == assay.EnforcementBlocking
 }
 
 func shQuote(s string) string { return "'" + strings.ReplaceAll(s, "'", "'\"'\"'") + "'" }
@@ -1311,7 +1324,13 @@ func (r *Runner) runOnce(ctx context.Context, c contracts.Contract) (RunRecord, 
 	quotaSettled := false
 	defer func() {
 		if quotaReservation.ID != 0 && !quotaSettled {
-			_ = quota.Release(db, quotaReservation.ID, time.Now().UTC())
+			// Best-effort (an unreleased reservation self-heals at its TTL),
+			// but per Session 4 the failure itself must not vanish: queue it
+			// so `gov reconcile` releases the headroom before the TTL does.
+			if rerr := quota.Release(db, quotaReservation.ID, time.Now().UTC()); rerr != nil {
+				payload, _ := json.Marshal(quotaReleasePayload{ReservationID: quotaReservation.ID})
+				noteOperationalFailure(db, id, opQuotaRelease, rerr, string(payload))
+			}
 		}
 	}()
 	ws, err := rn.Prepare(ctx, runner.PrepareRequest{Root: root, Home: r.Home, ID: id, Git: git})
@@ -1474,10 +1493,22 @@ func (r *Runner) runOnce(ctx context.Context, c contracts.Contract) (RunRecord, 
 	// when it required a complete (evidence-bearing) transcript — such a run
 	// is quarantined, never approved on an incomplete audit trail. Non-
 	// requiring runs still had the truncation recorded loudly above.
-	if oerr == nil && obs.OutputTruncated && c.Docker != nil && c.Docker.RequireCompleteTranscript {
-		violations = append(violations, fmt.Sprintf(
-			"output truncated: %d of %d transcript bytes discarded (complete transcript required)",
-			obs.BytesDiscarded, obs.BytesAccepted+obs.BytesDiscarded))
+	// "Requiring" is not only the explicit opt-in flag: a blocking-assay run
+	// is evidence-bearing by definition (its verdict gates the merge), so it
+	// must never be approved on a capped transcript just because the operator
+	// forgot to also set require_complete_transcript. And when Observe itself
+	// failed we cannot PROVE the transcript is complete, which for a
+	// completeness-requiring run is the same as incomplete (fail closed) —
+	// the old `oerr == nil &&` guard silently skipped the whole check.
+	if requiresCompleteTranscript(c) {
+		switch {
+		case oerr != nil:
+			violations = append(violations, "runner observation failed: cannot verify transcript completeness (complete transcript required): "+oerr.Error())
+		case obs.OutputTruncated:
+			violations = append(violations, fmt.Sprintf(
+				"output truncated: %d of %d transcript bytes discarded (complete transcript required)",
+				obs.BytesDiscarded, obs.BytesAccepted+obs.BytesDiscarded))
+		}
 	}
 	var selfReviewJSON string
 	rec.SelfReview, selfReviewJSON = readSelfReview(work)

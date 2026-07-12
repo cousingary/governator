@@ -57,9 +57,10 @@ func Enforce(c contracts.Contract, nativeSandbox bool, pubKeyHex string) error {
 }
 
 // VerifyOverride reports whether the contract carries a valid signed override
-// for its job_id, verified against pubKeyHex. An empty pubKeyHex refuses
-// every override (fail-closed: no operator key configured means no escape
-// hatch). The signed message is OverrideMessage(job_id, override_reason).
+// for its job_id AND its exact content, verified against pubKeyHex. An empty
+// pubKeyHex refuses every override (fail-closed: no operator key configured
+// means no escape hatch). The signed message is SigningMessage(c) — see
+// OverrideMessage for why the contract hash is part of what's signed.
 func VerifyOverride(c contracts.Contract, pubKeyHex string) bool {
 	if c.Containment == nil {
 		return false
@@ -77,14 +78,41 @@ func VerifyOverride(c contracts.Contract, pubKeyHex string) bool {
 	if err != nil || len(sig) != ed25519.SignatureSize {
 		return false
 	}
-	return ed25519.Verify(ed25519.PublicKey(pub), OverrideMessage(c.JobID, reason), sig)
+	msg, err := SigningMessage(c)
+	if err != nil {
+		return false
+	}
+	return ed25519.Verify(ed25519.PublicKey(pub), msg, sig)
+}
+
+// SigningMessage builds the exact bytes an operator signs to authorize a
+// containment override for contract c: OverrideMessage over c's job_id, the
+// hash of c with its containment block cleared (the signature can't cover
+// itself), and the override reason. Exposed so `gov containment message`,
+// tests, and VerifyOverride can never drift on the format.
+func SigningMessage(c contracts.Contract) ([]byte, error) {
+	stripped := c
+	stripped.Containment = nil
+	hash, err := contracts.ContractHash(stripped)
+	if err != nil {
+		return nil, err
+	}
+	reason := ""
+	if c.Containment != nil {
+		reason = strings.TrimSpace(c.Containment.OverrideReason)
+	}
+	return OverrideMessage(c.JobID, hash, reason), nil
 }
 
 // OverrideMessage is the exact bytes an operator signs (ed25519) to authorize
 // a containment override for one contract. Binding the job_id prevents an
-// override minted for one high-risk job being replayed against another.
-// Exposed so signing tooling and tests produce matching signatures without
-// duplicating the format.
-func OverrideMessage(jobID, reason string) []byte {
-	return []byte(jobID + ":" + reason)
+// override minted for one high-risk job being replayed against another;
+// binding contractHash (the contract's hash with its containment block
+// cleared) prevents the sharper replay where the SAME job's contract body is
+// edited after signing — widened scope, network enablement, a different
+// image — while the old signature keeps verifying. Any content edit changes
+// the hash and invalidates the signature. Exposed so signing tooling and
+// tests produce matching signatures without duplicating the format.
+func OverrideMessage(jobID, contractHash, reason string) []byte {
+	return []byte(jobID + ":" + contractHash + ":" + reason)
 }

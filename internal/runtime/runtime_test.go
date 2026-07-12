@@ -17,6 +17,7 @@ import (
 
 	"github.com/cousingary/governator/internal/agents"
 	"github.com/cousingary/governator/internal/config"
+	"github.com/cousingary/governator/internal/containment"
 	"github.com/cousingary/governator/internal/contracts"
 	"github.com/cousingary/governator/internal/observability"
 	"github.com/cousingary/governator/internal/policy"
@@ -1287,13 +1288,21 @@ func TestEnforceContainmentHighRiskAcceptanceCriterion(t *testing.T) {
 		t.Fatalf("native-sandbox-capable backend should pass high-risk local: %v", err)
 	}
 
-	// A signed override rescues a non-sandbox high-risk local run.
+	// A signed override rescues a non-sandbox high-risk local run. The
+	// signed message binds job_id, contract-content hash, and reason (see
+	// containment.SigningMessage) so it must be built from the final
+	// contract, not just the job_id.
 	pub, priv, _ := ed25519.GenerateKey(nil)
 	c = base
 	c.Agent = "glm"
 	reason := "isolated trusted host"
-	sig := ed25519.Sign(priv, []byte(c.JobID+":"+reason))
-	c.Containment = &contracts.Containment{OverrideReason: reason, OverrideSignature: hex.EncodeToString(sig)}
+	c.Containment = &contracts.Containment{OverrideReason: reason}
+	msg, merr := containment.SigningMessage(c)
+	if merr != nil {
+		t.Fatalf("SigningMessage: %v", merr)
+	}
+	sig := ed25519.Sign(priv, msg)
+	c.Containment.OverrideSignature = hex.EncodeToString(sig)
 	if err := enforceContainment(c, "glm", config.Config{Containment: config.Containment{OverridePublicKey: hex.EncodeToString(pub)}}); err != nil {
 		t.Fatalf("valid signed override should rescue high-risk local glm: %v", err)
 	}
@@ -1319,5 +1328,32 @@ func TestRunRejectsHighRiskLocalWithoutContainment(t *testing.T) {
 	_, err := New().Run(context.Background(), c)
 	if err == nil || !strings.Contains(err.Error(), "containment") {
 		t.Fatalf("expected containment failure before launch, got err=%v", err)
+	}
+}
+
+func TestRequiresCompleteTranscript(t *testing.T) {
+	// A blocking assay's verdict gates the merge, so such a run is
+	// evidence-bearing by definition and may never be approved on a capped
+	// (or unverifiable) transcript — even when the operator forgot the
+	// explicit docker.require_complete_transcript opt-in. Advisory/telemetry
+	// assay and plain runs keep the opt-in-only behavior.
+	cases := []struct {
+		name string
+		c    contracts.Contract
+		want bool
+	}{
+		{"plain run", contracts.Contract{}, false},
+		{"docker without flag", contracts.Contract{Docker: &contracts.DockerRunnerConfig{Image: "img:latest"}}, false},
+		{"explicit opt-in", contracts.Contract{Docker: &contracts.DockerRunnerConfig{Image: "img:latest", RequireCompleteTranscript: true}}, true},
+		{"blocking assay, no flag", contracts.Contract{Assay: &contracts.Assay{Profile: "coding-output-v1", Enforcement: "blocking"}}, true},
+		{"advisory assay, no flag", contracts.Contract{Assay: &contracts.Assay{Profile: "coding-output-v1", Enforcement: "advisory"}}, false},
+		{"telemetry assay, no flag", contracts.Contract{Assay: &contracts.Assay{Profile: "coding-output-v1", Enforcement: "telemetry"}}, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := requiresCompleteTranscript(tc.c); got != tc.want {
+				t.Fatalf("requiresCompleteTranscript = %v, want %v", got, tc.want)
+			}
+		})
 	}
 }

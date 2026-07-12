@@ -50,6 +50,19 @@ var validConditionOps = map[string]bool{
 	"contains": true, "matches_any": true,
 }
 
+// validConditionFields is the closed fact vocabulary (facts.go's Fact*
+// constants). Validate rejects any other field name: since an unresolvable
+// field makes a condition silently never match (see Condition's doc), a
+// typo'd field in a DENY rule would otherwise disarm that rule forever
+// without anyone noticing — the rule file loads clean, the rule just never
+// fires. Fail loudly at load time instead.
+var validConditionFields = map[string]bool{
+	FactRiskClass: true, FactMode: true, FactBackend: true,
+	FactNetworkEnabled: true, FactWriteOutOfScope: true,
+	FactEstimatedCostUSD: true, FactDailyCapUSD: true,
+	FactUnusualInfraRetry: true, FactInfraFailureKind: true,
+}
+
 // Validate reports every structural problem with r: empty ID, empty When,
 // an unrecognized Verdict/Op, or a request for VerdictAllow (see the
 // ConditionRule doc comment). Called at load time (config decode, project
@@ -75,6 +88,9 @@ func (r ConditionRule) Validate() error {
 	for i, c := range r.When {
 		if strings.TrimSpace(c.Field) == "" {
 			return fmt.Errorf("policy rule %q: when[%d].field is required", r.ID, i)
+		}
+		if !validConditionFields[c.Field] {
+			return fmt.Errorf("policy rule %q: when[%d].field %q is not a known fact (see internal/policy/facts.go: risk_class, mode, backend, network_enabled, write_out_of_scope, estimated_cost_usd, daily_cap_usd, unusual_infra_retry, infra_failure_kind); an unknown field would silently never match", r.ID, i, c.Field)
 		}
 		if !validConditionOps[c.Op] {
 			return fmt.Errorf("policy rule %q: when[%d].op %q is not one of eq, ne, gt, gte, lt, lte, contains, matches_any", r.ID, i, c.Op)

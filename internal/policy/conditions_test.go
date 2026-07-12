@@ -210,3 +210,22 @@ func TestMergeFactsExtraWinsOnCollision(t *testing.T) {
 		t.Fatalf("unexpected merge result: %+v", out)
 	}
 }
+
+func TestValidateRejectsUnknownConditionField(t *testing.T) {
+	// An unresolvable field makes a condition silently never match, so a
+	// typo'd field in a DENY rule would disarm the rule forever without a
+	// sound. Validate must fail loudly at load time instead.
+	r := ConditionRule{
+		ID:      "typo-rule",
+		When:    []Condition{{Field: "risk_clas", Op: "eq", Value: "high"}},
+		Verdict: VerdictDeny,
+		Reason:  "should never load",
+	}
+	if err := r.Validate(); err == nil {
+		t.Fatal("expected Validate to reject an unknown condition field, got nil")
+	}
+	r.When[0].Field = FactRiskClass
+	if err := r.Validate(); err != nil {
+		t.Fatalf("known field must validate: %v", err)
+	}
+}

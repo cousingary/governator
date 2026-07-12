@@ -77,7 +77,7 @@ func TestResolveOverridesOnlyResolvesMatchingAskRuleID(t *testing.T) {
 		{Source: SourceOrgPolicy, Verdict: VerdictAsk, Reason: "cost", RuleID: "cost-threshold"},
 		{Source: SourceOrgPolicy, Verdict: VerdictAsk, Reason: "network", RuleID: "network-enablement"},
 	}
-	resolved := ResolveOverrides(results, []Override{{RuleID: "cost-threshold", Verdict: VerdictAllow}})
+	resolved, _ := ResolveOverrides(results, []Override{{RuleID: "cost-threshold", Verdict: VerdictAllow}})
 	if resolved[0].Verdict != VerdictAllow || resolved[0].Source != SourceSessionOverride {
 		t.Fatalf("expected cost-threshold resolved to ALLOW via session override, got %+v", resolved[0])
 	}
@@ -92,7 +92,7 @@ func TestResolveOverridesOnlyResolvesMatchingAskRuleID(t *testing.T) {
 
 func TestResolveOverridesNeverResolvesDeny(t *testing.T) {
 	results := []LayerResult{{Source: SourceOrgPolicy, Verdict: VerdictDeny, Reason: "no", RuleID: "hard-deny"}}
-	resolved := ResolveOverrides(results, []Override{{RuleID: "hard-deny", Verdict: VerdictAllow}})
+	resolved, _ := ResolveOverrides(results, []Override{{RuleID: "hard-deny", Verdict: VerdictAllow}})
 	if resolved[0].Verdict != VerdictDeny {
 		t.Fatalf("DENY must never be resolved by an override, got %+v", resolved[0])
 	}
@@ -100,7 +100,7 @@ func TestResolveOverridesNeverResolvesDeny(t *testing.T) {
 
 func TestResolveOverridesDenyOverride(t *testing.T) {
 	results := []LayerResult{{Source: SourceJobContract, Verdict: VerdictAsk, Reason: "ask", RuleID: "r1"}}
-	resolved := ResolveOverrides(results, []Override{{RuleID: "r1", Verdict: VerdictDeny}})
+	resolved, _ := ResolveOverrides(results, []Override{{RuleID: "r1", Verdict: VerdictDeny}})
 	decision := EvaluateLayers(resolved...)
 	if decision.Verdict != VerdictDeny {
 		t.Fatalf("expected an operator DENY override to produce a final DENY, got %s", decision.Verdict)

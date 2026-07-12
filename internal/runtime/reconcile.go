@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
-	"os/exec"
 	"time"
 
 	"github.com/cousingary/governator/internal/breaker"
@@ -29,6 +28,7 @@ const (
 	opBreakerFailure   = "breaker_record_failure"
 	opBreakerSuccess   = "breaker_record_success"
 	opQuotaResetHint   = "quota_reset_hint"
+	opQuotaRelease     = "quota_release"
 	opSpendHaltCheck   = "spend_halt_check"
 	opWorkspaceDestroy = "workspace_destroy"
 	opPolicyRuleEvents = "policy_rule_events"
@@ -46,6 +46,10 @@ type quotaResetHintPayload struct {
 	Agent   string    `json:"agent"`
 	Account string    `json:"account"`
 	ResetAt time.Time `json:"reset_at"`
+}
+
+type quotaReleasePayload struct {
+	ReservationID int64 `json:"reservation_id"`
 }
 
 type workspaceDestroyPayload struct {
@@ -174,6 +178,12 @@ func dispatchReconcile(ctx context.Context, db *sql.DB, cfg config.Config, item 
 			return err
 		}
 		return quota.ApplyResetHint(db, p.Agent, p.Account, p.ResetAt, time.Now().UTC())
+	case opQuotaRelease:
+		var p quotaReleasePayload
+		if err := json.Unmarshal([]byte(item.Payload), &p); err != nil {
+			return err
+		}
+		return quota.Release(db, p.ReservationID, time.Now().UTC())
 	case opSpendHaltCheck:
 		return spend.MaybeHalt(cfg, db)
 	case opWorkspaceDestroy:
@@ -212,14 +222,18 @@ func dispatchReconcile(ctx context.Context, db *sql.DB, cfg config.Config, item 
 }
 
 // reconcileWorkspaceDestroy re-attempts a workspace/container teardown from
-// nothing but the Workspace fields recorded at enqueue time. Docker container
-// removal is attempted directly (idempotent — an already-gone container is
-// not an error, matching DockerRunner.Destroy); the worktree/copy teardown
-// reuses LocalWorktreeRunner.Destroy, whose logic is identical for both
-// runner kinds once the container itself is out of the picture.
+// nothing but the Workspace fields recorded at enqueue time. Container
+// removal goes through runner.RemoveContainer, which tolerates ONLY the
+// already-gone case — any real failure (daemon down, permission) propagates
+// so the outbox row stays pending instead of being marked done while a live
+// container leaks. The worktree/copy teardown reuses
+// LocalWorktreeRunner.Destroy, whose logic is identical for both runner
+// kinds once the container itself is out of the picture.
 func reconcileWorkspaceDestroy(ctx context.Context, p workspaceDestroyPayload) error {
 	if p.Container != "" {
-		_ = exec.CommandContext(ctx, "docker", "rm", "-f", p.Container).Run()
+		if err := runner.RemoveContainer(ctx, p.Container); err != nil {
+			return err
+		}
 	}
 	ws := runner.Workspace{Path: p.Path, Root: p.Root, Branch: p.Branch, Git: p.Git, Container: p.Container}
 	return runner.LocalWorktreeRunner{}.Destroy(ctx, ws, p.Approved)

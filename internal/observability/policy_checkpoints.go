@@ -117,21 +117,32 @@ type PolicyOverride struct {
 	CreatedBy string
 	CreatedAt string
 	ExpiresAt string // RFC3339; empty means never expires
+	// OneShot marks a bare `gov ask approve/deny` (no --rule): the override
+	// applies to exactly one subsequent evaluation of its job+rule, then is
+	// marked consumed (ConsumedAt set) and never matches again. A durable
+	// --rule override has OneShot false and is never consumed.
+	OneShot    bool
+	ConsumedAt string // RFC3339; empty means not yet consumed
 }
 
 // RecordPolicyOverride persists one temporary override rule.
 func RecordPolicyOverride(db *sql.DB, o PolicyOverride) error {
-	_, err := db.Exec(`INSERT INTO policy_overrides(scope_key,target,verdict,reason,created_by,created_at,expires_at) VALUES(?,?,?,?,?,?,?)`,
-		o.ScopeKey, o.Target, o.Verdict, o.Reason, o.CreatedBy, o.CreatedAt, o.ExpiresAt)
+	oneShot := 0
+	if o.OneShot {
+		oneShot = 1
+	}
+	_, err := db.Exec(`INSERT INTO policy_overrides(scope_key,target,verdict,reason,created_by,created_at,expires_at,one_shot) VALUES(?,?,?,?,?,?,?,?)`,
+		o.ScopeKey, o.Target, o.Verdict, o.Reason, o.CreatedBy, o.CreatedAt, o.ExpiresAt, oneShot)
 	return err
 }
 
 // ActivePolicyOverrides returns every override for scopeKey that has not
-// expired as of now (an empty ExpiresAt never expires), newest first so a
-// caller folding multiple matching overrides into one LayerResult naturally
-// prefers the most recent operator decision.
+// expired as of now (an empty ExpiresAt never expires) and has not been
+// consumed (only one-shot overrides ever are), newest first so a caller
+// folding multiple matching overrides into one LayerResult naturally prefers
+// the most recent operator decision.
 func ActivePolicyOverrides(db *sql.DB, scopeKey, now string) ([]PolicyOverride, error) {
-	rows, err := db.Query(`SELECT id,scope_key,target,verdict,reason,created_by,created_at,expires_at FROM policy_overrides WHERE scope_key=? AND (expires_at='' OR expires_at>?) ORDER BY created_at DESC, id DESC`, scopeKey, now)
+	rows, err := db.Query(`SELECT id,scope_key,target,verdict,reason,created_by,created_at,expires_at,one_shot,consumed_at FROM policy_overrides WHERE scope_key=? AND (expires_at='' OR expires_at>?) AND consumed_at='' ORDER BY created_at DESC, id DESC`, scopeKey, now)
 	if err != nil {
 		return nil, err
 	}
@@ -139,10 +150,22 @@ func ActivePolicyOverrides(db *sql.DB, scopeKey, now string) ([]PolicyOverride, 
 	var out []PolicyOverride
 	for rows.Next() {
 		var o PolicyOverride
-		if err := rows.Scan(&o.ID, &o.ScopeKey, &o.Target, &o.Verdict, &o.Reason, &o.CreatedBy, &o.CreatedAt, &o.ExpiresAt); err != nil {
+		var oneShot int
+		if err := rows.Scan(&o.ID, &o.ScopeKey, &o.Target, &o.Verdict, &o.Reason, &o.CreatedBy, &o.CreatedAt, &o.ExpiresAt, &oneShot, &o.ConsumedAt); err != nil {
 			return nil, err
 		}
+		o.OneShot = oneShot != 0
 		out = append(out, o)
 	}
 	return out, rows.Err()
+}
+
+// ConsumePolicyOverride terminalizes a one-shot override after the single
+// evaluation it authorized. The WHERE clause only matches a still-unconsumed
+// one-shot row, so double-consumption (two racing evaluations) is impossible
+// — the second caller simply affects zero rows and its evaluation never saw
+// the override anyway (ActivePolicyOverrides filters consumed rows).
+func ConsumePolicyOverride(db *sql.DB, id int64, now string) error {
+	_, err := db.Exec(`UPDATE policy_overrides SET consumed_at=? WHERE id=? AND one_shot=1 AND consumed_at=''`, now, id)
+	return err
 }
