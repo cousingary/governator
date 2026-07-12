@@ -522,3 +522,30 @@ claims:
         funcs:
           - TestEvaluateAgainstRealCLIPassAndFail
         build_tag: integration
+
+  - id: sol-s3s6-local-output-capping
+    title: "runner: local output caps: LocalWorktreeRunner.Launch bounds a host subprocess's stdout/stderr through the same cappedWriter DockerRunner uses, gated by local.output_cap_bytes/local.require_complete_transcript, and the local config participates in ExecutionIdentity.RunnerConfigHash so a tightened cap invalidates replay"
+    first_shipped_version: v1.5.0-sol-repair-s3s6-followup
+    claimed_maturity: tested
+    implementation:
+      - file: internal/runner/runner.go
+        symbols: [LocalWorktreeRunner]
+      - file: internal/runner/docker.go
+        symbols: [cappedWriter]
+      - file: internal/contracts/schema.go
+        symbols: [LocalRunnerConfig]
+      - file: internal/runtime/identity.go
+        symbols: [runnerConfig]
+    tests:
+      - file: internal/runner/local_test.go
+        funcs:
+          - TestLocalWorktreeRunnerLaunchCapsOutput
+          - TestLocalWorktreeRunnerObserveNoTruncationByDefault
+          - TestNewThreadsLocalConfig
+      - file: internal/contracts/schema_test.go
+        funcs:
+          - TestValidateRunnerLocalConfig
+          - TestEffectiveOutputCapBytesLocal
+      - file: internal/runtime/identity_test.go
+        funcs:
+          - TestRunnerConfigHashesLocalConfig

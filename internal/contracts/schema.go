@@ -253,6 +253,36 @@ func (d *DockerRunnerConfig) EffectiveOutputCapBytes() int64 {
 	return d.OutputCapBytes
 }
 
+// LocalRunnerConfig configures runner: local (or unset, its default): the
+// output-capping half of DockerRunnerConfig, applied to a host subprocess
+// instead of a container. Sol High 11 originally called for the same
+// output_cap_bytes/require_complete_transcript behavior DockerRunnerConfig
+// already had to also bound a local run's transcript — a plain LocalRunner
+// runner:docker doesn't need — this is a separate type (not a reused
+// DockerRunnerConfig) because validateRunner requires Docker to be absent
+// unless runner: docker, and a local job has no image/network/credential
+// concept to configure.
+type LocalRunnerConfig struct {
+	// OutputCapBytes mirrors DockerRunnerConfig.OutputCapBytes: caps how much
+	// of the local subprocess's stdout/stderr is persisted to the transcript.
+	// Optional; EffectiveOutputCapBytes defaults it to 20MiB.
+	OutputCapBytes int64 `yaml:"output_cap_bytes,omitempty" json:"output_cap_bytes,omitempty"`
+	// RequireCompleteTranscript mirrors DockerRunnerConfig's field of the same
+	// name: a local run whose transcript was capped is quarantined rather
+	// than approved on an incomplete evidence trail. Defaults false.
+	RequireCompleteTranscript bool `yaml:"require_complete_transcript,omitempty" json:"require_complete_transcript,omitempty"`
+}
+
+// EffectiveOutputCapBytes defaults an unset/invalid cap to 20MiB, identical
+// to DockerRunnerConfig's default, so the two runners bound unbounded output
+// the same way.
+func (l *LocalRunnerConfig) EffectiveOutputCapBytes() int64 {
+	if l == nil || l.OutputCapBytes <= 0 {
+		return 20 * 1024 * 1024
+	}
+	return l.OutputCapBytes
+}
+
 // imageDigestRE matches a true immutable digest reference: "@sha256:" followed
 // by exactly 64 hex characters at the end of the string. Session 6 (Sol High
 // 8) tightens this from a bare strings.Contains(image, "@sha256:") check,
@@ -428,6 +458,13 @@ type Contract struct {
 	// identically to "local", so every prior job YAML keeps working unchanged.
 	Runner string              `yaml:"runner,omitempty" json:"runner,omitempty"`
 	Docker *DockerRunnerConfig `yaml:"docker,omitempty" json:"docker,omitempty"`
+
+	// Local configures runner: local's output capping (Sol High 11) — the
+	// local-run half of Docker's output_cap_bytes/require_complete_transcript.
+	// Optional; absent behaves exactly as before (20MiB default cap,
+	// non-blocking truncation). Like Docker, it must be absent when
+	// runner: docker (that config lives in Docker instead).
+	Local *LocalRunnerConfig `yaml:"local,omitempty" json:"local,omitempty"`
 
 	// Containment is the Session 3 (Phase 2) risk-class containment override
 	// surface — optional on every contract, and absent on every prior job YAML
@@ -1030,7 +1067,13 @@ func validateRunner(c Contract, add func(string, string)) {
 		if c.Docker != nil {
 			add("docker", "must be absent unless runner: docker")
 		}
+		if c.Local != nil && c.Local.OutputCapBytes < 0 {
+			add("local.output_cap_bytes", "must be zero or greater")
+		}
 		return
+	}
+	if c.Local != nil {
+		add("local", "must be absent unless runner is local (or unset)")
 	}
 	if c.Docker == nil {
 		add("docker", "is required when runner: docker")

@@ -192,15 +192,21 @@ func adapterVersion(agent agents.Agent) string {
 	return hashJSON(agent.Capabilities())
 }
 
-// runnerConfig captures the effective runner kind plus the full Docker
-// configuration so a switch from local to Docker, or a tightened Docker
-// security setting, invalidates replay.
+// runnerConfig captures the effective runner kind plus the full Docker or
+// Local configuration so a switch from local to Docker, a tightened Docker
+// security setting, or a changed local output-cap/require_complete_transcript
+// setting (Sol High 11) invalidates replay.
 func runnerConfig(c contracts.Contract) map[string]any {
 	out := map[string]any{"runner": c.EffectiveRunner()}
 	if c.Docker != nil {
 		out["docker"] = *c.Docker
 	} else {
 		out["docker"] = nil
+	}
+	if c.Local != nil {
+		out["local"] = *c.Local
+	} else {
+		out["local"] = nil
 	}
 	return out
 }

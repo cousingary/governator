@@ -612,11 +612,15 @@ func enforceContainment(db *sql.DB, c contracts.Contract, agent string, cfg conf
 
 // requiresCompleteTranscript reports whether c may never be approved on an
 // incomplete (capped or unverifiable) transcript: either the operator opted
-// in explicitly (docker.require_complete_transcript) or the run is
+// in explicitly (docker.require_complete_transcript, or local's equivalent
+// require_complete_transcript for runner: local — Sol High 11) or the run is
 // evidence-bearing by construction — a blocking assay's verdict gates the
 // merge, so the audit trail behind that verdict must be whole.
 func requiresCompleteTranscript(c contracts.Contract) bool {
 	if c.Docker != nil && c.Docker.RequireCompleteTranscript {
+		return true
+	}
+	if c.Local != nil && c.Local.RequireCompleteTranscript {
 		return true
 	}
 	return c.Assay != nil && c.Assay.Enforcement == assay.EnforcementBlocking
@@ -1619,7 +1623,7 @@ func (r *Runner) runOnce(ctx context.Context, c contracts.Contract) (RunRecord, 
 	// effect: a docker request Governator can't satisfy must fail closed with
 	// a clear error here, never silently fall back to LocalWorktreeRunner and
 	// never leave a partially-acquired lock or reservation behind.
-	rn, err := runner.New(c.EffectiveRunner(), c.Docker)
+	rn, err := runner.New(c.EffectiveRunner(), c.Docker, c.Local)
 	if err != nil {
 		return RunRecord{}, err
 	}

@@ -299,7 +299,7 @@ func reconcileWorkspaceDestroy(ctx context.Context, p workspaceDestroyPayload) e
 		}
 	}
 	ws := runner.Workspace{Path: p.Path, Root: p.Root, Branch: p.Branch, Git: p.Git, Container: p.Container}
-	return runner.LocalWorktreeRunner{}.Destroy(ctx, ws, p.Approved)
+	return (&runner.LocalWorktreeRunner{}).Destroy(ctx, ws, p.Approved)
 }
 
 // CleanupReport summarizes one `gov cleanup --stale` pass.

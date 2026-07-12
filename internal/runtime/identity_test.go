@@ -8,6 +8,7 @@ import (
 
 	"github.com/cousingary/governator/internal/agents"
 	"github.com/cousingary/governator/internal/config"
+	"github.com/cousingary/governator/internal/contracts"
 	"github.com/cousingary/governator/internal/policy"
 	"github.com/cousingary/governator/internal/prompts"
 )
@@ -98,6 +99,31 @@ func TestExecutionIdentityHashSensitiveToEveryField(t *testing.T) {
 		if h := flipped.Hash(); h == baseHash {
 			t.Errorf("flipping %s did not change the identity hash (both %s)", name, baseHash)
 		}
+	}
+}
+
+// TestRunnerConfigHashesLocalConfig pins that runnerConfig (the input to
+// ExecutionIdentity.RunnerConfigHash) reflects Contract.Local the same way it
+// already reflected Contract.Docker — otherwise a tightened
+// local.require_complete_transcript or local.output_cap_bytes setting could
+// silently replay a stale approval minted under a looser one (Sol High 11).
+func TestRunnerConfigHashesLocalConfig(t *testing.T) {
+	base := contracts.Contract{}
+	tightened := contracts.Contract{Local: &contracts.LocalRunnerConfig{RequireCompleteTranscript: true}}
+	capped := contracts.Contract{Local: &contracts.LocalRunnerConfig{OutputCapBytes: 1024}}
+
+	baseHash := hashJSON(runnerConfig(base))
+	tightenedHash := hashJSON(runnerConfig(tightened))
+	cappedHash := hashJSON(runnerConfig(capped))
+
+	if baseHash == tightenedHash {
+		t.Fatal("setting local.require_complete_transcript did not change runnerConfig's hash")
+	}
+	if baseHash == cappedHash {
+		t.Fatal("setting local.output_cap_bytes did not change runnerConfig's hash")
+	}
+	if tightenedHash == cappedHash {
+		t.Fatal("two distinct local configs hashed equally")
 	}
 }
 

@@ -1371,6 +1371,8 @@ func TestRequiresCompleteTranscript(t *testing.T) {
 		{"plain run", contracts.Contract{}, false},
 		{"docker without flag", contracts.Contract{Docker: &contracts.DockerRunnerConfig{Image: "img:latest"}}, false},
 		{"explicit opt-in", contracts.Contract{Docker: &contracts.DockerRunnerConfig{Image: "img:latest", RequireCompleteTranscript: true}}, true},
+		{"local without flag", contracts.Contract{Local: &contracts.LocalRunnerConfig{}}, false},
+		{"local explicit opt-in", contracts.Contract{Local: &contracts.LocalRunnerConfig{RequireCompleteTranscript: true}}, true},
 		{"blocking assay, no flag", contracts.Contract{Assay: &contracts.Assay{Profile: "coding-output-v1", Enforcement: "blocking"}}, true},
 		{"advisory assay, no flag", contracts.Contract{Assay: &contracts.Assay{Profile: "coding-output-v1", Enforcement: "advisory"}}, false},
 		{"telemetry assay, no flag", contracts.Contract{Assay: &contracts.Assay{Profile: "coding-output-v1", Enforcement: "telemetry"}}, false},

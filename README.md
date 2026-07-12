@@ -144,7 +144,7 @@ gov version
 
 ## v1.5.0 — Sol redteam repair program
 
-An independent redteam review reproduced eight Critical and twelve High-severity gaps in v1.4.1 (replay bypasses, symlink escapes, unattested backend trust, non-atomic live-root merges, and more). All were repaired across seven sessions; see [docs/security.md](docs/security.md) for the full finding-by-finding register and [CHANGELOG.md](CHANGELOG.md) for the per-session summary. `gov version` reports the build's real semantic version, source commit, and claims hash, embedded at build time by `scripts/release.sh` — there is exactly one version story now, not the source/archive/repo-claim divergence Sol found. One item, local-runner output capping (Sol High 11), remains open; it is called out explicitly in the register rather than claimed as done.
+An independent redteam review reproduced eight Critical and twelve High-severity gaps in v1.4.1 (replay bypasses, symlink escapes, unattested backend trust, non-atomic live-root merges, and more). All were repaired across seven sessions, plus a documentation pass (S8) and one follow-up session that closed the single gap S8's own cross-check found (High 11's local-runner output capping — scoped into S3/S6 but not actually implemented there); see [docs/security.md](docs/security.md) for the full finding-by-finding register and [CHANGELOG.md](CHANGELOG.md) for the per-session summary. `gov version` reports the build's real semantic version, source commit, and claims hash, embedded at build time by `scripts/release.sh` — there is exactly one version story now, not the source/archive/repo-claim divergence Sol found. All eight Critical and twelve High findings are now fully closed.
 
 ## Roadmap (not built)
 

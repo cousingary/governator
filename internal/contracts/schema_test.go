@@ -276,6 +276,73 @@ func TestValidateRunnerHardeningFieldsStructural(t *testing.T) {
 	}
 }
 
+// TestValidateRunnerLocalConfig pins Sol High 11's contract-level surface:
+// Local mirrors Docker's placement rules — required to be absent under
+// runner: docker (that config lives in Docker instead), and its own
+// output_cap_bytes must be non-negative when runner is local (or unset).
+func TestValidateRunnerLocalConfig(t *testing.T) {
+	t.Run("local config rejected under runner: docker", func(t *testing.T) {
+		var errs ValidationErrors
+		add := func(field, message string) { errs = append(errs, ValidationError{Field: field, Message: message}) }
+		validateRunner(Contract{
+			Runner: "docker",
+			Docker: &DockerRunnerConfig{Image: "img:latest"},
+			Local:  &LocalRunnerConfig{OutputCapBytes: 10},
+		}, add)
+		found := false
+		for _, ve := range errs {
+			if ve.Field == "local" {
+				found = true
+			}
+		}
+		if !found {
+			t.Fatalf("expected a \"local\" field error when runner: docker also sets local, got %+v", errs)
+		}
+	})
+
+	t.Run("negative output_cap_bytes rejected under runner: local", func(t *testing.T) {
+		var errs ValidationErrors
+		add := func(field, message string) { errs = append(errs, ValidationError{Field: field, Message: message}) }
+		validateRunner(Contract{Runner: "local", Local: &LocalRunnerConfig{OutputCapBytes: -1}}, add)
+		found := false
+		for _, ve := range errs {
+			if ve.Field == "local.output_cap_bytes" {
+				found = true
+			}
+		}
+		if !found {
+			t.Fatalf("expected a \"local.output_cap_bytes\" field error, got %+v", errs)
+		}
+	})
+
+	t.Run("local config accepted under unset/local runner", func(t *testing.T) {
+		for _, runnerVal := range []string{"", "local"} {
+			var errs ValidationErrors
+			add := func(field, message string) { errs = append(errs, ValidationError{Field: field, Message: message}) }
+			validateRunner(Contract{Runner: runnerVal, Local: &LocalRunnerConfig{OutputCapBytes: 1024, RequireCompleteTranscript: true}}, add)
+			if len(errs) != 0 {
+				t.Fatalf("runner=%q: expected no errors, got %+v", runnerVal, errs)
+			}
+		}
+	})
+}
+
+// TestEffectiveOutputCapBytesLocal pins LocalRunnerConfig's default, matching
+// DockerRunnerConfig.EffectiveOutputCapBytes's 20MiB default so the two
+// runners bound unbounded output identically.
+func TestEffectiveOutputCapBytesLocal(t *testing.T) {
+	var nilCfg *LocalRunnerConfig
+	if got := nilCfg.EffectiveOutputCapBytes(); got != 20*1024*1024 {
+		t.Fatalf("nil receiver: got %d, want 20MiB default", got)
+	}
+	if got := (&LocalRunnerConfig{}).EffectiveOutputCapBytes(); got != 20*1024*1024 {
+		t.Fatalf("zero value: got %d, want 20MiB default", got)
+	}
+	if got := (&LocalRunnerConfig{OutputCapBytes: 42}).EffectiveOutputCapBytes(); got != 42 {
+		t.Fatalf("explicit value: got %d, want 42", got)
+	}
+}
+
 func TestIsHardenedRequiresNetworkDeny(t *testing.T) {
 	// Unrestricted egress is a data-exfiltration path no filesystem or
 	// capability control compensates for: a config with every other control
