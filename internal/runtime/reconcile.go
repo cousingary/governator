@@ -35,6 +35,10 @@ const (
 	opStageEvent       = "stage_event"
 	opPanelMembers     = "panel_members"
 	opAssayEvaluation  = "assay_evaluation"
+	opRunUpdate        = "run_update"
+	opRunCompletion    = "run_completion"
+	opRunArtifacts     = "run_artifacts"
+	opQuotaSettle      = "quota_settle"
 )
 
 type breakerFeedbackPayload struct {
@@ -50,6 +54,11 @@ type quotaResetHintPayload struct {
 
 type quotaReleasePayload struct {
 	ReservationID int64 `json:"reservation_id"`
+}
+
+type quotaSettlePayload struct {
+	ReservationID int64   `json:"reservation_id"`
+	Measured      float64 `json:"measured"`
 }
 
 type workspaceDestroyPayload struct {
@@ -78,6 +87,20 @@ type panelMembersPayload struct {
 
 type assayEvaluationPayload struct {
 	Record observability.AssayEvaluationRecord `json:"record"`
+}
+
+type runUpdatePayload struct {
+	Record   RunRecord `json:"record"`
+	Approved string    `json:"approved"`
+}
+
+type completionPayload struct {
+	Record observability.Completion `json:"record"`
+}
+
+type artifactsPayload struct {
+	Records []observability.ArtifactRecord `json:"records"`
+	Created string                         `json:"created"`
 }
 
 // noteOperationalFailure ensures a best-effort operation's error is never
@@ -184,6 +207,12 @@ func dispatchReconcile(ctx context.Context, db *sql.DB, cfg config.Config, item 
 			return err
 		}
 		return quota.Release(db, p.ReservationID, time.Now().UTC())
+	case opQuotaSettle:
+		var p quotaSettlePayload
+		if err := json.Unmarshal([]byte(item.Payload), &p); err != nil {
+			return err
+		}
+		return quota.Settle(db, p.ReservationID, p.Measured, time.Now().UTC())
 	case opSpendHaltCheck:
 		return spend.MaybeHalt(cfg, db)
 	case opWorkspaceDestroy:
@@ -216,6 +245,24 @@ func dispatchReconcile(ctx context.Context, db *sql.DB, cfg config.Config, item 
 			return err
 		}
 		return observability.RecordAssayEvaluation(db, p.Record)
+	case opRunUpdate:
+		var p runUpdatePayload
+		if err := json.Unmarshal([]byte(item.Payload), &p); err != nil {
+			return err
+		}
+		return updateRun(db, p.Record, p.Approved)
+	case opRunCompletion:
+		var p completionPayload
+		if err := json.Unmarshal([]byte(item.Payload), &p); err != nil {
+			return err
+		}
+		return observability.RecordCompletion(db, p.Record)
+	case opRunArtifacts:
+		var p artifactsPayload
+		if err := json.Unmarshal([]byte(item.Payload), &p); err != nil {
+			return err
+		}
+		return observability.RecordArtifacts(db, p.Records, p.Created)
 	default:
 		return fmt.Errorf("reconcile: unknown op_kind %q", item.OpKind)
 	}

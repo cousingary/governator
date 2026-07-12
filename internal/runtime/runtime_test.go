@@ -3,7 +3,6 @@ package runtime
 import (
 	"context"
 	"crypto/ed25519"
-	"crypto/sha1"
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
@@ -324,8 +323,7 @@ func TestLockReclaimsRecycledPID(t *testing.T) {
 	if err := os.MkdirAll(dir, 0700); err != nil {
 		t.Fatal(err)
 	}
-	sum := sha1.Sum([]byte(root))
-	lockPath := filepath.Join(dir, hex.EncodeToString(sum[:])+".lock")
+	lockPath := lockPath(root, home)
 
 	// Simulate a recycled PID: write the current PID with a bogus start ticks
 	// field. The real holder would match; a recycled PID will not.
@@ -388,8 +386,7 @@ func TestLockReclaimsStaleTimestampFallback(t *testing.T) {
 	if err := os.MkdirAll(dir, 0700); err != nil {
 		t.Fatal(err)
 	}
-	sum := sha1.Sum([]byte(root))
-	lockPath := filepath.Join(dir, hex.EncodeToString(sum[:])+".lock")
+	lockPath := lockPath(root, home)
 	// Lock created well past the staleness threshold, held by the current PID
 	// with no start_ticks (the portable fallback path).
 	age := time.Now().UTC().Add(-3 * lockStaleThreshold).UnixNano()
@@ -1355,5 +1352,103 @@ func TestRequiresCompleteTranscript(t *testing.T) {
 				t.Fatalf("requiresCompleteTranscript = %v, want %v", got, tc.want)
 			}
 		})
+	}
+}
+
+func TestLockCanonicalizesSymlinkAlias(t *testing.T) {
+	root, _ := fixture(t)
+	home := t.TempDir()
+	alias := filepath.Join(t.TempDir(), "repo-alias")
+	if err := os.Symlink(root, alias); err != nil {
+		t.Skipf("symlink unavailable: %v", err)
+	}
+	release, err := lock(root, home)
+	if err != nil {
+		t.Fatalf("lock real root: %v", err)
+	}
+	defer release()
+	if _, err := lock(alias, home); err == nil {
+		t.Fatal("symlink alias acquired a separate workspace lock for the same repository")
+	}
+	if lockPath(root, home) != lockPath(alias, home) {
+		t.Fatalf("real root and symlink alias should share lock path: %s vs %s", lockPath(root, home), lockPath(alias, home))
+	}
+}
+
+func TestMergeCommitHookRejectionRollsBackLiveRoot(t *testing.T) {
+	root, bin := fixture(t)
+	home := t.TempDir()
+	t.Setenv("GOV_HOME", home)
+	t.Setenv("GOV_CLAUDE_BIN", bin)
+	promptRoot := t.TempDir()
+	writePrompt(t, promptRoot, "claude-code", "surgeon")
+	t.Setenv("GOV_PROMPTS", promptRoot)
+	hook := filepath.Join(root, ".git", "hooks", "pre-commit")
+	body := "#!/bin/sh\nif [ \"$(git rev-parse --show-toplevel)\" = " + shQuote(root) + " ]; then echo reject-live-root >&2; exit 1; fi\nexit 0\n"
+	if err := os.WriteFile(hook, []byte(body), 0755); err != nil {
+		t.Fatal(err)
+	}
+	rec, err := New().Run(context.Background(), contract(root))
+	if err != nil {
+		t.Fatalf("run should quarantine rather than return merge-hook error: %v", err)
+	}
+	if rec.Status != "QUARANTINED" || !strings.Contains(rec.Message, "merge commit") {
+		t.Fatalf("expected merge commit quarantine, got status=%s message=%s", rec.Status, rec.Message)
+	}
+	status, err := exec.Command("git", "-C", root, "status", "--porcelain").CombinedOutput()
+	if err != nil {
+		t.Fatalf("git status: %v: %s", err, status)
+	}
+	if strings.TrimSpace(string(status)) != "" {
+		t.Fatalf("live root left dirty after rejected merge commit: %q", status)
+	}
+	if _, err := os.Stat(filepath.Join(root, "output", "result.txt")); !os.IsNotExist(err) {
+		t.Fatalf("agent output remained in live root after rollback: %v", err)
+	}
+}
+
+func TestWorkspaceCleanupGuardRemovesGraphPrepareFailureResources(t *testing.T) {
+	root, bin := fixture(t)
+	home := t.TempDir()
+	t.Setenv("GOV_HOME", home)
+	t.Setenv("GOV_CLAUDE_BIN", bin)
+	promptRoot := t.TempDir()
+	writePrompt(t, promptRoot, "claude-code", "surgeon")
+	t.Setenv("GOV_PROMPTS", promptRoot)
+	graphBin := filepath.Join(t.TempDir(), "codegraph")
+	graphScript := "#!/bin/sh\nif [ \"$1\" = version ]; then echo codegraph-test; exit 0; fi\necho graph failed >&2\nexit 2\n"
+	if err := os.WriteFile(graphBin, []byte(graphScript), 0755); err != nil {
+		t.Fatal(err)
+	}
+	cfgPath := filepath.Join(home, "config.yaml")
+	cfg := "graph:\n  mode: required\n  provider: codegraph\n  bin: " + graphBin + "\n"
+	if err := os.WriteFile(cfgPath, []byte(cfg), 0644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("GOV_CONFIG", cfgPath)
+	rec, err := New().Run(context.Background(), contract(root))
+	if err == nil {
+		t.Fatalf("expected required graph provider failure, got record=%+v", rec)
+	}
+	entries, readErr := os.ReadDir(filepath.Join(home, "worktrees"))
+	if readErr != nil && !os.IsNotExist(readErr) {
+		t.Fatalf("read worktrees: %v", readErr)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("cleanup guard left worktree dirs: %v", entries)
+	}
+	wt, wtErr := exec.Command("git", "-C", root, "worktree", "list", "--porcelain").CombinedOutput()
+	if wtErr != nil {
+		t.Fatalf("git worktree list: %v: %s", wtErr, wt)
+	}
+	if strings.Contains(string(wt), filepath.Join(home, "worktrees")) {
+		t.Fatalf("cleanup guard left registered git worktree: %s", wt)
+	}
+	branches, brErr := exec.Command("git", "-C", root, "branch", "--list", "gov/job/*").CombinedOutput()
+	if brErr != nil {
+		t.Fatalf("git branch --list: %v: %s", brErr, branches)
+	}
+	if strings.TrimSpace(string(branches)) != "" {
+		t.Fatalf("cleanup guard left job branch: %s", branches)
 	}
 }

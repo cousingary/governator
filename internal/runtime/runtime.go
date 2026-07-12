@@ -3,6 +3,7 @@ package runtime
 import (
 	"bufio"
 	"context"
+	"crypto/rand"
 	"crypto/sha1"
 	"crypto/sha256"
 	"database/sql"
@@ -15,6 +16,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	goruntime "runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -118,6 +120,12 @@ func updateRun(db *sql.DB, r RunRecord, approved string) error {
 	return err
 }
 
+func updateRunGraph(db *sql.DB, r RunRecord) error {
+	_, err := db.Exec(`UPDATE runs SET prompt_version=?,envelope_json=?,notes=?,graph_provider=?,graph_version=?,graph_fingerprint=?,graph_files=?,graph_nodes=?,graph_edges=?,graph_db_bytes=?,identity_hash=? WHERE id=?`,
+		r.PromptVersion, r.Envelope, r.Notes, r.Graph.Provider, r.Graph.Version, r.Graph.Fingerprint, r.Graph.FileCount, r.Graph.NodeCount, r.Graph.EdgeCount, r.Graph.DBSizeBytes, r.IdentityHash, r.ID)
+	return err
+}
+
 func Last(id string) (RunRecord, error) {
 	db, err := dbOpen(Home())
 	if err != nil {
@@ -211,12 +219,44 @@ func processStartTicks(pid int) string {
 	return fields[19]
 }
 
+// canonicalLockIdentity returns the physical identity used for the workspace
+// lock. A path string is not authority: /repo and /alias-to-repo must contend
+// for one lock. Resolve symlinks first, then prefer the device/inode pair
+// (with the resolved path retained only as diagnostic/collision material).
+func canonicalLockIdentity(root string) string {
+	abs, err := filepath.Abs(root)
+	if err != nil {
+		abs = filepath.Clean(root)
+	}
+	resolved := abs
+	if eval, err := filepath.EvalSymlinks(abs); err == nil {
+		resolved = eval
+	}
+	if goruntime.GOOS == "windows" {
+		resolved = strings.ToLower(resolved)
+	}
+	if info, err := os.Stat(resolved); err == nil {
+		if st, ok := info.Sys().(*syscall.Stat_t); ok {
+			return fmt.Sprintf("dev=%d ino=%d path=%s", st.Dev, st.Ino, resolved)
+		}
+	}
+	return "path=" + resolved
+}
+
 // lockPath returns the workspace lock file path for root, shared by lock()
 // and the Phase 4 recovery checks (which need to read a lock's liveness
 // without acquiring it).
 func lockPath(root, home string) string {
-	sum := sha1.Sum([]byte(root))
+	sum := sha1.Sum([]byte(canonicalLockIdentity(root)))
 	return filepath.Join(home, "locks", hex.EncodeToString(sum[:])+".lock")
+}
+
+func randomLockToken() string {
+	b := make([]byte, 16)
+	if _, err := rand.Read(b); err != nil {
+		return fmt.Sprintf("fallback-%d-%d", os.Getpid(), time.Now().UTC().UnixNano())
+	}
+	return hex.EncodeToString(b)
 }
 
 func lock(root, home string) (func(), error) {
@@ -225,28 +265,63 @@ func lock(root, home string) (func(), error) {
 		return nil, err
 	}
 	p := lockPath(root, home)
-	for tries := 0; tries < 2; tries++ {
-		pid := os.Getpid()
-		created := time.Now().UTC().UnixNano()
-		// Format: "<pid> <created_unix_nano> <start_ticks>". start_ticks is
-		// empty off Linux; on Linux it lets us reject a recycled PID precisely
-		// rather than relying on lockStaleThreshold alone. The first two
-		// fields stay parseable even for a hand-written or old lock that only
-		// contained a pid.
-		body := fmt.Sprintf("%d %d %s", pid, created, processStartTicks(pid))
-		f, err := os.OpenFile(p, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
-		if err == nil {
-			fmt.Fprint(f, body)
+	f, err := os.OpenFile(p, os.O_CREATE|os.O_RDWR, 0600)
+	if err != nil {
+		return nil, err
+	}
+	locked := false
+	defer func() {
+		if !locked {
 			f.Close()
-			return func() { _ = os.Remove(p) }, nil
 		}
-		if !isLiveLock(p) {
-			_ = os.Remove(p)
-			continue
-		}
+	}()
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
 		return nil, fmt.Errorf("workspace locked by an in-flight governator run (lock %s)", p)
 	}
-	return nil, errors.New("cannot acquire workspace lock")
+	locked = true
+	// If an old marker-only lock belongs to a live process, honor it even
+	// though that process cannot hold our advisory flock. This preserves
+	// recovery correctness across upgrades and also prevents a re-entrant lock
+	// in this same process from deleting a lock it did not create.
+	if isLiveLock(p) {
+		_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+		locked = false
+		return nil, fmt.Errorf("workspace locked by an in-flight governator run (lock %s)", p)
+	}
+	token := randomLockToken()
+	body := fmt.Sprintf("%d %d %s %s", os.Getpid(), time.Now().UTC().UnixNano(), processStartTicks(os.Getpid()), token)
+	if err := f.Truncate(0); err != nil {
+		_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+		locked = false
+		return nil, err
+	}
+	if _, err := f.Seek(0, 0); err != nil {
+		_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+		locked = false
+		return nil, err
+	}
+	if _, err := fmt.Fprint(f, body); err != nil {
+		_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+		locked = false
+		return nil, err
+	}
+	if err := f.Sync(); err != nil {
+		_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+		locked = false
+		return nil, err
+	}
+	return func() {
+		remove := false
+		if b, err := os.ReadFile(p); err == nil {
+			parts := strings.Fields(strings.TrimSpace(string(b)))
+			remove = len(parts) >= 4 && parts[3] == token
+		}
+		if remove {
+			_ = os.Remove(p)
+		}
+		_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+		_ = f.Close()
+	}, nil
 }
 
 // isLiveLock reports whether an existing lock file points at a genuinely
@@ -495,6 +570,69 @@ func requiresCompleteTranscript(c contracts.Contract) bool {
 		return true
 	}
 	return c.Assay != nil && c.Assay.Enforcement == assay.EnforcementBlocking
+}
+
+const workspaceCleanupTimeout = 2 * time.Minute
+
+func destroyWorkspaceWithOutbox(db *sql.DB, runID string, rn runner.Runner, ws runner.Workspace, approved bool) {
+	ctx, cancel := context.WithTimeout(context.Background(), workspaceCleanupTimeout)
+	defer cancel()
+	if err := rn.Destroy(ctx, ws, approved); err != nil {
+		payload, _ := json.Marshal(workspaceDestroyPayload{
+			Path: ws.Path, Root: ws.Root, Branch: ws.Branch, Git: ws.Git, Container: ws.Container, Approved: approved,
+		})
+		noteOperationalFailure(db, runID, opWorkspaceDestroy, err, string(payload))
+	}
+}
+
+func gitStatusPorcelain(ctx context.Context, root string) (string, error) {
+	code, out, err := shell(ctx, root, "git status --porcelain")
+	if err != nil || code != 0 {
+		return out, fmt.Errorf("git status --porcelain: %s", strings.TrimSpace(out))
+	}
+	return strings.TrimSpace(out), nil
+}
+
+func requireCleanLiveRoot(ctx context.Context, root string) error {
+	status, err := gitStatusPorcelain(ctx, root)
+	if err != nil {
+		return err
+	}
+	if status != "" {
+		return fmt.Errorf("live root dirty before merge: %s", status)
+	}
+	return nil
+}
+
+func rollbackLiveRoot(ctx context.Context, root, previousHead string, before snapshot, mergePaths []string) error {
+	if code, out, err := shell(ctx, root, "git reset --hard "+shQuote(previousHead)); err != nil || code != 0 {
+		return fmt.Errorf("rollback reset --hard: %s", strings.TrimSpace(out))
+	}
+	seen := map[string]bool{}
+	for _, p := range mergePaths {
+		if p == "" || seen[p] {
+			continue
+		}
+		seen[p] = true
+		// Clean only the paths this Governator merge was about to land; never
+		// run a broad git clean over the operator's repository.
+		_, _, _ = shell(ctx, root, "git clean -fd -- "+shQuote(p))
+	}
+	status, err := gitStatusPorcelain(ctx, root)
+	if err != nil {
+		return err
+	}
+	if status != "" {
+		return fmt.Errorf("rollback left live root dirty: %s", status)
+	}
+	after, err := fingerprint(root)
+	if err != nil {
+		return fmt.Errorf("rollback fingerprint: %w", err)
+	}
+	if snapshotDigest(after) != snapshotDigest(before) {
+		return errors.New("rollback fingerprint mismatch")
+	}
+	return nil
 }
 
 func shQuote(s string) string { return "'" + strings.ReplaceAll(s, "'", "'\"'\"'") + "'" }
@@ -1371,15 +1509,37 @@ func (r *Runner) runOnce(ctx context.Context, c contracts.Contract) (RunRecord, 
 	if err != nil {
 		return RunRecord{}, err
 	}
+	cleanupPending := true
+	defer func() {
+		if cleanupPending {
+			// Pre-terminal failures (for example required graph provider failure)
+			// transfer no ownership to quarantine; remove both worktree and job
+			// branch so reconcile/cleanup has no hidden resource leak.
+			destroyWorkspaceWithOutbox(db, id, rn, ws, true)
+		}
+	}()
 	work, branch := ws.Path, ws.Branch
+	transcript := filepath.Join(r.Home, "transcripts", id+".jsonl")
+	spec := agents.SpecFromContract(c, work)
+	rec := RunRecord{ID: id, JobID: c.JobID, JobType: c.JobType, Agent: resolved.Agent, Mode: string(c.Mode), Status: "RUNNING", Root: root, Worktree: work, Branch: branch, Transcript: transcript, Created: time.Now().UTC().Format(time.RFC3339Nano), PromptVersion: promptVersion.ID, Envelope: envelopeJSON(spec, agent.Capabilities()), RepairOf: c.RepairLineage, IdentityHash: identity.Hash()}
+	if err = insertRun(db, rec, hash, head); err != nil {
+		return rec, err
+	}
 	if err := observability.RecordStage(db, id, "WORKSPACE_READY", "", time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
-		return RunRecord{}, err
+		return rec, err
 	}
 	graphSnapshot, err := contextgraph.Prepare(ctx, work)
 	if err != nil {
-		return RunRecord{}, err
+		return rec, err
 	}
 	c.Allowed.Execute = append(c.Allowed.Execute, contextgraph.CommandPatterns(graphSnapshot)...)
+	rec.Graph = graphSnapshot
+	if graphSnapshot.Warning != "" {
+		rec.Notes = appendNote(rec.Notes, "graph_warning: "+graphSnapshot.Warning)
+	}
+	if err := updateRunGraph(db, rec); err != nil {
+		return rec, err
+	}
 	canaryName := ".governator-canary"
 	canaryPath := filepath.Join(work, canaryName)
 	if _, statErr := os.Lstat(canaryPath); !os.IsNotExist(statErr) {
@@ -1391,15 +1551,6 @@ func (r *Runner) runOnce(ctx context.Context, c contracts.Contract) (RunRecord, 
 	stagedArtifacts, err := stageConsumedArtifacts(db, work, c)
 	if err != nil {
 		return RunRecord{}, err
-	}
-	transcript := filepath.Join(r.Home, "transcripts", id+".jsonl")
-	spec := agents.SpecFromContract(c, work)
-	rec := RunRecord{ID: id, JobID: c.JobID, JobType: c.JobType, Agent: resolved.Agent, Mode: string(c.Mode), Status: "RUNNING", Root: root, Worktree: work, Branch: branch, Transcript: transcript, Created: time.Now().UTC().Format(time.RFC3339Nano), PromptVersion: promptVersion.ID, Envelope: envelopeJSON(spec, agent.Capabilities()), Graph: graphSnapshot, RepairOf: c.RepairLineage, IdentityHash: identity.Hash()}
-	if graphSnapshot.Warning != "" {
-		rec.Notes = appendNote(rec.Notes, "graph_warning: "+graphSnapshot.Warning)
-	}
-	if err = insertRun(db, rec, hash, head); err != nil {
-		return rec, err
 	}
 	if err = observability.RecordIdentity(db, c.JobID, c.JobType, resolved.Agent, rec.Created); err != nil {
 		return rec, err
@@ -1683,28 +1834,56 @@ func (r *Runner) runOnce(ctx context.Context, c contracts.Contract) (RunRecord, 
 		runAssayStep(ctx, db, cfg, c, id, hash, rec.Agent, artifactRecords, &violations)
 	}
 	rec.Diff = workspaceDiff(root, work, git, changed, deleted)
+	rootCommitted := false
 	if len(violations) == 0 {
 		if git {
-			_, _, _ = shell(ctx, work, "git add -A -- . ':(exclude).codegraph' ':(exclude).governator'")
-			cm := fmt.Sprintf("Governator job %s\n\nGov-Run: %s", c.JobID, id)
-			code, out, e := shell(ctx, work, "git commit --allow-empty -m "+shQuote(cm))
-			if e != nil || code != 0 {
-				violations = append(violations, "branch commit: "+out)
+			mergePaths := append(append([]string{}, changed...), deleted...)
+			if err := requireCleanLiveRoot(ctx, root); err != nil {
+				violations = append(violations, err.Error())
 			}
 			if len(violations) == 0 {
-				code, out, e = shell(ctx, root, "git merge --squash "+shQuote(branch))
+				detail, _ := json.Marshal(map[string]any{"previous_head": head, "paths": mergePaths})
+				if err := observability.RecordStage(db, id, "MERGE_INTENT", string(detail), time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
+					violations = append(violations, "merge intent ledger: "+err.Error())
+				}
+			}
+			_, _, _ = shell(ctx, work, "git add -A -- . ':(exclude).codegraph' ':(exclude).governator'")
+			cm := fmt.Sprintf("Governator job %s\n\nGov-Run: %s", c.JobID, id)
+			if len(violations) == 0 {
+				code, out, e := shell(ctx, work, "git commit --allow-empty -m "+shQuote(cm))
+				if e != nil || code != 0 {
+					violations = append(violations, "branch commit: "+out)
+				}
+			}
+			if len(violations) == 0 {
+				code, out, e := shell(ctx, root, "git merge --squash "+shQuote(branch))
 				if e != nil || code != 0 {
 					violations = append(violations, "squash merge: "+out)
 				}
 			}
 			if len(violations) == 0 {
-				code, out, e = shell(ctx, root, "git commit --allow-empty -m "+shQuote(cm))
+				if err := observability.RecordStage(db, id, "MERGE_APPLIED", "", time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
+					violations = append(violations, "merge applied ledger: "+err.Error())
+				}
+			}
+			if len(violations) == 0 {
+				code, out, e := shell(ctx, root, "git commit --allow-empty -m "+shQuote(cm))
 				if e != nil || code != 0 {
 					violations = append(violations, "merge commit: "+out)
 				}
 			}
+			if len(violations) > 0 {
+				if err := rollbackLiveRoot(ctx, root, head, liveBefore, mergePaths); err != nil {
+					violations = append(violations, "merge rollback: "+err.Error())
+				}
+			}
 			if len(violations) == 0 {
+				rootCommitted = true
 				rec.Commit, _ = gitHead(root)
+				if err := observability.RecordStage(db, id, "ROOT_COMMITTED", rec.Commit, time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
+					payload, _ := json.Marshal(stageEventPayload{RunID: id, Stage: "ROOT_COMMITTED", Detail: rec.Commit})
+					noteOperationalFailure(db, id, opStageEvent, err, string(payload))
+				}
 			}
 		} else {
 			if err := captureRecall(r.Home, id, root, append(append([]string{}, changed...), deleted...)); err != nil {
@@ -1719,7 +1898,12 @@ func (r *Runner) runOnce(ctx context.Context, c contracts.Contract) (RunRecord, 
 		}
 		if len(violations) == 0 {
 			if err := observability.RecordStage(db, id, "MERGED", "", time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
-				return rec, err
+				if rootCommitted {
+					payload, _ := json.Marshal(stageEventPayload{RunID: id, Stage: "MERGED", Detail: ""})
+					noteOperationalFailure(db, id, opStageEvent, err, string(payload))
+				} else {
+					return rec, err
+				}
 			}
 		}
 	}
@@ -1762,7 +1946,25 @@ func (r *Runner) runOnce(ctx context.Context, c contracts.Contract) (RunRecord, 
 			_, _, _ = shell(ctx, work, "git commit --allow-empty -m "+shQuote("Quarantined Governator run "+id))
 		}
 	}
+	ledgerPending := func(opKind string, opErr error, payload string) (RunRecord, error) {
+		noteOperationalFailure(db, id, opKind, opErr, payload)
+		rec.Status = "MERGED_LEDGER_PENDING"
+		rec.Message = "root committed; ledger finalization pending: " + opErr.Error()
+		_, _ = db.Exec(`UPDATE runs SET status=?,message=?,commit_hash=?,identity_hash=? WHERE id=?`, rec.Status, rec.Message, rec.Commit, rec.IdentityHash, rec.ID)
+		_ = observability.RecordStage(db, id, "MERGED_LEDGER_PENDING", opKind+": "+opErr.Error(), time.Now().UTC().Format(time.RFC3339Nano))
+		return rec, nil
+	}
+	if rootCommitted {
+		if err := observability.RecordStage(db, id, "LEDGER_FINALIZING", "", time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
+			payload, _ := json.Marshal(stageEventPayload{RunID: id, Stage: "LEDGER_FINALIZING", Detail: ""})
+			return ledgerPending(opStageEvent, err, string(payload))
+		}
+	}
 	if err := observability.RecordStage(db, id, rec.Status, "", time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
+		if rootCommitted {
+			payload, _ := json.Marshal(stageEventPayload{RunID: id, Stage: rec.Status, Detail: ""})
+			return ledgerPending(opStageEvent, err, string(payload))
+		}
 		return rec, err
 	}
 	approved := head
@@ -1779,9 +1981,13 @@ func (r *Runner) runOnce(ctx context.Context, c contracts.Contract) (RunRecord, 
 	identity.ApprovedHead = approved
 	rec.IdentityHash = identity.Hash()
 	if err := updateRun(db, rec, approved); err != nil {
+		if rootCommitted {
+			payload, _ := json.Marshal(runUpdatePayload{Record: rec, Approved: approved})
+			return ledgerPending(opRunUpdate, err, string(payload))
+		}
 		return rec, err
 	}
-	if err := observability.RecordCompletion(db, observability.Completion{
+	completion := observability.Completion{
 		RunID:           rec.ID,
 		Agent:           rec.Agent,
 		JobType:         rec.JobType,
@@ -1797,10 +2003,20 @@ func (r *Runner) runOnce(ctx context.Context, c contracts.Contract) (RunRecord, 
 		Usage:           rec.Usage,
 		ToolCalls:       rec.ToolCalls,
 		TranscriptBytes: rec.TranscriptBytes,
-	}); err != nil {
+	}
+	if err := observability.RecordCompletion(db, completion); err != nil {
+		if rootCommitted {
+			payload, _ := json.Marshal(completionPayload{Record: completion})
+			return ledgerPending(opRunCompletion, err, string(payload))
+		}
 		return rec, err
 	}
-	if err := observability.RecordArtifacts(db, artifactRecords, time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
+	artifactsCreated := time.Now().UTC().Format(time.RFC3339Nano)
+	if err := observability.RecordArtifacts(db, artifactRecords, artifactsCreated); err != nil {
+		if rootCommitted {
+			payload, _ := json.Marshal(artifactsPayload{Records: artifactRecords, Created: artifactsCreated})
+			return ledgerPending(opRunArtifacts, err, string(payload))
+		}
 		return rec, err
 	}
 	if quotaReservation.ID != 0 {
@@ -1809,6 +2025,10 @@ func (r *Runner) runOnce(ctx context.Context, c contracts.Contract) (RunRecord, 
 			measuredQuota = float64(rec.Usage.TotalTokens)
 		}
 		if err := quota.Settle(db, quotaReservation.ID, measuredQuota, time.Now().UTC()); err != nil {
+			if rootCommitted {
+				payload, _ := json.Marshal(quotaSettlePayload{ReservationID: quotaReservation.ID, Measured: measuredQuota})
+				return ledgerPending(opQuotaSettle, err, string(payload))
+			}
 			return rec, err
 		}
 		quotaSettled = true
@@ -1844,13 +2064,15 @@ func (r *Runner) runOnce(ctx context.Context, c contracts.Contract) (RunRecord, 
 	if err := spend.MaybeHalt(cfg, db); err != nil {
 		noteOperationalFailure(db, rec.ID, opSpendHaltCheck, err, "{}")
 	}
-	runApproved := rec.Status == "APPROVED"
-	if err := rn.Destroy(context.Background(), ws, runApproved); err != nil {
-		payload, _ := json.Marshal(workspaceDestroyPayload{
-			Path: ws.Path, Root: ws.Root, Branch: ws.Branch, Git: ws.Git, Container: ws.Container, Approved: runApproved,
-		})
-		noteOperationalFailure(db, rec.ID, opWorkspaceDestroy, err, string(payload))
+	if rootCommitted {
+		if err := observability.RecordStage(db, id, "COMPLETE", "", time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
+			payload, _ := json.Marshal(stageEventPayload{RunID: id, Stage: "COMPLETE", Detail: ""})
+			noteOperationalFailure(db, id, opStageEvent, err, string(payload))
+		}
 	}
+	runApproved := rec.Status == "APPROVED"
+	destroyWorkspaceWithOutbox(db, rec.ID, rn, ws, runApproved)
+	cleanupPending = false
 	return rec, nil
 }
 
