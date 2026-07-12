@@ -136,12 +136,12 @@ claims:
       platform: linux_amd64
 
   - id: docker-hardening
-    title: "DockerRunner enforces non-root user, read-only rootfs, cap-drop=ALL, no-new-privileges, seccomp/AppArmor, tmpfs, digest-pinned images, canonicalized mounts, and default-deny network egress"
+    title: "DockerRunner enforces non-root user, read-only rootfs, cap-drop=ALL, no-new-privileges, seccomp/AppArmor, tmpfs, digest-pinned images, and default-deny network egress"
     first_shipped_version: v1.4-session3
     claimed_maturity: shipped
     implementation:
       - file: internal/runner/docker.go
-        symbols: [runArgs, canonicalMount, RemoveContainer]
+        symbols: [runArgs, RemoveContainer]
     tests:
       - file: internal/runner/docker_test.go
         funcs:
@@ -157,6 +157,57 @@ claims:
       evidence_file: evidence/release-v1.4.1.json
       commit: 9c25e43e56d02b0f1b679ccd99b66813648bdd91
       platform: linux_amd64
+
+  - id: docker-hardened-verification-and-credential-containment
+    title: "Session 6 (Sol High 8/9/10): IsHardened rejects root/UID0 and requires a true 64-hex digest (AllowMutableTag is a logged exception, never containment); credential_mounts resolves symlinks, restricts to configured credential roots, allows only regular files unless a directory is explicitly authorized, and unconditionally refuses container/daemon control sockets; DockerRunner.Observe blocks approval (returns an error) when a hardened run's applied container configuration can't be verified to match what was declared, instead of degrading to a note"
+    first_shipped_version: v1.5-session6
+    claimed_maturity: tested
+    implementation:
+      - file: internal/contracts/schema.go
+        symbols: [IsHardened, validDockerUser, imagePinned, MutableTagException]
+      - file: internal/runner/docker.go
+        symbols: [credentialMountArgs, resolveCredentialMount, hardenedMismatches, Observe]
+    tests:
+      - file: internal/contracts/schema_test.go
+        funcs:
+          - TestDockerHardenedRejectsRootUser
+          - TestMutableTagException
+      - file: internal/runner/docker_test.go
+        funcs:
+          - TestCredentialMountNoRootsConfiguredRefuses
+          - TestCredentialMountOutsideRootsRejected
+          - TestCredentialMountSymlinkEscapeRejected
+          - TestCredentialMountDirectoryRequiresAuthorization
+          - TestCredentialMountSpecialFilesRejectedEvenIfDirAuthorized
+          - TestCredentialMountDockerSocketRejected
+          - TestDockerObserveHardenedNoContainerFailsClosed
+          - TestDockerObserveHardenedLiveMatchApproves
+          - TestDockerObserveHardenedLiveMismatchBlocks
+
+  - id: normalized-backend-event-protocol
+    title: "Session 6 (Sol High 12): per-backend transcript-format EventKind coverage is declared explicitly (policy.formatEventCoverage); a starter temporal rule that cannot fire for a format because the format's parser doesn't supply a required event kind is reported via policy.UnenforceableRules and flagged (or blocked, per doctrine.unenforceable_rule_action) rather than silently never firing; OpenCode/Pi transcript parsing was generalized from bash-only exec extraction to generic tool classification, giving them real read/write/network coverage"
+    first_shipped_version: v1.5-session6
+    claimed_maturity: tested
+    implementation:
+      - file: internal/policy/events.go
+        symbols: [SupportsEventKind, UnenforceableRules]
+      - file: internal/runtime/runtime.go
+        symbols: [transcriptEvent, auditTranscript]
+      - file: internal/config/config.go
+        symbols: [Doctrine]
+    tests:
+      - file: internal/policy/events_test.go
+        funcs:
+          - TestUnenforceableRulesCodexMissingReadWriteNetwork
+          - TestUnenforceableRulesClaudeGLMFullCoverage
+          - TestUnenforceableRulesOpenCodePiMissingToolOutputOnly
+          - TestUnenforceableRulesUnknownFormatEverythingUnenforceable
+      - file: internal/runtime/transcript_test.go
+        funcs:
+          - TestAuditTranscriptCodexUnenforceableRulesFlaggedByDefault
+          - TestAuditTranscriptUnenforceableRulesBlockWhenConfigured
+          - TestAuditTranscriptOpenCodeGenericToolClassificationEnablesRules
+          - TestAuditTranscriptPiGenericToolClassificationEnablesRules
 
   - id: loud-output-truncation
     title: "Output truncation is recorded (bytes accepted/discarded), emits an OUTPUT_TRUNCATED ledger event, and blocks/quarantines runs whose complete transcript was required"

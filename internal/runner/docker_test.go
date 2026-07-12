@@ -7,6 +7,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -135,57 +136,62 @@ func TestDockerRunnerNetworkAllowOptIn(t *testing.T) {
 	}
 }
 
-// TestDockerRunArgsCredentialMounts needs no docker daemon: runArgs is a
-// pure function. A bare host path (the only form contract validation
-// requires) must become host:host:ro — appending ":ro" directly would hand
-// docker "ro" as the container path and fail every bare-path mount at
-// launch. A host:container pair passes through with ":ro" appended.
-func TestDockerRunArgsCredentialMounts(t *testing.T) {
-	d := &DockerRunner{Config: contracts.DockerRunnerConfig{
-		Image:            dockerTestImage,
-		CredentialMounts: []string{"/host/.netrc", "/host/creds:/root/creds"},
-	}}
-	args := d.runArgs(Workspace{Container: "c", Path: "/ws"}, "bin", nil)
-	joined := ""
-	for _, a := range args {
-		joined += a + "\n"
-	}
-	for _, want := range []string{"/host/.netrc:/host/.netrc:ro", "/host/creds:/root/creds:ro"} {
-		found := false
-		for _, a := range args {
-			if a == want {
-				found = true
-				break
-			}
-		}
-		if !found {
-			t.Errorf("expected mount arg %q in runArgs output:\n%s", want, joined)
-		}
+// isolateConfig points config.Current() at a nonexistent config file (so no
+// real operator config leaks into the test) and, when root != "", declares
+// it as the sole credential root via GOV_CREDENTIAL_ROOTS. Mirrors the
+// isolation pattern internal/config's own tests use.
+func isolateConfig(t *testing.T, root string) {
+	t.Helper()
+	t.Setenv("GOV_CONFIG", filepath.Join(t.TempDir(), "nonexistent-config.yaml"))
+	if root != "" {
+		t.Setenv("GOV_CREDENTIAL_ROOTS", root)
 	}
 }
 
-// TestDockerRunArgsCanonicalizesMounts pins Session 3b: mount paths are
-// filepath.Clean'd so a relative segment or trailing slash can't point the
-// bind elsewhere than validation intended. No daemon required.
-func TestDockerRunArgsCanonicalizesMounts(t *testing.T) {
+// TestDockerRunArgsCredentialMounts needs no docker daemon: runArgs is a
+// pure function over the filesystem and config. Session 6 (Sol High 9)
+// retired the host:container override form and requires every mount to
+// resolve, under an operator-configured credential root, to a real regular
+// file — so this test now mounts a real temp file rather than an arbitrary
+// unchecked path, and asserts the fixed container-side destination.
+func TestDockerRunArgsCredentialMounts(t *testing.T) {
+	root := t.TempDir()
+	netrc := filepath.Join(root, ".netrc")
+	if err := os.WriteFile(netrc, []byte("machine example login x"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	isolateConfig(t, root)
+
 	d := &DockerRunner{Config: contracts.DockerRunnerConfig{
 		Image:            dockerTestImage,
-		CredentialMounts: []string{"/host/../host/.netrc", "/host/creds/:/root/creds/"},
+		CredentialMounts: []string{netrc},
 	}}
-	args := d.runArgs(Workspace{Container: "c", Path: "/ws/"}, "bin", nil)
-	want := map[string]bool{
-		"/host/.netrc:/host/.netrc:ro": true,
-		"/host/creds:/root/creds:ro":   true,
+	args, err := d.runArgs(Workspace{Container: "c", Path: "/ws"}, "bin", nil)
+	if err != nil {
+		t.Fatalf("runArgs: %v", err)
 	}
+	want := netrc + ":" + credentialContainerRoot + "/.netrc:ro"
+	found := false
 	for _, a := range args {
-		if want[a] {
-			delete(want, a)
+		if a == want {
+			found = true
+			break
 		}
 	}
-	if len(want) > 0 {
-		t.Errorf("missing canonicalized mount args %v in: %v", want, args)
+	if !found {
+		t.Errorf("expected mount arg %q in runArgs output:\n%s", want, strings.Join(args, "\n"))
 	}
-	// Workspace bind is also canonicalized (trailing slash dropped).
+}
+
+// TestDockerRunArgsCanonicalizesMounts pins Session 3b: the workspace bind is
+// filepath.Clean'd so a trailing slash can't shift where the repo lands.
+func TestDockerRunArgsCanonicalizesMounts(t *testing.T) {
+	isolateConfig(t, "")
+	d := &DockerRunner{Config: contracts.DockerRunnerConfig{Image: dockerTestImage}}
+	args, err := d.runArgs(Workspace{Container: "c", Path: "/ws/"}, "bin", nil)
+	if err != nil {
+		t.Fatalf("runArgs: %v", err)
+	}
 	foundWS := false
 	for _, a := range args {
 		if a == "/ws:/workspace" {
@@ -201,6 +207,7 @@ func TestDockerRunArgsCanonicalizesMounts(t *testing.T) {
 // to the expected docker flag, and absent controls produce no flag (so prior
 // job YAML stays byte-identical). No daemon required.
 func TestDockerRunArgsHardeningFlags(t *testing.T) {
+	isolateConfig(t, "")
 	d := &DockerRunner{Config: contracts.DockerRunnerConfig{
 		Image:                   "img@sha256:" + strings.Repeat("a", 64),
 		User:                    "65532:65532",
@@ -213,7 +220,10 @@ func TestDockerRunArgsHardeningFlags(t *testing.T) {
 		Network:                 "allow",
 		DenyMetadataAndLocalNet: true,
 	}}
-	args := d.runArgs(Workspace{Container: "c", Path: "/ws"}, "bin", nil)
+	args, err := d.runArgs(Workspace{Container: "c", Path: "/ws"}, "bin", nil)
+	if err != nil {
+		t.Fatalf("runArgs: %v", err)
+	}
 	joined := strings.Join(args, "\n")
 	wants := []string{
 		"--user", "65532:65532",
@@ -243,8 +253,12 @@ func TestDockerRunArgsHardeningFlags(t *testing.T) {
 // (no hardening fields) produces args with none of the new flags — the
 // regression guard for "prior job YAML stays byte-identical."
 func TestDockerRunArgsDefaultDenyNoHardening(t *testing.T) {
+	isolateConfig(t, "")
 	d := &DockerRunner{Config: contracts.DockerRunnerConfig{Image: dockerTestImage}}
-	args := d.runArgs(Workspace{Container: "c", Path: "/ws"}, "bin", nil)
+	args, err := d.runArgs(Workspace{Container: "c", Path: "/ws"}, "bin", nil)
+	if err != nil {
+		t.Fatalf("runArgs: %v", err)
+	}
 	joined := strings.Join(args, "\n")
 	for _, forbidden := range []string{"--read-only", "--cap-drop", "--user", "--tmpfs", "no-new-privileges", "seccomp", "apparmor", "--add-host"} {
 		if strings.Contains(joined, forbidden) {
@@ -253,6 +267,164 @@ func TestDockerRunArgsDefaultDenyNoHardening(t *testing.T) {
 	}
 	if !strings.Contains(joined, "--network") {
 		t.Errorf("plain config must default-deny via --network none, got:\n%s", joined)
+	}
+}
+
+// TestCredentialMountNoRootsConfiguredRefuses is the direct regression test
+// for the fail-closed default: with no credential root configured, every
+// credential mount is refused, even a mount that would otherwise be a
+// perfectly ordinary regular file.
+func TestCredentialMountNoRootsConfiguredRefuses(t *testing.T) {
+	dir := t.TempDir()
+	f := filepath.Join(dir, "secret")
+	if err := os.WriteFile(f, []byte("x"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	isolateConfig(t, "")
+	d := &DockerRunner{Config: contracts.DockerRunnerConfig{Image: dockerTestImage, CredentialMounts: []string{f}}}
+	if _, err := d.runArgs(Workspace{Container: "c", Path: "/ws"}, "bin", nil); err == nil {
+		t.Fatal("expected an error with no credential roots configured")
+	}
+}
+
+// TestCredentialMountOutsideRootsRejected is Sol High 9's "restrict host
+// paths to configured credential roots": a mount resolving outside every
+// configured root must be refused even though it's a perfectly ordinary file.
+func TestCredentialMountOutsideRootsRejected(t *testing.T) {
+	root := t.TempDir()
+	outside := t.TempDir()
+	f := filepath.Join(outside, "secret")
+	if err := os.WriteFile(f, []byte("x"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	isolateConfig(t, root)
+	d := &DockerRunner{Config: contracts.DockerRunnerConfig{Image: dockerTestImage, CredentialMounts: []string{f}}}
+	if _, err := d.runArgs(Workspace{Container: "c", Path: "/ws"}, "bin", nil); err == nil {
+		t.Fatal("expected an error for a mount outside every configured credential root")
+	}
+}
+
+// TestCredentialMountSymlinkEscapeRejected is Sol High 9's "resolve
+// symlinks": a symlink inside an authorized root pointing OUTSIDE every
+// root must not smuggle an arbitrary host file in as a "credential" just
+// because its link lives in the right place.
+func TestCredentialMountSymlinkEscapeRejected(t *testing.T) {
+	root := t.TempDir()
+	outside := t.TempDir()
+	realSecret := filepath.Join(outside, "real-secret")
+	if err := os.WriteFile(realSecret, []byte("x"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(root, "innocuous-looking-cred")
+	if err := os.Symlink(realSecret, link); err != nil {
+		t.Fatal(err)
+	}
+	isolateConfig(t, root)
+	d := &DockerRunner{Config: contracts.DockerRunnerConfig{Image: dockerTestImage, CredentialMounts: []string{link}}}
+	if _, err := d.runArgs(Workspace{Container: "c", Path: "/ws"}, "bin", nil); err == nil {
+		t.Fatal("expected an error for a symlink resolving outside every configured credential root")
+	}
+}
+
+// TestCredentialMountDirectoryRequiresAuthorization is Sol High 9's
+// "allow only regular files by default": a directory mount must be refused
+// unless explicitly authorized, even though it's under a configured root.
+func TestCredentialMountDirectoryRequiresAuthorization(t *testing.T) {
+	root := t.TempDir()
+	sub := filepath.Join(root, "aws")
+	if err := os.Mkdir(sub, 0700); err != nil {
+		t.Fatal(err)
+	}
+	isolateConfig(t, root)
+
+	unauthorized := &DockerRunner{Config: contracts.DockerRunnerConfig{Image: dockerTestImage, CredentialMounts: []string{sub}}}
+	if _, err := unauthorized.runArgs(Workspace{Container: "c", Path: "/ws"}, "bin", nil); err == nil {
+		t.Fatal("expected an error for an unauthorized directory mount")
+	}
+
+	authorized := &DockerRunner{Config: contracts.DockerRunnerConfig{
+		Image: dockerTestImage, CredentialMounts: []string{sub},
+		CredentialMountAllowDirs: []string{sub},
+	}}
+	args, err := authorized.runArgs(Workspace{Container: "c", Path: "/ws"}, "bin", nil)
+	if err != nil {
+		t.Fatalf("expected an explicitly authorized directory to mount, got: %v", err)
+	}
+	want := sub + ":" + credentialContainerRoot + "/aws:ro"
+	found := false
+	for _, a := range args {
+		if a == want {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected authorized directory mount %q in args:\n%s", want, strings.Join(args, "\n"))
+	}
+}
+
+// TestCredentialMountSpecialFilesRejectedEvenIfDirAuthorized is Sol High 9's
+// "reject sockets, devices, FIFOs ... unless separately authorized" read
+// conservatively: unlike directories, non-regular special files have no
+// legitimate "credential" use, so there is no authorization path for them —
+// not even by authorizing the directory that contains them.
+func TestCredentialMountSpecialFilesRejectedEvenIfDirAuthorized(t *testing.T) {
+	root := t.TempDir()
+	fifo := filepath.Join(root, "fifo")
+	if err := syscall.Mkfifo(fifo, 0600); err != nil {
+		t.Skipf("mkfifo unavailable on this platform: %v", err)
+	}
+	isolateConfig(t, root)
+	d := &DockerRunner{Config: contracts.DockerRunnerConfig{
+		Image: dockerTestImage, CredentialMounts: []string{fifo},
+		CredentialMountAllowDirs: []string{root},
+	}}
+	if _, err := d.runArgs(Workspace{Container: "c", Path: "/ws"}, "bin", nil); err == nil {
+		t.Fatal("expected a FIFO credential mount to be rejected even under an authorized directory")
+	}
+}
+
+// TestCredentialMountDockerSocketRejected is the direct regression test for
+// Sol High 9's explicit callout: "reject Docker/container runtime sockets."
+// Refused even when it happens to live under a configured root and even
+// with directory authorization on its parent — the strongest of the
+// containment checks, with no escape hatch.
+func TestCredentialMountDockerSocketRejected(t *testing.T) {
+	root := t.TempDir()
+	fakeVarRun := filepath.Join(root, "var-run")
+	if err := os.Mkdir(fakeVarRun, 0700); err != nil {
+		t.Fatal(err)
+	}
+	isolateConfig(t, root)
+	d := &DockerRunner{Config: contracts.DockerRunnerConfig{
+		Image:                    dockerTestImage,
+		CredentialMounts:         []string{"/var/run/docker.sock"},
+		CredentialMountAllowDirs: []string{"/var/run"},
+	}}
+	if _, err := d.runArgs(Workspace{Container: "c", Path: "/ws"}, "bin", nil); err == nil {
+		t.Fatal("expected the docker socket path to be rejected unconditionally")
+	}
+}
+
+// TestCredentialMountBasenameCollisionRejected: two distinct host files that
+// would land at the same container basename must fail closed on the
+// ambiguity rather than one silently shadowing the other.
+func TestCredentialMountBasenameCollisionRejected(t *testing.T) {
+	rootA := t.TempDir()
+	rootB := t.TempDir()
+	fileA := filepath.Join(rootA, "cred")
+	fileB := filepath.Join(rootB, "cred")
+	if err := os.WriteFile(fileA, []byte("a"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(fileB, []byte("b"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	isolateConfig(t, rootA+string(os.PathListSeparator)+rootB)
+	d := &DockerRunner{Config: contracts.DockerRunnerConfig{
+		Image: dockerTestImage, CredentialMounts: []string{fileA, fileB},
+	}}
+	if _, err := d.runArgs(Workspace{Container: "c", Path: "/ws"}, "bin", nil); err == nil {
+		t.Fatal("expected a container-basename collision between two distinct credential mounts to error")
 	}
 }
 
@@ -352,5 +524,202 @@ func TestContainerAlreadyGoneMatching(t *testing.T) {
 	}
 	if containerAlreadyGone("permission denied while trying to connect to the Docker daemon socket") {
 		t.Fatal("permission failure must NOT count as already gone")
+	}
+}
+
+// hardenedTestConfig is a fully-hardened DockerRunnerConfig matching what
+// dockerTestInspectMatching reports back, so tests can mutate a single field
+// off this baseline to produce exactly one mismatch.
+func hardenedTestConfig(digest string) contracts.DockerRunnerConfig {
+	return contracts.DockerRunnerConfig{
+		Image: "busybox@sha256:" + digest, User: "65532:65532",
+		ReadOnlyRootfs: true, CapDropAll: true, NoNewPrivileges: true,
+		MemoryLimit: "128m", CPULimit: "0.5", PIDsLimit: 64,
+	}
+}
+
+func dockerTestInspectMatching(digest string) dockerInspect {
+	var insp dockerInspect
+	insp.Image = "sha256:" + digest
+	insp.Config.User = "65532:65532"
+	insp.HostConfig.NetworkMode = "none"
+	insp.HostConfig.ReadonlyRootfs = true
+	insp.HostConfig.CapDrop = []string{"ALL"}
+	insp.HostConfig.SecurityOpt = []string{"no-new-privileges"}
+	insp.HostConfig.Memory = 134217728
+	insp.HostConfig.NanoCpus = 500000000
+	insp.HostConfig.PidsLimit = 64
+	insp.Mounts = []struct {
+		Destination string `json:"Destination"`
+		RW          bool   `json:"RW"`
+	}{{Destination: "/workspace", RW: true}}
+	return insp
+}
+
+// TestHardenedMismatchesCleanConfigNoMismatch is the positive control: a
+// docker inspect payload matching the declared hardened config exactly must
+// report zero mismatches. No daemon required — hardenedMismatches is pure.
+func TestHardenedMismatchesCleanConfigNoMismatch(t *testing.T) {
+	digest := strings.Repeat("a", 64)
+	cfg := hardenedTestConfig(digest)
+	if got := hardenedMismatches(cfg, dockerTestInspectMatching(digest)); len(got) != 0 {
+		t.Fatalf("expected no mismatches for a matching inspect payload, got: %v", got)
+	}
+}
+
+// TestHardenedMismatchesDetectsEachControl is the direct regression test for
+// Sol High 8/10: each hardening control gets its own applied-vs-declared
+// check, and a single divergence in any one of them is caught. No daemon
+// required.
+func TestHardenedMismatchesDetectsEachControl(t *testing.T) {
+	digest := strings.Repeat("a", 64)
+	cases := []struct {
+		name    string
+		mutate  func(*dockerInspect)
+		wantSub string
+	}{
+		{"user mismatch", func(i *dockerInspect) { i.Config.User = "0:0" }, "user:"},
+		{"network not none", func(i *dockerInspect) { i.HostConfig.NetworkMode = "bridge" }, "network:"},
+		{"rootfs not readonly", func(i *dockerInspect) { i.HostConfig.ReadonlyRootfs = false }, "read_only_rootfs:"},
+		{"cap drop missing ALL", func(i *dockerInspect) { i.HostConfig.CapDrop = nil }, "cap_drop_all:"},
+		{"no-new-privileges missing", func(i *dockerInspect) { i.HostConfig.SecurityOpt = nil }, "no_new_privileges:"},
+		{"image id mismatch", func(i *dockerInspect) { i.Image = "sha256:" + strings.Repeat("b", 64) }, "image:"},
+		{"memory not applied", func(i *dockerInspect) { i.HostConfig.Memory = 0 }, "memory_limit:"},
+		{"cpu not applied", func(i *dockerInspect) { i.HostConfig.NanoCpus = 0 }, "cpu_limit:"},
+		{"pids limit mismatch", func(i *dockerInspect) { i.HostConfig.PidsLimit = 999 }, "pids_limit:"},
+		{"unexpected rw mount", func(i *dockerInspect) {
+			i.Mounts = append(i.Mounts, struct {
+				Destination string `json:"Destination"`
+				RW          bool   `json:"RW"`
+			}{Destination: "/etc/passwd", RW: true})
+		}, "unexpected read-write mount"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			insp := dockerTestInspectMatching(digest)
+			c.mutate(&insp)
+			got := hardenedMismatches(hardenedTestConfig(digest), insp)
+			if len(got) == 0 {
+				t.Fatal("expected at least one mismatch, got none")
+			}
+			found := false
+			for _, m := range got {
+				if strings.Contains(m, c.wantSub) {
+					found = true
+				}
+			}
+			if !found {
+				t.Errorf("expected a mismatch containing %q, got: %v", c.wantSub, got)
+			}
+		})
+	}
+}
+
+// TestDockerObserveHardenedNoContainerFailsClosed is the direct regression
+// test for Sol High 10: a hardened config with nothing to inspect (Container
+// == "") must error, not silently return a clean-looking ObserveResult.
+func TestDockerObserveHardenedNoContainerFailsClosed(t *testing.T) {
+	d := &DockerRunner{Config: hardenedTestConfig(strings.Repeat("a", 64))}
+	if _, err := d.Observe(context.Background(), Workspace{}); err == nil {
+		t.Fatal("expected an error for a hardened config with no container to inspect")
+	}
+}
+
+// TestDockerObserveNonHardenedInspectFailureStaysSoft pins that Session 6's
+// fail-closed behavior is scoped to hardened configs only: an ordinary
+// (non-hardened) config with a bogus container name still returns a soft
+// note and no error, exactly as before Session 6.
+func TestDockerObserveNonHardenedInspectFailureStaysSoft(t *testing.T) {
+	d := &DockerRunner{Config: contracts.DockerRunnerConfig{Image: dockerTestImage}}
+	obs, err := d.Observe(context.Background(), Workspace{Container: "gov-nonexistent-container-xyz"})
+	if err != nil {
+		t.Fatalf("non-hardened config must not fail closed on inspect failure, got: %v", err)
+	}
+	if !strings.Contains(obs.Notes, "docker_inspect_failed") {
+		t.Errorf("expected a soft inspect-failure note, got notes=%q", obs.Notes)
+	}
+}
+
+// TestDockerObserveMutableTagExceptionLogged pins Session 6's replacement
+// for the old AllowMutableTag containment escape: it's surfaced as a loud
+// note on every Observe call, hardened or not.
+func TestDockerObserveMutableTagExceptionLogged(t *testing.T) {
+	d := &DockerRunner{Config: contracts.DockerRunnerConfig{Image: "agent:latest", AllowMutableTag: true}}
+	obs, err := d.Observe(context.Background(), Workspace{})
+	if err != nil {
+		t.Fatalf("Observe: %v", err)
+	}
+	if !strings.Contains(obs.Notes, "mutable_tag_exception") {
+		t.Errorf("expected mutable_tag_exception note, got notes=%q", obs.Notes)
+	}
+}
+
+// dockerTestImageDigest resolves dockerTestImage's pulled digest for tests
+// that need a real @sha256: reference to launch a genuinely hardened
+// container. Skips (never fails) if the local image has no recorded
+// RepoDigest, e.g. a locally-built image with no registry pull provenance.
+func dockerTestImageDigest(t *testing.T) string {
+	t.Helper()
+	out, err := exec.Command("docker", "inspect", dockerTestImage, "--format", "{{index .RepoDigests 0}}").Output()
+	if err != nil {
+		t.Skipf("could not resolve %s digest: %v", dockerTestImage, err)
+	}
+	ref := strings.TrimSpace(string(out))
+	idx := strings.Index(ref, "@sha256:")
+	if idx < 0 {
+		t.Skipf("%s has no recorded RepoDigest, skipping", dockerTestImage)
+	}
+	return ref[idx+len("@sha256:"):]
+}
+
+// TestDockerObserveHardenedLiveMatchApproves is the positive end-to-end
+// control for Sol High 8/10: a container actually launched with every
+// hardened flag runArgs would emit passes Observe with no error.
+func TestDockerObserveHardenedLiveMatchApproves(t *testing.T) {
+	requireDocker(t)
+	digest := dockerTestImageDigest(t)
+	isolateConfig(t, "")
+
+	d := &DockerRunner{Config: hardenedTestConfig(digest)}
+	ws := Workspace{Container: "gov-hardened-match-test", Path: t.TempDir()}
+	t.Cleanup(func() { _ = RemoveContainer(context.Background(), ws.Container) })
+
+	args, err := d.runArgs(ws, "sleep", []string{"30"})
+	if err != nil {
+		t.Fatalf("runArgs: %v", err)
+	}
+	// Insert -d (detached) right after "run" so the container stays alive
+	// for inspection instead of blocking this test for 30s.
+	createArgs := append([]string{args[0], "-d"}, args[1:]...)
+	if out, err := exec.Command("docker", createArgs...).CombinedOutput(); err != nil {
+		t.Fatalf("docker run: %v: %s", err, out)
+	}
+
+	obs, err := d.Observe(context.Background(), ws)
+	if err != nil {
+		t.Fatalf("expected a genuinely hardened container to pass Observe, got: %v (notes=%q)", err, obs.Notes)
+	}
+}
+
+// TestDockerObserveHardenedLiveMismatchBlocks is the negative end-to-end
+// control: a real, running container that does NOT satisfy the declared
+// hardened config (launched as root, no cap drop) must fail Observe.
+func TestDockerObserveHardenedLiveMismatchBlocks(t *testing.T) {
+	requireDocker(t)
+	digest := dockerTestImageDigest(t)
+	isolateConfig(t, "")
+
+	ws := Workspace{Container: "gov-hardened-mismatch-test"}
+	t.Cleanup(func() { _ = RemoveContainer(context.Background(), ws.Container) })
+	if out, err := exec.Command("docker", "run", "-d", "--name", ws.Container,
+		"busybox@sha256:"+digest, "sleep", "30").CombinedOutput(); err != nil {
+		t.Fatalf("docker run: %v: %s", err, out)
+	}
+
+	// Declares hardening the container above was never actually launched
+	// with (no --user, no --cap-drop, no --network none).
+	d := &DockerRunner{Config: hardenedTestConfig(digest)}
+	if _, err := d.Observe(context.Background(), ws); err == nil {
+		t.Fatal("expected Observe to block approval for a container that doesn't match its declared hardened config")
 	}
 }

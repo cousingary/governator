@@ -88,3 +88,91 @@ func stringField(input map[string]any, keys ...string) string {
 	}
 	return ""
 }
+
+// Transcript format identifiers, mirroring internal/agents' Transcript*
+// constants (claude-stream-json, codex-json, glm-stream-json, opencode-json,
+// pi-json). Duplicated as plain strings rather than imported for the same
+// reason internal/contracts mirrors policy's own Verdict/op constants
+// (policyRuleVerdicts/policyRuleOps): internal/config already imports this
+// package (PolicyRules), and internal/agents imports internal/config, so
+// policy -> agents would close an import cycle (policy -> agents -> config
+// -> policy). Session 6 (Sol High 12) is the one place this package needs to
+// reason about transcript formats at all, so the values are named here
+// rather than left as scattered literals.
+const (
+	formatClaude   = "claude-stream-json"
+	formatCodex    = "codex-json"
+	formatGLM      = "glm-stream-json"
+	formatOpenCode = "opencode-json"
+	formatPi       = "pi-json"
+)
+
+// formatEventCoverage declares, per transcript format, which EventKinds that
+// format's parser (internal/runtime's transcriptEvent) can structurally
+// produce. Session 6 (Sol High 12): "the source explicitly notes that Claude
+// and GLM receive rich tool events, while Codex, OpenCode and Pi generally
+// receive only shell-command events... create a normalized backend event
+// protocol... do not advertise a temporal rule as cross-backend until every
+// supported adapter supplies its required event types." This is that
+// declaration — the ground truth UnenforceableRules checks against.
+//
+//   - Claude/GLM transcripts carry generic Anthropic-style tool_use/
+//     tool_result content blocks, so every event kind classifies.
+//   - Codex's JSON stream exposes only command_execution (shell); it has no
+//     generic tool-call schema this codebase parses, so only EventExec is
+//     available.
+//   - OpenCode/Pi expose a generic tool-name+input shape (previously mined
+//     only for bash extraction; Session 6 generalizes it via
+//     policy.ClassifyEvent) that lets read/write/exec/network classify
+//     whenever the backend's own tool names match the classifier's maps.
+//     Neither format exposes tool-result *text* the way Claude/GLM's
+//     tool_result blocks do, so EventToolOutput stays unavailable for them.
+var formatEventCoverage = map[string]map[EventKind]bool{
+	formatClaude:   {EventRead: true, EventWrite: true, EventExec: true, EventNetwork: true, EventToolOutput: true},
+	formatGLM:      {EventRead: true, EventWrite: true, EventExec: true, EventNetwork: true, EventToolOutput: true},
+	formatCodex:    {EventExec: true},
+	formatOpenCode: {EventRead: true, EventWrite: true, EventExec: true, EventNetwork: true},
+	formatPi:       {EventRead: true, EventWrite: true, EventExec: true, EventNetwork: true},
+}
+
+// SupportsEventKind reports whether format's parser can structurally
+// produce events of kind. An unrecognized format supports nothing (fail
+// closed: an unknown backend gets no free pass on cross-backend rules).
+func SupportsEventKind(format string, kind EventKind) bool {
+	return formatEventCoverage[format][kind]
+}
+
+// ruleRequiredKinds maps each starter temporal rule (rules.go) to the
+// EventKinds its cause/trigger events depend on. Kept next to
+// formatEventCoverage (not in rules.go) so the two stay reviewable
+// together — this table is the "backend coverage" half of a rule's
+// definition, EvaluateTemporalRules is the "logic" half.
+var ruleRequiredKinds = map[string][]EventKind{
+	RuleSecretPrecedesNetwork:       {EventRead, EventNetwork},
+	RuleOutOfScopeReadPrecedesWrite: {EventRead, EventWrite},
+	RuleInjectionPrecedesExec:       {EventToolOutput, EventExec},
+}
+
+// starterRuleNames is every rule ruleRequiredKinds declares, in a stable
+// order, so UnenforceableRules' output order never depends on map iteration.
+var starterRuleNames = []string{RuleSecretPrecedesNetwork, RuleOutOfScopeReadPrecedesWrite, RuleInjectionPrecedesExec}
+
+// UnenforceableRules returns the starter rule names that cannot possibly
+// fire for a transcript of the given format, because the format's parser
+// doesn't supply one or more of the event kinds the rule depends on (Sol
+// High 12). Callers (internal/runtime's auditTranscript) use this to FLAG or
+// block per policy config instead of leaving the coverage gap silent, which
+// is what happened before Session 6: a rule requiring events an adapter
+// never supplies simply never fired, with nothing recorded anywhere.
+func UnenforceableRules(format string) []string {
+	var out []string
+	for _, name := range starterRuleNames {
+		for _, kind := range ruleRequiredKinds[name] {
+			if !SupportsEventKind(format, kind) {
+				out = append(out, name)
+				break
+			}
+		}
+	}
+	return out
+}

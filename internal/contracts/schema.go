@@ -172,6 +172,14 @@ type DockerRunnerConfig struct {
 	Network          string   `yaml:"network,omitempty" json:"network,omitempty"`
 	CredentialMounts []string `yaml:"credential_mounts,omitempty" json:"credential_mounts,omitempty"`
 	OutputCapBytes   int64    `yaml:"output_cap_bytes,omitempty" json:"output_cap_bytes,omitempty"`
+	// CredentialMountAllowDirs is the Session 6 (Sol High 9) explicit
+	// authorization to mount a directory (rather than a regular file) as a
+	// credential: a credential_mounts entry may resolve to a directory only
+	// when its cleaned absolute path also appears here. Every other entry
+	// must resolve, after symlink resolution, to a regular file — the safe
+	// default. Absent by default, so no prior job YAML gains directory-mount
+	// power it didn't have.
+	CredentialMountAllowDirs []string `yaml:"credential_mount_allow_dirs,omitempty" json:"credential_mount_allow_dirs,omitempty"`
 
 	// User runs the container process as a non-root user (docker --user),
 	// e.g. "65532:65532". Required for IsHardened — root inside the container
@@ -195,10 +203,14 @@ type DockerRunnerConfig struct {
 	// Tmpfs mounts controlled temporary filesystems (--tmpfs). Needed under
 	// ReadOnlyRootfs for /tmp, /run, and any dir the backend CLI writes to.
 	Tmpfs []string `yaml:"tmpfs,omitempty" json:"tmpfs,omitempty"`
-	// AllowMutableTag is the documented operator exception to the digest
-	// requirement: a mutable tag (image:latest) is accepted only when this is
-	// set, and the choice is recorded in provenance. Without it, IsHardened
-	// requires Image to be pinned by digest (image@sha256:...).
+	// AllowMutableTag is the documented operator consent to run a mutable
+	// tag (image:latest) instead of a pinned digest. Session 6 (Sol High 8):
+	// this NEVER makes IsHardened true by itself — a mutable tag can be
+	// silently retagged underneath a "hardened" config, so a high-risk job on
+	// a mutable tag must go through internal/containment's signed operator
+	// override instead. Setting this only suppresses surprise (validation
+	// still passes) and is logged loudly by DockerRunner.Observe
+	// (MutableTagException) rather than silently treated as pinned.
 	AllowMutableTag bool `yaml:"allow_mutable_tag,omitempty" json:"allow_mutable_tag,omitempty"`
 	// EgressAllowlist is reserved for a future runner that can actually
 	// enforce host:port egress filtering. Validation currently REJECTS a
@@ -241,35 +253,99 @@ func (d *DockerRunnerConfig) EffectiveOutputCapBytes() int64 {
 	return d.OutputCapBytes
 }
 
-// imagePinned reports whether Image references an immutable digest, the
-// hardening requirement — a mutable tag (image:latest) can be silently
-// retagged underneath a "hardened" config. AllowMutableTag is the documented
-// operator exception (recorded, not enforced, at the registry).
+// imageDigestRE matches a true immutable digest reference: "@sha256:" followed
+// by exactly 64 hex characters at the end of the string. Session 6 (Sol High
+// 8) tightens this from a bare strings.Contains(image, "@sha256:") check,
+// which let a malformed or truncated digest still read as "pinned".
+var imageDigestRE = regexp.MustCompile(`@sha256:[0-9a-fA-F]{64}$`)
+
+// digestPinned reports whether Image carries a real 64-hex-character sha256
+// digest reference, ignoring AllowMutableTag entirely — the digest check is
+// a fact about the string, not a policy decision.
+func digestPinned(image string) bool {
+	return imageDigestRE.MatchString(image)
+}
+
+// imagePinned reports whether Image qualifies for hardened status: a real
+// digest reference, full stop. Session 6 (Sol High 8) removes the prior
+// AllowMutableTag escape hatch here — a mutable tag (image:latest) can be
+// silently retagged underneath a "hardened" config, so allowing it to count
+// as pinned defeated the whole point of pinning. AllowMutableTag is now
+// surfaced only via MutableTagException, an explicit signed/logged exception
+// path (internal/containment's operator override), never as containment
+// itself.
 func (d *DockerRunnerConfig) imagePinned() bool {
 	if d == nil {
 		return false
 	}
-	if d.AllowMutableTag {
-		return true
-	}
-	return strings.Contains(d.Image, "@sha256:")
+	return digestPinned(d.Image)
 }
 
-// IsHardened reports whether every Session 3 (Phase 2) containment control is
-// in place: non-root user, read-only root filesystem, cap-drop=ALL,
-// no-new-privileges, a pinned (digest) image, and network deny. A risk_class:
-// high contract requires an IsHardened docker config — or a verified native
-// sandbox / signed override (see internal/containment) — and must never
-// silently resolve to local execution. Network deny is part of hardened
-// because unrestricted egress is a data-exfiltration path no filesystem or
-// capability control compensates for; a high-risk job that genuinely needs
-// the network goes through the signed operator override instead. A nil
-// receiver (no docker config) is never hardened.
+// MutableTagException reports whether this config is deliberately running an
+// unpinned image with the operator's documented consent (AllowMutableTag),
+// as opposed to simply being unpinned by omission. Session 6 (Sol High 8):
+// this can never make IsHardened true — a high-risk job on a mutable tag
+// must go through internal/containment's signed operator override — but
+// callers (e.g. DockerRunner.Observe) use it to log the exception loudly
+// rather than silently proceeding as if the image were pinned.
+func (d *DockerRunnerConfig) MutableTagException() bool {
+	if d == nil {
+		return false
+	}
+	return d.AllowMutableTag && !digestPinned(d.Image)
+}
+
+// dockerUserPartRE validates one colon-separated part of a docker --user
+// value (a name or a numeric id): non-empty, alphanumeric plus
+// underscore/hyphen/dot, the same charset docker itself accepts for
+// user/group names and ids.
+var dockerUserPartRE = regexp.MustCompile(`^[A-Za-z0-9_][A-Za-z0-9_.-]*$`)
+
+// validDockerUser reports whether user is a syntactically valid docker
+// --user value ("uid" or "uid:gid", name or numeric) that does NOT resolve
+// to root. Session 6 (Sol High 8): the prior check was bare `d.User != ""`,
+// which let "root", "0", and "0:0" all qualify as hardened. Rejects the
+// literal names/ids docker treats as root in either the user or group
+// position; it cannot resolve an arbitrary in-image username to a uid
+// without running the container, so a hardened contract is expected to use
+// numeric ids (as every example in this codebase's docs does).
+func validDockerUser(user string) bool {
+	user = strings.TrimSpace(user)
+	if user == "" {
+		return false
+	}
+	parts := strings.SplitN(user, ":", 2)
+	if len(parts) > 2 {
+		return false
+	}
+	rootNames := map[string]bool{"root": true, "0": true}
+	for _, p := range parts {
+		if !dockerUserPartRE.MatchString(p) {
+			return false
+		}
+		if rootNames[strings.ToLower(p)] {
+			return false
+		}
+	}
+	return true
+}
+
+// IsHardened reports whether every Session 3 (Phase 2)/Session 6 containment
+// control is in place: a syntactically valid non-root user, read-only root
+// filesystem, cap-drop=ALL, no-new-privileges, a true digest-pinned image,
+// and network deny. A risk_class: high contract requires an IsHardened
+// docker config — or a verified native sandbox / signed override (see
+// internal/containment) — and must never silently resolve to local
+// execution. Network deny is part of hardened because unrestricted egress is
+// a data-exfiltration path no filesystem or capability control compensates
+// for; a high-risk job that genuinely needs the network goes through the
+// signed operator override instead. A nil receiver (no docker config) is
+// never hardened.
 func (d *DockerRunnerConfig) IsHardened() bool {
 	if d == nil {
 		return false
 	}
-	return d.User != "" && d.ReadOnlyRootfs && d.CapDropAll && d.NoNewPrivileges &&
+	return validDockerUser(d.User) && d.ReadOnlyRootfs && d.CapDropAll && d.NoNewPrivileges &&
 		d.imagePinned() && d.EffectiveNetwork() == "deny"
 }
 
@@ -975,6 +1051,23 @@ func validateRunner(c Contract, add func(string, string)) {
 	for i, mount := range c.Docker.CredentialMounts {
 		field := fmt.Sprintf("docker.credential_mounts[%d]", i)
 		trimmed := strings.TrimSpace(mount)
+		switch {
+		case trimmed == "":
+			add(field, "must not be blank")
+		case !filepath.IsAbs(trimmed):
+			add(field, "must be an absolute host path")
+		case strings.Contains(trimmed, ":"):
+			// Session 6 (Sol High 9) retires the host:container override
+			// form: every credential mount now lands at a fixed, dedicated
+			// container path (see DockerRunner.resolveCredentialMount), so an
+			// operator can no longer choose an arbitrary container-side
+			// destination for a host secret.
+			add(field, "must be a bare host path (container destination is no longer configurable; see docker.credential_mount_allow_dirs for directory mounts)")
+		}
+	}
+	for i, dir := range c.Docker.CredentialMountAllowDirs {
+		field := fmt.Sprintf("docker.credential_mount_allow_dirs[%d]", i)
+		trimmed := strings.TrimSpace(dir)
 		if trimmed == "" {
 			add(field, "must not be blank")
 		} else if !filepath.IsAbs(trimmed) {

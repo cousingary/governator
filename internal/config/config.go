@@ -75,6 +75,17 @@ type Doctrine struct {
 	// contract with neither a cleanup block nor a lint/format validator in
 	// success.validators) from a warning to a validation error.
 	RequireCleanup bool `yaml:"require_cleanup"`
+	// UnenforceableRuleAction controls what happens when a starter temporal
+	// rule (internal/policy's RuleSecretPrecedesNetwork etc.) cannot possibly
+	// fire for a run's transcript format because that backend's parser
+	// doesn't supply an event kind the rule needs (Session 6, Sol High 12:
+	// internal/policy.UnenforceableRules). "flag" (the default, including
+	// "") records an advisory RuleViolation — visible to operators, never
+	// blocks the run, so no prior run's outcome changes just because this
+	// field now exists. "block" makes it a hard denial, for operators who
+	// want a coverage gap on a security-relevant backend to fail closed
+	// instead. Never silent either way — that was the actual bug.
+	UnenforceableRuleAction string `yaml:"unenforceable_rule_action,omitempty"`
 }
 
 // Containment configures the Session 3 (Phase 2) risk-class containment
@@ -84,6 +95,17 @@ type Doctrine struct {
 // before launch. Configure it only when you genuinely need the escape hatch.
 type Containment struct {
 	OverridePublicKey string `yaml:"override_public_key"`
+}
+
+// Credentials configures the Session 6 (Sol High 9) credential-mount
+// containment: Roots is the operator-declared allowlist of host directories
+// a docker.credential_mounts entry may resolve under, after symlink
+// resolution. Empty (the default) refuses every credential mount — an
+// operator must explicitly declare at least one root before any job can
+// mount host credentials into a container, so no prior config.yaml grants
+// broader access than it did before this field existed.
+type Credentials struct {
+	Roots []string `yaml:"roots"`
 }
 
 type Defaults struct {
@@ -119,6 +141,7 @@ type Config struct {
 	Defaults          Defaults           `yaml:"defaults"`
 	Assay             Assay              `yaml:"assay"`
 	Containment       Containment        `yaml:"containment"`
+	Credentials       Credentials        `yaml:"credentials"`
 	// PolicyRules is the Session 5 (Sol Phase 4) organization layer of the
 	// layered policy engine: declarative rules evaluated first and with the
 	// most authority — no lower layer (project doctrine, job contract,
@@ -230,6 +253,14 @@ func LoadStrict() (Config, error) {
 		if q.WindowType != "" && q.WindowType != "5h" && q.WindowType != "daily" && q.WindowType != "weekly" && q.WindowType != "monthly" {
 			return Config{}, fmt.Errorf("invalid quota window_type %q (want 5h, daily, weekly, or monthly)", q.WindowType)
 		}
+	}
+	for _, root := range cfg.Credentials.Roots {
+		if !filepath.IsAbs(root) {
+			return Config{}, fmt.Errorf("invalid credentials.roots entry %q (want an absolute path)", root)
+		}
+	}
+	if a := cfg.Doctrine.UnenforceableRuleAction; a != "" && a != "flag" && a != "block" {
+		return Config{}, fmt.Errorf("invalid doctrine.unenforceable_rule_action %q (want flag or block)", a)
 	}
 	seenPolicyRuleIDs := map[string]bool{}
 	for _, rule := range cfg.PolicyRules {
@@ -365,6 +396,9 @@ func merge(dst *Config, src Config) {
 	if src.Doctrine.RequireCleanup {
 		dst.Doctrine.RequireCleanup = true
 	}
+	if src.Doctrine.UnenforceableRuleAction != "" {
+		dst.Doctrine.UnenforceableRuleAction = src.Doctrine.UnenforceableRuleAction
+	}
 	if src.Defaults.Agent != "" {
 		dst.Defaults.Agent = src.Defaults.Agent
 	}
@@ -383,6 +417,9 @@ func merge(dst *Config, src Config) {
 	if src.Containment.OverridePublicKey != "" {
 		dst.Containment.OverridePublicKey = src.Containment.OverridePublicKey
 	}
+	if src.Credentials.Roots != nil {
+		dst.Credentials.Roots = append([]string(nil), src.Credentials.Roots...)
+	}
 }
 
 func applyEnv(cfg *Config) {
@@ -396,6 +433,9 @@ func applyEnv(cfg *Config) {
 	}
 	if value := Env("GOV_SNAPSHOT_ROOTS"); value != "" {
 		cfg.SnapshotRoots = splitPathList(value)
+	}
+	if value := Env("GOV_CREDENTIAL_ROOTS"); value != "" {
+		cfg.Credentials.Roots = splitPathList(value)
 	}
 	if value := firstEnv("GOV_LEDGER_DIR", "GOV_HOME", "GOVERNATOR_HOME"); value != "" {
 		cfg.LedgerDir = value
@@ -449,6 +489,9 @@ func applyEnv(cfg *Config) {
 		if b, err := strconv.ParseBool(value); err == nil {
 			cfg.Doctrine.RequireCleanup = b
 		}
+	}
+	if value := Env("GOV_UNENFORCEABLE_RULE_ACTION"); value != "" {
+		cfg.Doctrine.UnenforceableRuleAction = value
 	}
 	if value := Env("GOV_DEFAULT_AGENT"); value != "" {
 		cfg.Defaults.Agent = value
@@ -515,6 +558,9 @@ func clean(cfg *Config) {
 	}
 	for i := range cfg.SnapshotRoots {
 		cfg.SnapshotRoots[i] = expand(cfg.SnapshotRoots[i])
+	}
+	for i := range cfg.Credentials.Roots {
+		cfg.Credentials.Roots[i] = expand(cfg.Credentials.Roots[i])
 	}
 }
 

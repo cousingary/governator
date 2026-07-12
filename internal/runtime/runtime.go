@@ -964,16 +964,30 @@ func transcriptResultText(content any) string {
 	return ""
 }
 
-// transcriptEvent extracts zero or more Phase 6 policy.Event nodes from one
-// transcript line. Claude/GLM transcripts carry explicit Anthropic-style
-// content blocks (tool_use: name+input; tool_result: content) so every tool
-// call and its output classify directly via policy.ClassifyEvent /
-// policy.ToolOutputEvent. Other backends' transcript formats don't expose a
-// generic tool-call schema the way Claude's does, so they fall back to the
-// exec-only event already available from command (transcriptCommand's
-// extraction, reused rather than recomputed) — the temporal rules that need
-// read/write/network events simply never fire for those formats, which is a
-// coverage gap, not a false signal.
+// transcriptEvent extracts zero or more Phase 6 (Session 6, Sol High 12: the
+// normalized backend event protocol) policy.Event nodes from one transcript
+// line, per format:
+//
+//   - Claude/GLM transcripts carry explicit Anthropic-style content blocks
+//     (tool_use: name+input; tool_result: content) so every tool call and
+//     its output classify directly via policy.ClassifyEvent /
+//     policy.ToolOutputEvent — full coverage, including EventToolOutput.
+//   - OpenCode/Pi expose a generic tool-name+input shape (the same shape
+//     transcriptCommand already mined for bash extraction alone); Session 6
+//     generalizes that to classify ANY tool call via policy.ClassifyEvent,
+//     giving these formats real read/write/exec/network coverage whenever
+//     the backend's own tool names match the classifier's maps. Neither
+//     format exposes tool-result *text* the way Claude/GLM's tool_result
+//     blocks do, so no EventToolOutput is ever produced for them.
+//   - Codex's JSON stream has no generic tool-call schema this codebase
+//     parses at all — only command_execution (shell) — so it falls back to
+//     the exec-only event already available from command (transcriptCommand's
+//     extraction, reused rather than recomputed).
+//
+// policy.formatEventCoverage declares exactly this truth so
+// policy.UnenforceableRules can flag/block (rather than silently skip) a
+// temporal rule that needs an event kind a format can't supply — see
+// auditTranscript's Phase 6 section below.
 func transcriptEvent(format string, value map[string]any, seq int, command string) []policy.Event {
 	typeName, _ := value["type"].(string)
 	switch format {
@@ -989,6 +1003,34 @@ func transcriptEvent(format string, value map[string]any, seq int, command strin
 			}
 		}
 		return nil
+	case agents.TranscriptOpenCode:
+		tool, _ := value["tool"].(string)
+		if tool == "" {
+			tool, _ = value["name"].(string)
+		}
+		if tool == "" {
+			return nil
+		}
+		input, _ := value["input"].(map[string]any)
+		if input == nil {
+			if state, ok := value["state"].(map[string]any); ok {
+				input, _ = state["input"].(map[string]any)
+			}
+		}
+		return []policy.Event{policy.ClassifyEvent(seq, tool, input)}
+	case agents.TranscriptPi:
+		tool, _ := value["toolName"].(string)
+		if tool == "" {
+			tool, _ = value["tool_name"].(string)
+		}
+		if tool == "" {
+			return nil
+		}
+		input, _ := value["args"].(map[string]any)
+		if input == nil {
+			input, _ = value["input"].(map[string]any)
+		}
+		return []policy.Event{policy.ClassifyEvent(seq, tool, input)}
 	default:
 		if command != "" {
 			return []policy.Event{policy.ClassifyEvent(seq, "bash", map[string]any{"command": command})}
@@ -1245,6 +1287,27 @@ func auditTranscript(path, format, work string, c contracts.Contract) transcript
 		}
 	}
 	audit.RuleViolations = policy.EvaluateTemporalRules(scopedEvents, secretPatterns, c.Allowed.Read)
+	// Session 6 (Sol High 12): a starter rule that cannot possibly fire for
+	// this backend's transcript format (policy.UnenforceableRules — e.g.
+	// Codex's exec-only event coverage) must never stay silent just because
+	// it never fired; that silence is the exact coverage gap the finding
+	// described ("do not advertise a temporal rule as cross-backend until
+	// every supported adapter supplies its required event types"). Recorded
+	// as a RuleViolation like any other rule outcome — advisory (RuleFlag,
+	// the default) unless doctrine.unenforceable_rule_action is "block", in
+	// which case it folds into audit.Violations via the same RuleDeny path
+	// below as a real policy rule violation, for operators who'd rather fail
+	// closed on missing coverage than merely be told about it.
+	unenforceableVerdict := policy.RuleFlag
+	if config.Current().Doctrine.UnenforceableRuleAction == "block" {
+		unenforceableVerdict = policy.RuleDeny
+	}
+	for _, rule := range policy.UnenforceableRules(format) {
+		audit.RuleViolations = append(audit.RuleViolations, policy.RuleViolation{
+			Rule: rule, Verdict: unenforceableVerdict, CauseSeq: -1, TriggerSeq: -1,
+			Detail: fmt.Sprintf("rule unenforceable for backend transcript format %q: its parser does not supply an event kind this rule requires", format),
+		})
+	}
 	for _, rv := range audit.RuleViolations {
 		if rv.Verdict == policy.RuleDeny {
 			audit.Violations = append(audit.Violations, "policy rule violation ("+rv.Rule+"): "+rv.Detail)
@@ -1962,15 +2025,25 @@ func (r *Runner) runOnce(ctx context.Context, c contracts.Contract) (RunRecord, 
 	// failed we cannot PROVE the transcript is complete, which for a
 	// completeness-requiring run is the same as incomplete (fail closed) —
 	// the old `oerr == nil &&` guard silently skipped the whole check.
-	if requiresCompleteTranscript(c) {
-		switch {
-		case oerr != nil:
-			violations = append(violations, "runner observation failed: cannot verify transcript completeness (complete transcript required): "+oerr.Error())
-		case obs.OutputTruncated:
-			violations = append(violations, fmt.Sprintf(
-				"output truncated: %d of %d transcript bytes discarded (complete transcript required)",
-				obs.BytesDiscarded, obs.BytesAccepted+obs.BytesDiscarded))
-		}
+	//
+	// Session 6 (Sol High 8/10): DockerRunner.Observe now also returns a
+	// non-nil oerr whenever the docker config declared itself hardened and
+	// Observe could not verify the applied container configuration actually
+	// matched (inspection failure or a mismatch) — an unverified hardened
+	// claim must never be approved. That case is unconditional, not gated
+	// behind require_complete_transcript: a hardened run with no separate
+	// completeness requirement must still not be approved on a hardened
+	// claim it can't back up. A completeness-requiring run keeps the more
+	// specific message below (it's the same oerr either way).
+	switch {
+	case oerr != nil && requiresCompleteTranscript(c):
+		violations = append(violations, "runner observation failed: cannot verify transcript completeness (complete transcript required): "+oerr.Error())
+	case oerr != nil:
+		violations = append(violations, "docker hardened observation failed: "+oerr.Error())
+	case obs.OutputTruncated && requiresCompleteTranscript(c):
+		violations = append(violations, fmt.Sprintf(
+			"output truncated: %d of %d transcript bytes discarded (complete transcript required)",
+			obs.BytesDiscarded, obs.BytesAccepted+obs.BytesDiscarded))
 	}
 	var selfReviewJSON string
 	rec.SelfReview, selfReviewJSON = readSelfReview(work)

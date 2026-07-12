@@ -106,11 +106,10 @@ func TestValidAgentsMatchesCanonicalBackends(t *testing.T) {
 	}
 }
 
-// TestDockerIsHardened pins Session 3's definition of hardened containment:
-// every one of the privilege-reducing controls must be set, and the image must
-// be pinned by digest (or carry the documented mutable-tag exception). A nil
-// config is never hardened, so a high-risk job with no docker block cannot
-// sneak through IsHardened.
+// TestDockerIsHardened pins Session 3/6's definition of hardened containment:
+// every one of the privilege-reducing controls must be set, and the image
+// must carry a true digest. A nil config is never hardened, so a high-risk
+// job with no docker block cannot sneak through IsHardened.
 func TestDockerIsHardened(t *testing.T) {
 	pinned := "ghcr.io/acme/agent@sha256:" + strings.Repeat("a", 64)
 	cases := []struct {
@@ -132,10 +131,20 @@ func TestDockerIsHardened(t *testing.T) {
 			Image: pinned, User: "65532:65532", ReadOnlyRootfs: true,
 			CapDropAll: true, NoNewPrivileges: true,
 		}, true},
-		{"mutable tag with explicit exception all controls", &DockerRunnerConfig{
+		// Session 6 (Sol High 8): AllowMutableTag must NEVER yield hardened —
+		// it is a logged exception (MutableTagException), not containment. A
+		// high-risk job on a mutable tag must go through the signed operator
+		// override in internal/containment instead.
+		{"mutable tag with explicit exception all controls still not hardened", &DockerRunnerConfig{
 			Image: "agent:latest", AllowMutableTag: true, User: "65532:65532",
 			ReadOnlyRootfs: true, CapDropAll: true, NoNewPrivileges: true,
-		}, true},
+		}, false},
+		// Session 6 (Sol High 8): a truncated/malformed digest must not pass —
+		// the prior check was a bare strings.Contains(image, "@sha256:").
+		{"short digest not a real 64-hex digest", &DockerRunnerConfig{
+			Image: "agent@sha256:" + strings.Repeat("a", 10), User: "65532:65532",
+			ReadOnlyRootfs: true, CapDropAll: true, NoNewPrivileges: true,
+		}, false},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -143,6 +152,49 @@ func TestDockerIsHardened(t *testing.T) {
 				t.Fatalf("IsHardened() = %v, want %v", got, c.want)
 			}
 		})
+	}
+}
+
+// TestDockerHardenedRejectsRootUser is the direct regression test for Sol
+// High 8's "root user accepted" reproduction: User values "root", "0", and
+// "0:0" all previously satisfied `d.User != ""` and qualified as hardened.
+func TestDockerHardenedRejectsRootUser(t *testing.T) {
+	pinned := "ghcr.io/acme/agent@sha256:" + strings.Repeat("a", 64)
+	base := func(user string) *DockerRunnerConfig {
+		return &DockerRunnerConfig{
+			Image: pinned, User: user, ReadOnlyRootfs: true,
+			CapDropAll: true, NoNewPrivileges: true,
+		}
+	}
+	for _, rootLike := range []string{"root", "0", "0:0", "ROOT", "root:root", "0:root"} {
+		if base(rootLike).IsHardened() {
+			t.Fatalf("User %q must not qualify as hardened", rootLike)
+		}
+	}
+	// A syntactically invalid user (not root, just malformed) must also be
+	// rejected: "validate user/group syntax" per the fix list.
+	if base("not a valid user!!").IsHardened() {
+		t.Fatal("syntactically invalid user must not qualify as hardened")
+	}
+	// The documented non-root form must still pass.
+	if !base("65532:65532").IsHardened() {
+		t.Fatal("65532:65532 is a valid non-root user and should be hardened (all else equal)")
+	}
+}
+
+// TestMutableTagException pins the Session 6 replacement for the old
+// AllowMutableTag containment escape hatch: it is now purely a logging
+// signal (an explicit, documented exception), never a path to IsHardened.
+func TestMutableTagException(t *testing.T) {
+	if (&DockerRunnerConfig{Image: "agent:latest"}).MutableTagException() {
+		t.Fatal("AllowMutableTag unset must never report an exception")
+	}
+	if !(&DockerRunnerConfig{Image: "agent:latest", AllowMutableTag: true}).MutableTagException() {
+		t.Fatal("mutable tag with AllowMutableTag set must report the exception")
+	}
+	pinned := "ghcr.io/acme/agent@sha256:" + strings.Repeat("a", 64)
+	if (&DockerRunnerConfig{Image: pinned, AllowMutableTag: true}).MutableTagException() {
+		t.Fatal("a digest-pinned image is not a mutable-tag exception even with the flag set")
 	}
 }
 

