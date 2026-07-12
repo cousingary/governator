@@ -2082,7 +2082,25 @@ func snapCmd(args []string) int {
 		}
 		return 0
 	}
-	return bad("usage: gov snap create [label]|list|diff <id>|restore <id> [--dry-run]")
+	if len(args) >= 1 && args[0] == "prune" {
+		keep := 48
+		if len(args) == 3 && args[1] == "--keep" {
+			parsed, err := strconv.Atoi(args[2])
+			if err != nil {
+				return bad("usage: gov snap prune [--keep N]")
+			}
+			keep = parsed
+		} else if len(args) != 1 {
+			return bad("usage: gov snap prune [--keep N]")
+		}
+		removed, err := snapshots.Prune(keep)
+		if err != nil {
+			return bad("snap: " + err.Error())
+		}
+		fmt.Printf("Kept newest %d, pruned %d old snapshot(s).\n", keep, len(removed))
+		return 0
+	}
+	return bad("usage: gov snap create [label]|list|diff <id>|restore <id> [--dry-run]|prune [--keep N]")
 }
 
 func parityCmd(args []string) int {

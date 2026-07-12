@@ -4,6 +4,8 @@ All notable changes to Governator are documented here.
 
 ## v1.0.0 — first production release (2026-07-12)
 
+- **`gov snap prune [--keep N]`** (default 48): removes all but the N newest snapshots, matching the legacy `harness_recall.py prune` semantics (newest-first by ID, labeled snapshots not exempt; hardlink dedup makes removing older snapshots safe for newer ones). This was the last missing piece of `docs/migration.md` step 3 — legacy snapshot cron automation can now be fully replaced by `gov snap create` + `gov snap prune`.
+
 > Versioning note: this is Governator's first released version. Section headings below labeled v1.1–v1.5 (and the matching branch names) were pre-release development milestones of the initial build, kept for history; none was ever released.
 
 ### Sol redteam repair program

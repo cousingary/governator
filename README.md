@@ -112,7 +112,7 @@ gov repair-packet <run_id>
 gov eval harness <case-dir>
 gov eval scorecard
 gov protect status|apply|release <path>
-gov snap create [label]|list|diff <id>|restore <id> [--dry-run]
+gov snap create [label]|list|diff <id>|restore <id> [--dry-run]|prune [--keep N]
 gov graph status|refresh [path]
 gov graph query <search> [--path <path>] [--limit <n>]
 gov hook pre-tool-use [--run <id>] [--shadow <python-gate>]

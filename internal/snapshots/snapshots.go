@@ -249,6 +249,32 @@ func Create(label string) (Manifest, error) {
 	return manifest, nil
 }
 
+// Prune removes all but the keep newest snapshots and returns the IDs it
+// removed, matching the legacy harness_recall.py semantics: newest-first by
+// ID, labeled snapshots not exempt. Hardlink dedup makes removal of older
+// snapshots safe — each snapshot holds its own directory entries, so newer
+// snapshots keep their content regardless of which older links disappear.
+func Prune(keep int) ([]string, error) {
+	if keep < 1 {
+		return nil, errors.New("prune: --keep must be at least 1")
+	}
+	manifests, err := List()
+	if err != nil {
+		return nil, err
+	}
+	if len(manifests) <= keep {
+		return nil, nil
+	}
+	var removed []string
+	for _, manifest := range manifests[keep:] {
+		if err := os.RemoveAll(filepath.Join(StoreDir(), manifest.ID)); err != nil {
+			return removed, err
+		}
+		removed = append(removed, manifest.ID)
+	}
+	return removed, nil
+}
+
 func find(id string) (Manifest, string, error) {
 	list, err := List()
 	if err != nil {

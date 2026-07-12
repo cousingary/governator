@@ -3,6 +3,7 @@ package snapshots
 import (
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -130,5 +131,67 @@ func TestFindExactIDWinsOverPrefixCollision(t *testing.T) {
 	}
 	if got.ID != first.ID {
 		t.Fatalf("find returned wrong snapshot: got=%q want=%q", got.ID, first.ID)
+	}
+}
+
+func TestPruneKeepsNewestAndMatchesLegacySemantics(t *testing.T) {
+	root := t.TempDir()
+	store := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "note.txt"), []byte("x"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("GOV_SNAPSHOT_DIR", store)
+	t.Setenv("GOV_SNAPSHOT_ROOTS", root)
+
+	// IDs are second-granularity timestamps; use labels to keep them unique
+	// without sleeping. Labeled snapshots must NOT be exempt (legacy parity).
+	var ids []string
+	for _, label := range []string{"a", "b", "c", "d", "e"} {
+		manifest, err := Create(label)
+		if err != nil {
+			t.Fatal(err)
+		}
+		ids = append(ids, manifest.ID)
+	}
+
+	if _, err := Prune(0); err == nil {
+		t.Fatal("Prune(0) must be rejected")
+	}
+
+	removed, err := Prune(2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(removed) != 3 {
+		t.Fatalf("expected 3 removed, got %d: %v", len(removed), removed)
+	}
+	list, err := List()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(list) != 2 {
+		t.Fatalf("expected 2 surviving snapshots, got %d", len(list))
+	}
+	// List is newest-first; the two newest by ID must be the survivors, and
+	// their content must still be readable (hardlink safety after removal).
+	sorted := append([]string(nil), ids...)
+	sort.Sort(sort.Reverse(sort.StringSlice(sorted)))
+	for i, want := range sorted[:2] {
+		if list[i].ID != want {
+			t.Fatalf("survivor %d = %s, want %s", i, list[i].ID, want)
+		}
+		data, err := os.ReadFile(filepath.Join(store, want, "r0", "note.txt"))
+		if err != nil || string(data) != "x" {
+			t.Fatalf("survivor %s content unreadable after prune: %v", want, err)
+		}
+	}
+
+	// Prune with keep >= count is a no-op.
+	removed, err = Prune(10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(removed) != 0 {
+		t.Fatalf("expected no-op, removed %v", removed)
 	}
 }
