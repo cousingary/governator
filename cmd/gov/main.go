@@ -44,12 +44,31 @@ func run(args []string) int {
 		usage()
 		return 2
 	}
+	// Sol Critical 2: a malformed configuration must fail the process at
+	// startup, never be silently replaced by defaults inside Current(). init
+	// (writes the config), validate (checks it explicitly below), version/help
+	// (need no config) and hook (a high-frequency path that must stay
+	// resilient — the launching job already validated config) skip the guard.
+	switch args[0] {
+	case "init", "validate", "version", "--version", "-version", "help", "--help", "-h", "hook":
+	default:
+		if code := guardConfig(); code != 0 {
+			return code
+		}
+	}
 	switch args[0] {
 	case "init":
 		return initCmd(args[1:])
 	case "validate":
 		if len(args) != 2 {
 			return bad("usage: gov validate <job.yaml>")
+		}
+		// Sol Critical 2: validate the configuration too. A malformed config
+		// must report INVALID with a specific message, never VALID plus silent
+		// built-in defaults (the original reproduced failure).
+		if _, err := config.LoadStrict(); err != nil {
+			fmt.Fprintln(os.Stderr, "CONFIG INVALID:", err)
+			return 1
 		}
 		c, err := contracts.ParseFile(args[1])
 		if err != nil {
@@ -1684,6 +1703,22 @@ func graphCmd(args []string) int {
 }
 
 func bad(s string) int { fmt.Fprintln(os.Stderr, s); return 2 }
+
+// guardConfig is the Sol Critical 2 startup gate: load the configuration
+// strictly and refuse to proceed when it is present-but-invalid (unreadable,
+// malformed YAML, unknown field, invalid policy value). A missing file is NOT
+// an error — built-in defaults apply. Returns 0 when the config is valid (or
+// absent) and a non-zero exit code (with a specific message on stderr) when it
+// is malformed, so Current() can never be reached with a bad file in the CLI
+// path.
+func guardConfig() int {
+	if _, err := config.LoadStrict(); err != nil {
+		fmt.Fprintln(os.Stderr, "governator: configuration is invalid — refusing to proceed:", err)
+		fmt.Fprintln(os.Stderr, "fix the file or remove it to fall back to built-in defaults")
+		return 2
+	}
+	return 0
+}
 
 // routeExplain implements `gov route --explain <contract.yaml>`: a dry run of
 // the route broker against an agent: auto contract. It resolves and prints the

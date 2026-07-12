@@ -56,6 +56,7 @@ type RunRecord struct {
 	Commit          string                    `json:"commit,omitempty"`
 	Created         string                    `json:"created"`
 	Replayed        bool                      `json:"replayed"`
+	IdentityHash    string                    `json:"identity_hash,omitempty"`
 	CostUSD         float64                   `json:"cost_usd"`
 	Usage           observability.TokenUsage  `json:"usage"`
 	ToolCalls       int                       `json:"tool_calls"`
@@ -106,14 +107,14 @@ func dbOpen(home string) (*sql.DB, error) {
 }
 
 func insertRun(db *sql.DB, r RunRecord, ch, head string) error {
-	_, err := db.Exec(`INSERT INTO runs(id,job_id,job_type,agent,mode,status,root,worktree,branch,contract_hash,base_head,diff,transcript,message,created,prompt_version,envelope_json,notes,graph_provider,graph_version,graph_fingerprint,graph_files,graph_nodes,graph_edges,graph_db_bytes,repair_of)
-VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, r.ID, r.JobID, r.JobType, r.Agent, r.Mode, r.Status, r.Root, r.Worktree, r.Branch, ch, head, r.Diff, r.Transcript, r.Message, r.Created, r.PromptVersion, r.Envelope, r.Notes, r.Graph.Provider, r.Graph.Version, r.Graph.Fingerprint, r.Graph.FileCount, r.Graph.NodeCount, r.Graph.EdgeCount, r.Graph.DBSizeBytes, r.RepairOf)
+	_, err := db.Exec(`INSERT INTO runs(id,job_id,job_type,agent,mode,status,root,worktree,branch,contract_hash,base_head,diff,transcript,message,created,prompt_version,envelope_json,notes,graph_provider,graph_version,graph_fingerprint,graph_files,graph_nodes,graph_edges,graph_db_bytes,repair_of,identity_hash)
+VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, r.ID, r.JobID, r.JobType, r.Agent, r.Mode, r.Status, r.Root, r.Worktree, r.Branch, ch, head, r.Diff, r.Transcript, r.Message, r.Created, r.PromptVersion, r.Envelope, r.Notes, r.Graph.Provider, r.Graph.Version, r.Graph.Fingerprint, r.Graph.FileCount, r.Graph.NodeCount, r.Graph.EdgeCount, r.Graph.DBSizeBytes, r.RepairOf, r.IdentityHash)
 	return err
 }
 
 func updateRun(db *sql.DB, r RunRecord, approved string) error {
-	_, err := db.Exec(`UPDATE runs SET status=?,approved_head=?,diff=?,message=?,commit_hash=? WHERE id=?`,
-		r.Status, approved, r.Diff, r.Message, r.Commit, r.ID)
+	_, err := db.Exec(`UPDATE runs SET status=?,approved_head=?,diff=?,message=?,commit_hash=?,identity_hash=? WHERE id=?`,
+		r.Status, approved, r.Diff, r.Message, r.Commit, r.IdentityHash, r.ID)
 	return err
 }
 
@@ -1187,12 +1188,12 @@ func (r *Runner) runOnce(ctx context.Context, c contracts.Contract) (RunRecord, 
 			return RunRecord{}, err
 		}
 	}
-	var prior string
-	if db.QueryRow(`SELECT id FROM runs WHERE contract_hash=? AND approved_head=? AND status='APPROVED' ORDER BY created DESC LIMIT 1`, hash, head).Scan(&prior) == nil {
-		replayed, replayErr := Last(prior)
-		replayed.Replayed = true
-		return replayed, replayErr
-	}
+	// Sol Critical 1: the replay probe no longer fires here. It moved below
+	// every pre-launch trust gate (config, spend, routing, breaker,
+	// containment, layered policy, quota, prompt resolution) and now keys on
+	// the full ExecutionIdentity hash rather than contract_hash+approved_head,
+	// so a stale approval can never bypass current policy, configuration,
+	// routing, containment, quota, prompt or backend state.
 	cfg := config.Current()
 	if err := quota.SeedFromConfig(db, cfg, time.Now().UTC()); err != nil {
 		return RunRecord{}, err
@@ -1225,10 +1226,13 @@ func (r *Runner) runOnce(ctx context.Context, c contracts.Contract) (RunRecord, 
 	// is built means a fail-closed decision (no candidate qualifies) refuses
 	// with no orphan workspace or canary left behind. The resolved agent feeds
 	// every downstream read (prompt registry, agents.New, identity, run record)
-	// so the run reports what actually ran, while the contract hash — computed
-	// earlier from the authored contract — still keys the replay cache on
-	// agent: auto. An explicit agent skips the broker entirely (rule: the
-	// broker validates health but never overrides an explicit choice).
+	// so the run reports what actually ran. The contract hash — computed
+	// earlier from the authored contract — feeds the ExecutionIdentity (Sol
+	// Critical 1) alongside the resolved agent, so an agent: auto resolution
+	// that lands on a different backend mints a different identity and never
+	// replays an approval obtained under the other backend. An explicit agent
+	// skips the broker entirely (rule: the broker validates health but never
+	// overrides an explicit choice).
 	resolved := c
 	if c.Agent == contracts.AgentAuto {
 		decision, derr := router.Router{Health: breaker.Store{DB: db}}.Resolve(db, router.RequestFromContract(c))
@@ -1333,6 +1337,36 @@ func (r *Runner) runOnce(ctx context.Context, c contracts.Contract) (RunRecord, 
 			}
 		}
 	}()
+	// Sol Critical 1 / Phase A: resolve the prompt version and the backend
+	// adapter here (before workspace creation and before the replay probe) so
+	// the ExecutionIdentity — the replay key — captures the exact prompt and
+	// backend any replayed approval was evaluated against. Neither resolution
+	// depends on the worktree, so moving them up from their old post-workspace
+	// position is safe. The replay probe is intentionally AFTER every
+	// pre-launch trust gate (config, spend, routing, breaker, containment,
+	// layered policy, quota): a prior approval must clear current policy before
+	// it can be reused, and the identity hash ensures any changed trust input
+	// (org DENY, backend binary, prompt version, …) simply never matches.
+	promptRoot := config.Env("GOV_PROMPTS")
+	if promptRoot == "" {
+		promptRoot = "prompts"
+	}
+	promptVersion, err := prompts.Resolve(promptRoot, resolved.Agent, string(c.Mode))
+	if err != nil {
+		return RunRecord{}, err
+	}
+	agent, err := agents.New(resolved.Agent)
+	if err != nil {
+		return RunRecord{}, err
+	}
+	identity := computeExecutionIdentity(cfg, c, agent, root, head, hash, promptVersion)
+	if priorID, perr := replayMatch(db, identity.Hash()); perr != nil {
+		return RunRecord{}, perr
+	} else if priorID != "" {
+		replayed, replayErr := Last(priorID)
+		replayed.Replayed = true
+		return replayed, replayErr
+	}
 	ws, err := rn.Prepare(ctx, runner.PrepareRequest{Root: root, Home: r.Home, ID: id, Git: git})
 	if err != nil {
 		return RunRecord{}, err
@@ -1359,20 +1393,8 @@ func (r *Runner) runOnce(ctx context.Context, c contracts.Contract) (RunRecord, 
 		return RunRecord{}, err
 	}
 	transcript := filepath.Join(r.Home, "transcripts", id+".jsonl")
-	promptRoot := config.Env("GOV_PROMPTS")
-	if promptRoot == "" {
-		promptRoot = "prompts"
-	}
-	promptVersion, err := prompts.Resolve(promptRoot, resolved.Agent, string(c.Mode))
-	if err != nil {
-		return RunRecord{}, err
-	}
-	agent, err := agents.New(resolved.Agent)
-	if err != nil {
-		return RunRecord{}, err
-	}
 	spec := agents.SpecFromContract(c, work)
-	rec := RunRecord{ID: id, JobID: c.JobID, JobType: c.JobType, Agent: resolved.Agent, Mode: string(c.Mode), Status: "RUNNING", Root: root, Worktree: work, Branch: branch, Transcript: transcript, Created: time.Now().UTC().Format(time.RFC3339Nano), PromptVersion: promptVersion.ID, Envelope: envelopeJSON(spec, agent.Capabilities()), Graph: graphSnapshot, RepairOf: c.RepairLineage}
+	rec := RunRecord{ID: id, JobID: c.JobID, JobType: c.JobType, Agent: resolved.Agent, Mode: string(c.Mode), Status: "RUNNING", Root: root, Worktree: work, Branch: branch, Transcript: transcript, Created: time.Now().UTC().Format(time.RFC3339Nano), PromptVersion: promptVersion.ID, Envelope: envelopeJSON(spec, agent.Capabilities()), Graph: graphSnapshot, RepairOf: c.RepairLineage, IdentityHash: identity.Hash()}
 	if graphSnapshot.Warning != "" {
 		rec.Notes = appendNote(rec.Notes, "graph_warning: "+graphSnapshot.Warning)
 	}
@@ -1747,6 +1769,15 @@ func (r *Runner) runOnce(ctx context.Context, c contracts.Contract) (RunRecord, 
 	if rec.Status == "APPROVED" && git {
 		approved, _ = gitHead(root)
 	}
+	// Finalize the ExecutionIdentity's ApprovedHead to the post-merge HEAD for
+	// an approved git run (mirroring the approved_head column): a subsequent
+	// run whose current HEAD equals this post-merge HEAD then matches the
+	// identity and replays. For non-git or non-approved runs the pre-launch
+	// head stands. Recomputing the hash here (rather than at insertRun) is
+	// what makes the stored identity reflect the commit the approval landed
+	// on, not the commit the run started from.
+	identity.ApprovedHead = approved
+	rec.IdentityHash = identity.Hash()
 	if err := updateRun(db, rec, approved); err != nil {
 		return rec, err
 	}

@@ -120,3 +120,46 @@ func TestGovValidateSilentWhenCleanupBlockPresent(t *testing.T) {
 		t.Fatalf("expected no doctrine finding once a cleanup block is present, got: %s", output)
 	}
 }
+
+// TestGovValidateReportsMalformedConfigAsInvalid reproduces the Sol Critical 2
+// black-box failure: with a malformed configuration, `gov validate` must
+// report CONFIG INVALID and exit non-zero — never VALID plus silent built-in
+// defaults. The job contract itself is valid; the config is the problem.
+func TestGovValidateReportsMalformedConfigAsInvalid(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(t.TempDir(), "config.yaml")
+	// Unknown field → strict decoding rejects it.
+	if err := os.WriteFile(configPath, []byte("bogus_top_level_field: true\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("GOV_CONFIG", configPath)
+	path := surgeonJobWithoutCleanup(t, dir)
+
+	code, output := captureValidate(t, path)
+	if code == 0 {
+		t.Fatalf("expected non-zero exit for malformed config, got 0: %s", output)
+	}
+	if strings.Contains(output, "VALID ") {
+		t.Fatalf("malformed config must not print VALID: %s", output)
+	}
+	if !strings.Contains(output, "CONFIG INVALID") {
+		t.Fatalf("expected CONFIG INVALID in output, got: %s", output)
+	}
+}
+
+// TestGovValidateAcceptsMissingConfig proves the absent-config branch: a
+// missing config file is fine (built-in defaults), so validate proceeds and
+// reports the contract (not the config) as valid.
+func TestGovValidateAcceptsMissingConfig(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("GOV_CONFIG", filepath.Join(t.TempDir(), "missing-config.yaml"))
+	path := surgeonJobWithoutCleanup(t, dir)
+
+	code, output := captureValidate(t, path)
+	if code != 0 {
+		t.Fatalf("missing config should not fail validate, got %d: %s", code, output)
+	}
+	if !strings.Contains(output, "VALID ") {
+		t.Fatalf("expected VALID for a good contract with no config, got: %s", output)
+	}
+}

@@ -182,6 +182,12 @@ CREATE TABLE IF NOT EXISTS policy_overrides(id INTEGER PRIMARY KEY AUTOINCREMENT
 		"graph_provider TEXT NOT NULL DEFAULT ''", "graph_version TEXT NOT NULL DEFAULT ''", "graph_fingerprint TEXT NOT NULL DEFAULT ''",
 		"graph_files INTEGER NOT NULL DEFAULT 0", "graph_nodes INTEGER NOT NULL DEFAULT 0", "graph_edges INTEGER NOT NULL DEFAULT 0", "graph_db_bytes INTEGER NOT NULL DEFAULT 0",
 		"repair_of TEXT NOT NULL DEFAULT ''",
+		// identity_hash (Sol Critical 1 / Phase A) is the full ExecutionIdentity
+		// digest the replay probe keys on. Empty-string default on pre-existing
+		// APPROVED rows is honest: those approvals predate the identity model and
+		// were never fingerprinted against the current trust inputs, so they
+		// simply never match a replay probe (which passes a non-empty hash).
+		"identity_hash TEXT NOT NULL DEFAULT ''",
 	} {
 		if _, alterErr := db.Exec("ALTER TABLE runs ADD COLUMN " + column); alterErr != nil && !strings.Contains(strings.ToLower(alterErr.Error()), "duplicate column") {
 			db.Close()
@@ -249,6 +255,7 @@ CREATE TABLE IF NOT EXISTS policy_overrides(id INTEGER PRIMARY KEY AUTOINCREMENT
 		}
 	}
 	if _, err = db.Exec(`CREATE INDEX IF NOT EXISTS runs_key ON runs(contract_hash, approved_head, status);
+CREATE INDEX IF NOT EXISTS runs_identity ON runs(identity_hash, status);
 CREATE INDEX IF NOT EXISTS runs_failure ON runs(failure_taxonomy, created);
 CREATE INDEX IF NOT EXISTS runs_repair_of ON runs(repair_of);
 CREATE INDEX IF NOT EXISTS files_run ON files_touched(run_id);

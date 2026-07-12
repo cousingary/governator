@@ -456,3 +456,69 @@ func TestLoadContainmentOverridePublicKey(t *testing.T) {
 		t.Fatalf("env override key = %q", cfg.Containment.OverridePublicKey)
 	}
 }
+
+// TestLoadStrictMissingFileReturnsDefaults proves the absent-config branch of
+// Sol Critical 2: a missing configuration file is NOT an error — built-in
+// defaults apply. This is the one case where falling back to defaults is
+// correct; every other present-but-invalid case must fail (see below).
+func TestLoadStrictMissingFileReturnsDefaults(t *testing.T) {
+	cleanEnv(t)
+	t.Setenv("GOV_CONFIG", filepath.Join(t.TempDir(), "does-not-exist.yaml"))
+	cfg, err := LoadStrict()
+	if err != nil {
+		t.Fatalf("missing config file should not error, got: %v", err)
+	}
+	builtIn := BuiltIn()
+	if cfg.Defaults.Agent != builtIn.Defaults.Agent || cfg.Defaults.MaxMinutes != builtIn.Defaults.MaxMinutes {
+		t.Fatalf("missing config did not return built-in defaults: %+v", cfg.Defaults)
+	}
+}
+
+// TestLoadStrictRejectsMalformedYAML proves the malformed-YAML branch of Sol
+// Critical 2: present-but-unparseable configuration is fatal with a specific
+// message, never silently replaced by defaults.
+func TestLoadStrictRejectsMalformedYAML(t *testing.T) {
+	cleanEnv(t)
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	t.Setenv("GOV_CONFIG", path)
+	// Unclosed flow mapping — a YAML syntax error, not just an unknown field.
+	if err := os.WriteFile(path, []byte("spend: {daily_cap_usd: [unterminated\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	_, err := LoadStrict()
+	if err == nil {
+		t.Fatal("malformed YAML should produce an error, got nil")
+	}
+}
+
+// TestLoadStrictRejectsUnknownField proves the strict-decoding branch via the
+// canonical LoadStrict API (an unknown field is fatal). Mirrors the existing
+// TestLoadRejectsUnknownKeys but pins the canonical entry point.
+func TestLoadStrictRejectsUnknownField(t *testing.T) {
+	cleanEnv(t)
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	t.Setenv("GOV_CONFIG", path)
+	if err := os.WriteFile(path, []byte("totally_made_up_field: true\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	_, err := LoadStrict()
+	if err == nil || !strings.Contains(err.Error(), "totally_made_up_field") {
+		t.Fatalf("expected an error naming the unknown field, got: %v", err)
+	}
+}
+
+// TestLoadStrictRejectsInvalidPolicyValue proves the invalid-policy branch via
+// the canonical LoadStrict API: a structurally-valid but semantically-invalid
+// policy rule (bad verdict) is fatal at load time, never silently disarmed.
+func TestLoadStrictRejectsInvalidPolicyValue(t *testing.T) {
+	cleanEnv(t)
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	t.Setenv("GOV_CONFIG", path)
+	if err := os.WriteFile(path, []byte("policy_rules:\n  - id: bad\n    when: [{field: backend, op: eq, value: glm}]\n    verdict: ALLOW\n    reason: r\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	_, err := LoadStrict()
+	if err == nil {
+		t.Fatal("invalid policy verdict should produce an error, got nil")
+	}
+}

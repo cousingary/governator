@@ -2,6 +2,9 @@ package config
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -172,7 +175,19 @@ func BuiltIn() Config {
 	}
 }
 
-func Load() (Config, error) {
+// LoadStrict reads, strictly-decodes and validates the configuration file. It
+// is the canonical configuration API for Sol Critical 2 (malformed
+// configuration must fail closed):
+//   - absent config → built-in defaults (no error);
+//   - present-but-unreadable → a specific error;
+//   - malformed YAML → a specific error;
+//   - unknown fields (yaml.KnownFields strict decoding) → a specific error;
+//   - invalid policy rule values → a specific error.
+//
+// Security-sensitive callers and the CLI startup guard use this, never the
+// error-hiding Current() convenience. Load() remains as a backward-compatible
+// alias.
+func LoadStrict() (Config, error) {
 	cfg := BuiltIn()
 	path := Path()
 	data, err := os.ReadFile(path)
@@ -224,14 +239,54 @@ func Load() (Config, error) {
 	return cfg, nil
 }
 
+// Load remains as a backward-compatible alias for LoadStrict. New callers
+// should call LoadStrict directly to make the strict-decoding contract
+// explicit at the call site.
+func Load() (Config, error) { return LoadStrict() }
+
+// Current returns the effective configuration. It is a convenience for callers
+// that cannot propagate an error (e.g. package-level helpers); prefer
+// LoadStrict wherever the error can be observed.
+//
+// Sol Critical 2: Current() no longer SILENTLY hides a malformed config. When
+// LoadStrict reports an error it writes a visible warning to stderr and returns
+// built-in defaults rather than crashing a host process (panic-free). The real
+// protection is the CLI startup guard (cmd/gov guardConfig), which exits the
+// process before any command body runs when the configuration is invalid — so
+// in the normal CLI path Current() is never reached with a bad file. Library
+// callers that bypass that guard should call LoadStrict directly.
 func Current() Config {
-	cfg, err := Load()
+	cfg, err := LoadStrict()
 	if err != nil {
+		fmt.Fprintln(os.Stderr, "governator: malformed configuration ignored, using built-in defaults:", err)
 		cfg = BuiltIn()
 		applyEnv(&cfg)
 		clean(&cfg)
 	}
 	return cfg
+}
+
+// Hash returns a stable SHA-256 digest of the effective configuration. It is
+// the "effective config hash" trust-bearing input of the ExecutionIdentity
+// (Sol §11 Phase A): two runs whose loaded configuration differs in any
+// operator-declared field — backend paths, spend cap, org policy rules,
+// containment key, quota windows, assay settings — produce different hashes,
+// so a prior APPROVED run can never be replayed against a configuration it was
+// never actually evaluated against (Critical 1). encoding/json marshals map
+// keys in sorted order, so the digest is canonical regardless of map
+// iteration order.
+func (c Config) Hash() string {
+	data, err := json.Marshal(c)
+	if err != nil {
+		// Config is a plain struct of comparable/slice/map values whose only
+		// non-builtin field (policy.ConditionRule) is itself JSON-serializable,
+		// so Marshal cannot fail in practice. Falling back to a fixed sentinel
+		// keeps a failure loud (every run mints a fresh identity, so replay
+		// never matches) rather than panicking on a governance-critical path.
+		return "config-unhashable"
+	}
+	sum := sha256.Sum256(data)
+	return hex.EncodeToString(sum[:])
 }
 
 func merge(dst *Config, src Config) {
