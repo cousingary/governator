@@ -218,13 +218,24 @@ func panelExecFixture(t *testing.T, bins map[string]string, modes map[string]str
 }
 
 // TestRunPanelQuorumProceedsWithoutStraggler is the Phase 2 quorum
-// acceptance test: min_success=2 on a 3-member panel with a 1s hard
-// timeout. m1 (claude-code) succeeds immediately; m2 (codex) takes 2 real
+// acceptance test: min_success=2 on a 3-member panel with a 5s hard
+// timeout. m1 (claude-code) succeeds quickly; m2 (codex) takes 6 real
 // seconds but still succeeds, reaching quorum (2/2); by the time m3's
 // (glm) turn comes the level's cumulative wall-clock already exceeds the
-// 1s hard timeout, so RunPanel never launches it — m3 is recorded TIMEOUT.
+// 5s hard timeout, so RunPanel never launches it — m3 is recorded TIMEOUT.
 // The panel still completes: comparison and judge run against only m1 and
 // m2's artifacts and reach APPROVED.
+//
+// The hard timeout and m2's sleep are kept a full order of magnitude
+// apart (5s vs 6s vs m1's near-zero sleep) rather than the tightest
+// margin that makes the intended ordering hold on an idle machine: this
+// test previously used a 1s timeout with a 2s sleep, and m1's own
+// RunWithAutoRepair overhead (worktree/git setup, ledger writes, process
+// spawn) — normally well under 1s — was observed to occasionally exceed
+// it under load (parallel `-race` package runs), which marked m2 TIMEOUT
+// before it ever launched and failed the test nondeterministically. The
+// wider margin tolerates realistic setup-overhead variance without
+// changing what the test verifies.
 func TestRunPanelQuorumProceedsWithoutStraggler(t *testing.T) {
 	root, _ := fixture(t)
 	panelExecFixture(t,
@@ -232,7 +243,7 @@ func TestRunPanelQuorumProceedsWithoutStraggler(t *testing.T) {
 			"claude-code": panelFakeBackend(t, `mkdir -p .governator/artifacts
 printf '{"summary":"m1","findings":[]}' > .governator/artifacts/art1.json
 `+panelFakeResult),
-			"codex": panelFakeBackend(t, `sleep 2
+			"codex": panelFakeBackend(t, `sleep 6
 mkdir -p .governator/artifacts
 printf '{"summary":"m2","findings":[]}' > .governator/artifacts/art2.json
 `+panelFakeResult),
@@ -266,7 +277,7 @@ printf '{"summary":"judged","recommendation":"n/a"}' > .governator/artifacts/pan
 
 	spec := contracts.PanelSpec{
 		ID: "panel", Members: []string{"m1", "m2", "m3"}, ComparisonJob: "cmp", Judge: "judge",
-		MinSuccess: 2, HardTimeoutSeconds: 1,
+		MinSuccess: 2, HardTimeoutSeconds: 5,
 	}
 	levels := [][]contracts.Contract{{m1, m2, m3}, {cmp}, {judge}}
 
