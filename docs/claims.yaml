@@ -312,7 +312,20 @@ claims:
     # below are kept as an accurate historical record of the v1.4.1 release,
     # not as current shipped-maturity proof; re-establish "shipped" against a
     # fresh binary_build_evidence.commit in a future release pass (S14/S15).
-    claimed_maturity: tested
+    #
+    # 2026-07-13: raised tested -> ACCEPTED. A real acceptance pass against the
+    # live claude-code CLI now exercises the post-rename lifecycle end to end
+    # (evidence/acceptance-2026-07-13-attest-ask.json): the ASK gate quarantines
+    # BEFORE any backend launch at zero cost, a bare `gov ask approve` unblocks
+    # exactly one real run (APPROVED, merged, $0.084), and the NEXT run re-ASKs
+    # on a fresh checkpoint at zero cost — proving the reserved->consumed
+    # boundary S8 rebuilt. SHIPPED still requires identity-embedding binary
+    # provenance from the canonical scripts/release.sh; that invocation was
+    # denied by the permission layer in the session that produced this evidence,
+    # and a plain `go build` (version=1.5.0-dev, source_commit=unknown) is not
+    # acceptable provenance. Re-cut via scripts/release.sh and set
+    # binary_build_evidence.commit to that build to close the last rung.
+    claimed_maturity: accepted
     implementation:
       - file: internal/policy/verdict.go
         symbols: [Verdict, EvaluateLayers, ResolveOverrides, LayerResult]
@@ -340,8 +353,8 @@ claims:
         funcs:
           - TestSol3OneShotApprovalSurvivesWhenAnotherRuleStillBlocks
     acceptance_artifacts:
-      - path: evidence/release-v1.4.1.json
-        pointer: acceptance_evidence.8_ask_policy_lifecycle
+      - path: evidence/acceptance-2026-07-13-attest-ask.json
+        pointer: acceptance_evidence.3_ask_policy_lifecycle
     binary_build_evidence:
       evidence_file: evidence/release-v1.4.1.json
       commit: 9c25e43e56d02b0f1b679ccd99b66813648bdd91
