@@ -565,3 +565,258 @@ claims:
       - file: internal/runtime/identity_test.go
         funcs:
           - TestRunnerConfigHashesLocalConfig
+
+  # --- Sol redteam v3 (agents/governator-sol-upgrade3.md, agents/governator-sol3-repair-plan.md,
+  # closure report agents/governator-sol3-repair-report.md, S1-S15, 2026-07-13) ---
+  # Each claim below is "tested": implementation symbols verified present via go/parser,
+  # named test funcs verified present in the named test file. None assert "shipped" yet --
+  # doing so needs a fresh binary_build_evidence acceptance-evidence file in the
+  # evidence/release-vX.json shape prior sessions used, which is a separate undertaking
+  # from closing the audit's behavioral findings (S15 sizing note: see repair report).
+
+  - id: sol3-s1-hook-protocol-fail-closed
+    title: "gov hook pre-tool-use fails closed on malformed/oversized/wrong-version input (never emitAllow on a decode error), with a 0600 append-only emergency journal when the ledger write itself fails"
+    first_shipped_version: v1.5.0-sol3-repair-s1
+    claimed_maturity: tested
+    implementation:
+      - file: cmd/gov/main.go
+        symbols: [hookCmd, readHookPayload, decodeHookInput, denyHookProtocolError, recordHookDecision, tryRecordHookDecision, writeEmergencyHookJournal]
+    tests:
+      - file: cmd/gov/main_test.go
+        funcs:
+          - TestSol3HookProtocolMalformedInputDenies
+          - TestSol3HookProtocolOversizedPayloadDenies
+          - TestSol3HookProtocolValidPayloadsNotOverBlocked
+          - TestSol3HookProtocolEmergencyJournal
+
+  - id: sol3-s2-canonical-backend-resolution
+    title: "Every backend executable resolves exactly once per run into an immutable record (PATH lookup, symlink-canonicalized path, file identity, SHA-256); replay, identity, and launch all consume that one record instead of re-resolving or hashing a bare name directly"
+    first_shipped_version: v1.5.0-sol3-repair-s2
+    claimed_maturity: tested
+    implementation:
+      - file: internal/agents/resolution.go
+        symbols: [ResolvePath, Resolve]
+      - file: internal/runtime/identity.go
+        symbols: [computeExecutionIdentity]
+    tests:
+      - file: internal/runtime/identity_test.go
+        funcs:
+          - TestSol3ReplayInvalidatedByBarePathBackendSwap
+      - file: internal/agents/resolution_test.go
+        funcs:
+          - TestSol3ResolvePathBareNameProducesRealHash
+          - TestSol3ResolvePathFailsClosedWhenUnresolvable
+          - TestSol3RunCLIFailsClosedWhenResolvedBinDeletedBeforeLaunch
+          - TestSol3RunCLIUsesResolvedPathNotFreshPATHLookup
+
+  - id: sol3-s3-immutable-run-environment
+    title: "Configuration-derived, disk-backed inputs (doctrine enforcement, protected-path patterns) are read once per run and frozen, not re-read independently by each subsystem mid-run; a lint guard fails the build if execution-critical packages call config.Current() outside one named exception"
+    first_shipped_version: v1.5.0-sol3-repair-s3
+    claimed_maturity: tested
+    implementation:
+      - file: internal/protectedpaths/protectedpaths.go
+        symbols: [PatternsFor]
+      - file: internal/runtime/runtime.go
+        symbols: [auditTranscript]
+    tests:
+      - file: internal/runtime/config_mutation_test.go
+        funcs:
+          - TestSol3ConfigMutationDuringRunDoesNotAlterDoctrineEnforcement
+      - file: internal/runtime/config_current_guard_test.go
+        funcs:
+          - TestSol3NoConfigCurrentInExecutionCriticalPackages
+
+  - id: sol3-s4-real-behavioral-attestation
+    title: "Capability attestation runs independent behavioral probes (sandbox/read-only/network/transcript/approval) against the actual resolved executable in a scratch workspace; a version-string alone never sets probe results, and a probe that can't run leaves that capability unattested rather than assumed true"
+    first_shipped_version: v1.5.0-sol3-repair-s4
+    claimed_maturity: tested
+    implementation:
+      - file: internal/attest/attest.go
+        symbols: [GenerateFromResolution, runBehavioralProbes, RequiredProbesPassed, RequiredProbesPassedForBackend, VerifyHighRiskNative]
+    tests:
+      - file: internal/attest/sol3_attest_test.go
+        funcs:
+          - TestSol3FakeCodexVersionStringDoesNotAttestCapabilities
+      - file: internal/runtime/sol3_attestation_test.go
+        funcs:
+          - TestSol3FakeCodexAttestationCannotAuthorizeHighRiskLocal
+
+  - id: sol3-s5-final-state-validation-barrier
+    title: "After the final validator/cleanup/Assayer stage, a complete re-measurement barrier (symlink scan, worktree fingerprint, changed/deleted paths, budgets, protected-path checks, artifact re-hash) runs before merge; any delta from the approved measurement quarantines with the live root untouched, and staging uses exact approved paths (never git add -A)"
+    first_shipped_version: v1.5.0-sol3-repair-s5
+    claimed_maturity: tested
+    implementation:
+      - file: internal/runtime/runtime.go
+        symbols: [validateFinalWorktreeShape, finalValidationMeasurement, finalStateDeltaViolations]
+    tests:
+      - file: internal/runtime/sol3_final_barrier_test.go
+        funcs:
+          - TestSol3FinalBarrierQuarantinesValidatorCreatedUndeclaredFile
+          - TestSol3FinalBarrierQuarantinesValidatorProtectedPathMutation
+          - TestSol3FinalBarrierQuarantinesValidatorDeletesInScopeFile
+          - TestSol3FinalBarrierAllowsCleanupFormatterRewrite
+          - TestSol3FinalBarrierQuarantinesValidatorLineBudgetOverflow
+
+  - id: sol3-s6-runtime-path-containment
+    title: "Runtime-created symlinks/junctions/special files are rejected before merge (scanned after execution, after each validator, and at the final barrier); produced/consumed artifact collection uses Lstat+no-follow and refuses symlinked targets; risk_class:medium effectful jobs are tiered into the same host-containment requirement as high-risk jobs by default"
+    first_shipped_version: v1.5.0-sol3-repair-s6
+    claimed_maturity: tested
+    implementation:
+      - file: internal/runtime/artifacts.go
+        symbols: [collectProducedArtifacts, readRegularNoFollowAbsolute, writeNewNoFollow, writeFileNoFollowOverwrite]
+      - file: internal/containment/containment.go
+        symbols: [LocalEffectfulTieringEnforced, Effectful, RequiresHostContainment, EnforcePolicy]
+    tests:
+      - file: internal/runtime/sol3_runtime_path_containment_test.go
+        funcs:
+          - TestSol3MediumEffectfulLocalDeniedBeforeLaunch
+          - TestSol3RuntimeCreatedSymlinkQuarantinesBeforeMerge
+          - TestSol3RuntimeCreatedSpecialFileQuarantines
+          - TestSol3ProducedArtifactSymlinkRefusedNoCopy
+
+  # sol3-s7 (P0.6, Assayer outbox transactionality) is not represented as a
+  # claims.yaml entry: this file's verifier (internal/claims/claims.go) only
+  # resolves implementation symbols against THIS repo (repoRoot is always the
+  # Governator checkout), and S7's fix is entirely inside the sibling Assayer
+  # repo (assayer/outbox.py) with no Governator-side symbol to bind to -- the
+  # same reason no pre-existing claim in this file (e.g. sol-s7-assayer-v2-bridge)
+  # ever points at an assayer/*.py path directly. S7's finding, fix commit, and
+  # regression tests are recorded in docs/security.md's Sol v3 findings register
+  # and the closure report instead.
+
+  - id: sol3-s8-ask-lifecycle-and-config-validation
+    title: "One-shot policy overrides follow available->reserved->consumed|released|expired, consumed only immediately before the governed action's execution boundary (rule A's approval survives rule B still blocking); config decode validates raw supplied values before defaulting (negative max_minutes/timeout/token limits rejected, not defaulted), rejects a second YAML document, and rejects NaN/Inf in every numeric/spend/quota field"
+    first_shipped_version: v1.5.0-sol3-repair-s8
+    claimed_maturity: tested
+    implementation:
+      - file: internal/observability/policy_checkpoints.go
+        symbols: [reclaimStaleOneShotReservations, ClaimActivePolicyOverrides, ConsumePolicyOverrideReservation, ReleasePolicyOverrideReservation]
+      - file: internal/config/config.go
+        symbols: [LoadStrict, finite, parsableTimestamp, validateRawSuppliedValues]
+      - file: internal/policy/conditions.go
+        symbols: [ToFloat]
+    tests:
+      - file: internal/runtime/sol3_ask_lifecycle_test.go
+        funcs:
+          - TestSol3OneShotApprovalSurvivesWhenAnotherRuleStillBlocks
+      - file: internal/config/sol3_config_validation_test.go
+        funcs:
+          - TestSol3LoadStrictRejectsMultipleYAMLDocuments
+          - TestSol3LoadStrictRejectsNaNAndInfSpendCap
+          - TestSol3LoadStrictRejectsNaNAndInfQuotaFields
+          - TestSol3LoadStrictRejectsNegativeMaxMinutesInsteadOfDefaulting
+          - TestSol3LoadStrictRejectsMalformedQuotaTimestamp
+      - file: internal/policy/sol3_tofloat_test.go
+        funcs:
+          - TestSol3ToFloatRejectsNaNAndInf
+          - TestSol3ConditionRuleValidateRejectsNaNLiteralForNumericOperator
+
+  - id: sol3-s9-quota-and-spend-reservations
+    title: "Quota headroom validation and reservation are one conditional SQLite transaction (concurrent reservations can never exceed headroom); settle/release/expire claim only unsettled rows so two recovery workers never double-decrement; daily spend reservations are ledger-backed and shared across gov run/gov batch processes, and unknown-cost runs fail closed to a conservative estimate rather than counting as zero"
+    first_shipped_version: v1.5.0-sol3-repair-s9
+    claimed_maturity: tested
+    implementation:
+      - file: internal/quota/quota.go
+        symbols: [Reserve, claimReservation, Release, Settle, ExpireStale]
+      - file: internal/spend/reservation.go
+        symbols: [ReserveGlobal, SettleGlobal, ReleaseGlobal, ReleaseForRun]
+    tests:
+      - file: internal/quota/sol3_reserve_concurrency_test.go
+        funcs:
+          - TestSol3ConcurrentReservationsCannotExceedHeadroom
+          - TestSol3SettleVersusExpireDoesNotDoubleDecrement
+          - TestSol3SettleVersusReleaseDoesNotDoubleDecrement
+          - TestSol3TwoRecoveryWorkersNeverDoubleApplyExpire
+      - file: internal/spend/sol3_reservation_test.go
+        funcs:
+          - TestSol3ReserveGlobalConcurrentAcrossTwoConnectionsNeverExceedsCap
+          - TestSol3SettleGlobalUnknownCostFallsBackToEstimateNotZero
+          - TestSol3SettleGlobalKnownCostUsesActualNotEstimate
+          - TestSol3SettleVersusReleaseGlobalMutualExclusion
+          - TestSol3ReleaseForRunOnlyTouchesThatRun
+
+  - id: sol3-s10-reconcile-leasing-and-docker-recovery
+    title: "gov reconcile claims maintenance-outbox rows atomically (leased pending->processing->done|dead) so two reconcilers never double-apply a non-idempotent op; crash recovery persists a full workspace/runner descriptor before launch and destroys a leftover Docker container through the real runner.Destroy path, never marking a run recovered while cleanup is outstanding"
+    first_shipped_version: v1.5.0-sol3-repair-s10
+    claimed_maturity: tested
+    implementation:
+      - file: internal/observability/outbox.go
+        symbols: [ClaimOutbox, OutboxAlreadyApplied, MarkOutboxApplied]
+      - file: internal/runtime/recovery.go
+        symbols: [recoverInterruptedRun, destroyLeftoverWorkspace]
+    tests:
+      - file: internal/runtime/sol3_docker_crash_recovery_test.go
+        funcs:
+          - TestSol3RecoveryRemovesLeftoverDockerContainer
+          - TestSol3RecoveryLeavesRunRunningWhenContainerCleanupFails
+      - file: internal/runtime/sol3_reconcile_leasing_test.go
+        funcs:
+          - TestSol3ConcurrentReconcilersNeverDoubleApplyBreakerFailure
+          - TestSol3ClaimOutboxNeverDoubleClaimsAcrossTwoConnections
+
+  - id: sol3-s11-multi-artifact-assay-protocol
+    title: "Assay evaluates every produced artifact (a contract with several artifacts under a blocking assay blocks on any failing one, not just the first); each artifact resolves to a per-artifact profile, the contract-wide default, or an explicit exemption, with an undeclared produced artifact failing closed; the Governator-Assayer wire protocol carries the artifact's declared path/media type/language and is version-checked, failing closed on mismatch"
+    first_shipped_version: v1.5.0-sol3-repair-s11
+    claimed_maturity: tested
+    implementation:
+      - file: internal/runtime/assay.go
+        symbols: [resolveArtifactAssay, assayDeclaresBlocking, runAssayStep]
+      - file: internal/assay/assay.go
+        symbols: [Evaluate]
+    tests:
+      - file: internal/runtime/assay_test.go
+        funcs:
+          - TestSol3AssayEvaluatesEveryProducedArtifactThirdFailureBlocks
+          - TestSol3UndeclaredProducedArtifactFailsClosed
+          - TestSol3ArtifactAssayNoneExemptsWithoutOverBlocking
+      - file: internal/assay/assay_test.go
+        funcs:
+          - TestSol3ArtifactDeclaredPathReachesRealAssayerFilePathCheck
+
+  - id: sol3-s12-transcript-conformance
+    title: "Transcript conformance checks session-start/completion events, tool-use/tool-result pairing, session-identity consistency, and turn-count-vs-tool-count reconciliation per adapter; a single benign recognizable event can no longer establish transcript completeness (default posture is advisory/flagged; doctrine.transcript_conformance_action: block makes it enforcement-blocking)"
+    first_shipped_version: v1.5.0-sol3-repair-s12
+    claimed_maturity: tested
+    implementation:
+      - file: internal/runtime/sol3_transcript_conformance.go
+        symbols: [transcriptIsSessionStart, transcriptIsCompletion, newTranscriptConformanceState]
+    tests:
+      - file: internal/runtime/sol3_transcript_conformance_test.go
+        funcs:
+          - TestSol3TranscriptConformanceCorpusSingleBenignEventBlocked
+          - TestSol3TranscriptConformanceDefaultIsAdvisoryOnly
+          - TestSol3TranscriptConformanceConformingFixturesPass
+          - TestSol3TranscriptConformanceSessionIdentityMixedBlocks
+          - TestSol3TranscriptConformanceUnpairedToolUseBlocks
+          - TestSol3TranscriptConformanceTurnCountShortBlocks
+          - TestSol3TranscriptConformanceCoexistsWithTemporalRuleDeny
+
+  - id: sol3-s13-snapshot-correctness
+    title: "Snapshot hardlink dedup is content-hash based, not size+mtime (a file whose content changes with both preserved is never dedup'd to stale content); gov snap restore supports an explicit --exact mode that deletes only post-snapshot additions, never protected paths, and only after presenting the deletion set and receiving confirmation (interactive --yes or an operator-set unattended policy) -- default restore behavior is unchanged (overlay)"
+    first_shipped_version: v1.5.0-sol3-repair-s13
+    claimed_maturity: tested
+    implementation:
+      - file: internal/snapshots/snapshots.go
+        symbols: [contentHash, same, postSnapshotAdditions, Restore]
+    tests:
+      - file: internal/snapshots/snapshots_test.go
+        funcs:
+          - TestSameDetectsContentChangeDespiteMatchingSizeAndMtime
+          - TestSameTreatsIdenticalContentAsSameRegardlessOfMtime
+          - TestSnapshotDoesNotHardlinkStaleContentWhenSizeAndMtimeMatch
+          - TestRestoreExactRemovesAdditionsAndOverlayDoesNot
+          - TestRestoreExactPreservesProtectedPaths
+          - TestRestoreExactRequiresConfirmation
+
+  - id: sol3-s14-unified-release-pipeline
+    title: "scripts/release.sh is the sole release pipeline (goreleaser retired): every run wipes and rebuilds an empty staging directory, packages all 4 platforms under one identical ldflags identity, and refuses to package if any required test tier (unit, race, integration, the Sol3 black-box corpus, bounded fuzz, Assayer's matrix) actually fails -- tier pass/fail is captured directly (printf -v), not through a subshell exit-status trap that can silently swallow a real failure"
+    first_shipped_version: v1.5.0-sol3-repair-s14
+    claimed_maturity: tested
+    implementation:
+      - file: internal/claims/claims.go
+        symbols: [verifyReleaseArtifact, verifyArtifactManifest]
+    tests:
+      - file: internal/claims/claims_test.go
+        funcs:
+          - TestVerifyReleaseArtifactChecksExactBinaryAndSelfReportedVersion
+          - TestVerifyRealClaimsFileIsFullyConsistent
