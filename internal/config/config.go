@@ -103,6 +103,17 @@ type Doctrine struct {
 	// suspiciously minimal transcript to fail closed instead of merely
 	// being reported.
 	TranscriptConformanceAction string `yaml:"transcript_conformance_action,omitempty"`
+	// ExactRestoreUnattended is the Sol3 P2.1 (finding #18) unattended policy
+	// for `gov snap restore --exact`, which (unlike the pre-existing overlay
+	// restore) deletes live files added after the snapshot was taken. Exact
+	// restore always requires either the CLI's interactive --yes confirmation
+	// or this field set to "allow" before it deletes anything — empty (the
+	// default) means every unattended/scripted caller that doesn't pass --yes
+	// gets the deletion plan printed back and nothing removed, so no existing
+	// automation can be surprised into losing files just because this mode now
+	// exists. Protected paths are never deleted by exact restore regardless of
+	// this setting.
+	ExactRestoreUnattended string `yaml:"exact_restore_unattended,omitempty"`
 }
 
 // Containment configures the Session 3 (Phase 2) risk-class containment
@@ -339,6 +350,9 @@ func LoadStrict() (Config, error) {
 	if a := cfg.Doctrine.TranscriptConformanceAction; a != "" && a != "flag" && a != "block" {
 		return Config{}, fmt.Errorf("invalid doctrine.transcript_conformance_action %q (want flag or block)", a)
 	}
+	if a := cfg.Doctrine.ExactRestoreUnattended; a != "" && a != "allow" {
+		return Config{}, fmt.Errorf("invalid doctrine.exact_restore_unattended %q (want allow)", a)
+	}
 	if t := cfg.Containment.LocalEffectfulTiering; t != "" && t != "enforce" && t != "off" {
 		return Config{}, fmt.Errorf("invalid containment.local_effectful_tiering %q (want enforce or off)", t)
 	}
@@ -482,6 +496,9 @@ func merge(dst *Config, src Config) {
 	if src.Doctrine.TranscriptConformanceAction != "" {
 		dst.Doctrine.TranscriptConformanceAction = src.Doctrine.TranscriptConformanceAction
 	}
+	if src.Doctrine.ExactRestoreUnattended != "" {
+		dst.Doctrine.ExactRestoreUnattended = src.Doctrine.ExactRestoreUnattended
+	}
 	if src.Defaults.Agent != "" {
 		dst.Defaults.Agent = src.Defaults.Agent
 	}
@@ -581,6 +598,9 @@ func applyEnv(cfg *Config) {
 	}
 	if value := Env("GOV_TRANSCRIPT_CONFORMANCE_ACTION"); value != "" {
 		cfg.Doctrine.TranscriptConformanceAction = value
+	}
+	if value := Env("GOV_EXACT_RESTORE_UNATTENDED"); value != "" {
+		cfg.Doctrine.ExactRestoreUnattended = value
 	}
 	if value := Env("GOV_DEFAULT_AGENT"); value != "" {
 		cfg.Defaults.Agent = value

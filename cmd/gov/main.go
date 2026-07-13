@@ -2067,18 +2067,56 @@ func snapCmd(args []string) int {
 		return 0
 	}
 	if len(args) >= 2 && args[0] == "restore" {
-		dryRun := len(args) == 3 && args[2] == "--dry-run"
-		if len(args) > 3 || (len(args) == 3 && !dryRun) {
-			return bad("usage: gov snap restore <id> [--dry-run]")
+		mode := snapshots.RestoreOverlay
+		dryRun := false
+		yes := false
+		for _, flag := range args[2:] {
+			switch flag {
+			case "--dry-run":
+				dryRun = true
+			case "--overlay":
+				mode = snapshots.RestoreOverlay
+			case "--exact":
+				mode = snapshots.RestoreExact
+			case "--yes":
+				yes = true
+			default:
+				return bad("usage: gov snap restore <id> [--overlay|--exact] [--dry-run] [--yes]")
+			}
 		}
-		count, err := snapshots.Restore(args[1], dryRun)
+		unattended := yes || config.Current().Doctrine.ExactRestoreUnattended == "allow"
+		result, err := snapshots.Restore(args[1], mode, dryRun, unattended)
+		if errors.Is(err, snapshots.ErrExactRestoreConfirmationRequired) {
+			fmt.Printf("Exact restore of %s would delete %d post-snapshot addition(s):\n", args[1], len(result.Deleted))
+			for _, path := range result.Deleted {
+				fmt.Printf("  - %s\n", path)
+			}
+			if len(result.Preserved) > 0 {
+				fmt.Println("Protected paths kept despite --exact:")
+				for _, path := range result.Preserved {
+					fmt.Printf("  ! %s\n", path)
+				}
+			}
+			fmt.Println("Re-run with --yes to confirm, or set doctrine.exact_restore_unattended: allow (or GOV_EXACT_RESTORE_UNATTENDED=allow) for unattended callers.")
+			return 1
+		}
 		if err != nil {
 			return bad("snap: " + err.Error())
 		}
+		verb := "Restored"
 		if dryRun {
-			fmt.Printf("DRY-RUN: would restore %d file(s); nothing written.\n", count)
-		} else {
-			fmt.Printf("Restored %d file(s).\n", count)
+			verb = "DRY-RUN: would restore"
+		}
+		fmt.Printf("%s %d file(s).\n", verb, result.Restored)
+		if mode == snapshots.RestoreExact {
+			verb = "Deleted"
+			if dryRun {
+				verb = "DRY-RUN: would delete"
+			}
+			fmt.Printf("%s %d post-snapshot addition(s).\n", verb, len(result.Deleted))
+			if len(result.Preserved) > 0 {
+				fmt.Printf("Kept %d protected post-snapshot addition(s).\n", len(result.Preserved))
+			}
 		}
 		return 0
 	}
@@ -2100,7 +2138,7 @@ func snapCmd(args []string) int {
 		fmt.Printf("Kept newest %d, pruned %d old snapshot(s).\n", keep, len(removed))
 		return 0
 	}
-	return bad("usage: gov snap create [label]|list|diff <id>|restore <id> [--dry-run]|prune [--keep N]")
+	return bad("usage: gov snap create [label]|list|diff <id>|restore <id> [--overlay|--exact] [--dry-run] [--yes]|prune [--keep N]")
 }
 
 func parityCmd(args []string) int {
@@ -2458,7 +2496,7 @@ Usage:
   gov eval harness <case-dir>
   gov eval scorecard
   gov protect status|apply|release <path>
-  gov snap create [label]|list|diff <id>|restore <id> [--dry-run]
+  gov snap create [label]|list|diff <id>|restore <id> [--overlay|--exact] [--dry-run] [--yes]
   gov graph status|refresh [path]
   gov graph query <search> [--path <path>] [--limit <n>]
   gov hook pre-tool-use [--run <id>] [--shadow <python-gate>]

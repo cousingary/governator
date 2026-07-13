@@ -1,6 +1,8 @@
 package snapshots
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -13,7 +15,18 @@ import (
 	"time"
 
 	"github.com/cousingary/governator/internal/config"
+	"github.com/cousingary/governator/internal/protectedpaths"
 )
+
+// ErrExactRestoreConfirmationRequired is returned by Restore when mode is
+// RestoreExact, the plan would delete at least one post-snapshot addition,
+// and the caller passed confirmed=false. The caller (gov snap restore) must
+// present the returned RestoreResult's Deleted/Preserved sets to the operator
+// and re-invoke with confirmed=true (interactive --yes) or an operator-set
+// unattended policy (doctrine.exact_restore_unattended: allow) before
+// anything is removed. Nothing is deleted, and no pre-restore snapshot is
+// taken, when this error is returned.
+var ErrExactRestoreConfirmationRequired = errors.New("exact restore requires confirmation: pass --yes or set doctrine.exact_restore_unattended: allow")
 
 var excluded = map[string]bool{
 	".git": true, "node_modules": true, "__pycache__": true, ".next": true,
@@ -105,6 +118,29 @@ func List() ([]Manifest, error) {
 	return out, nil
 }
 
+// contentHash returns the SHA-256 digest of a file's actual bytes.
+func contentHash(path string) (string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
+}
+
+// same reports whether two files have identical content. Sol audit finding
+// #19: size + mtime is not proof of identity — a file's bytes can change
+// while both are deliberately preserved, which previously let snapshotRoot
+// hardlink stale content from a prior snapshot into a new one, and let Diff
+// miss a real edit. Size is checked first purely as a cheap short-circuit
+// (differing sizes can never be identical content); anything past that must
+// match by actual content hash. mtime is deliberately not consulted at all
+// anymore: it was never proof of anything and a byte-identical file is the
+// same file regardless of when it was last touched.
 func same(a, b string) bool {
 	left, err := os.Stat(a)
 	if err != nil {
@@ -114,11 +150,18 @@ func same(a, b string) bool {
 	if err != nil {
 		return false
 	}
-	// Sub-second precision is required: two writes to the same file inside one
-	// second that keep the same size would compare as identical under whole-
-	// second mtime, causing Diff to miss the change and snapshotRoot to
-	// hardlink stale content into the new snapshot.
-	return left.Size() == right.Size() && left.ModTime().UnixNano() == right.ModTime().UnixNano()
+	if left.Size() != right.Size() {
+		return false
+	}
+	hashA, err := contentHash(a)
+	if err != nil {
+		return false
+	}
+	hashB, err := contentHash(b)
+	if err != nil {
+		return false
+	}
+	return hashA == hashB
 }
 
 func copyFile(src, dst string) error {
@@ -301,6 +344,43 @@ func find(id string) (Manifest, string, error) {
 	return prefixMatches[0], filepath.Join(StoreDir(), prefixMatches[0].ID), nil
 }
 
+// postSnapshotAdditions returns the live files under root.Path that are not
+// present in the snapshot at dir/root.ID — i.e. files added after the
+// snapshot was taken. Shared by Diff (reported as Kind "A") and Restore's
+// RestoreExact mode (the deletion candidate set).
+func postSnapshotAdditions(dir string, root Root) ([]string, error) {
+	snapRoot := filepath.Join(dir, root.ID)
+	inSnapshot := map[string]bool{}
+	if err := filepath.WalkDir(snapRoot, func(path string, entry fs.DirEntry, walkErr error) error {
+		if walkErr != nil || entry.IsDir() {
+			return nil
+		}
+		rel, _ := filepath.Rel(snapRoot, path)
+		inSnapshot[rel] = true
+		return nil
+	}); err != nil {
+		return nil, err
+	}
+	var additions []string
+	err := filepath.WalkDir(root.Path, func(path string, entry fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return nil
+		}
+		if entry.IsDir() && path != root.Path && excluded[entry.Name()] {
+			return filepath.SkipDir
+		}
+		if entry.IsDir() {
+			return nil
+		}
+		rel, _ := filepath.Rel(root.Path, path)
+		if !inSnapshot[rel] {
+			additions = append(additions, path)
+		}
+		return nil
+	})
+	return additions, err
+}
+
 func Diff(id string) ([]Change, error) {
 	manifest, dir, err := find(id)
 	if err != nil {
@@ -309,13 +389,11 @@ func Diff(id string) ([]Change, error) {
 	var changes []Change
 	for _, root := range manifest.Roots {
 		snapRoot := filepath.Join(dir, root.ID)
-		inSnapshot := map[string]bool{}
 		_ = filepath.WalkDir(snapRoot, func(path string, entry fs.DirEntry, walkErr error) error {
 			if walkErr != nil || entry.IsDir() {
 				return nil
 			}
 			rel, _ := filepath.Rel(snapRoot, path)
-			inSnapshot[rel] = true
 			live := filepath.Join(root.Path, rel)
 			if _, err := os.Stat(live); os.IsNotExist(err) {
 				changes = append(changes, Change{Kind: "D", Path: live})
@@ -324,22 +402,13 @@ func Diff(id string) ([]Change, error) {
 			}
 			return nil
 		})
-		_ = filepath.WalkDir(root.Path, func(path string, entry fs.DirEntry, walkErr error) error {
-			if walkErr != nil {
-				return nil
-			}
-			if entry.IsDir() && path != root.Path && excluded[entry.Name()] {
-				return filepath.SkipDir
-			}
-			if entry.IsDir() {
-				return nil
-			}
-			rel, _ := filepath.Rel(root.Path, path)
-			if !inSnapshot[rel] {
-				changes = append(changes, Change{Kind: "A", Path: path})
-			}
-			return nil
-		})
+		additions, err := postSnapshotAdditions(dir, root)
+		if err != nil {
+			return nil, err
+		}
+		for _, path := range additions {
+			changes = append(changes, Change{Kind: "A", Path: path})
+		}
 	}
 	sort.Slice(changes, func(i, j int) bool {
 		if changes[i].Kind == changes[j].Kind {
@@ -350,14 +419,86 @@ func Diff(id string) ([]Change, error) {
 	return changes, nil
 }
 
-func Restore(id string, dryRun bool) (int, error) {
+// RestoreMode selects how Restore reconciles the live root against a
+// snapshot (Sol audit finding #18: the pre-Sol3 behavior only ever overlaid,
+// silently keeping any file added after the snapshot, despite the command
+// name and recovery purpose implying a full restoration).
+type RestoreMode int
+
+const (
+	// RestoreOverlay copies snapshot files back over the live root but never
+	// removes a file that was added to the live root after the snapshot was
+	// taken. This is the long-standing default behavior, unchanged.
+	RestoreOverlay RestoreMode = iota
+	// RestoreExact additionally removes post-snapshot additions so the live
+	// root matches the snapshot exactly, except for paths matching the
+	// protected-path manifest, which are never deleted. Deletion only
+	// happens when confirmed is true (see Restore).
+	RestoreExact
+)
+
+// RestoreResult reports what a Restore call did (or, for RestoreExact
+// without confirmation, what it would do).
+type RestoreResult struct {
+	Restored  int      // files copied back from the snapshot
+	Deleted   []string // post-snapshot additions removed (RestoreExact only); on dry-run or an unconfirmed plan, this is the set that WOULD be removed
+	Preserved []string // post-snapshot additions that matched a protected-path pattern and were kept despite RestoreExact
+}
+
+func matchesProtected(path string, patterns []string) bool {
+	for _, pattern := range patterns {
+		if protectedpaths.Match(path, pattern) {
+			return true
+		}
+	}
+	return false
+}
+
+// Restore reconciles the live root(s) against snapshot id. mode selects
+// overlay (copy back only, additions untouched — the original behavior) or
+// exact (also deletes post-snapshot additions). For RestoreExact, deletion
+// only happens once: a pre-restore snapshot has been taken (so exact restore
+// is itself always recoverable), the deletion set has been computed with
+// protected paths excluded, and confirmed is true — otherwise Restore returns
+// the plan (Deleted/Preserved populated, nothing touched) alongside
+// ErrExactRestoreConfirmationRequired so the caller can present it to the
+// operator before retrying with confirmation.
+func Restore(id string, mode RestoreMode, dryRun bool, confirmed bool) (RestoreResult, error) {
 	manifest, dir, err := find(id)
 	if err != nil {
-		return 0, err
+		return RestoreResult{}, err
 	}
+
+	var deletions []string
+	var preserved []string
+	if mode == RestoreExact {
+		patterns, err := protectedpaths.Patterns()
+		if err != nil {
+			return RestoreResult{}, fmt.Errorf("exact restore: reading protected-path manifest: %w", err)
+		}
+		for _, root := range manifest.Roots {
+			additions, err := postSnapshotAdditions(dir, root)
+			if err != nil {
+				return RestoreResult{}, err
+			}
+			for _, path := range additions {
+				if matchesProtected(path, patterns) {
+					preserved = append(preserved, path)
+					continue
+				}
+				deletions = append(deletions, path)
+			}
+		}
+		sort.Strings(deletions)
+		sort.Strings(preserved)
+		if len(deletions) > 0 && !dryRun && !confirmed {
+			return RestoreResult{Deleted: deletions, Preserved: preserved}, ErrExactRestoreConfirmationRequired
+		}
+	}
+
 	if !dryRun {
 		if _, err := Create("pre-restore"); err != nil {
-			return 0, fmt.Errorf("pre-restore snapshot: %w", err)
+			return RestoreResult{}, fmt.Errorf("pre-restore snapshot: %w", err)
 		}
 	}
 	count := 0
@@ -382,8 +523,23 @@ func Restore(id string, dryRun bool) (int, error) {
 			return copyFile(path, target)
 		})
 		if err != nil {
-			return count, err
+			return RestoreResult{Restored: count, Deleted: deletions, Preserved: preserved}, err
 		}
 	}
-	return count, nil
+
+	result := RestoreResult{Restored: count, Preserved: preserved}
+	if mode == RestoreExact {
+		if dryRun {
+			result.Deleted = deletions
+			return result, nil
+		}
+		for _, path := range deletions {
+			if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+				result.Deleted = deletions
+				return result, fmt.Errorf("exact restore: removing %s: %w", path, err)
+			}
+		}
+		result.Deleted = deletions
+	}
+	return result, nil
 }
