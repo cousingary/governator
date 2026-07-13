@@ -49,10 +49,16 @@ func attachProvenance(d GateDecision) GateDecision {
 
 // GateInput is the PreToolUse payload. ToolName/tool_input mirror Claude Code;
 // CWD resolves relative paths for the F4 Bash-plane protected-path check.
+// HookEventName mirrors Claude Code's common `hook_event_name` field — this
+// binary only evaluates PreToolUse semantics, so cmd/gov's hook protocol
+// decoding (P0.7) rejects a payload that names a different event instead of
+// silently applying PreToolUse rules to it. Omitted by older callers/tests,
+// so it is optional here and only checked when present.
 type GateInput struct {
-	ToolName  string         `json:"tool_name"`
-	ToolInput map[string]any `json:"tool_input"`
-	CWD       string         `json:"cwd,omitempty"`
+	ToolName      string         `json:"tool_name"`
+	ToolInput     map[string]any `json:"tool_input"`
+	CWD           string         `json:"cwd,omitempty"`
+	HookEventName string         `json:"hook_event_name,omitempty"`
 }
 
 type NeutralGateInput struct {

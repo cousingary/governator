@@ -2163,13 +2163,13 @@ func hookCmd(args []string) int {
 			return bad("usage: gov hook pre-tool-use [--run <id>] [--shadow <python-gate>]")
 		}
 	}
-	data, err := io.ReadAll(os.Stdin)
-	if err != nil {
-		return emitDegraded("stdin read failed: " + err.Error())
+	data, protoErr := readHookPayload(os.Stdin, hookProtocolMaxBytes)
+	if protoErr != nil {
+		return denyHookProtocolError(runID, protoErr)
 	}
-	var in govruntime.GateInput
-	if err := json.Unmarshal(data, &in); err != nil {
-		return emitAllow()
+	in, protoErr := decodeHookInput(data)
+	if protoErr != nil {
+		return denyHookProtocolError(runID, protoErr)
 	}
 	if in.ToolInput == nil {
 		in.ToolInput = map[string]any{}
@@ -2199,7 +2199,7 @@ func hookCmd(args []string) int {
 	cmd.Stdin = bytes.NewReader(data)
 	var pythonOutput bytes.Buffer
 	cmd.Stdout = &pythonOutput
-	err = cmd.Run()
+	err := cmd.Run()
 	event := observability.ParityEvent{Payload: string(data), GoDecision: string(goOutput), PythonDecision: pythonOutput.String()}
 	if err != nil {
 		event.PythonUnavailable = true
@@ -2236,17 +2236,98 @@ func shadowVerdict(out []byte) string {
 	return string(trimmed)
 }
 
-func emitAllow() int {
-	// Unparseable payload — no tool/command to evaluate. An allow decision
-	// never writes stdout JSON (see EmitHookJSON), so this is silent success.
-	return 0
+// hookProtocolMaxBytes bounds the PreToolUse hook stdin payload (audit #7 /
+// P0.7): oversized input is rejected before it is fully buffered. Real
+// tool_input is small (paths, commands, at most a sizeable Edit/Write diff);
+// this leaves generous headroom while still being a bound.
+const hookProtocolMaxBytes = 8 << 20 // 8 MiB
+
+// hookProtocolSupportedEvent is the only Claude Code hook_event_name this
+// binary evaluates PreToolUse rules for — settings.json wires `gov hook
+// pre-tool-use` only to the PreToolUse event. A payload that explicitly
+// names a different event means this binary was invoked for the wrong hook;
+// fail closed instead of silently applying PreToolUse semantics to it.
+const hookProtocolSupportedEvent = "PreToolUse"
+
+// hookProtocolError distinguishes a malformed/truncated/oversized/version-
+// mismatched hook payload (audit #7) from a normal policy deny. Code is one
+// of the two reason codes governator-sol-upgrade3.md names.
+type hookProtocolError struct {
+	Code   string // HOOK_PROTOCOL_ERROR | HOOK_VERSION_MISMATCH
+	Reason string
 }
 
-func emitDegraded(why string) int {
-	return govruntime.EmitHookJSON(govruntime.GateDecision{
-		Allow: false, Degraded: true, Finding: "F5",
-		Reason: "gate unavailable (" + why + "); degraded safety net active",
-	})
+func (e *hookProtocolError) Error() string { return e.Code + ": " + e.Reason }
+
+// readHookPayload reads stdin bounded to maxBytes+1 so an oversized payload
+// is detected without buffering an unbounded amount of input first, and
+// distinguishes an empty payload from a read failure — both are protocol
+// errors, not a basis for evaluating any decision.
+func readHookPayload(r io.Reader, maxBytes int64) ([]byte, *hookProtocolError) {
+	data, err := io.ReadAll(io.LimitReader(r, maxBytes+1))
+	if err != nil {
+		return nil, &hookProtocolError{"HOOK_PROTOCOL_ERROR", "stdin read failed: " + err.Error()}
+	}
+	if len(data) == 0 {
+		return nil, &hookProtocolError{"HOOK_PROTOCOL_ERROR", "empty hook payload"}
+	}
+	if int64(len(data)) > maxBytes {
+		return nil, &hookProtocolError{"HOOK_PROTOCOL_ERROR", fmt.Sprintf("payload exceeds %d byte limit", maxBytes)}
+	}
+	return data, nil
+}
+
+// decodeHookInput applies strict schema decoding to an already size-bounded
+// payload: well-formed JSON, no trailing content after the first JSON value
+// (rejects truncated-then-resumed or accidentally concatenated payloads —
+// the `{broken` reproduction plus its siblings), a non-empty tool_name, and
+// — when the caller supplies it — a hook_event_name matching this binary's
+// only supported event.
+//
+// This deliberately does NOT use json.Decoder's DisallowUnknownFields:
+// Claude Code's real PreToolUse payload carries several common fields this
+// gate doesn't act on (session_id, transcript_path, permission_mode,
+// tool_use_id, ...), and rejecting those would make every future Claude
+// Code release a fail-closed incident instead of a no-op for this gate.
+// "Strict" here means structurally strict (shape, trailing bytes, required
+// fields), not closed to additive fields.
+func decodeHookInput(data []byte) (govruntime.GateInput, *hookProtocolError) {
+	dec := json.NewDecoder(bytes.NewReader(data))
+	var in govruntime.GateInput
+	if err := dec.Decode(&in); err != nil {
+		return govruntime.GateInput{}, &hookProtocolError{"HOOK_PROTOCOL_ERROR", "malformed JSON: " + err.Error()}
+	}
+	if err := dec.Decode(new(json.RawMessage)); err != io.EOF {
+		return govruntime.GateInput{}, &hookProtocolError{"HOOK_PROTOCOL_ERROR", "trailing content after hook payload"}
+	}
+	if strings.TrimSpace(in.ToolName) == "" {
+		return govruntime.GateInput{}, &hookProtocolError{"HOOK_PROTOCOL_ERROR", "missing tool_name"}
+	}
+	if in.HookEventName != "" && in.HookEventName != hookProtocolSupportedEvent {
+		return govruntime.GateInput{}, &hookProtocolError{"HOOK_VERSION_MISMATCH",
+			fmt.Sprintf("unsupported hook_event_name %q, expected %q", in.HookEventName, hookProtocolSupportedEvent)}
+	}
+	return in, nil
+}
+
+// denyHookProtocolError is the P0.7 fail-closed path for a hook payload that
+// could not be trusted enough to evaluate. Claude Code's PreToolUse hook
+// honors a block via exit 0 + stdout `hookSpecificOutput.permissionDecision:
+// "deny"` (stdout JSON is parsed only on exit 0; any nonzero exit other than
+// 2 is a NON-blocking hook error under Claude Code's documented contract,
+// meaning the tool call would proceed despite the nonzero exit — and exit 2
+// discards stdout JSON entirely, so it can't carry the structured
+// HOOK_PROTOCOL_ERROR/HOOK_VERSION_MISMATCH reason). This reuses the exact
+// exit-0-plus-JSON mechanism every other gate denial (F1-F7) already uses in
+// production, rather than a second, unproven denial channel.
+func denyHookProtocolError(runID string, pe *hookProtocolError) int {
+	// Reason carries "CODE: detail" (pe.Error()) rather than the bare detail
+	// so the code survives into hookJSON's permissionDecisionReason on
+	// stdout — Finding itself is DB/journal-only, never serialized to the
+	// hook's stdout contract.
+	decision := govruntime.GateDecision{Allow: false, Finding: pe.Code, Reason: pe.Error()}
+	recordHookDecision(runID, govruntime.GateInput{ToolName: "<unparseable>"}, decision)
+	return govruntime.EmitHookJSON(decision)
 }
 
 // recordHookDecision appends a row to the hook_events audit log — a table of
@@ -2254,13 +2335,22 @@ func emitDegraded(why string) int {
 // ClassifyFailure; audit rows there would displace/corrupt real violation
 // data). Records the decision (allow/deny), not just the input, so the
 // interactive plane's audit trail actually reflects what the gate decided
-// (the F6 unification goal). Best-effort: a ledger write failure must NEVER
-// block an already-computed decision, so errors are swallowed.
+// (the F6 unification goal). A ledger write failure must NEVER block an
+// already-computed decision, but per audit "Policy hook emergency journal"
+// the decision itself must never be silently lost either: when the ledger
+// is unavailable or the write fails, it falls back to the append-only
+// emergency journal instead of swallowing the error.
 func recordHookDecision(runID string, in govruntime.GateInput, d govruntime.GateDecision) {
 	home := govruntime.Home()
+	if !tryRecordHookDecision(home, runID, in, d) {
+		writeEmergencyHookJournal(home, runID, in, d)
+	}
+}
+
+func tryRecordHookDecision(home, runID string, in govruntime.GateInput, d govruntime.GateDecision) bool {
 	db, err := observability.Open(home)
 	if err != nil {
-		return
+		return false
 	}
 	defer db.Close()
 	decision := "allow"
@@ -2271,8 +2361,55 @@ func recordHookDecision(runID string, in govruntime.GateInput, d govruntime.Gate
 	cmd, _ := in.ToolInput["command"].(string)
 	detail := in.ToolName + " " + cmd + " " + string(payload)
 	sourcesJSON, _ := json.Marshal(d.Sources)
-	_, _ = db.Exec(`INSERT INTO hook_events(run_id, tool, decision, finding, detail, sources, policy_hash, created) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+	_, err = db.Exec(`INSERT INTO hook_events(run_id, tool, decision, finding, detail, sources, policy_hash, created) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
 		runID, in.ToolName, decision, d.Finding, detail, string(sourcesJSON), d.PolicyHash, time.Now().UTC().Format(time.RFC3339))
+	return err == nil
+}
+
+// hookEmergencyJournalFile is the audit's "Policy hook emergency journal":
+// an append-only, restrictively-permissioned filesystem record that survives
+// even when the SQLite ledger itself is what's broken. One JSON line per
+// decision; the file is only ever appended to, never truncated or rewritten.
+const hookEmergencyJournalFile = "hook_emergency_journal.jsonl"
+
+func writeEmergencyHookJournal(home, runID string, in govruntime.GateInput, d govruntime.GateDecision) {
+	if home == "" {
+		return
+	}
+	if err := os.MkdirAll(home, 0o700); err != nil {
+		return
+	}
+	f, err := os.OpenFile(filepath.Join(home, hookEmergencyJournalFile), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+	decision := "allow"
+	if !d.Allow {
+		decision = "deny"
+	}
+	line, err := json.Marshal(struct {
+		Time     string `json:"time"`
+		RunID    string `json:"run_id,omitempty"`
+		Tool     string `json:"tool"`
+		Decision string `json:"decision"`
+		Finding  string `json:"finding,omitempty"`
+		Reason   string `json:"reason,omitempty"`
+	}{
+		Time:     time.Now().UTC().Format(time.RFC3339Nano),
+		RunID:    runID,
+		Tool:     in.ToolName,
+		Decision: decision,
+		Finding:  d.Finding,
+		Reason:   d.Reason,
+	})
+	if err != nil {
+		return
+	}
+	if _, err := f.Write(append(line, '\n')); err != nil {
+		return
+	}
+	_ = f.Sync()
 }
 
 func contractError(path string, err error) int {

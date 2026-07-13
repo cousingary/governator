@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -356,5 +357,215 @@ func TestHookDecisionRecordsProvenance(t *testing.T) {
 	}
 	if policyHash == "" {
 		t.Fatal("policy_hash was not recorded")
+	}
+}
+
+// --- Sol redteam v3 S1 — P0.7 hook protocol fail-closed (corpus #6) --------
+// governator-sol-upgrade3.md finding #7: `printf '{broken' | gov hook
+// pre-tool-use` returned exit 0, no denial, no useful error, no audit
+// record. hookDenyJSON below decodes the real PreToolUse deny contract
+// (exit 0 + hookSpecificOutput.permissionDecision=deny — see
+// docs.claude.com/en/docs/claude-code/hooks: JSON is only parsed on exit 0,
+// and exit 2 discards stdout JSON entirely, so exit 0 is the only channel
+// that can carry a distinguishable HOOK_PROTOCOL_ERROR/HOOK_VERSION_MISMATCH
+// reason).
+func hookDenyJSON(t *testing.T, output string) (permissionDecision, reason string) {
+	t.Helper()
+	var parsed struct {
+		HookSpecificOutput struct {
+			PermissionDecision       string `json:"permissionDecision"`
+			PermissionDecisionReason string `json:"permissionDecisionReason"`
+		} `json:"hookSpecificOutput"`
+	}
+	if err := json.Unmarshal([]byte(output), &parsed); err != nil {
+		t.Fatalf("output=%q is not valid hook JSON: %v", output, err)
+	}
+	return parsed.HookSpecificOutput.PermissionDecision, parsed.HookSpecificOutput.PermissionDecisionReason
+}
+
+func TestSol3HookProtocolMalformedInputDenies(t *testing.T) {
+	cases := []struct {
+		name     string
+		payload  string
+		wantCode string
+	}{
+		{"truncated brace (audit reproduction)", `{broken`, "HOOK_PROTOCOL_ERROR"},
+		{"truncated valid-looking prefix", `{"tool_name":"Bash","tool_in`, "HOOK_PROTOCOL_ERROR"},
+		{"empty payload", ``, "HOOK_PROTOCOL_ERROR"},
+		{"missing tool_name", `{"tool_input":{"command":"ls"}}`, "HOOK_PROTOCOL_ERROR"},
+		{"tool_input wrong type", `{"tool_name":"Bash","tool_input":"not-an-object"}`, "HOOK_PROTOCOL_ERROR"},
+		{"concatenated second document", `{"tool_name":"Read","tool_input":{}}{"tool_name":"Bash","tool_input":{"command":"rm -rf /"}}`, "HOOK_PROTOCOL_ERROR"},
+		{"unsupported hook_event_name", `{"tool_name":"Bash","tool_input":{"command":"ls"},"hook_event_name":"PostToolUse"}`, "HOOK_VERSION_MISMATCH"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			home := t.TempDir()
+			t.Setenv("GOV_HOME", home)
+			t.Setenv("GOV_CONFIG", filepath.Join(t.TempDir(), "missing-config.yaml"))
+			runID := "sol3-s1-" + strings.Map(func(r rune) rune {
+				if r == ' ' || r == '(' || r == ')' {
+					return '-'
+				}
+				return r
+			}, tc.name)
+
+			code, output := captureRunInput(t, []string{"hook", "pre-tool-use", "--run", runID}, tc.payload)
+			if code != 0 {
+				t.Fatalf("exit=%d, want 0 (Claude Code only parses hook JSON on exit 0)", code)
+			}
+			decision, reason := hookDenyJSON(t, output)
+			if decision != "deny" {
+				t.Fatalf("payload %q must not be ALLOW: permissionDecision=%q output=%q", tc.payload, decision, output)
+			}
+			if !strings.Contains(reason, tc.wantCode) {
+				t.Fatalf("reason=%q, want it to contain %s", reason, tc.wantCode)
+			}
+
+			db, err := observability.Open(home)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer db.Close()
+			var dbDecision, finding string
+			if err := db.QueryRow(`SELECT decision,finding FROM hook_events WHERE run_id=?`, runID).Scan(&dbDecision, &finding); err != nil {
+				t.Fatalf("hook_events row missing for run %s: %v", runID, err)
+			}
+			if dbDecision != "deny" || finding != tc.wantCode {
+				t.Fatalf("hook_events decision=%q finding=%q, want deny/%s", dbDecision, finding, tc.wantCode)
+			}
+		})
+	}
+}
+
+// captureRunInputAsync is captureRunInput's pipe-fed sibling for payloads
+// that exceed the OS pipe buffer (~64KB): unlike captureRunInput, it writes
+// stdin from a goroutine concurrently with run(args) so a multi-megabyte
+// payload can't deadlock the writer against a reader that hasn't started yet.
+func captureRunInputAsync(t *testing.T, args []string, input string) (int, string) {
+	t.Helper()
+	oldIn, oldOut := os.Stdin, os.Stdout
+	inR, inW, _ := os.Pipe()
+	outR, outW, _ := os.Pipe()
+	go func() {
+		_, _ = inW.WriteString(input)
+		_ = inW.Close()
+	}()
+	os.Stdin, os.Stdout = inR, outW
+	code := run(args)
+	_ = outW.Close()
+	os.Stdin, os.Stdout = oldIn, oldOut
+	data, _ := io.ReadAll(outR)
+	return code, string(data)
+}
+
+// TestSol3HookProtocolOversizedPayloadDenies is corpus #6's "oversized"
+// variant: a payload past hookProtocolMaxBytes must be rejected before an
+// attempt to decode it, not just fail JSON parsing incidentally.
+func TestSol3HookProtocolOversizedPayloadDenies(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("GOV_HOME", home)
+	t.Setenv("GOV_CONFIG", filepath.Join(t.TempDir(), "missing-config.yaml"))
+
+	padding := strings.Repeat("a", hookProtocolMaxBytes+1)
+	payload := `{"tool_name":"Bash","tool_input":{"command":"` + padding + `"}}`
+	code, output := captureRunInputAsync(t, []string{"hook", "pre-tool-use", "--run", "sol3-s1-oversized"}, payload)
+	if code != 0 {
+		t.Fatalf("exit=%d, want 0", code)
+	}
+	decision, reason := hookDenyJSON(t, output)
+	if decision != "deny" {
+		t.Fatalf("oversized payload must not be ALLOW: permissionDecision=%q", decision)
+	}
+	if !strings.Contains(reason, "HOOK_PROTOCOL_ERROR") {
+		t.Fatalf("reason=%q, want HOOK_PROTOCOL_ERROR", reason)
+	}
+}
+
+// TestSol3HookProtocolValidPayloadsNotOverBlocked is the no-over-blocking
+// half of corpus #6: the fail-closed fix must not turn legitimate PreToolUse
+// invocations into denials. Covers a normal allow, a normal policy deny
+// (pre-existing F3 behavior), a payload carrying the extra common fields
+// Claude Code actually sends (session_id/transcript_path/permission_mode
+// plus a matching hook_event_name), and a payload with a trailing newline
+// (common from JSON-line writers) — none of these are "strict schema
+// decoding" violations.
+func TestSol3HookProtocolValidPayloadsNotOverBlocked(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("GOV_HOME", home)
+	t.Setenv("GOV_CONFIG", filepath.Join(t.TempDir(), "missing-config.yaml"))
+
+	cases := []struct {
+		name      string
+		payload   string
+		wantAllow bool
+	}{
+		{"plain allow", `{"tool_name":"Read","tool_input":{"file_path":"README.md"}}`, true},
+		{"plain deny (F3 rm -rf)", `{"tool_name":"Bash","tool_input":{"command":"rm -rf dist"}}`, false},
+		{"real Claude Code common fields, allow", `{"session_id":"abc123","transcript_path":"/tmp/t.jsonl","cwd":"/tmp","hook_event_name":"PreToolUse","permission_mode":"default","tool_name":"Read","tool_input":{"file_path":"README.md"}}`, true},
+		{"trailing newline", "{\"tool_name\":\"Read\",\"tool_input\":{\"file_path\":\"README.md\"}}\n", true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			code, output := captureRunInput(t, []string{"hook", "pre-tool-use"}, tc.payload)
+			if code != 0 {
+				t.Fatalf("exit=%d, want 0", code)
+			}
+			if tc.wantAllow {
+				if strings.TrimSpace(output) != "" {
+					t.Fatalf("want silent allow, got output=%q", output)
+				}
+				return
+			}
+			decision, _ := hookDenyJSON(t, output)
+			if decision != "deny" {
+				t.Fatalf("want deny, got permissionDecision=%q output=%q", decision, output)
+			}
+		})
+	}
+}
+
+// TestSol3HookProtocolEmergencyJournal is the audit's "Policy hook emergency
+// journal": when the ledger write fails, the decision must land in the
+// append-only fallback file instead of being silently swallowed. Forces the
+// ledger open to fail by pre-creating ledger.db as a directory.
+func TestSol3HookProtocolEmergencyJournal(t *testing.T) {
+	home := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(home, "ledger.db"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("GOV_HOME", home)
+	t.Setenv("GOV_CONFIG", filepath.Join(t.TempDir(), "missing-config.yaml"))
+
+	code, output := captureRunInput(t, []string{"hook", "pre-tool-use", "--run", "sol3-s1-journal"}, `{broken`)
+	if code != 0 {
+		t.Fatalf("exit=%d, want 0", code)
+	}
+	decision, reason := hookDenyJSON(t, output)
+	if decision != "deny" || !strings.Contains(reason, "HOOK_PROTOCOL_ERROR") {
+		t.Fatalf("decision=%q reason=%q, want deny/HOOK_PROTOCOL_ERROR even though the ledger is unavailable", decision, reason)
+	}
+
+	journalPath := filepath.Join(home, "hook_emergency_journal.jsonl")
+	info, err := os.Stat(journalPath)
+	if err != nil {
+		t.Fatalf("emergency journal not written: %v", err)
+	}
+	if perm := info.Mode().Perm(); perm != 0o600 {
+		t.Fatalf("journal perms=%o, want 0600", perm)
+	}
+	raw, err := os.ReadFile(journalPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var rec struct {
+		RunID    string `json:"run_id"`
+		Decision string `json:"decision"`
+		Finding  string `json:"finding"`
+	}
+	if err := json.Unmarshal(bytes.TrimSpace(raw), &rec); err != nil {
+		t.Fatalf("journal line not valid JSON: %v (raw=%q)", err, raw)
+	}
+	if rec.RunID != "sol3-s1-journal" || rec.Decision != "deny" || rec.Finding != "HOOK_PROTOCOL_ERROR" {
+		t.Fatalf("journal record=%+v, want run_id=sol3-s1-journal decision=deny finding=HOOK_PROTOCOL_ERROR", rec)
 	}
 }

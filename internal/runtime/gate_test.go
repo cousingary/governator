@@ -41,43 +41,43 @@ func TestGateParityF1F7(t *testing.T) {
 		wantAxis  string // which F-axis must decide (empty = don't assert)
 	}{
 		// --- F3: hardened classify_shell_command (high_danger_only) ---------
-		{"F3 rm -rf blocks", GateInput{"Bash", map[string]any{"command": "rm -rf dist"}, cwd}, false, "F3"},
-		{"F3 find -exec rm blocks", GateInput{"Bash", map[string]any{"command": "find . -exec rm {} +"}, cwd}, false, "F3"},
-		{"F3 git push main blocks", GateInput{"Bash", map[string]any{"command": "git push origin main"}, cwd}, false, "F3"},
-		{"F3 git force push blocks", GateInput{"Bash", map[string]any{"command": "git push --force origin feat"}, cwd}, false, "F3"},
-		{"F3 DROP TABLE blocks", GateInput{"Bash", map[string]any{"command": "psql -c 'DROP TABLE users'"}, cwd}, false, "F3"},
-		{"F3 dd to device blocks", GateInput{"Bash", map[string]any{"command": "dd if=/dev/zero of=/dev/sda"}, cwd}, false, "F3"},
-		{"F3 routine rm file allows", GateInput{"Bash", map[string]any{"command": "rm scratch.txt"}, cwd}, true, "F3"},
-		{"F3 go test allows", GateInput{"Bash", map[string]any{"command": "go test ./..."}, cwd}, true, "F3"},
-		{"F3 ls allows", GateInput{"Bash", map[string]any{"command": "ls -la"}, cwd}, true, "F3"},
+		{"F3 rm -rf blocks", GateInput{"Bash", map[string]any{"command": "rm -rf dist"}, cwd, ""}, false, "F3"},
+		{"F3 find -exec rm blocks", GateInput{"Bash", map[string]any{"command": "find . -exec rm {} +"}, cwd, ""}, false, "F3"},
+		{"F3 git push main blocks", GateInput{"Bash", map[string]any{"command": "git push origin main"}, cwd, ""}, false, "F3"},
+		{"F3 git force push blocks", GateInput{"Bash", map[string]any{"command": "git push --force origin feat"}, cwd, ""}, false, "F3"},
+		{"F3 DROP TABLE blocks", GateInput{"Bash", map[string]any{"command": "psql -c 'DROP TABLE users'"}, cwd, ""}, false, "F3"},
+		{"F3 dd to device blocks", GateInput{"Bash", map[string]any{"command": "dd if=/dev/zero of=/dev/sda"}, cwd, ""}, false, "F3"},
+		{"F3 routine rm file allows", GateInput{"Bash", map[string]any{"command": "rm scratch.txt"}, cwd, ""}, true, "F3"},
+		{"F3 go test allows", GateInput{"Bash", map[string]any{"command": "go test ./..."}, cwd, ""}, true, "F3"},
+		{"F3 ls allows", GateInput{"Bash", map[string]any{"command": "ls -la"}, cwd, ""}, true, "F3"},
 
 		// --- F2: protected-path Write/Edit/MultiEdit gate -------------------
-		{"F2 Write to protected file blocks", GateInput{"Write", map[string]any{"file_path": protectedFile}, cwd}, false, "F2"},
-		{"F2 Edit to protected file blocks", GateInput{"Edit", map[string]any{"file_path": protectedFile}, cwd}, false, "F2"},
-		{"F2 MultiEdit to protected file blocks", GateInput{"MultiEdit", map[string]any{"file_path": protectedFile}, cwd}, false, "F2"},
-		{"F2 Write to scratch allows", GateInput{"Write", map[string]any{"file_path": filepath.Join(t.TempDir(), "x.go")}, cwd}, true, "F2"},
+		{"F2 Write to protected file blocks", GateInput{"Write", map[string]any{"file_path": protectedFile}, cwd, ""}, false, "F2"},
+		{"F2 Edit to protected file blocks", GateInput{"Edit", map[string]any{"file_path": protectedFile}, cwd, ""}, false, "F2"},
+		{"F2 MultiEdit to protected file blocks", GateInput{"MultiEdit", map[string]any{"file_path": protectedFile}, cwd, ""}, false, "F2"},
+		{"F2 Write to scratch allows", GateInput{"Write", map[string]any{"file_path": filepath.Join(t.TempDir(), "x.go")}, cwd, ""}, true, "F2"},
 
 		// --- F4: Bash-plane protected-path enforcement (args + redirects) ---
 		// The actual 86-file class: an opaque script naming the protected dir.
-		{"F4 opaque script on protected dir blocks", GateInput{"Bash", map[string]any{"command": "python build.py --dir " + protectedDir}, cwd}, false, "F4"},
-		{"F4 rm protected file blocks", GateInput{"Bash", map[string]any{"command": "rm " + protectedFile}, cwd}, false, "F4"},
-		{"F4 redirect into protected file blocks", GateInput{"Bash", map[string]any{"command": "echo x > " + protectedFile}, cwd}, false, "F4"},
-		{"F4 read-only cat of protected allows", GateInput{"Bash", map[string]any{"command": "cat " + protectedFile}, cwd}, true, "F3"},
-		{"F4 ls of protected dir allows", GateInput{"Bash", map[string]any{"command": "ls " + protectedDir}, cwd}, true, "F3"},
-		{"F4 unprotected rm allows", GateInput{"Bash", map[string]any{"command": "rm " + filepath.Join(t.TempDir(), "scratch.txt")}, cwd}, true, "F3"},
+		{"F4 opaque script on protected dir blocks", GateInput{"Bash", map[string]any{"command": "python build.py --dir " + protectedDir}, cwd, ""}, false, "F4"},
+		{"F4 rm protected file blocks", GateInput{"Bash", map[string]any{"command": "rm " + protectedFile}, cwd, ""}, false, "F4"},
+		{"F4 redirect into protected file blocks", GateInput{"Bash", map[string]any{"command": "echo x > " + protectedFile}, cwd, ""}, false, "F4"},
+		{"F4 read-only cat of protected allows", GateInput{"Bash", map[string]any{"command": "cat " + protectedFile}, cwd, ""}, true, "F3"},
+		{"F4 ls of protected dir allows", GateInput{"Bash", map[string]any{"command": "ls " + protectedDir}, cwd, ""}, true, "F3"},
+		{"F4 unprotected rm allows", GateInput{"Bash", map[string]any{"command": "rm " + filepath.Join(t.TempDir(), "scratch.txt")}, cwd, ""}, true, "F3"},
 
 		// --- F1: degraded denylist (fail-closed when full eval unavailable) -
-		{"F1 degraded rm -rf blocks", GateInput{"Bash", map[string]any{"command": "rm -rf /tmp/x"}, cwd}, false, "F1"},
-		{"F1 degraded shred blocks", GateInput{"Bash", map[string]any{"command": "shred secret.key"}, cwd}, false, "F1"},
-		{"F1 degraded mkfs blocks", GateInput{"Bash", map[string]any{"command": "mkfs.ext4 /dev/sda1"}, cwd}, false, "F1"},
-		{"F1 degraded routine allows", GateInput{"Bash", map[string]any{"command": "echo hello"}, cwd}, true, "F1"},
+		{"F1 degraded rm -rf blocks", GateInput{"Bash", map[string]any{"command": "rm -rf /tmp/x"}, cwd, ""}, false, "F1"},
+		{"F1 degraded shred blocks", GateInput{"Bash", map[string]any{"command": "shred secret.key"}, cwd, ""}, false, "F1"},
+		{"F1 degraded mkfs blocks", GateInput{"Bash", map[string]any{"command": "mkfs.ext4 /dev/sda1"}, cwd, ""}, false, "F1"},
+		{"F1 degraded routine allows", GateInput{"Bash", map[string]any{"command": "echo hello"}, cwd, ""}, true, "F1"},
 
 		// --- default: non-Bash non-mutating tools always allow --------------
-		{"default Read allows", GateInput{"Read", map[string]any{"file_path": protectedFile}, cwd}, true, "default"},
-		{"default Grep allows", GateInput{"Grep", map[string]any{"pattern": "x"}, cwd}, true, "default"},
+		{"default Read allows", GateInput{"Read", map[string]any{"file_path": protectedFile}, cwd, ""}, true, "default"},
+		{"default Grep allows", GateInput{"Grep", map[string]any{"pattern": "x"}, cwd, ""}, true, "default"},
 
 		// --- HARNESS_UNLOCK escape hatch (mirrors Python) -------------------
-		{"unlock Write to protected allows", GateInput{"Write", map[string]any{"file_path": protectedFile}, cwd}, true, "F2"},
+		{"unlock Write to protected allows", GateInput{"Write", map[string]any{"file_path": protectedFile}, cwd, ""}, true, "F2"},
 	}
 
 	for i, tc := range tests {
