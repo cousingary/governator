@@ -1199,6 +1199,13 @@ type transcriptAudit struct {
 	Usage           observability.TokenUsage
 	ToolCalls       int
 	TranscriptBytes int64
+	// ConformanceSchemaVersion (Sol3 P1.8, finding #15) is Governator's own
+	// versioned transcript-sequence-conformance schema this run was checked
+	// against — see transcriptConformanceSchemaVersion. Recorded even when
+	// empty protectedPatterns/format make every conformance check a no-op,
+	// so the evidence trail always states which schema generation produced
+	// this audit.
+	ConformanceSchemaVersion string
 	// RuleViolations (Phase 6) is every hit from the temporal rule engine —
 	// both the blocking (deny) kind, which is also folded into Violations
 	// above, and the advisory (flag) kind, which is not. Callers ledger the
@@ -1444,13 +1451,14 @@ func recognizedTranscriptEvent(format string, v any) bool {
 	return false
 }
 
-func auditTranscript(path, format, work string, c contracts.Contract, protectedPatterns []string, unenforceableRuleAction string) transcriptAudit {
+func auditTranscript(path, format, work string, c contracts.Contract, protectedPatterns []string, unenforceableRuleAction, transcriptConformanceAction string) transcriptAudit {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return transcriptAudit{Violations: []string{"transcript audit: " + err.Error()}, CostUnavailable: true}
 	}
-	audit := transcriptAudit{TranscriptBytes: int64(len(data))}
+	audit := transcriptAudit{TranscriptBytes: int64(len(data)), ConformanceSchemaVersion: transcriptConformanceSchemaVersion}
 	usage := newUsageAccumulator()
+	conf := newTranscriptConformanceState(format)
 	known := map[string]bool{
 		agents.TranscriptClaude: true, agents.TranscriptCodex: true,
 		agents.TranscriptGLM: true, agents.TranscriptOpenCode: true,
@@ -1469,6 +1477,7 @@ func auditTranscript(path, format, work string, c contracts.Contract, protectedP
 				walk(item)
 			}
 		case map[string]any:
+			conf.observeNode(x)
 			command := transcriptCommand(format, x)
 			if command != "" {
 				audit.Commands = append(audit.Commands, command)
@@ -1517,6 +1526,9 @@ func auditTranscript(path, format, work string, c contracts.Contract, protectedP
 		sawValidJSON = true
 		if recognizedTranscriptEvent(format, v) {
 			sawRecognizedEvent = true
+		}
+		if m, ok := v.(map[string]any); ok {
+			conf.observeLine(m)
 		}
 		usage.walk(format, v)
 		walk(v)
@@ -1630,6 +1642,16 @@ func auditTranscript(path, format, work string, c contracts.Contract, protectedP
 			Detail: fmt.Sprintf("rule unenforceable for backend transcript format %q: its parser does not supply an event kind this rule requires", format),
 		})
 	}
+	// Sol3 P1.8 (finding #15): same two-tier posture as the unenforceable-rule
+	// handling just above — advisory (RuleFlag, the default) unless
+	// doctrine.transcript_conformance_action is "block", in which case a
+	// failed session-start/completion/pairing/identity/turn-count check
+	// folds into audit.Violations via the exact same loop below.
+	conformanceVerdict := policy.RuleFlag
+	if transcriptConformanceAction == "block" {
+		conformanceVerdict = policy.RuleDeny
+	}
+	audit.RuleViolations = append(audit.RuleViolations, conf.violations(conformanceVerdict)...)
 	for _, rv := range audit.RuleViolations {
 		if rv.Verdict == policy.RuleDeny {
 			audit.Violations = append(audit.Violations, "policy rule violation ("+rv.Rule+"): "+rv.Detail)
@@ -2451,7 +2473,7 @@ func (r *Runner) runOnce(ctx context.Context, c contracts.Contract) (RunRecord, 
 		}
 	}
 	redactErr := redact(transcript)
-	audit := auditTranscript(transcript, agent.Capabilities().TranscriptFormat, work, c, env.ProtectedPatterns, env.Config.Doctrine.UnenforceableRuleAction)
+	audit := auditTranscript(transcript, agent.Capabilities().TranscriptFormat, work, c, env.ProtectedPatterns, env.Config.Doctrine.UnenforceableRuleAction, env.Config.Doctrine.TranscriptConformanceAction)
 	if err := observability.RecordStage(db, id, "AUDITED", "", time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
 		return rec, err
 	}

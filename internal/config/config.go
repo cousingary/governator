@@ -89,6 +89,20 @@ type Doctrine struct {
 	// want a coverage gap on a security-relevant backend to fail closed
 	// instead. Never silent either way — that was the actual bug.
 	UnenforceableRuleAction string `yaml:"unenforceable_rule_action,omitempty"`
+	// TranscriptConformanceAction controls what happens when a run's
+	// transcript fails the Sol3 P1.8 (finding #15) sequence-conformance
+	// checks — session-start event, completion event, tool-start/result
+	// pairing, session identity consistency, turn-count reconciliation —
+	// beyond the pre-existing "at least one recognized event" bar. Same
+	// posture as UnenforceableRuleAction above and for the same reason: this
+	// finding is not release-blocking (P0), and for local untrusted
+	// high-risk backends the real backstop is already containment tiering
+	// (P0.4) and behavioral attestation (P0.1), not transcript trust. "flag"
+	// (the default, including "") records an advisory RuleViolation;
+	// "block" makes it a hard denial for operators who want a malformed or
+	// suspiciously minimal transcript to fail closed instead of merely
+	// being reported.
+	TranscriptConformanceAction string `yaml:"transcript_conformance_action,omitempty"`
 }
 
 // Containment configures the Session 3 (Phase 2) risk-class containment
@@ -322,6 +336,9 @@ func LoadStrict() (Config, error) {
 	if a := cfg.Doctrine.UnenforceableRuleAction; a != "" && a != "flag" && a != "block" {
 		return Config{}, fmt.Errorf("invalid doctrine.unenforceable_rule_action %q (want flag or block)", a)
 	}
+	if a := cfg.Doctrine.TranscriptConformanceAction; a != "" && a != "flag" && a != "block" {
+		return Config{}, fmt.Errorf("invalid doctrine.transcript_conformance_action %q (want flag or block)", a)
+	}
 	if t := cfg.Containment.LocalEffectfulTiering; t != "" && t != "enforce" && t != "off" {
 		return Config{}, fmt.Errorf("invalid containment.local_effectful_tiering %q (want enforce or off)", t)
 	}
@@ -462,6 +479,9 @@ func merge(dst *Config, src Config) {
 	if src.Doctrine.UnenforceableRuleAction != "" {
 		dst.Doctrine.UnenforceableRuleAction = src.Doctrine.UnenforceableRuleAction
 	}
+	if src.Doctrine.TranscriptConformanceAction != "" {
+		dst.Doctrine.TranscriptConformanceAction = src.Doctrine.TranscriptConformanceAction
+	}
 	if src.Defaults.Agent != "" {
 		dst.Defaults.Agent = src.Defaults.Agent
 	}
@@ -558,6 +578,9 @@ func applyEnv(cfg *Config) {
 	}
 	if value := Env("GOV_UNENFORCEABLE_RULE_ACTION"); value != "" {
 		cfg.Doctrine.UnenforceableRuleAction = value
+	}
+	if value := Env("GOV_TRANSCRIPT_CONFORMANCE_ACTION"); value != "" {
+		cfg.Doctrine.TranscriptConformanceAction = value
 	}
 	if value := Env("GOV_DEFAULT_AGENT"); value != "" {
 		cfg.Defaults.Agent = value

@@ -58,7 +58,7 @@ func TestAuditTranscriptEnforcesMaxTokens(t *testing.T) {
 	contract := contracts.Contract{}
 	contract.Budget.MaxTokens = 100
 	contract.Budget.MaxCommands = 10
-	audit := auditTranscript(path, agents.TranscriptClaude, "", contract, nil, "")
+	audit := auditTranscript(path, agents.TranscriptClaude, "", contract, nil, "", "")
 	if audit.Usage.TotalTokens != 110 || audit.TranscriptBytes != int64(len(line)) {
 		t.Fatalf("unexpected audit telemetry: %+v", audit)
 	}
