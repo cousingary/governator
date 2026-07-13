@@ -15,17 +15,46 @@ import (
 	"github.com/cousingary/governator/internal/contracts"
 )
 
-// Enforce applies the risk-class containment policy and returns a non-nil
-// error when a high-risk contract lacks qualifying containment. It is
+// LocalEffectfulTieringEnforced reports whether Session 6's local-run gate is
+// active. Unknown/empty values fail closed to enforced; config validation keeps
+// operator-authored values to "enforce" or "off".
+func LocalEffectfulTieringEnforced(mode string) bool {
+	return strings.TrimSpace(mode) != "off"
+}
+
+// Effectful reports whether a contract can create persistent effects in the
+// workspace/artifact graph. Pure read-only scout contracts can be medium risk
+// without host containment; any declared write/produced artifact is effectful.
+func Effectful(c contracts.Contract) bool {
+	return len(c.Allowed.Write) > 0 || len(c.Preflight.IntendedWrites) > 0 || len(c.Produces) > 0
+}
+
+// RequiresHostContainment reports whether this contract must prove host-level
+// containment. High risk remains fail-closed as before. Session 6 adds medium
+// risk when the job is effectful and local effectful tiering is enforced.
+func RequiresHostContainment(c contracts.Contract, enforceLocalEffectful bool) bool {
+	risk := strings.TrimSpace(c.RiskClass)
+	if risk == "high" {
+		return true
+	}
+	return enforceLocalEffectful && risk == "medium" && Effectful(c)
+}
+
+// Enforce applies the default risk-class containment policy. It preserves the
+// historical call shape while enabling Session 6's enforced-by-default
+// medium/high effectful local-run gate.
+func Enforce(c contracts.Contract, nativeSandbox bool, pubKeyHex string) error {
+	return EnforcePolicy(c, nativeSandbox, pubKeyHex, true)
+}
+
+// EnforcePolicy applies the risk-class containment policy and returns a
+// non-nil error when a contract lacks qualifying containment. It is
 // fail-closed by construction: nativeSandbox reports whether the resolved
 // backend declares a native sandbox capability (verified at the agent layer,
 // never trusted from the contract alone), and pubKeyHex is the operator
-// override public key from config — empty means overrides are refused, so a
-// high-risk job with no qualifying containment simply cannot run.
-//
-// Non-high-risk contracts pass through untouched (the policy is risk-tiered).
-func Enforce(c contracts.Contract, nativeSandbox bool, pubKeyHex string) error {
-	if strings.TrimSpace(c.RiskClass) != "high" {
+// override public key from config — empty means overrides are refused.
+func EnforcePolicy(c contracts.Contract, nativeSandbox bool, pubKeyHex string, enforceLocalEffectful bool) error {
+	if !RequiresHostContainment(c, enforceLocalEffectful) {
 		return nil
 	}
 	switch c.EffectiveRunner() {
@@ -37,9 +66,9 @@ func Enforce(c contracts.Contract, nativeSandbox bool, pubKeyHex string) error {
 			return nil
 		}
 		return fmt.Errorf(
-			"containment: risk_class: high requires a hardened docker config " +
-				"(non-root user, read-only rootfs, cap-drop=ALL, no-new-privileges, pinned image) " +
-				"or a signed operator override; the declared docker config is not hardened")
+			"containment: risk_class %q requires a hardened docker config "+
+				"(non-root user, read-only rootfs, cap-drop=ALL, no-new-privileges, pinned image, network=deny) "+
+				"or a signed operator override; the declared docker config is not hardened", strings.TrimSpace(c.RiskClass))
 	case "local":
 		if nativeSandbox {
 			return nil
@@ -48,11 +77,11 @@ func Enforce(c contracts.Contract, nativeSandbox bool, pubKeyHex string) error {
 			return nil
 		}
 		return fmt.Errorf(
-			"containment: risk_class: high with runner: local requires a backend "+
-				"with a verified native sandbox or a signed operator override; "+
-				"%q does not declare a native sandbox capability", c.Agent)
+			"containment: risk_class %q effectful runner: local requires hardened docker, "+
+				"a backend with a verified native OS sandbox, or a signed operator override; "+
+				"%q does not declare a native sandbox capability", strings.TrimSpace(c.RiskClass), c.Agent)
 	default:
-		return fmt.Errorf("containment: risk_class: high does not support runner %q", c.EffectiveRunner())
+		return fmt.Errorf("containment: risk_class %q does not support runner %q", strings.TrimSpace(c.RiskClass), c.EffectiveRunner())
 	}
 }
 

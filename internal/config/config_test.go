@@ -22,7 +22,7 @@ func cleanEnv(t *testing.T) {
 		"GOV_DOCTRINE_REQUIRE_CLEANUP",
 		"GOV_DEFAULT_AGENT", "GOV_DEFAULT_MAX_MINUTES",
 		"GOV_ASSAY_REPO", "GOV_ASSAY_PYTHON", "GOV_ASSAY_TIMEOUT_SECONDS",
-		"GOV_CONTAINMENT_OVERRIDE_PUBLIC_KEY",
+		"GOV_CONTAINMENT_OVERRIDE_PUBLIC_KEY", "GOV_CONTAINMENT_LOCAL_EFFECTFUL_TIERING",
 	} {
 		t.Setenv(name, "")
 	}
@@ -433,6 +433,9 @@ func TestLoadContainmentOverridePublicKey(t *testing.T) {
 	if cfg.Containment.OverridePublicKey != "" {
 		t.Fatalf("expected containment.override_public_key to default empty (fail-closed), got %q", cfg.Containment.OverridePublicKey)
 	}
+	if cfg.Containment.LocalEffectfulTiering != "enforce" {
+		t.Fatalf("expected containment.local_effectful_tiering to default enforce, got %q", cfg.Containment.LocalEffectfulTiering)
+	}
 
 	path := filepath.Join(home, "config.yaml")
 	t.Setenv("GOV_CONFIG", path)
@@ -454,6 +457,45 @@ func TestLoadContainmentOverridePublicKey(t *testing.T) {
 	}
 	if cfg.Containment.OverridePublicKey != "cafef00d" {
 		t.Fatalf("env override key = %q", cfg.Containment.OverridePublicKey)
+	}
+}
+
+func TestLoadContainmentLocalEffectfulTieringFromFileAndEnv(t *testing.T) {
+	cleanEnv(t)
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	path := filepath.Join(home, "config.yaml")
+	t.Setenv("GOV_CONFIG", path)
+	if err := os.WriteFile(path, []byte("containment: {local_effectful_tiering: off}\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Containment.LocalEffectfulTiering != "off" {
+		t.Fatalf("file local_effectful_tiering = %q", cfg.Containment.LocalEffectfulTiering)
+	}
+
+	t.Setenv("GOV_CONTAINMENT_LOCAL_EFFECTFUL_TIERING", "enforce")
+	cfg, err = Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Containment.LocalEffectfulTiering != "enforce" {
+		t.Fatalf("env local_effectful_tiering = %q", cfg.Containment.LocalEffectfulTiering)
+	}
+}
+
+func TestLoadRejectsInvalidContainmentLocalEffectfulTiering(t *testing.T) {
+	cleanEnv(t)
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	t.Setenv("GOV_CONFIG", path)
+	if err := os.WriteFile(path, []byte("containment: {local_effectful_tiering: permissive}\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "invalid containment.local_effectful_tiering") {
+		t.Fatalf("error=%v", err)
 	}
 }
 

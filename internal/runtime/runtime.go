@@ -572,16 +572,32 @@ func validateNoLocalSymlinkEscape(root string) error {
 		if d.Type()&os.ModeSymlink != 0 {
 			return fmt.Errorf("local containment: symlink/junction paths are not allowed in local worktrees: %s", rel)
 		}
+		info, statErr := d.Info()
+		if statErr != nil {
+			return statErr
+		}
+		mode := info.Mode()
+		if !mode.IsRegular() && !mode.IsDir() {
+			return fmt.Errorf("local containment: special files are not allowed in local worktrees: %s", rel)
+		}
 		return nil
 	})
+}
+
+func appendRuntimePathScanViolation(violations []string, stage, work string) []string {
+	if err := validateFinalWorktreeShape(work); err != nil {
+		return append(violations, "runtime path containment "+stage+": "+err.Error())
+	}
+	return violations
 }
 
 // enforceContainment applies the Session 3 (Phase 2) risk-class containment
 // policy. It resolves the backend's native-sandbox capability (a verified
 // agent-layer fact, not a contract claim) and the operator override key from
-// config, then delegates to containment.Enforce. Non-high-risk contracts are
-// a no-op. The check runs before quota/workspace acquisition so a denied
-// high-risk run leaves no side effects.
+// config, then delegates to containment.EnforcePolicy. Contracts that do not
+// require host containment are a no-op. The check runs before quota/workspace
+// acquisition so a denied high-risk or medium-risk effectful run leaves no side
+// effects.
 //
 // agent is the single Agent instance the caller already built for this run
 // (via agents.New) — enforceContainment builds no Agent of its own. It DOES
@@ -594,7 +610,8 @@ func validateNoLocalSymlinkEscape(root string) error {
 // to have its backend CLI actually installed just to fail closed for an
 // unrelated reason.
 func enforceContainment(db *sql.DB, c contracts.Contract, agent agents.Agent, cfg config.Config) (string, error) {
-	if strings.TrimSpace(c.RiskClass) != "high" {
+	enforceLocalEffectful := containment.LocalEffectfulTieringEnforced(cfg.Containment.LocalEffectfulTiering)
+	if !containment.RequiresHostContainment(c, enforceLocalEffectful) {
 		return "", nil
 	}
 	nativeSandbox := agent.Capabilities().NativeSandbox
@@ -615,7 +632,7 @@ func enforceContainment(db *sql.DB, c contracts.Contract, agent agents.Agent, cf
 		}
 		attestationID = id
 	}
-	return attestationID, containment.Enforce(c, nativeSandbox, cfg.Containment.OverridePublicKey)
+	return attestationID, containment.EnforcePolicy(c, nativeSandbox, cfg.Containment.OverridePublicKey, enforceLocalEffectful)
 }
 
 // requiresCompleteTranscript reports whether c may never be approved on an
@@ -813,6 +830,223 @@ func requireCleanLiveRoot(ctx context.Context, root string) error {
 	}
 	if status != "" {
 		return fmt.Errorf("live root dirty before merge: %s", status)
+	}
+	return nil
+}
+
+type finalStateMeasurement struct {
+	work            snapshot
+	changed         []string
+	deleted         []string
+	artifactRecords []observability.ArtifactRecord
+	diff            string
+}
+
+func validateFinalWorktreeShape(root string) error {
+	return filepath.WalkDir(root, func(p string, d os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		rel, relErr := filepath.Rel(root, p)
+		if relErr != nil {
+			return relErr
+		}
+		rel = filepath.ToSlash(rel)
+		if rel == ".git" || strings.HasPrefix(rel, ".git/") || rel == ".codegraph" || strings.HasPrefix(rel, ".codegraph/") {
+			if d.IsDir() {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if d.Type()&os.ModeSymlink != 0 {
+			return fmt.Errorf("symlink/junction path: %s", rel)
+		}
+		info, statErr := d.Info()
+		if statErr != nil {
+			return statErr
+		}
+		mode := info.Mode()
+		if !mode.IsRegular() && !mode.IsDir() {
+			return fmt.Errorf("special file path: %s", rel)
+		}
+		return nil
+	})
+}
+
+func finalValidationMeasurement(ctx context.Context, home, root, work, runID string, git bool, c contracts.Contract, protectedPatterns []string, workBefore, liveBefore, protectedBefore, gitControlBefore snapshot) (finalStateMeasurement, []string) {
+	var m finalStateMeasurement
+	var violations []string
+	if err := validateFinalWorktreeShape(work); err != nil {
+		violations = append(violations, "final barrier worktree scan: "+err.Error())
+	}
+	workAfter, werr := fingerprint(work)
+	liveAfter, lerr := fingerprint(root)
+	protectedAfter, perr := protectedFingerprint(protectedPatterns)
+	gitControlAfter, gcerr := gitControlFingerprint(work)
+	if werr != nil {
+		violations = append(violations, "final barrier worktree fingerprint: "+werr.Error())
+	}
+	if lerr != nil {
+		violations = append(violations, "final barrier live fingerprint: "+lerr.Error())
+	}
+	if perr != nil {
+		violations = append(violations, "final barrier protected fingerprint: "+perr.Error())
+	}
+	if gcerr != nil {
+		violations = append(violations, "final barrier git control-plane fingerprint: "+gcerr.Error())
+	} else if snapshotDigest(gitControlBefore) != snapshotDigest(gitControlAfter) {
+		violations = append(violations, "final barrier git control-plane mutation")
+	}
+	if perr == nil {
+		protectedChanged, protectedDeleted := changes(protectedBefore, protectedAfter)
+		if len(protectedChanged)+len(protectedDeleted) > 0 {
+			violations = append(violations, "final barrier protected path mutation: "+strings.Join(append(protectedChanged, protectedDeleted...), ","))
+		}
+	}
+	if werr == nil {
+		rawChanged, rawDeleted := changes(workBefore, workAfter)
+		m.work = workAfter
+		m.changed, m.deleted = filterSourceChanges(rawChanged, rawDeleted)
+	}
+	if lerr == nil {
+		liveChanged, liveDeleted := changes(liveBefore, liveAfter)
+		if len(liveChanged)+len(liveDeleted) > 0 {
+			violations = append(violations, "final barrier out-of-worktree mutation: "+strings.Join(append(liveChanged, liveDeleted...), ","))
+		}
+	}
+	artifactRecords, artifactViolations := collectProducedArtifacts(home, work, runID, c.Produces)
+	m.artifactRecords = artifactRecords
+	violations = append(violations, artifactViolations...)
+	for _, p := range append(append([]string{}, m.changed...), m.deleted...) {
+		if !matchesAny(c.Allowed.Write, p) && p != "RESULT.json" {
+			violations = append(violations, "final barrier write outside allowlist: "+p)
+		}
+		if matchesAny(c.Forbidden.Paths, p) {
+			violations = append(violations, "final barrier forbidden path: "+p)
+		}
+		if !policy.MatchesAny(c.Preflight.IntendedWrites, p) && p != "RESULT.json" {
+			violations = append(violations, "final barrier write outside intended_writes: "+p)
+		}
+	}
+	if len(m.changed)+len(m.deleted) > c.Budget.MaxFilesChanged {
+		violations = append(violations, "final barrier max_files_changed exceeded")
+	}
+	if len(m.deleted) > c.Budget.MaxDeleted {
+		violations = append(violations, "final barrier max_deleted exceeded")
+	}
+	metrics := measureDiff(root, work, git, workBefore, m.changed, m.deleted)
+	if metrics.Lines > c.Budget.MaxLinesChanged {
+		violations = append(violations, fmt.Sprintf("final barrier max_lines_changed exceeded: %d > %d", metrics.Lines, c.Budget.MaxLinesChanged))
+	}
+	if metrics.NewFiles > c.Budget.MaxNewFiles {
+		violations = append(violations, fmt.Sprintf("final barrier max_new_files exceeded: %d > %d", metrics.NewFiles, c.Budget.MaxNewFiles))
+	}
+	if werr == nil {
+		for _, p := range c.Success.RequiredFiles {
+			found := false
+			for n := range workAfter {
+				if glob(p, n) {
+					found = true
+					break
+				}
+			}
+			if !found {
+				violations = append(violations, "final barrier required file missing: "+p)
+			}
+		}
+	}
+	m.diff = workspaceDiff(root, work, git, m.changed, m.deleted)
+	return m, violations
+}
+
+func artifactRecordsDigest(records []observability.ArtifactRecord) string {
+	sorted := append([]observability.ArtifactRecord(nil), records...)
+	sort.Slice(sorted, func(i, j int) bool {
+		if sorted[i].Name == sorted[j].Name {
+			return sorted[i].Path < sorted[j].Path
+		}
+		return sorted[i].Name < sorted[j].Name
+	})
+	h := sha256.New()
+	for _, r := range sorted {
+		h.Write([]byte(r.Name))
+		h.Write([]byte{0})
+		h.Write([]byte(r.SHA256))
+		h.Write([]byte{0})
+		h.Write([]byte(strconv.FormatInt(r.Bytes, 10)))
+		h.Write([]byte{0})
+		h.Write([]byte(strconv.FormatBool(r.SchemaOK)))
+		h.Write([]byte{0})
+	}
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+func finalStateDeltaViolations(approved, final finalStateMeasurement) []string {
+	var violations []string
+	if snapshotDigest(approved.work) != snapshotDigest(final.work) {
+		violations = append(violations, "final barrier worktree changed after approved measurement")
+	}
+	if strings.Join(approved.changed, "\\x00") != strings.Join(final.changed, "\\x00") || strings.Join(approved.deleted, "\\x00") != strings.Join(final.deleted, "\\x00") {
+		violations = append(violations, "final barrier change set changed after approved measurement")
+	}
+	if artifactRecordsDigest(approved.artifactRecords) != artifactRecordsDigest(final.artifactRecords) {
+		violations = append(violations, "final barrier artifacts changed after approved measurement")
+	}
+	return violations
+}
+
+func gitAddExactPaths(ctx context.Context, work string, paths []string) error {
+	seen := map[string]bool{}
+	args := make([]string, 0, len(paths))
+	for _, p := range paths {
+		if p == "" || seen[p] {
+			continue
+		}
+		seen[p] = true
+		args = append(args, shQuote(p))
+	}
+	if len(args) == 0 {
+		return nil
+	}
+	code, out, err := shell(ctx, work, "git add -- "+strings.Join(args, " "))
+	if err != nil || code != 0 {
+		return fmt.Errorf("git add exact paths: %s", strings.TrimSpace(out))
+	}
+	return nil
+}
+
+func verifyOnlyApprovedGitChanges(ctx context.Context, work string, approved []string) error {
+	allowed := map[string]bool{}
+	for _, p := range approved {
+		allowed[p] = true
+	}
+	status, err := gitStatusPorcelain(ctx, work)
+	if err != nil {
+		return err
+	}
+	if status == "" {
+		return nil
+	}
+	for _, line := range strings.Split(status, "\n") {
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+		if len(line) < 4 {
+			return fmt.Errorf("unparseable git status after precise add: %s", line)
+		}
+		path := strings.TrimSpace(line[3:])
+		if strings.Contains(path, " -> ") {
+			parts := strings.Split(path, " -> ")
+			path = parts[len(parts)-1]
+		}
+		path = strings.Trim(path, "\"")
+		path = filepath.ToSlash(path)
+		if isGovernatorInternalPath(path) || path == ".codegraph" || strings.HasPrefix(path, ".codegraph/") {
+			continue
+		}
+		if !allowed[path] {
+			return fmt.Errorf("unapproved worktree change after precise add: %s", path)
+		}
 	}
 	return nil
 }
@@ -1366,6 +1600,10 @@ type diffMetrics struct {
 }
 
 func countLines(path string) int {
+	info, err := os.Lstat(path)
+	if err != nil || info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
+		return 0
+	}
 	f, err := os.Open(path)
 	if err != nil {
 		return 0
@@ -2077,6 +2315,7 @@ func (r *Runner) runOnce(ctx context.Context, c contracts.Contract) (RunRecord, 
 	protectedAfter, perr := protectedFingerprint(env.ProtectedPatterns)
 	gitControlAfter, gcerr := gitControlFingerprint(work)
 	violations := append([]string{}, audit.Violations...)
+	violations = appendRuntimePathScanViolation(violations, "after agent execution", work)
 	violations = append(violations, telemetryViolations(c, audit)...)
 	if redactErr != nil {
 		violations = append(violations, "transcript redaction failed: "+redactErr.Error())
@@ -2162,8 +2401,7 @@ func (r *Runner) runOnce(ctx context.Context, c contracts.Contract) (RunRecord, 
 	if len(rawChanged)+len(rawDeleted) == 0 {
 		rec.Notes = appendNote(rec.Notes, "fallback_worktree_unchanged")
 	}
-	artifactRecords, artifactViolations := collectProducedArtifacts(r.Home, work, id, c.Produces)
-	violations = append(violations, artifactViolations...)
+	var artifactRecords []observability.ArtifactRecord
 	changed, deleted := filterSourceChanges(rawChanged, rawDeleted)
 	liveChanged, liveDeleted := changes(liveBefore, liveAfter)
 	if len(liveChanged)+len(liveDeleted) > 0 {
@@ -2220,6 +2458,11 @@ func (r *Runner) runOnce(ctx context.Context, c contracts.Contract) (RunRecord, 
 			out += "\n" + e.Error()
 		}
 		recordValidatorEvidence(db, id, v, code, out, "success")
+		beforeScan := len(violations)
+		violations = appendRuntimePathScanViolation(violations, "after success validator", work)
+		if len(violations) > beforeScan {
+			break
+		}
 		if code != 0 || e != nil {
 			if errors.Is(e, context.DeadlineExceeded) || errors.Is(ctx.Err(), context.DeadlineExceeded) {
 				violations = append(violations, fmt.Sprintf("run deadline exceeded during success validator: %s", v))
@@ -2249,6 +2492,11 @@ func (r *Runner) runOnce(ctx context.Context, c contracts.Contract) (RunRecord, 
 				out += "\n" + e.Error()
 			}
 			recordValidatorEvidence(db, id, v, code, out, "cleanup")
+			beforeScan := len(violations)
+			violations = appendRuntimePathScanViolation(violations, "after cleanup validator", work)
+			if len(violations) > beforeScan {
+				break
+			}
 			if (code != 0 || e != nil) && c.Cleanup.Required {
 				if errors.Is(e, context.DeadlineExceeded) || errors.Is(ctx.Err(), context.DeadlineExceeded) {
 					violations = append(violations, fmt.Sprintf("run deadline exceeded during cleanup validator: %s", v))
@@ -2268,6 +2516,7 @@ func (r *Runner) runOnce(ctx context.Context, c contracts.Contract) (RunRecord, 
 		if err := c.PostRunValidate(work); err != nil {
 			violations = append(violations, "post-run validation failed: "+err.Error())
 		}
+		violations = appendRuntimePathScanViolation(violations, "after post-run validation", work)
 	}
 	// Assay (Phase 3A: Governator<->Assayer synchronous bridge). Runs in the
 	// same position as the validators above — after every shell/PostRunValidate
@@ -2281,13 +2530,50 @@ func (r *Runner) runOnce(ctx context.Context, c contracts.Contract) (RunRecord, 
 	// not configured in Governator's own config still writes a
 	// VerdictSkipped row, so "skipped" is always visible and distinguishable
 	// from "never asked for" in the ledger.
-	if c.Assay != nil {
+	var approvedFinal finalStateMeasurement
+	if len(violations) == 0 {
+		var finalViolations []string
+		approvedFinal, finalViolations = finalValidationMeasurement(ctx, r.Home, root, work, id, git, c, env.ProtectedPatterns, workBefore, liveBefore, protectedBefore, gitControlBefore)
+		// Preserve the final barrier's remeasured evidence even when that
+		// measurement produces a quarantining violation. Artifact schema failures,
+		// for example, must still ledger the recollected artifact with
+		// schema_ok=false so operators can inspect the exact rejected payload.
+		changed = approvedFinal.changed
+		deleted = approvedFinal.deleted
+		artifactRecords = approvedFinal.artifactRecords
+		if approvedFinal.diff != "" {
+			rec.Diff = approvedFinal.diff
+		}
+		violations = append(violations, finalViolations...)
+	}
+	if len(violations) == 0 && c.Assay != nil {
 		if err := observability.RecordStage(db, id, "ASSAYING", "", time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
 			return rec, err
 		}
 		runAssayStep(ctx, db, cfg, c, id, hash, rec.Agent, artifactRecords, &violations)
 	}
-	rec.Diff = workspaceDiff(root, work, git, changed, deleted)
+	if len(violations) == 0 {
+		finalAfterAssay, finalViolations := finalValidationMeasurement(ctx, r.Home, root, work, id, git, c, env.ProtectedPatterns, workBefore, liveBefore, protectedBefore, gitControlBefore)
+		changed = finalAfterAssay.changed
+		deleted = finalAfterAssay.deleted
+		artifactRecords = finalAfterAssay.artifactRecords
+		if finalAfterAssay.diff != "" {
+			rec.Diff = finalAfterAssay.diff
+		}
+		violations = append(violations, finalViolations...)
+		if len(finalViolations) == 0 && c.Assay != nil {
+			violations = append(violations, finalStateDeltaViolations(approvedFinal, finalAfterAssay)...)
+		}
+		if len(violations) == 0 {
+			detail, _ := json.Marshal(map[string]any{"worktree_digest": snapshotDigest(finalAfterAssay.work), "paths": append(append([]string{}, changed...), deleted...)})
+			if err := observability.RecordStage(db, id, "FINAL_VALIDATION_BARRIER", string(detail), time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
+				violations = append(violations, "final barrier ledger: "+err.Error())
+			}
+		}
+	}
+	if rec.Diff == "" {
+		rec.Diff = workspaceDiff(root, work, git, changed, deleted)
+	}
 	rootCommitted := false
 	if len(violations) == 0 {
 		if git {
@@ -2301,7 +2587,13 @@ func (r *Runner) runOnce(ctx context.Context, c contracts.Contract) (RunRecord, 
 					violations = append(violations, "merge intent ledger: "+err.Error())
 				}
 			}
-			_, _, _ = shell(ctx, work, "git add -A -- . ':(exclude).codegraph' ':(exclude).governator'")
+			if len(violations) == 0 {
+				if err := gitAddExactPaths(ctx, work, mergePaths); err != nil {
+					violations = append(violations, err.Error())
+				} else if err := verifyOnlyApprovedGitChanges(ctx, work, mergePaths); err != nil {
+					violations = append(violations, err.Error())
+				}
+			}
 			cm := fmt.Sprintf("Governator job %s\n\nGov-Run: %s", c.JobID, id)
 			if len(violations) == 0 {
 				code, out, e := shell(ctx, work, "git commit --allow-empty -m "+shQuote(cm))

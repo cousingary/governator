@@ -95,6 +95,12 @@ type Doctrine struct {
 // before launch. Configure it only when you genuinely need the escape hatch.
 type Containment struct {
 	OverridePublicKey string `yaml:"override_public_key"`
+	// LocalEffectfulTiering controls Session 6's medium/high effectful local-run
+	// containment gate. "enforce" (the built-in default) requires hardened
+	// Docker, a behaviorally attested native OS sandbox, or a signed override.
+	// "off" is the explicit compatibility escape hatch for operators who choose
+	// to keep medium-risk effectful jobs on local worktrees temporarily.
+	LocalEffectfulTiering string `yaml:"local_effectful_tiering"`
 }
 
 // Credentials configures the Session 6 (Sol High 9) credential-mount
@@ -192,9 +198,10 @@ func BuiltIn() Config {
 		// (see Assay's doc comment). Python/TimeoutSeconds default sensibly
 		// so a config that only sets `assay.repo` gets a working invocation.
 		Assay: Assay{Python: "python3", TimeoutSeconds: 60},
-		// Containment intentionally left unset: no override key means high-risk
-		// jobs must qualify for containment on their own (fail-closed).
-		Containment: Containment{},
+		// No override key means risky jobs must qualify for containment on their
+		// own (fail-closed). Session 6's medium/high effectful local-run gate is
+		// enforced by default and can only be relaxed explicitly.
+		Containment: Containment{LocalEffectfulTiering: "enforce"},
 	}
 }
 
@@ -261,6 +268,9 @@ func LoadStrict() (Config, error) {
 	}
 	if a := cfg.Doctrine.UnenforceableRuleAction; a != "" && a != "flag" && a != "block" {
 		return Config{}, fmt.Errorf("invalid doctrine.unenforceable_rule_action %q (want flag or block)", a)
+	}
+	if t := cfg.Containment.LocalEffectfulTiering; t != "" && t != "enforce" && t != "off" {
+		return Config{}, fmt.Errorf("invalid containment.local_effectful_tiering %q (want enforce or off)", t)
 	}
 	seenPolicyRuleIDs := map[string]bool{}
 	for _, rule := range cfg.PolicyRules {
@@ -417,6 +427,9 @@ func merge(dst *Config, src Config) {
 	if src.Containment.OverridePublicKey != "" {
 		dst.Containment.OverridePublicKey = src.Containment.OverridePublicKey
 	}
+	if src.Containment.LocalEffectfulTiering != "" {
+		dst.Containment.LocalEffectfulTiering = src.Containment.LocalEffectfulTiering
+	}
 	if src.Credentials.Roots != nil {
 		dst.Credentials.Roots = append([]string(nil), src.Credentials.Roots...)
 	}
@@ -514,6 +527,9 @@ func applyEnv(cfg *Config) {
 	}
 	if value := Env("GOV_CONTAINMENT_OVERRIDE_PUBLIC_KEY"); value != "" {
 		cfg.Containment.OverridePublicKey = value
+	}
+	if value := Env("GOV_CONTAINMENT_LOCAL_EFFECTFUL_TIERING"); value != "" {
+		cfg.Containment.LocalEffectfulTiering = value
 	}
 }
 

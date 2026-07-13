@@ -29,15 +29,42 @@ func highRiskContract(runner string, docker *contracts.DockerRunnerConfig, cont 
 	}
 }
 
-func TestEnforceNonHighRiskIsNoOp(t *testing.T) {
-	// A low/medium/unset risk contract with the empty-runner local default
-	// must pass unchanged — Session 3's containment gate is risk-tiered.
-	for _, risk := range []string{"", "low", "medium"} {
+func TestEnforceNonHostRiskIsNoOp(t *testing.T) {
+	// Unset/low risk and read-only medium-risk contracts must pass unchanged.
+	// Session 6 promotes only medium-risk effectful local work to host
+	// containment; pure scout reads remain no-ops.
+	for _, risk := range []string{"", "low"} {
 		c := highRiskContract("local", nil, nil)
 		c.RiskClass = risk
 		if err := Enforce(c, false, ""); err != nil {
 			t.Fatalf("risk_class %q: expected no error, got %v", risk, err)
 		}
+	}
+	c := highRiskContract("local", nil, nil)
+	c.RiskClass = "medium"
+	c.Allowed.Write = nil
+	c.Preflight.IntendedWrites = nil
+	c.Produces = nil
+	if err := Enforce(c, false, ""); err != nil {
+		t.Fatalf("read-only medium risk should remain a no-op: %v", err)
+	}
+}
+
+func TestEnforceMediumRiskEffectfulLocalFailsByDefault(t *testing.T) {
+	c := highRiskContract("local", nil, nil)
+	c.RiskClass = "medium"
+	c.Allowed.Write = []string{"output/**"}
+	if err := Enforce(c, false, ""); err == nil {
+		t.Fatal("expected medium-risk effectful local without containment to fail, got nil")
+	}
+}
+
+func TestEnforceMediumRiskEffectfulPolicyOffPasses(t *testing.T) {
+	c := highRiskContract("local", nil, nil)
+	c.RiskClass = "medium"
+	c.Allowed.Write = []string{"output/**"}
+	if err := EnforcePolicy(c, false, "", false); err != nil {
+		t.Fatalf("policy-off compatibility mode should allow medium-risk effectful local: %v", err)
 	}
 }
 
