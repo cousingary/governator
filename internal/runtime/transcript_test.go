@@ -36,7 +36,7 @@ func TestAuditTranscriptPerBackendFormat(t *testing.T) {
 			if err := os.WriteFile(path, []byte(tc.line+"\n"), 0600); err != nil {
 				t.Fatal(err)
 			}
-			audit := auditTranscript(path, tc.format, "", contract)
+			audit := auditTranscript(path, tc.format, "", contract, nil, "")
 			if audit.CostUSD != tc.cost || audit.CostUnavailable != tc.costUnavailable {
 				t.Fatalf("audit cost=%v unavailable=%v", audit.CostUSD, audit.CostUnavailable)
 			}
@@ -59,7 +59,7 @@ func TestAuditTranscriptRejectsMalformedJSONL(t *testing.T) {
 	c := contracts.Contract{}
 	c.Allowed.Execute = []string{"go test ./..."}
 	c.Budget.MaxCommands = 10
-	audit := auditTranscript(path, agents.TranscriptCodex, "", c)
+	audit := auditTranscript(path, agents.TranscriptCodex, "", c, nil, "")
 	if len(audit.Violations) != 1 || !strings.Contains(audit.Violations[0], "malformed JSON on line 2") {
 		t.Fatalf("malformed transcript must fail closed: %v", audit.Violations)
 	}
@@ -86,7 +86,7 @@ func TestAuditTranscriptTolerantOfLeadingCLIBanner(t *testing.T) {
 	c := contracts.Contract{}
 	c.Allowed.Execute = []string{"go test ./..."}
 	c.Budget.MaxCommands = 10
-	audit := auditTranscript(path, agents.TranscriptCodex, "", c)
+	audit := auditTranscript(path, agents.TranscriptCodex, "", c, nil, "")
 	if len(audit.Violations) != 0 {
 		t.Fatalf("leading CLI banner before the JSON stream starts must not violate: %v", audit.Violations)
 	}
@@ -109,7 +109,7 @@ func TestAuditGLMGoldenTranscript(t *testing.T) {
 		Allowed: contracts.Permissions{Execute: []string{"test -f output/result.txt"}},
 		Budget:  contracts.Budget{MaxCommands: 10},
 	}
-	audit := auditTranscript("testdata/glm_stream.jsonl", agents.TranscriptGLM, "", contract)
+	audit := auditTranscript("testdata/glm_stream.jsonl", agents.TranscriptGLM, "", contract, nil, "")
 	if !audit.CostAvailable || audit.CostUSD != 0.1375 {
 		t.Fatalf("glm cost not extracted from result envelope: cost=%v available=%v (drift in cost_usd/total_cost_usd field?)", audit.CostUSD, audit.CostAvailable)
 	}
@@ -146,7 +146,7 @@ func TestAuditTranscriptRejectsAllPlaintextPiJSON(t *testing.T) {
 	if err := os.WriteFile(path, []byte("THIS IS PLAIN TEXT, NOT JSON\n"), 0600); err != nil {
 		t.Fatal(err)
 	}
-	audit := auditTranscript(path, agents.TranscriptPi, "", contracts.Contract{})
+	audit := auditTranscript(path, agents.TranscriptPi, "", contracts.Contract{}, nil, "")
 	joined := strings.Join(audit.Violations, "; ")
 	if !strings.Contains(joined, "TRANSCRIPT_FORMAT_INVALID") || !strings.Contains(joined, "no valid JSON events") {
 		t.Fatalf("all-plaintext pi-json must fail closed as transcript format invalid: %v", audit.Violations)
@@ -161,7 +161,7 @@ func TestAuditTranscriptRejectsUnrecognizedStartupNoise(t *testing.T) {
 		t.Fatal(err)
 	}
 	c := contracts.Contract{Allowed: contracts.Permissions{Execute: []string{"go test ./..."}}, Budget: contracts.Budget{MaxCommands: 10}}
-	audit := auditTranscript(path, agents.TranscriptCodex, "", c)
+	audit := auditTranscript(path, agents.TranscriptCodex, "", c, nil, "")
 	if len(audit.Violations) == 0 || !strings.Contains(strings.Join(audit.Violations, "; "), "TRANSCRIPT_FORMAT_INVALID") {
 		t.Fatalf("unrecognized startup plaintext must fail closed: %v", audit.Violations)
 	}
@@ -183,7 +183,7 @@ func TestAuditTranscriptCodexUnenforceableRulesFlaggedByDefault(t *testing.T) {
 		t.Fatal(err)
 	}
 	c := contracts.Contract{Allowed: contracts.Permissions{Execute: []string{"*"}}, Budget: contracts.Budget{MaxCommands: 10}}
-	audit := auditTranscript(path, agents.TranscriptCodex, "", c)
+	audit := auditTranscript(path, agents.TranscriptCodex, "", c, nil, "")
 
 	want := map[string]bool{
 		policy.RuleSecretPrecedesNetwork:       true,
@@ -211,15 +211,17 @@ func TestAuditTranscriptCodexUnenforceableRulesFlaggedByDefault(t *testing.T) {
 // wants a coverage gap on a security-relevant backend to fail closed, not
 // just be advised about it, gets exactly that.
 func TestAuditTranscriptUnenforceableRulesBlockWhenConfigured(t *testing.T) {
-	t.Setenv("GOV_CONFIG", filepath.Join(t.TempDir(), "nonexistent-config.yaml"))
-	t.Setenv("GOV_UNENFORCEABLE_RULE_ACTION", "block")
 	path := filepath.Join(t.TempDir(), "codex.jsonl")
 	data := []byte(`{"type":"item.completed","item":{"type":"command_execution","command":"git status"}}` + "\n")
 	if err := os.WriteFile(path, data, 0600); err != nil {
 		t.Fatal(err)
 	}
 	c := contracts.Contract{Allowed: contracts.Permissions{Execute: []string{"*"}}, Budget: contracts.Budget{MaxCommands: 10}}
-	audit := auditTranscript(path, agents.TranscriptCodex, "", c)
+	// unenforceableRuleAction is now passed explicitly (the run's frozen
+	// RunEnvironment.Config.Doctrine.UnenforceableRuleAction) rather than
+	// read via auditTranscript calling config.Current() itself — Sol
+	// Finding 2 / Session 3.
+	audit := auditTranscript(path, agents.TranscriptCodex, "", c, nil, "block")
 	if len(audit.Violations) == 0 {
 		t.Fatalf("unenforceable_rule_action: block must fold the coverage gap into audit.Violations, got none")
 	}
@@ -246,7 +248,7 @@ func TestAuditTranscriptOpenCodeGenericToolClassificationEnablesRules(t *testing
 		t.Fatal(err)
 	}
 	c := contracts.Contract{Forbidden: contracts.Forbidden{Paths: []string{"/secrets/**"}}}
-	audit := auditTranscript(path, agents.TranscriptOpenCode, "", c)
+	audit := auditTranscript(path, agents.TranscriptOpenCode, "", c, nil, "")
 
 	found := false
 	for _, rv := range audit.RuleViolations {
@@ -288,7 +290,7 @@ func TestAuditTranscriptPiGenericToolClassificationEnablesRules(t *testing.T) {
 		t.Fatal(err)
 	}
 	c := contracts.Contract{Forbidden: contracts.Forbidden{Paths: []string{"/secrets/**"}}}
-	audit := auditTranscript(path, agents.TranscriptPi, "", c)
+	audit := auditTranscript(path, agents.TranscriptPi, "", c, nil, "")
 
 	found := false
 	for _, rv := range audit.RuleViolations {

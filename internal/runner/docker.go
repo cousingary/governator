@@ -14,7 +14,6 @@ import (
 	"time"
 
 	"github.com/cousingary/governator/internal/agents"
-	"github.com/cousingary/governator/internal/config"
 	"github.com/cousingary/governator/internal/contracts"
 )
 
@@ -58,6 +57,11 @@ func trimmed(b []byte) string {
 // instance per run), so the truncation tally is read after Launch by Observe.
 type DockerRunner struct {
 	Config contracts.DockerRunnerConfig
+	// CredentialRoots is the caller's frozen RunEnvironment.CredentialRoots
+	// (Config.Credentials.Roots), set once by runner.New. credentialMountArgs
+	// no longer calls config.Current() itself — see runner.New's doc
+	// comment.
+	CredentialRoots []string
 
 	mu    sync.Mutex
 	trunc truncationStats
@@ -257,7 +261,7 @@ func (d *DockerRunner) credentialMountArgs() ([]string, error) {
 	if len(d.Config.CredentialMounts) == 0 {
 		return nil, nil
 	}
-	roots := config.Current().Credentials.Roots
+	roots := d.CredentialRoots
 	var out []string
 	seen := map[string]string{}
 	for _, mount := range d.Config.CredentialMounts {

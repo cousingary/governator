@@ -23,8 +23,21 @@ func Expand(path string) string {
 	return os.ExpandEnv(path)
 }
 
+// Patterns reads the manifest path chosen by the live configuration. It
+// exists for standalone administrative callers (gov protect, gov doctor)
+// where re-reading config.yaml on every call is intentional. Execution-
+// critical callers (a run's protected-path fingerprint, the transcript
+// audit's secret-pattern check) must call PatternsFor with a manifest path
+// captured once in the run's RunEnvironment instead — see Sol Finding 2 /
+// governator-sol3-repair-plan.md Session 3.
 func Patterns() ([]string, error) {
-	data, err := os.ReadFile(Manifest())
+	return PatternsFor(Manifest())
+}
+
+// PatternsFor reads and parses the protected-path manifest at the given
+// path, without consulting the live configuration for which path to use.
+func PatternsFor(manifestPath string) ([]string, error) {
+	data, err := os.ReadFile(manifestPath)
 	if os.IsNotExist(err) {
 		return nil, nil
 	}

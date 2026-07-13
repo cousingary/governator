@@ -200,16 +200,18 @@ type Router struct {
 // an error for "no candidate qualifies" — that is the normal fail-closed
 // outcome, expressed as Decision.Selected == "" with every candidate excluded.
 // An error means the broker could not read its evidence (a broken ledger).
-func (r Router) Resolve(db *sql.DB, req Request) (Decision, error) {
+func (r Router) Resolve(db *sql.DB, req Request, cfg config.Config) (Decision, error) {
 	objective := req.Objective
 	if objective == "" {
 		objective = "balanced"
 	}
 	weights := riskAdjustedWeights(objectiveWeights(objective), req.RiskClass)
-	// Loaded once per decision (not once per candidate): config.Current()
-	// re-reads config.yaml from disk, and a decision only has a handful of
-	// candidates.
-	cfg := config.Current()
+	// cfg is the caller's frozen RunEnvironment.Config (Sol Finding 2 /
+	// Session 3) — Resolve used to call config.Current() here itself,
+	// re-reading config.yaml from disk independently of whatever the rest of
+	// the run had already frozen. A decision only has a handful of
+	// candidates, so threading one already-loaded value through costs
+	// nothing.
 	candidates := r.candidatePool(req.Candidates)
 	lineageAgent, err := lineageAgentFor(db, req.RepairLineage)
 	if err != nil {

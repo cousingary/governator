@@ -86,7 +86,12 @@ type Runner interface {
 // doesn't set an explicit output cap — the zero value already defaults
 // correctly via LocalRunnerConfig.EffectiveOutputCapBytes) and is ignored
 // for mode "docker", matching how dockerCfg is ignored for mode "local".
-func New(mode string, dockerCfg *contracts.DockerRunnerConfig, localCfg *contracts.LocalRunnerConfig) (Runner, error) {
+// credentialRoots is the caller's frozen RunEnvironment.CredentialRoots (Sol
+// Finding 2 / Session 3) — DockerRunner used to read config.Current().
+// Credentials.Roots itself at credential-mount time, independently of
+// whatever the rest of the run had already frozen. Ignored for mode "local"
+// (LocalWorktreeRunner never mounts credentials).
+func New(mode string, dockerCfg *contracts.DockerRunnerConfig, localCfg *contracts.LocalRunnerConfig, credentialRoots []string) (Runner, error) {
 	switch mode {
 	case "", "local":
 		cfg := contracts.LocalRunnerConfig{}
@@ -101,7 +106,7 @@ func New(mode string, dockerCfg *contracts.DockerRunnerConfig, localCfg *contrac
 		if err := CheckDockerAvailable(); err != nil {
 			return nil, fmt.Errorf("runner: docker requested but unavailable: %w", err)
 		}
-		return &DockerRunner{Config: *dockerCfg}, nil
+		return &DockerRunner{Config: *dockerCfg, CredentialRoots: credentialRoots}, nil
 	default:
 		return nil, fmt.Errorf("runner: unknown mode %q", mode)
 	}

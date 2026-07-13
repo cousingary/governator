@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/cousingary/governator/internal/agents"
+	"github.com/cousingary/governator/internal/config"
 	"github.com/cousingary/governator/internal/contracts"
 	"github.com/cousingary/governator/internal/observability"
 )
@@ -44,7 +45,12 @@ func seedRun(t *testing.T, db *sql.DB, id, agent, jobType, taxonomy string) {
 
 func mustResolve(t *testing.T, r Router, db *sql.DB, req Request) Decision {
 	t.Helper()
-	d, err := r.Resolve(db, req)
+	// A zero-value config.Config keeps these tests isolated from whatever
+	// config.yaml the test host happens to have — same isolation rationale
+	// as the ModelCapability stub tests inject (see Router.ModelCapability's
+	// doc comment); tests that care about specific Backends entries build
+	// their own Router.ModelCapability stub rather than relying on cfg.
+	d, err := r.Resolve(db, req, config.Config{})
 	if err != nil {
 		t.Fatalf("Resolve error: %v", err)
 	}
@@ -372,12 +378,23 @@ func TestDefaultModelCapabilityReadsConfigFile(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Setenv("GOV_CONFIG", cfgPath)
+	cfg, err := config.LoadStrict()
+	if err != nil {
+		t.Fatalf("LoadStrict: %v", err)
+	}
 	db := newLedger(t)
 	r := Router{Binary: allPresent} // no ModelCapability override
 	req := baseReq("code_change")
 	req.Requirements = contracts.RoutingRequirements{Vision: true, MinContextTokens: 100000}
 	req.Candidates = []string{"claude-code", "codex"}
-	d := mustResolve(t, r, db, req)
+	// This test exists specifically to prove Resolve's default
+	// ModelCapability path reads Backends from the caller's supplied cfg —
+	// mustResolve's config.Config{} default would defeat the point, so call
+	// Resolve directly with the config actually loaded from cfgPath.
+	d, err := r.Resolve(db, req, cfg)
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
 	if d.Selected != "claude-code" {
 		t.Fatalf("config.yaml declares claude-code vision+context_tokens; expected selection, got %q\n%s", d.Selected, d.Format())
 	}

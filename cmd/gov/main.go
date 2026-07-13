@@ -1780,7 +1780,7 @@ func routeExplain(path string) int {
 		return 1
 	}
 	defer db.Close()
-	decision, err := router.Router{Health: breaker.Store{DB: db}}.Resolve(db, router.RequestFromContract(*contract))
+	decision, err := router.Router{Health: breaker.Store{DB: db}}.Resolve(db, router.RequestFromContract(*contract), config.Current())
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "route:", err)
 		return 1

@@ -161,7 +161,10 @@ func Reconcile(ctx context.Context) (ReconcileReport, error) {
 		return ReconcileReport{}, err
 	}
 	defer db.Close()
-	cfg := config.Current()
+	cfg, err := config.LoadStrict()
+	if err != nil {
+		return ReconcileReport{}, err
+	}
 	items, err := observability.PendingOutbox(db)
 	if err != nil {
 		return ReconcileReport{}, err

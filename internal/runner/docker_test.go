@@ -165,7 +165,7 @@ func TestDockerRunArgsCredentialMounts(t *testing.T) {
 	d := &DockerRunner{Config: contracts.DockerRunnerConfig{
 		Image:            dockerTestImage,
 		CredentialMounts: []string{netrc},
-	}}
+	}, CredentialRoots: []string{root}}
 	args, err := d.runArgs(Workspace{Container: "c", Path: "/ws"}, "bin", nil)
 	if err != nil {
 		t.Fatalf("runArgs: %v", err)
@@ -298,7 +298,7 @@ func TestCredentialMountOutsideRootsRejected(t *testing.T) {
 		t.Fatal(err)
 	}
 	isolateConfig(t, root)
-	d := &DockerRunner{Config: contracts.DockerRunnerConfig{Image: dockerTestImage, CredentialMounts: []string{f}}}
+	d := &DockerRunner{Config: contracts.DockerRunnerConfig{Image: dockerTestImage, CredentialMounts: []string{f}}, CredentialRoots: []string{root}}
 	if _, err := d.runArgs(Workspace{Container: "c", Path: "/ws"}, "bin", nil); err == nil {
 		t.Fatal("expected an error for a mount outside every configured credential root")
 	}
@@ -320,7 +320,7 @@ func TestCredentialMountSymlinkEscapeRejected(t *testing.T) {
 		t.Fatal(err)
 	}
 	isolateConfig(t, root)
-	d := &DockerRunner{Config: contracts.DockerRunnerConfig{Image: dockerTestImage, CredentialMounts: []string{link}}}
+	d := &DockerRunner{Config: contracts.DockerRunnerConfig{Image: dockerTestImage, CredentialMounts: []string{link}}, CredentialRoots: []string{root}}
 	if _, err := d.runArgs(Workspace{Container: "c", Path: "/ws"}, "bin", nil); err == nil {
 		t.Fatal("expected an error for a symlink resolving outside every configured credential root")
 	}
@@ -337,7 +337,7 @@ func TestCredentialMountDirectoryRequiresAuthorization(t *testing.T) {
 	}
 	isolateConfig(t, root)
 
-	unauthorized := &DockerRunner{Config: contracts.DockerRunnerConfig{Image: dockerTestImage, CredentialMounts: []string{sub}}}
+	unauthorized := &DockerRunner{Config: contracts.DockerRunnerConfig{Image: dockerTestImage, CredentialMounts: []string{sub}}, CredentialRoots: []string{root}}
 	if _, err := unauthorized.runArgs(Workspace{Container: "c", Path: "/ws"}, "bin", nil); err == nil {
 		t.Fatal("expected an error for an unauthorized directory mount")
 	}
@@ -345,7 +345,7 @@ func TestCredentialMountDirectoryRequiresAuthorization(t *testing.T) {
 	authorized := &DockerRunner{Config: contracts.DockerRunnerConfig{
 		Image: dockerTestImage, CredentialMounts: []string{sub},
 		CredentialMountAllowDirs: []string{sub},
-	}}
+	}, CredentialRoots: []string{root}}
 	args, err := authorized.runArgs(Workspace{Container: "c", Path: "/ws"}, "bin", nil)
 	if err != nil {
 		t.Fatalf("expected an explicitly authorized directory to mount, got: %v", err)
@@ -377,7 +377,7 @@ func TestCredentialMountSpecialFilesRejectedEvenIfDirAuthorized(t *testing.T) {
 	d := &DockerRunner{Config: contracts.DockerRunnerConfig{
 		Image: dockerTestImage, CredentialMounts: []string{fifo},
 		CredentialMountAllowDirs: []string{root},
-	}}
+	}, CredentialRoots: []string{root}}
 	if _, err := d.runArgs(Workspace{Container: "c", Path: "/ws"}, "bin", nil); err == nil {
 		t.Fatal("expected a FIFO credential mount to be rejected even under an authorized directory")
 	}
@@ -399,7 +399,7 @@ func TestCredentialMountDockerSocketRejected(t *testing.T) {
 		Image:                    dockerTestImage,
 		CredentialMounts:         []string{"/var/run/docker.sock"},
 		CredentialMountAllowDirs: []string{"/var/run"},
-	}}
+	}, CredentialRoots: []string{root}}
 	if _, err := d.runArgs(Workspace{Container: "c", Path: "/ws"}, "bin", nil); err == nil {
 		t.Fatal("expected the docker socket path to be rejected unconditionally")
 	}
@@ -422,7 +422,7 @@ func TestCredentialMountBasenameCollisionRejected(t *testing.T) {
 	isolateConfig(t, rootA+string(os.PathListSeparator)+rootB)
 	d := &DockerRunner{Config: contracts.DockerRunnerConfig{
 		Image: dockerTestImage, CredentialMounts: []string{fileA, fileB},
-	}}
+	}, CredentialRoots: []string{rootA, rootB}}
 	if _, err := d.runArgs(Workspace{Container: "c", Path: "/ws"}, "bin", nil); err == nil {
 		t.Fatal("expected a container-basename collision between two distinct credential mounts to error")
 	}

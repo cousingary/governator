@@ -505,7 +505,7 @@ func TestAuditAllowsRTKWrappedCommand(t *testing.T) {
 	if err := os.WriteFile(path, data, 0600); err != nil {
 		t.Fatal(err)
 	}
-	audit := auditTranscript(path, agents.TranscriptClaude, "", contract(t.TempDir()))
+	audit := auditTranscript(path, agents.TranscriptClaude, "", contract(t.TempDir()), nil, "")
 	for _, violation := range audit.Violations {
 		if strings.Contains(violation, "outside allowlist") {
 			t.Fatalf("RTK-wrapped command rejected: %v", audit.Violations)
@@ -528,7 +528,7 @@ func TestAuditDetectsSecretReadPrecedesNetwork(t *testing.T) {
 		t.Fatal(err)
 	}
 	c := contracts.Contract{Forbidden: contracts.Forbidden{Paths: []string{"/secrets/**"}}}
-	audit := auditTranscript(path, agents.TranscriptClaude, "", c)
+	audit := auditTranscript(path, agents.TranscriptClaude, "", c, nil, "")
 	if len(audit.RuleViolations) != 1 || audit.RuleViolations[0].Rule != policy.RuleSecretPrecedesNetwork || audit.RuleViolations[0].Verdict != policy.RuleDeny {
 		t.Fatalf("expected 1 secret-read-precedes-network deny, got %+v", audit.RuleViolations)
 	}
@@ -555,7 +555,7 @@ func TestAuditDetectsOutOfScopeReadPrecedesWrite(t *testing.T) {
 		t.Fatal(err)
 	}
 	c := contracts.Contract{Allowed: contracts.Permissions{Read: []string{"workspace/**"}}}
-	audit := auditTranscript(path, agents.TranscriptClaude, "", c)
+	audit := auditTranscript(path, agents.TranscriptClaude, "", c, nil, "")
 	if len(audit.RuleViolations) != 1 || audit.RuleViolations[0].Rule != policy.RuleOutOfScopeReadPrecedesWrite || audit.RuleViolations[0].Verdict != policy.RuleDeny {
 		t.Fatalf("expected 1 out-of-scope-read-precedes-write deny, got %+v", audit.RuleViolations)
 	}
@@ -581,7 +581,7 @@ func TestAuditRelativizesInScopeAbsoluteWorktreeRead(t *testing.T) {
 		t.Fatal(err)
 	}
 	c := contracts.Contract{Allowed: contracts.Permissions{Read: []string{"CHANGELOG.md"}}}
-	audit := auditTranscript(path, agents.TranscriptClaude, work, c)
+	audit := auditTranscript(path, agents.TranscriptClaude, work, c, nil, "")
 	if len(audit.RuleViolations) != 0 {
 		t.Fatalf("in-scope absolute worktree read must not trip rule 2, got %+v", audit.RuleViolations)
 	}
@@ -595,7 +595,7 @@ func TestAuditRelativizesInScopeAbsoluteWorktreeRead(t *testing.T) {
 	if err := os.WriteFile(pathOut, dataOut, 0600); err != nil {
 		t.Fatal(err)
 	}
-	auditOut := auditTranscript(pathOut, agents.TranscriptClaude, work, c)
+	auditOut := auditTranscript(pathOut, agents.TranscriptClaude, work, c, nil, "")
 	if len(auditOut.RuleViolations) != 1 || auditOut.RuleViolations[0].Rule != policy.RuleOutOfScopeReadPrecedesWrite {
 		t.Fatalf("genuinely out-of-scope absolute read must still deny, got %+v", auditOut.RuleViolations)
 	}
@@ -614,7 +614,7 @@ func TestAuditFlagsInjectionPrecedesExecAdvisoryOnly(t *testing.T) {
 		t.Fatal(err)
 	}
 	c := contracts.Contract{Allowed: contracts.Permissions{Execute: []string{"echo hi"}}}
-	audit := auditTranscript(path, agents.TranscriptClaude, "", c)
+	audit := auditTranscript(path, agents.TranscriptClaude, "", c, nil, "")
 	if len(audit.RuleViolations) != 1 || audit.RuleViolations[0].Rule != policy.RuleInjectionPrecedesExec || audit.RuleViolations[0].Verdict != policy.RuleFlag {
 		t.Fatalf("expected 1 suspected-injection-precedes-exec flag, got %+v", audit.RuleViolations)
 	}

@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/cousingary/governator/internal/breaker"
+	"github.com/cousingary/governator/internal/config"
 	"github.com/cousingary/governator/internal/contracts"
 	"github.com/cousingary/governator/internal/observability"
 	"github.com/cousingary/governator/internal/router"
@@ -94,7 +95,7 @@ func diversityGroup(key, agent string) string {
 // even before diversity narrows the pool, resolvePanelBackends returns
 // router.ErrNoCandidate immediately — diversity can degrade a panel, it can
 // never be the reason a member runs with no backend.
-func resolvePanelBackends(db *sql.DB, rtr router.Router, jobs []contracts.Contract, spec contracts.PanelSpec) ([]contracts.Contract, PanelReport, error) {
+func resolvePanelBackends(db *sql.DB, rtr router.Router, jobs []contracts.Contract, spec contracts.PanelSpec, cfg config.Config) ([]contracts.Contract, PanelReport, error) {
 	out := append([]contracts.Contract(nil), jobs...)
 	byID := make(map[string]int, len(out))
 	for i, j := range out {
@@ -117,12 +118,12 @@ func resolvePanelBackends(db *sql.DB, rtr router.Router, jobs []contracts.Contra
 
 		req := router.RequestFromContract(job)
 		req.ExcludeAgents = excludedFor(req, usedGroups, div.GroupBy)
-		decision, err := rtr.Resolve(db, req)
+		decision, err := rtr.Resolve(db, req, cfg)
 		if err != nil {
 			return nil, report, err
 		}
 		if decision.Selected == "" && len(req.ExcludeAgents) > 0 {
-			decision, err = resolveDiversityFallback(db, rtr, job, usedGroups, div, &report, memberID)
+			decision, err = resolveDiversityFallback(db, rtr, job, usedGroups, div, &report, memberID, cfg)
 			if err != nil {
 				return nil, report, err
 			}
@@ -149,11 +150,11 @@ func resolvePanelBackends(db *sql.DB, rtr router.Router, jobs []contracts.Contra
 // exclusions entirely and reuses a backend rather than fail the member.
 // Either path records why in report — diversity can degrade a panel, it
 // must never do so silently.
-func resolveDiversityFallback(db *sql.DB, rtr router.Router, job contracts.Contract, usedGroups map[string]bool, div contracts.PanelDiversity, report *PanelReport, memberID string) (router.Decision, error) {
+func resolveDiversityFallback(db *sql.DB, rtr router.Router, job contracts.Contract, usedGroups map[string]bool, div contracts.PanelDiversity, report *PanelReport, memberID string, cfg config.Config) (router.Decision, error) {
 	if div.FallbackGroupBy != "" {
 		fallbackReq := router.RequestFromContract(job)
 		fallbackReq.ExcludeAgents = excludedFor(fallbackReq, usedGroups, div.FallbackGroupBy)
-		if fbDecision, fbErr := rtr.Resolve(db, fallbackReq); fbErr != nil {
+		if fbDecision, fbErr := rtr.Resolve(db, fallbackReq, cfg); fbErr != nil {
 			return router.Decision{}, fbErr
 		} else if fbDecision.Selected != "" {
 			report.degrade(fmt.Sprintf("member %s: no candidate satisfied diversity exclusion (%s); used fallback grouping (%s)", memberID, div.GroupBy, div.FallbackGroupBy))
@@ -161,7 +162,7 @@ func resolveDiversityFallback(db *sql.DB, rtr router.Router, job contracts.Contr
 		}
 	}
 	noExclusion := router.RequestFromContract(job)
-	decision, err := rtr.Resolve(db, noExclusion)
+	decision, err := rtr.Resolve(db, noExclusion, cfg)
 	if err != nil {
 		return router.Decision{}, err
 	}
@@ -232,11 +233,15 @@ func (r *Runner) RunPanel(ctx context.Context, spec contracts.PanelSpec, levels 
 		return BatchSummary{}, PanelReport{}, fmt.Errorf("panel: expected at least a member level and a comparison level, got %d", len(levels))
 	}
 
+	cfg, err := config.LoadStrict()
+	if err != nil {
+		return BatchSummary{}, PanelReport{}, err
+	}
 	db, err := dbOpen(r.Home)
 	if err != nil {
 		return BatchSummary{}, PanelReport{}, err
 	}
-	assigned, report, err := resolvePanelBackends(db, router.Router{Health: breaker.Store{DB: db}}, levels[0], spec)
+	assigned, report, err := resolvePanelBackends(db, router.Router{Health: breaker.Store{DB: db}}, levels[0], spec, cfg)
 	db.Close()
 	if err != nil {
 		return BatchSummary{}, report, err

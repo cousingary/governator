@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/cousingary/governator/internal/config"
 	"github.com/cousingary/governator/internal/contracts"
 	"github.com/cousingary/governator/internal/observability"
 	"github.com/cousingary/governator/internal/router"
@@ -28,7 +29,7 @@ func TestResolvePanelBackendsAssignsDistinctBackends(t *testing.T) {
 	jobs := []contracts.Contract{panelMember("m1"), panelMember("m2"), panelMember("m3")}
 	spec := contracts.PanelSpec{ID: "panel", Members: []string{"m1", "m2", "m3"}, ComparisonJob: "cmp", Judge: "judge"}
 
-	out, report, err := resolvePanelBackends(db, router.Router{Binary: allPresentBinary}, jobs, spec)
+	out, report, err := resolvePanelBackends(db, router.Router{Binary: allPresentBinary}, jobs, spec, config.Config{})
 	if err != nil {
 		t.Fatalf("resolvePanelBackends: %v", err)
 	}
@@ -66,7 +67,7 @@ func TestResolvePanelBackendsDegradesWhenPoolTooSmall(t *testing.T) {
 	jobs := []contracts.Contract{panelMember("m1"), panelMember("m2"), panelMember("m3")}
 	spec := contracts.PanelSpec{ID: "panel", Members: []string{"m1", "m2", "m3"}, ComparisonJob: "cmp", Judge: "judge"}
 
-	out, report, err := resolvePanelBackends(db, router.Router{Binary: only2}, jobs, spec)
+	out, report, err := resolvePanelBackends(db, router.Router{Binary: only2}, jobs, spec, config.Config{})
 	if err != nil {
 		t.Fatalf("resolvePanelBackends: %v", err)
 	}
@@ -106,7 +107,7 @@ func TestResolvePanelBackendsExplicitAgentCountsTowardDiversity(t *testing.T) {
 	jobs := []contracts.Contract{m1, panelMember("m2")}
 	spec := contracts.PanelSpec{ID: "panel", Members: []string{"m1", "m2"}, ComparisonJob: "cmp", Judge: "judge"}
 
-	out, report, err := resolvePanelBackends(db, router.Router{Binary: allPresentBinary}, jobs, spec)
+	out, report, err := resolvePanelBackends(db, router.Router{Binary: allPresentBinary}, jobs, spec, config.Config{})
 	if err != nil {
 		t.Fatalf("resolvePanelBackends: %v", err)
 	}

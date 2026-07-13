@@ -424,11 +424,7 @@ func writeFileNoFollow(path string, data []byte, perm os.FileMode) error {
 	return f.Chmod(perm)
 }
 
-func protectedFingerprint() (snapshot, error) {
-	patterns, err := protectedpaths.Patterns()
-	if err != nil {
-		return nil, err
-	}
+func protectedFingerprint(patterns []string) (snapshot, error) {
 	out := snapshot{}
 	for _, pattern := range patterns {
 		matches := protectedpaths.Resolve(pattern)
@@ -1147,7 +1143,7 @@ func recognizedTranscriptEvent(format string, v any) bool {
 	return false
 }
 
-func auditTranscript(path, format, work string, c contracts.Contract) transcriptAudit {
+func auditTranscript(path, format, work string, c contracts.Contract, protectedPatterns []string, unenforceableRuleAction string) transcriptAudit {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return transcriptAudit{Violations: []string{"transcript audit: " + err.Error()}, CostUnavailable: true}
@@ -1276,8 +1272,7 @@ func auditTranscript(path, format, work string, c contracts.Contract) transcript
 	// into audit.Violations like any other policy breach); a flag-verdict hit
 	// stays advisory (RuleViolations only — the caller ledgers it but it never
 	// changes this run's outcome, same posture as an assay advisory verdict).
-	secretPatterns, _ := protectedpaths.Patterns()
-	secretPatterns = append(append([]string{}, secretPatterns...), c.Forbidden.Paths...)
+	secretPatterns := append(append([]string{}, protectedPatterns...), c.Forbidden.Paths...)
 	// Real agent transcripts (Claude's Read/Write tool_use blocks) always
 	// carry absolute file_path values, but allowed.read/forbidden.paths are
 	// documented and validated as repository-relative patterns (see
@@ -1314,8 +1309,18 @@ func auditTranscript(path, format, work string, c contracts.Contract) transcript
 	// which case it folds into audit.Violations via the same RuleDeny path
 	// below as a real policy rule violation, for operators who'd rather fail
 	// closed on missing coverage than merely be told about it.
+	//
+	// Sol Finding 2 / Session 3: this used to call config.Current() here,
+	// re-reading config.yaml from disk at audit time — after the agent has
+	// already run. An operator (or an attacker with file write access) could
+	// flip doctrine.unenforceable_rule_action from "block" to "flag" while
+	// the backend was still executing and the run would be evaluated against
+	// the *changed* value, contradicting the frozen RunEnvironment the rest
+	// of the run already committed to. unenforceableRuleAction is now the
+	// value captured once in the run's RunEnvironment, before the agent ever
+	// launched.
 	unenforceableVerdict := policy.RuleFlag
-	if config.Current().Doctrine.UnenforceableRuleAction == "block" {
+	if unenforceableRuleAction == "block" {
 		unenforceableVerdict = policy.RuleDeny
 	}
 	for _, rule := range policy.UnenforceableRules(format) {
@@ -1565,7 +1570,16 @@ func (r *Runner) fallbackEligible(c contracts.Contract, rec RunRecord) (bool, st
 		if err != nil {
 			return false, "", err
 		}
-		cfg := config.Current()
+		// fallbackEligible runs strictly after the previous runOnce attempt
+		// has already returned — this is a fresh decision point for the next
+		// attempt, not a re-read partway through an in-flight run, so loading
+		// current configuration here (via LoadStrict, which fails closed
+		// instead of silently falling back to defaults) is correct rather
+		// than a repeat of Sol Finding 2.
+		cfg, err := config.LoadStrict()
+		if err != nil {
+			return false, "", err
+		}
 		facts := policy.MergeFacts(policy.BuildContractFacts(c, rec.Agent), map[string]any{
 			policy.FactUnusualInfraRetry: true,
 			policy.FactInfraFailureKind:  rec.FailureTaxonomy,
@@ -1602,6 +1616,18 @@ func (r *Runner) runOnce(ctx context.Context, c contracts.Contract) (RunRecord, 
 	if err != nil {
 		return RunRecord{}, err
 	}
+	// Sol Finding 2 / Session 3: the RunEnvironment is built here, first,
+	// before any run decision — before policy.Preflight, before runner
+	// resolution, before the lock, before anything that could be construed
+	// as "this run has started deciding something." Every execution-critical
+	// read of configuration for the rest of this attempt comes from this one
+	// frozen snapshot; nothing below calls config.Current() again. See
+	// RunEnvironment's doc comment in environment.go for the exploit this
+	// closes.
+	env, err := buildRunEnvironment()
+	if err != nil {
+		return RunRecord{}, err
+	}
 	// id is minted here (rather than just before workspace creation, where it
 	// used to live) so the Phase 4 stage checkpoints below — PARSED and
 	// PREFLIGHTED happen before any workspace or quota reservation exists —
@@ -1635,7 +1661,7 @@ func (r *Runner) runOnce(ctx context.Context, c contracts.Contract) (RunRecord, 
 	// effect: a docker request Governator can't satisfy must fail closed with
 	// a clear error here, never silently fall back to LocalWorktreeRunner and
 	// never leave a partially-acquired lock or reservation behind.
-	rn, err := runner.New(c.EffectiveRunner(), c.Docker, c.Local)
+	rn, err := runner.New(c.EffectiveRunner(), c.Docker, c.Local, env.CredentialRoots)
 	if err != nil {
 		return RunRecord{}, err
 	}
@@ -1673,7 +1699,11 @@ func (r *Runner) runOnce(ctx context.Context, c contracts.Contract) (RunRecord, 
 	// the full ExecutionIdentity hash rather than contract_hash+approved_head,
 	// so a stale approval can never bypass current policy, configuration,
 	// routing, containment, quota, prompt or backend state.
-	cfg := config.Current()
+	//
+	// cfg is env.Config (frozen above, at the very top of this function) —
+	// not a fresh config.Current() read. Every use of cfg below this line
+	// describes the same environment recorded in this run's identity.
+	cfg := env.Config
 	if err := quota.SeedFromConfig(db, cfg, time.Now().UTC()); err != nil {
 		return RunRecord{}, err
 	}
@@ -1714,7 +1744,7 @@ func (r *Runner) runOnce(ctx context.Context, c contracts.Contract) (RunRecord, 
 	// overrides an explicit choice).
 	resolved := c
 	if c.Agent == contracts.AgentAuto {
-		decision, derr := router.Router{Health: breaker.Store{DB: db}}.Resolve(db, router.RequestFromContract(c))
+		decision, derr := router.Router{Health: breaker.Store{DB: db}}.Resolve(db, router.RequestFromContract(c), cfg)
 		if derr != nil {
 			return RunRecord{}, derr
 		}
@@ -1924,7 +1954,7 @@ func (r *Runner) runOnce(ctx context.Context, c contracts.Contract) (RunRecord, 
 	if err != nil {
 		return rec, err
 	}
-	protectedBefore, err := protectedFingerprint()
+	protectedBefore, err := protectedFingerprint(env.ProtectedPatterns)
 	if err != nil {
 		return rec, err
 	}
@@ -1996,7 +2026,7 @@ func (r *Runner) runOnce(ctx context.Context, c contracts.Contract) (RunRecord, 
 		}
 	}
 	redactErr := redact(transcript)
-	audit := auditTranscript(transcript, agent.Capabilities().TranscriptFormat, work, c)
+	audit := auditTranscript(transcript, agent.Capabilities().TranscriptFormat, work, c, env.ProtectedPatterns, env.Config.Doctrine.UnenforceableRuleAction)
 	if err := observability.RecordStage(db, id, "AUDITED", "", time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
 		return rec, err
 	}
@@ -2044,7 +2074,7 @@ func (r *Runner) runOnce(ctx context.Context, c contracts.Contract) (RunRecord, 
 	}
 	workAfter, werr := fingerprint(work)
 	liveAfter, lerr := fingerprint(root)
-	protectedAfter, perr := protectedFingerprint()
+	protectedAfter, perr := protectedFingerprint(env.ProtectedPatterns)
 	gitControlAfter, gcerr := gitControlFingerprint(work)
 	violations := append([]string{}, audit.Violations...)
 	violations = append(violations, telemetryViolations(c, audit)...)

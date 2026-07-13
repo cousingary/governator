@@ -81,7 +81,10 @@ func (r *Runner) RunBatch(ctx context.Context, jobs []contracts.Contract, opts B
 		return BatchSummary{}, startErr
 	}
 
-	cfg := config.Current()
+	cfg, err := config.LoadStrict()
+	if err != nil {
+		return BatchSummary{}, err
+	}
 	acctDB, err := dbOpen(r.Home)
 	if err != nil {
 		return BatchSummary{}, err
