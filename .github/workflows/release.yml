@@ -1,0 +1,72 @@
+name: Release
+
+# Sol redteam v3 S14 (finding #20 / P2.2, P2.3): the single, unified release
+# pipeline. Triggered by a `v*` tag push; delegates entirely to
+# scripts/release.sh (the canonical entry point — see that script's header
+# for why .goreleaser.yml was retired) so a local run and a CI run produce
+# byte-for-byte the same file set: gov_<version>_<platform>.tar.gz per
+# platform, checksums.txt, build-manifest.json, sbom.json, claims.yaml,
+# test-summary.json, acceptance-summary.json, signature.
+#
+# This workflow is inert until a git remote and a `v*` tag exist (docs/
+# publishing.md step 2/5) — it is committed now so the CI proof mechanism is
+# declared and ready, per the audit's P2.3 correction, even though no live
+# run has executed yet in this environment.
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - name: Derive VERSION from the pushed tag
+        run: echo "VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
+
+      - name: Run the unified release pipeline
+        env:
+          GOV_RELEASE_HMAC_KEY: ${{ secrets.GOV_RELEASE_HMAC_KEY }}
+        run: scripts/release.sh
+
+      - name: Upload release artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: gov-${{ env.VERSION }}
+          path: |
+            dist/*.tar.gz
+            dist/checksums.txt
+            dist/build-manifest.json
+            dist/sbom.json
+            dist/claims.yaml
+            dist/test-summary.json
+            dist/acceptance-summary.json
+            dist/signature
+          if-no-files-found: error
+
+      - name: Create GitHub release (draft)
+        uses: softprops/action-gh-release@v2
+        with:
+          draft: true
+          files: |
+            dist/*.tar.gz
+            dist/checksums.txt
+            dist/build-manifest.json
+            dist/sbom.json
+            dist/claims.yaml
+            dist/test-summary.json
+            dist/acceptance-summary.json
+            dist/signature
