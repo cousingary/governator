@@ -2,7 +2,9 @@ package runtime
 
 import (
 	"context"
+	"crypto/rand"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -166,11 +168,52 @@ type ReconcileReport struct {
 	Outcomes  []ReconcileOutcome `json:"outcomes"`
 }
 
-// Reconcile drains every pending maintenance_outbox row: each is retried
-// against the same operation the original best-effort call attempted. A row
-// that succeeds is marked done; a row that fails again stays pending with its
-// attempts counter incremented, ready for the next reconcile pass (or for
-// `gov cleanup --stale` to give up on, once attempts crosses the caller's
+// reconcileClaimLimit bounds a single Reconcile call's claim to a generously
+// large number of rows — effectively "everything currently pending or
+// lease-expired," matching PendingOutbox's old unbounded behavior for any
+// realistic queue depth. Reconcile claims exactly once per call, not in a
+// loop: a row whose operation fails deterministically (e.g. an unknown
+// op_kind, or any permanently-broken payload) is released back to "pending"
+// by MarkOutboxRetry immediately, and a claim-until-empty loop would
+// re-claim and re-fail that same row forever within one call — this is a
+// real hang a -race run of the existing TestReconcileRetriesUnknownOpKind
+// caught during this session's own verification. One claim, one pass, then
+// return; a permanently-failing row waits for the *next* `gov reconcile`
+// invocation, exactly as it did before leasing existed.
+const reconcileClaimLimit = 10000
+
+// reconcileLeaseDuration is how long a claimed row stays "processing" before
+// a later Reconcile pass (this process or another) is allowed to reclaim it.
+// Generous relative to any single operation in dispatchReconcile (all local
+// DB writes plus, for opWorkspaceDestroy, a bounded docker/git call under
+// workspaceCleanupTimeout) so a live reconciler is never raced by its own
+// next pass, while still being short enough that a killed reconciler's rows
+// come back for retry within one operator-visible cycle.
+const reconcileLeaseDuration = 5 * time.Minute
+
+// reconcileOwnerID identifies this process's claim on leased rows, purely
+// for operator diagnosis (ClaimOutbox's exclusivity comes from the SQL, not
+// from this string being unique) — a random suffix keeps it distinct even
+// when the pid is reused across two closely-spaced `gov reconcile` runs.
+func reconcileOwnerID() string {
+	b := make([]byte, 8)
+	if _, err := rand.Read(b); err != nil {
+		return fmt.Sprintf("pid-%d-%d", os.Getpid(), time.Now().UTC().UnixNano())
+	}
+	return fmt.Sprintf("pid-%d-%s", os.Getpid(), hex.EncodeToString(b))
+}
+
+// Reconcile drains every claimable maintenance_outbox row: each is leased
+// (Sol P1.5, finding #12 — two `gov reconcile` processes running
+// concurrently can never claim the same row, closing the double-dispatch
+// this session's regression corpus reproduces) then retried against the same
+// operation the original best-effort call attempted. A row already recorded
+// in maintenance_outbox_applied (its operation ran to completion on a prior
+// lease that expired before MarkOutboxDone landed) is finalized without
+// re-running the operation. A row that succeeds is marked done and applied;
+// a row that fails again is released back to pending with its attempts
+// counter incremented, ready for the next reconcile pass (or for `gov
+// cleanup --stale` to give up on, once attempts crosses the caller's
 // threshold).
 func Reconcile(ctx context.Context) (ReconcileReport, error) {
 	db, err := dbOpen(Home())
@@ -182,23 +225,41 @@ func Reconcile(ctx context.Context) (ReconcileReport, error) {
 	if err != nil {
 		return ReconcileReport{}, err
 	}
-	items, err := observability.PendingOutbox(db)
-	if err != nil {
-		return ReconcileReport{}, err
-	}
+	owner := reconcileOwnerID()
 	report := ReconcileReport{}
+	now := time.Now().UTC()
+	leaseUntil := now.Add(reconcileLeaseDuration)
+	items, err := observability.ClaimOutbox(db, owner, reconcileClaimLimit, now.Format(time.RFC3339Nano), leaseUntil.Format(time.RFC3339Nano))
+	if err != nil {
+		return report, err
+	}
 	for _, item := range items {
 		report.Processed++
-		now := time.Now().UTC().Format(time.RFC3339Nano)
+		nowStr := time.Now().UTC().Format(time.RFC3339Nano)
+		applied, err := observability.OutboxAlreadyApplied(db, item.ID)
+		if err != nil {
+			return report, err
+		}
+		if applied {
+			if err := observability.MarkOutboxDone(db, item.ID, nowStr); err != nil {
+				return report, err
+			}
+			report.Done++
+			report.Outcomes = append(report.Outcomes, ReconcileOutcome{ID: item.ID, RunID: item.RunID, OpKind: item.OpKind, Status: "done"})
+			continue
+		}
 		if opErr := dispatchReconcile(ctx, db, cfg, item); opErr != nil {
-			if err := observability.MarkOutboxRetry(db, item.ID, opErr.Error(), now); err != nil {
+			if err := observability.MarkOutboxRetry(db, item.ID, opErr.Error(), nowStr); err != nil {
 				return report, err
 			}
 			report.Retried++
 			report.Outcomes = append(report.Outcomes, ReconcileOutcome{ID: item.ID, RunID: item.RunID, OpKind: item.OpKind, Status: "retry", Error: opErr.Error()})
 			continue
 		}
-		if err := observability.MarkOutboxDone(db, item.ID, now); err != nil {
+		if err := observability.MarkOutboxApplied(db, item.ID, nowStr); err != nil {
+			return report, err
+		}
+		if err := observability.MarkOutboxDone(db, item.ID, nowStr); err != nil {
 			return report, err
 		}
 		report.Done++
@@ -309,7 +370,12 @@ func dispatchReconcile(ctx context.Context, db *sql.DB, cfg config.Config, item 
 		if err := json.Unmarshal([]byte(item.Payload), &p); err != nil {
 			return err
 		}
-		_, err := db.Exec(`INSERT INTO validators(run_id,command,exit_code,output,stage) VALUES(?,?,?,?,?)`, p.RunID, p.Command, p.ExitCode, p.Output, p.Stage)
+		// outbox_id=item.ID is this row's idempotency key (Sol P1.5, finding
+		// #12): ON CONFLICT(outbox_id) DO NOTHING means a lease that expired
+		// and got reclaimed after this INSERT already committed — but before
+		// MarkOutboxDone recorded it — writes zero duplicate evidence rows on
+		// the retried attempt, instead of erroring or silently duplicating.
+		_, err := db.Exec(`INSERT INTO validators(run_id,command,exit_code,output,stage,outbox_id) VALUES(?,?,?,?,?,?) ON CONFLICT(outbox_id) DO NOTHING`, p.RunID, p.Command, p.ExitCode, p.Output, p.Stage, item.ID)
 		return err
 	case opOneShotOverrideRelease:
 		var p oneShotOverrideReleasePayload

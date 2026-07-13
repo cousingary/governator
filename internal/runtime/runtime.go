@@ -99,6 +99,71 @@ func envelopeJSON(spec agents.BackendSpec, capability agents.Capability) string 
 	return string(payload)
 }
 
+// workspaceDescriptor is the complete workspace/runner descriptor persisted
+// as the WORKSPACE_READY stage's detail (Sol P1.6, finding #13): everything
+// a later process-crash recovery pass needs to reconstruct the exact Runner
+// and runner.Workspace an interrupted run was using, without any in-memory
+// state surviving the crash. Runner/Path/Root/Branch/Git/Container are what
+// recovery.go's destroyLeftoverWorkspace actually needs to call the real
+// runner.Destroy path; ImageID/RunnerConfigHash/WorkspaceDigest are
+// provenance recorded because a crashed run is exactly when that context is
+// otherwise lost.
+type workspaceDescriptor struct {
+	Runner           string `json:"runner"`
+	Path             string `json:"path"`
+	Root             string `json:"root"`
+	Branch           string `json:"branch,omitempty"`
+	Git              bool   `json:"git"`
+	Container        string `json:"container,omitempty"`
+	ImageID          string `json:"image_id,omitempty"`
+	RunnerConfigHash string `json:"runner_config_hash,omitempty"`
+	WorkspaceDigest  string `json:"workspace_digest,omitempty"`
+}
+
+// newWorkspaceDescriptor captures ws (freshly returned by rn.Prepare) plus
+// the contract's runner configuration into a workspaceDescriptor. Called
+// once, before the agent ever launches, so the recorded state cannot be
+// contaminated by anything the agent does afterward.
+func newWorkspaceDescriptor(c contracts.Contract, ws runner.Workspace) (workspaceDescriptor, error) {
+	snap, err := fingerprint(ws.Path)
+	if err != nil {
+		return workspaceDescriptor{}, err
+	}
+	d := workspaceDescriptor{
+		Runner:          c.EffectiveRunner(),
+		Path:            ws.Path,
+		Root:            ws.Root,
+		Branch:          ws.Branch,
+		Git:             ws.Git,
+		Container:       ws.Container,
+		WorkspaceDigest: snapshotDigest(snap),
+	}
+	if d.Runner == "docker" && c.Docker != nil {
+		d.ImageID = c.Docker.Image
+	}
+	d.RunnerConfigHash = runnerConfigHash(d.Runner, c.Docker, c.Local)
+	return d, nil
+}
+
+// runnerConfigHash fingerprints whichever runner config is actually active
+// for kind, so a workspaceDescriptor records exactly what configuration
+// produced the workspace it describes.
+func runnerConfigHash(kind string, docker *contracts.DockerRunnerConfig, local *contracts.LocalRunnerConfig) string {
+	var payload any
+	switch kind {
+	case "docker":
+		payload = docker
+	default:
+		payload = local
+	}
+	b, err := json.Marshal(payload)
+	if err != nil {
+		return ""
+	}
+	sum := sha256.Sum256(b)
+	return hex.EncodeToString(sum[:])
+}
+
 type Runner struct{ Home string }
 
 func Home() string { return config.Current().LedgerDir }
@@ -2241,7 +2306,23 @@ func (r *Runner) runOnce(ctx context.Context, c contracts.Contract) (RunRecord, 
 	if err = insertRun(db, rec, hash, head); err != nil {
 		return rec, err
 	}
-	if err := observability.RecordStage(db, id, "WORKSPACE_READY", "", time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
+	// Sol P1.6 (finding #13): WORKSPACE_READY used to carry an empty detail,
+	// so a process-crash recovery pass had nothing but RunRecord's bare
+	// worktree/branch fields to work with — no container name, no runner
+	// kind — and fell back to an ad hoc, container-blind cleanup. Persisting
+	// the full descriptor here, before the agent ever launches, means
+	// recovery (recovery.go's destroyLeftoverWorkspace) can reconstruct the
+	// exact Runner and Workspace this run used and tear it down through the
+	// same runner.Destroy path the normal completion flow uses.
+	wsDescriptor, err := newWorkspaceDescriptor(c, ws)
+	if err != nil {
+		return rec, err
+	}
+	wsDescriptorJSON, err := json.Marshal(wsDescriptor)
+	if err != nil {
+		return rec, err
+	}
+	if err := observability.RecordStage(db, id, "WORKSPACE_READY", string(wsDescriptorJSON), time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
 		return rec, err
 	}
 	graphSnapshot, err := contextgraph.Prepare(ctx, work)

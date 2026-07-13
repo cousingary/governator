@@ -285,6 +285,39 @@ CREATE TABLE IF NOT EXISTS policy_overrides(id INTEGER PRIMARY KEY AUTOINCREMENT
 			return nil, alterErr
 		}
 	}
+	// lease_owner/lease_until (Sol P1.5, finding #12) turn maintenance_outbox
+	// into a real leased queue: PendingOutbox used to hand every "pending" row
+	// to whichever `gov reconcile` process asked, so two processes running
+	// concurrently could both dispatch the same non-idempotent operation.
+	// ClaimOutbox's single conditional UPDATE now transitions a row to
+	// "processing" with an owner + expiry before any operation runs; a lease
+	// that expires without being marked done/dead becomes reclaimable again
+	// (crash recovery for the reconciler itself). Empty defaults on
+	// pre-existing rows are honest — those rows predate leasing and were
+	// never claimed by anyone.
+	for _, column := range []string{"lease_owner TEXT NOT NULL DEFAULT ''", "lease_until TEXT NOT NULL DEFAULT ''"} {
+		if _, alterErr := db.Exec("ALTER TABLE maintenance_outbox ADD COLUMN " + column); alterErr != nil && !strings.Contains(strings.ToLower(alterErr.Error()), "duplicate column") {
+			db.Close()
+			return nil, alterErr
+		}
+	}
+	// outbox_id (Sol P1.5, finding #12) is the idempotency key for a
+	// reconcile-sourced validators row: NULL for every row written by a live
+	// run (the overwhelming majority, and SQLite's unique index allows
+	// unlimited NULLs), set to the maintenance_outbox row's own id only when
+	// dispatchReconcile's opValidatorEvidence case writes it, so a row whose
+	// lease expired and got reclaimed after the INSERT already succeeded
+	// (but before the outbox row was marked done) hits ON CONFLICT(outbox_id)
+	// DO NOTHING instead of writing a duplicate evidence row.
+	if _, alterErr := db.Exec("ALTER TABLE validators ADD COLUMN outbox_id INTEGER"); alterErr != nil && !strings.Contains(strings.ToLower(alterErr.Error()), "duplicate column") {
+		db.Close()
+		return nil, alterErr
+	}
+	if _, err = db.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS validators_outbox_id ON validators(outbox_id);
+CREATE TABLE IF NOT EXISTS maintenance_outbox_applied(outbox_id INTEGER PRIMARY KEY, applied_at TEXT NOT NULL);`); err != nil {
+		db.Close()
+		return nil, err
+	}
 	if _, err = db.Exec(`CREATE INDEX IF NOT EXISTS runs_key ON runs(contract_hash, approved_head, status);
 CREATE INDEX IF NOT EXISTS runs_identity ON runs(identity_hash, status);
 CREATE INDEX IF NOT EXISTS runs_failure ON runs(failure_taxonomy, created);
@@ -303,7 +336,8 @@ CREATE INDEX IF NOT EXISTS assay_evaluations_run ON assay_evaluations(run_id);
 CREATE INDEX IF NOT EXISTS run_stages_run ON run_stages(run_id);
 CREATE INDEX IF NOT EXISTS policy_rule_events_run ON policy_rule_events(run_id);
 CREATE INDEX IF NOT EXISTS operational_errors_run ON operational_errors(run_id,op_kind);
-CREATE INDEX IF NOT EXISTS maintenance_outbox_status ON maintenance_outbox(status,op_kind);`); err != nil {
+CREATE INDEX IF NOT EXISTS maintenance_outbox_status ON maintenance_outbox(status,op_kind);
+CREATE INDEX IF NOT EXISTS maintenance_outbox_lease ON maintenance_outbox(status,lease_until,created_at,id);`); err != nil {
 		db.Close()
 		return nil, err
 	}

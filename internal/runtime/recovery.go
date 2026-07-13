@@ -12,6 +12,7 @@ import (
 
 	"github.com/cousingary/governator/internal/observability"
 	"github.com/cousingary/governator/internal/quota"
+	"github.com/cousingary/governator/internal/runner"
 	"github.com/cousingary/governator/internal/spend"
 )
 
@@ -200,7 +201,22 @@ func recoverInterruptedRun(ctx context.Context, db *sql.DB, r RunRecord, forced 
 	if err := spend.ReleaseForRun(db, r.ID, now); err != nil {
 		return RecoveryVerdict{RunID: r.ID}, err
 	}
-	destroyLeftoverWorkspace(ctx, r)
+	// Sol P1.6 (finding #13): a failed workspace/container teardown must
+	// never be papered over by marking the run recovered/abandoned anyway —
+	// that is exactly how a crashed Docker run left its container running
+	// forever while the ledger called the run cleanly closed. A cleanup
+	// failure is durably enqueued (destroyLeftoverWorkspace already did that)
+	// and the run is left RUNNING so the next recovery pass (or `gov
+	// reconcile` draining the enqueued opWorkspaceDestroy row) retries it;
+	// only a successful teardown reaches the ABANDONED/QUARANTINED update
+	// below.
+	if ok := destroyLeftoverWorkspace(ctx, db, r, stages); !ok {
+		detail := "workspace/container cleanup failed; retry enqueued to maintenance_outbox, run left RUNNING pending cleanup"
+		if err := observability.RecordStage(db, r.ID, "CLEANUP_PENDING", detail, now.Format(time.RFC3339Nano)); err != nil {
+			return RecoveryVerdict{RunID: r.ID}, err
+		}
+		return RecoveryVerdict{RunID: r.ID, Action: "cleanup_pending", Detail: detail}, nil
+	}
 
 	status := "ABANDONED"
 	action := "safe_resume"
@@ -216,22 +232,71 @@ func recoverInterruptedRun(ctx context.Context, db *sql.DB, r RunRecord, forced 
 	return RecoveryVerdict{RunID: r.ID, Action: action, Detail: reason}, nil
 }
 
-// destroyLeftoverWorkspace removes an interrupted run's worktree (and its
-// branch, for the git path) if it still exists. A no-op when the worktree was
-// already cleaned up, so recover --stale is safe to run repeatedly.
-func destroyLeftoverWorkspace(ctx context.Context, r RunRecord) {
-	if r.Worktree == "" {
-		return
+// workspaceDescriptorFromStages finds the WORKSPACE_READY stage row (it may
+// not be the latest — a crash can happen many stages later) and decodes its
+// workspaceDescriptor detail. Pre-S10 runs, and any run whose crash predates
+// even WORKSPACE_READY, have no such row (or an empty/legacy detail); ok is
+// false in both cases so the caller falls back to RunRecord's bare fields.
+func workspaceDescriptorFromStages(stages []observability.StageRecord) (workspaceDescriptor, bool) {
+	for _, s := range stages {
+		if s.Stage != "WORKSPACE_READY" || s.Detail == "" {
+			continue
+		}
+		var d workspaceDescriptor
+		if err := json.Unmarshal([]byte(s.Detail), &d); err != nil {
+			return workspaceDescriptor{}, false
+		}
+		if d.Path == "" {
+			return workspaceDescriptor{}, false
+		}
+		return d, true
 	}
-	if _, err := os.Stat(r.Worktree); os.IsNotExist(err) {
-		return
+	return workspaceDescriptor{}, false
+}
+
+// destroyLeftoverWorkspace tears down an interrupted run's workspace through
+// the same runner.Destroy path the normal completion flow uses (Sol P1.6,
+// finding #13) — never a bespoke, container-blind worktree-only cleanup.
+// The WORKSPACE_READY descriptor (see newWorkspaceDescriptor) tells it which
+// Runner kind and Container name were actually in play; a run recorded
+// before that descriptor existed falls back to RunRecord's worktree/branch
+// fields, exactly as before this session (local worktrees only — no run that
+// predates the descriptor could have used the Docker runner).
+//
+// A no-op (returns true) when there is nothing left to tear down. Any
+// Destroy failure is durably enqueued via the same maintenance_outbox
+// opWorkspaceDestroy path `gov reconcile` already knows how to retry, and
+// this function reports failure so the caller does not mark the run
+// recovered/abandoned while a container may still be alive.
+func destroyLeftoverWorkspace(ctx context.Context, db *sql.DB, r RunRecord, stages []observability.StageRecord) bool {
+	kind := "local"
+	ws := runner.Workspace{Path: r.Worktree, Root: r.Root, Branch: r.Branch, Git: r.Branch != ""}
+	if d, ok := workspaceDescriptorFromStages(stages); ok {
+		kind = d.Runner
+		ws = runner.Workspace{Path: d.Path, Root: d.Root, Branch: d.Branch, Git: d.Git, Container: d.Container}
 	}
-	if r.Branch != "" {
-		_, _, _ = shell(ctx, r.Root, "git worktree remove --force "+shQuote(r.Worktree))
-		_, _, _ = shell(ctx, r.Root, "git branch -D "+shQuote(r.Branch))
-	} else {
-		_ = os.RemoveAll(r.Worktree)
+	if ws.Path == "" && ws.Container == "" {
+		return true
 	}
+	if ws.Path != "" && ws.Container == "" {
+		if _, err := os.Stat(ws.Path); os.IsNotExist(err) {
+			return true
+		}
+	}
+	var rn runner.Runner = &runner.LocalWorktreeRunner{}
+	if kind == "docker" {
+		rn = &runner.DockerRunner{}
+	}
+	destroyCtx, cancel := context.WithTimeout(ctx, workspaceCleanupTimeout)
+	defer cancel()
+	if err := rn.Destroy(destroyCtx, ws, true); err != nil {
+		payload, _ := json.Marshal(workspaceDestroyPayload{
+			Path: ws.Path, Root: ws.Root, Branch: ws.Branch, Git: ws.Git, Container: ws.Container, Approved: true,
+		})
+		noteOperationalFailure(db, r.ID, opWorkspaceDestroy, err, string(payload))
+		return false
+	}
+	return true
 }
 
 // lockIsLive reports whether root's workspace lock currently points at a
