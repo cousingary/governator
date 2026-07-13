@@ -103,6 +103,20 @@ ON CONFLICT(backend,account,window_type) DO UPDATE SET estimated_limit=excluded.
 	return nil
 }
 
+// Reserve atomically checks headroom and books a reservation across every
+// window the backend/account has (daily, weekly, ...): the pre-fix version
+// read headroom, then opened a *separate* transaction that wrote
+// unconditionally, so two concurrent Reserve calls could both observe
+// sufficient headroom and both commit, together exceeding estimated_limit
+// (audit finding #10). Each window's reserved_usage bump now happens inside
+// one transaction via a conditional UPDATE whose WHERE clause re-checks
+// headroom at write time; SQLite serializes writers, so the loser of a race
+// re-evaluates against the winner's already-committed reservation and
+// correctly affects zero rows instead of overshooting. windows is read
+// *before* Begin (matching the pre-fix structure) purely to know which
+// window_types to attempt and to word the error — every row's actual
+// admission is decided by the conditional UPDATE inside the transaction, not
+// by this snapshot, so a stale read here cannot cause overshoot.
 func Reserve(db *sql.DB, backend, account, runID string, usage float64, ttl time.Duration, now time.Time) (Reservation, error) {
 	backend = normalize(backend)
 	account = normalizeAccount(account)
@@ -119,16 +133,27 @@ func Reserve(db *sql.DB, backend, account, runID string, usage float64, ttl time
 	if len(windows) == 0 {
 		return Reservation{}, nil
 	}
-	for _, w := range windows {
-		if w.EstimatedLimit > 0 && w.MeasuredUsage+w.ReservedUsage+usage > w.EstimatedLimit {
-			return Reservation{}, fmt.Errorf("%w: %s/%s remaining %.0f < estimate %.0f (reset %s)", ErrNoHeadroom, backend, w.WindowType, remaining(w), usage, formatTime(w.ResetAt))
-		}
-	}
 	tx, err := db.Begin()
 	if err != nil {
 		return Reservation{}, err
 	}
 	defer tx.Rollback()
+	for _, w := range windows {
+		res, err := tx.Exec(`UPDATE quota_windows SET reserved_usage=reserved_usage+?, updated_at=?
+WHERE backend=? AND account=? AND window_type=?
+  AND (estimated_limit<=0 OR measured_usage+reserved_usage+?<=estimated_limit)`,
+			usage, formatTime(now), backend, account, w.WindowType, usage)
+		if err != nil {
+			return Reservation{}, err
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			return Reservation{}, err
+		}
+		if n == 0 {
+			return Reservation{}, fmt.Errorf("%w: %s/%s remaining %.0f < estimate %.0f (reset %s)", ErrNoHeadroom, backend, w.WindowType, remaining(w), usage, formatTime(w.ResetAt))
+		}
+	}
 	expires := now.Add(ttl)
 	res, err := tx.Exec(`INSERT INTO quota_reservations(run_id,backend,account,usage,expires_at,created_at,settled_at) VALUES(?,?,?,?,?,?,'')`, runID, backend, account, usage, formatTime(expires), formatTime(now))
 	if err != nil {
@@ -136,9 +161,6 @@ func Reserve(db *sql.DB, backend, account, runID string, usage float64, ttl time
 	}
 	id, err := res.LastInsertId()
 	if err != nil {
-		return Reservation{}, err
-	}
-	if _, err := tx.Exec(`UPDATE quota_windows SET reserved_usage=reserved_usage+?, updated_at=? WHERE backend=? AND account=?`, usage, formatTime(now), backend, account); err != nil {
 		return Reservation{}, err
 	}
 	if err := tx.Commit(); err != nil {
@@ -179,27 +201,49 @@ func ReleaseForRun(db *sql.DB, runID string, now time.Time) error {
 	return nil
 }
 
+// claimReservation atomically transitions an unsettled reservation to
+// settled (the schema's settled_at column also gates Release and
+// ExpireStale, not just Settle — "settled" here means "no longer open", not
+// specifically "measured"). The claim and the RETURNING read happen as one
+// statement, so two concurrent callers (Settle vs Release vs ExpireStale,
+// or two callers of the same one) can never both believe they own the row:
+// SQLite serializes the UPDATE, the loser's WHERE settled_at=” matches
+// nothing, and ok=false tells it to treat the reservation as already
+// resolved by someone else — the exact pre-fix double-decrement/
+// double-booking race (audit finding #10) is closed by construction.
+func claimReservation(tx *sql.Tx, reservationID int64, now time.Time, expired bool) (backend, account string, reserved float64, ok bool, err error) {
+	expiredFlag := 0
+	if expired {
+		expiredFlag = 1
+	}
+	err = tx.QueryRow(`UPDATE quota_reservations SET settled_at=?, expired=?
+WHERE id=? AND settled_at=''
+RETURNING backend, account, usage`,
+		formatTime(now), expiredFlag, reservationID).Scan(&backend, &account, &reserved)
+	if err == sql.ErrNoRows {
+		return "", "", 0, false, nil
+	}
+	if err != nil {
+		return "", "", 0, false, err
+	}
+	return backend, account, reserved, true, nil
+}
+
 func Release(db *sql.DB, reservationID int64, now time.Time) error {
 	if db == nil || reservationID == 0 {
 		return nil
-	}
-	var backend, account string
-	var reserved float64
-	var settled string
-	err := db.QueryRow(`SELECT backend,account,usage,COALESCE(settled_at,'') FROM quota_reservations WHERE id=?`, reservationID).Scan(&backend, &account, &reserved, &settled)
-	if err == sql.ErrNoRows || settled != "" {
-		return nil
-	}
-	if err != nil {
-		return err
 	}
 	tx, err := db.Begin()
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
-	if _, err := tx.Exec(`UPDATE quota_reservations SET settled_at=?, expired=1 WHERE id=?`, formatTime(now), reservationID); err != nil {
+	backend, account, reserved, ok, err := claimReservation(tx, reservationID, now, true)
+	if err != nil {
 		return err
+	}
+	if !ok {
+		return nil
 	}
 	if _, err := tx.Exec(`UPDATE quota_windows SET reserved_usage=MAX(reserved_usage-?,0), updated_at=? WHERE backend=? AND account=?`, reserved, formatTime(now), backend, account); err != nil {
 		return err
@@ -211,28 +255,25 @@ func Settle(db *sql.DB, reservationID int64, measuredUsage float64, now time.Tim
 	if db == nil || reservationID == 0 {
 		return nil
 	}
-	var backend, account string
-	var reserved float64
-	var settled string
-	err := db.QueryRow(`SELECT backend,account,usage,COALESCE(settled_at,'') FROM quota_reservations WHERE id=?`, reservationID).Scan(&backend, &account, &reserved, &settled)
-	if err == sql.ErrNoRows || settled != "" {
-		return nil
-	}
-	if err != nil {
-		return err
-	}
 	if measuredUsage < 0 {
 		measuredUsage = 0
-	}
-	if measuredUsage == 0 {
-		measuredUsage = reserved
 	}
 	tx, err := db.Begin()
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
-	if _, err := tx.Exec(`UPDATE quota_reservations SET settled_at=?, measured_usage=? WHERE id=?`, formatTime(now), measuredUsage, reservationID); err != nil {
+	backend, account, reserved, ok, err := claimReservation(tx, reservationID, now, false)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return nil
+	}
+	if measuredUsage == 0 {
+		measuredUsage = reserved
+	}
+	if _, err := tx.Exec(`UPDATE quota_reservations SET measured_usage=? WHERE id=?`, measuredUsage, reservationID); err != nil {
 		return err
 	}
 	if _, err := tx.Exec(`UPDATE quota_windows SET reserved_usage=MAX(reserved_usage-?,0), measured_usage=measured_usage+?, updated_at=? WHERE backend=? AND account=?`, reserved, measuredUsage, formatTime(now), backend, account); err != nil {
@@ -242,36 +283,51 @@ func Settle(db *sql.DB, reservationID int64, measuredUsage float64, now time.Tim
 }
 
 func ExpireStale(db *sql.DB, now time.Time) error {
-	rows, err := db.Query(`SELECT id,backend,account,usage FROM quota_reservations WHERE settled_at='' AND expires_at<>'' AND expires_at<?`, formatTime(now))
+	if db == nil {
+		return nil
+	}
+	rows, err := db.Query(`SELECT id FROM quota_reservations WHERE settled_at='' AND expires_at<>'' AND expires_at<?`, formatTime(now))
 	if err != nil {
 		return err
 	}
-	defer rows.Close()
-	type stale struct {
-		id               int64
-		backend, account string
-		usage            float64
-	}
-	var staleRows []stale
+	var ids []int64
 	for rows.Next() {
-		var s stale
-		if err := rows.Scan(&s.id, &s.backend, &s.account, &s.usage); err != nil {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
 			return err
 		}
-		staleRows = append(staleRows, s)
+		ids = append(ids, id)
 	}
 	if err := rows.Err(); err != nil {
 		return err
 	}
-	for _, s := range staleRows {
-		if _, err := db.Exec(`UPDATE quota_reservations SET settled_at=?, expired=1 WHERE id=?`, formatTime(now), s.id); err != nil {
-			return err
-		}
-		if _, err := db.Exec(`UPDATE quota_windows SET reserved_usage=MAX(reserved_usage-?,0), updated_at=? WHERE backend=? AND account=?`, s.usage, formatTime(now), s.backend, s.account); err != nil {
+	rows.Close()
+	for _, id := range ids {
+		if err := expireOne(db, id, now); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+func expireOne(db *sql.DB, reservationID int64, now time.Time) error {
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	backend, account, reserved, ok, err := claimReservation(tx, reservationID, now, true)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return nil
+	}
+	if _, err := tx.Exec(`UPDATE quota_windows SET reserved_usage=MAX(reserved_usage-?,0), updated_at=? WHERE backend=? AND account=?`, reserved, formatTime(now), backend, account); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 func Headroom(db *sql.DB, backend, account string, now time.Time) (Snapshot, error) {

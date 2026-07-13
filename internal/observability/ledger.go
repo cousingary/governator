@@ -159,6 +159,7 @@ CREATE TABLE IF NOT EXISTS breaker_events(id INTEGER PRIMARY KEY AUTOINCREMENT, 
 CREATE TABLE IF NOT EXISTS fallback_attempts(id INTEGER PRIMARY KEY AUTOINCREMENT, root_run_id TEXT NOT NULL, run_id TEXT NOT NULL, attempt INTEGER NOT NULL, backend TEXT NOT NULL DEFAULT '', fallback_reason TEXT NOT NULL DEFAULT '', created TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS quota_windows(backend TEXT NOT NULL, account TEXT NOT NULL DEFAULT 'default', window_type TEXT NOT NULL, window_started_at TEXT NOT NULL DEFAULT '', reset_at TEXT NOT NULL DEFAULT '', estimated_limit REAL NOT NULL DEFAULT 0, measured_usage REAL NOT NULL DEFAULT 0, reserved_usage REAL NOT NULL DEFAULT 0, confidence REAL NOT NULL DEFAULT 0, source TEXT NOT NULL DEFAULT '', updated_at TEXT NOT NULL DEFAULT '', PRIMARY KEY(backend,account,window_type));
 CREATE TABLE IF NOT EXISTS quota_reservations(id INTEGER PRIMARY KEY AUTOINCREMENT, run_id TEXT NOT NULL DEFAULT '', backend TEXT NOT NULL, account TEXT NOT NULL DEFAULT 'default', usage REAL NOT NULL DEFAULT 0, measured_usage REAL NOT NULL DEFAULT 0, expires_at TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL DEFAULT '', settled_at TEXT NOT NULL DEFAULT '', expired INTEGER NOT NULL DEFAULT 0);
+CREATE TABLE IF NOT EXISTS spend_reservations(id INTEGER PRIMARY KEY AUTOINCREMENT, run_id TEXT NOT NULL DEFAULT '', day TEXT NOT NULL DEFAULT '', estimated_usd REAL NOT NULL DEFAULT 0, actual_usd REAL NOT NULL DEFAULT 0, status TEXT NOT NULL DEFAULT 'pending', expires_at TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL DEFAULT '', settled_at TEXT NOT NULL DEFAULT '');
 CREATE TABLE IF NOT EXISTS artifacts(run_id TEXT NOT NULL, name TEXT NOT NULL, path TEXT NOT NULL, sha256 TEXT NOT NULL, bytes INTEGER NOT NULL DEFAULT 0, schema_ok INTEGER NOT NULL DEFAULT 0, created TEXT NOT NULL DEFAULT '', PRIMARY KEY(run_id,name));
 CREATE TABLE IF NOT EXISTS panel_members(panel_id TEXT NOT NULL, member_label TEXT NOT NULL, job_id TEXT NOT NULL, agent TEXT NOT NULL DEFAULT '', artifact_name TEXT NOT NULL DEFAULT '', created TEXT NOT NULL DEFAULT '', PRIMARY KEY(panel_id,member_label));
 CREATE TABLE IF NOT EXISTS assay_evaluations(id INTEGER PRIMARY KEY AUTOINCREMENT, run_id TEXT NOT NULL, attempt_id TEXT NOT NULL DEFAULT '', job_id TEXT NOT NULL DEFAULT '', profile TEXT NOT NULL DEFAULT '', policy_version TEXT NOT NULL DEFAULT '', verdict TEXT NOT NULL DEFAULT '', failed_checks TEXT NOT NULL DEFAULT '', checks_hash TEXT NOT NULL DEFAULT '', duration_ms INTEGER NOT NULL DEFAULT 0, created TEXT NOT NULL DEFAULT '');
@@ -294,6 +295,8 @@ CREATE INDEX IF NOT EXISTS fallback_attempts_root ON fallback_attempts(root_run_
 CREATE INDEX IF NOT EXISTS quota_windows_backend ON quota_windows(backend,account);
 CREATE INDEX IF NOT EXISTS quota_reservations_run ON quota_reservations(run_id);
 CREATE INDEX IF NOT EXISTS quota_reservations_open ON quota_reservations(settled_at,expires_at);
+CREATE INDEX IF NOT EXISTS spend_reservations_day ON spend_reservations(day,status);
+CREATE INDEX IF NOT EXISTS spend_reservations_run ON spend_reservations(run_id);
 CREATE INDEX IF NOT EXISTS artifacts_name ON artifacts(name,run_id);
 CREATE INDEX IF NOT EXISTS panel_members_job ON panel_members(job_id);
 CREATE INDEX IF NOT EXISTS assay_evaluations_run ON assay_evaluations(run_id);

@@ -41,6 +41,8 @@ const (
 	opQuotaSettle            = "quota_settle"
 	opValidatorEvidence      = "validator_evidence"
 	opOneShotOverrideRelease = "one_shot_override_release"
+	opSpendRelease           = "spend_release"
+	opSpendSettle            = "spend_settle"
 )
 
 type breakerFeedbackPayload struct {
@@ -65,6 +67,16 @@ type oneShotOverrideReleasePayload struct {
 type quotaSettlePayload struct {
 	ReservationID int64   `json:"reservation_id"`
 	Measured      float64 `json:"measured"`
+}
+
+type spendReleasePayload struct {
+	ReservationID int64 `json:"reservation_id"`
+}
+
+type spendSettlePayload struct {
+	ReservationID int64   `json:"reservation_id"`
+	ActualUSD     float64 `json:"actual_usd"`
+	CostAvailable bool    `json:"cost_available"`
 }
 
 type workspaceDestroyPayload struct {
@@ -232,6 +244,18 @@ func dispatchReconcile(ctx context.Context, db *sql.DB, cfg config.Config, item 
 		return quota.Settle(db, p.ReservationID, p.Measured, time.Now().UTC())
 	case opSpendHaltCheck:
 		return spend.MaybeHalt(cfg, db)
+	case opSpendRelease:
+		var p spendReleasePayload
+		if err := json.Unmarshal([]byte(item.Payload), &p); err != nil {
+			return err
+		}
+		return spend.ReleaseGlobal(db, p.ReservationID, time.Now().UTC())
+	case opSpendSettle:
+		var p spendSettlePayload
+		if err := json.Unmarshal([]byte(item.Payload), &p); err != nil {
+			return err
+		}
+		return spend.SettleGlobal(db, p.ReservationID, p.ActualUSD, p.CostAvailable, time.Now().UTC())
 	case opWorkspaceDestroy:
 		var p workspaceDestroyPayload
 		if err := json.Unmarshal([]byte(item.Payload), &p); err != nil {

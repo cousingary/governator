@@ -838,7 +838,14 @@ func TestSpendCapAutoHaltsAfterCrossingCapMidRun(t *testing.T) {
 	t.Setenv("GOV_HOME", home)
 	t.Setenv("GOV_CLAUDE_BIN", bin)
 	t.Setenv("GOV_CONFIG", filepath.Join(t.TempDir(), "missing-config.yaml"))
-	t.Setenv("GOV_SPEND_DAILY_CAP_USD", "0.20")
+	// Sol P1.4: the pre-launch reservation now checks the job's own estimate
+	// (spend.unboundedEstimateUSD == $0.25, since this contract sets no
+	// budget.max_tokens) against the cap before allowing launch, so the cap
+	// must be exactly the estimate for the first run to both (a) be admitted
+	// (0 settled + 0.25 estimate <= 0.25 cap) and (b) cross the cap once its
+	// $0.25 actual cost settles (0.25 >= 0.25 cap), which is what triggers
+	// MaybeHalt below.
+	t.Setenv("GOV_SPEND_DAILY_CAP_USD", "0.25")
 	haltFile := filepath.Join(t.TempDir(), "HALT")
 	t.Setenv("GOV_SPEND_HALT_FILE", haltFile)
 

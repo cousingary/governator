@@ -12,6 +12,7 @@ import (
 
 	"github.com/cousingary/governator/internal/observability"
 	"github.com/cousingary/governator/internal/quota"
+	"github.com/cousingary/governator/internal/spend"
 )
 
 // stageOrder is the durable run state machine (Phase 4 plan). A run's
@@ -194,6 +195,9 @@ func recoverInterruptedRun(ctx context.Context, db *sql.DB, r RunRecord, forced 
 	}
 
 	if err := quota.ReleaseForRun(db, r.ID, now); err != nil {
+		return RecoveryVerdict{RunID: r.ID}, err
+	}
+	if err := spend.ReleaseForRun(db, r.ID, now); err != nil {
 		return RecoveryVerdict{RunID: r.ID}, err
 	}
 	destroyLeftoverWorkspace(ctx, r)

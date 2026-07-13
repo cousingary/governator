@@ -2053,8 +2053,9 @@ func (r *Runner) runOnce(ctx context.Context, c contracts.Contract) (RunRecord, 
 	// as enforceContainment above). Candidate targets checked here: network
 	// enablement, write outside the contract's declared read scope, and a
 	// pre-launch cost estimate versus the operator's daily cap.
+	estimatedCostUSD := spend.EstimateCostUSD(resolved.Agent, c.Budget.MaxTokens, nil)
 	policyFacts := policy.MergeFacts(policy.BuildContractFacts(c, resolved.Agent), map[string]any{
-		policy.FactEstimatedCostUSD: spend.EstimateCostUSD(resolved.Agent, c.Budget.MaxTokens, nil),
+		policy.FactEstimatedCostUSD: estimatedCostUSD,
 		policy.FactDailyCapUSD:      cfg.Spend.DailyCapUSD,
 	})
 	gateDecision, pendingAsks, pendingOneShotIDs, gerr := evaluatePolicyGate(db, cfg, c, root, id, policyFacts)
@@ -2083,6 +2084,55 @@ func (r *Runner) runOnce(ctx context.Context, c contracts.Contract) (RunRecord, 
 			if rerr := observability.ReleasePolicyOverrideReservation(db, oid, releaseAt); rerr != nil {
 				payload, _ := json.Marshal(oneShotOverrideReleasePayload{OverrideID: oid})
 				noteOperationalFailure(db, id, opOneShotOverrideRelease, rerr, string(payload))
+			}
+		}
+	}()
+	// Sol P1.4 (finding #11): the early spend.CheckBudget above is a cheap
+	// pre-flight check only — it reads TodaySpend, which excludes RUNNING
+	// rows, so two processes racing it can both pass before either's cost
+	// lands. This is the actual atomic cross-process gate: it reserves
+	// estimatedCostUSD against the daily cap in one SQLite statement, closing
+	// that race the same way quota.Reserve below closes it for quota
+	// headroom. Placed after the policy gate (so it never reserves against a
+	// DENY/ASK) and before quota.Reserve (mirroring the pre-fix ordering:
+	// spend was always checked before quota).
+	spendTTL := time.Duration(c.Budget.MaxMinutes+5) * time.Minute
+	spendReservation, spendOK, spendReason, serr := spend.ReserveGlobal(db, cfg, id, estimatedCostUSD, spendTTL, time.Now().UTC())
+	if serr != nil {
+		return RunRecord{}, serr
+	}
+	if !spendOK {
+		refused := RunRecord{
+			ID: id, JobID: c.JobID, JobType: c.JobType, Agent: resolved.Agent, Mode: string(c.Mode),
+			Status: "QUARANTINED", Root: root, Created: time.Now().UTC().Format(time.RFC3339Nano),
+			Message: "SPEND_CAP: " + spendReason, FailureTaxonomy: "SPEND_CAP", RepairOf: c.RepairLineage,
+		}
+		if err := insertRun(db, refused, hash, head); err != nil {
+			return refused, err
+		}
+		if err := observability.RecordIdentity(db, c.JobID, c.JobType, resolved.Agent, refused.Created); err != nil {
+			return refused, err
+		}
+		if err := observability.RecordCompletion(db, observability.Completion{
+			RunID: refused.ID, Agent: refused.Agent, JobType: refused.JobType, Status: refused.Status,
+			FailureTaxonomy: refused.FailureTaxonomy, Notes: refused.Message, Violations: []string{"spend_cap: " + spendReason},
+		}); err != nil {
+			return refused, err
+		}
+		if err := observability.RecordStage(db, id, "QUARANTINED", "", time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
+			return refused, err
+		}
+		return refused, nil
+	}
+	spendSettled := false
+	defer func() {
+		if spendReservation.ID != 0 && !spendSettled {
+			// Best-effort (an unreleased reservation self-heals at its TTL),
+			// but the failure itself must not vanish: queue it so `gov
+			// reconcile` releases the headroom before the TTL does.
+			if rerr := spend.ReleaseGlobal(db, spendReservation.ID, time.Now().UTC()); rerr != nil {
+				payload, _ := json.Marshal(spendReleasePayload{ReservationID: spendReservation.ID})
+				noteOperationalFailure(db, id, opSpendRelease, rerr, string(payload))
 			}
 		}
 	}()
@@ -2838,6 +2888,17 @@ func (r *Runner) runOnce(ctx context.Context, c contracts.Contract) (RunRecord, 
 			return rec, err
 		}
 		quotaSettled = true
+	}
+	if spendReservation.ID != 0 {
+		costAvailable := !audit.CostUnavailable
+		if err := spend.SettleGlobal(db, spendReservation.ID, rec.CostUSD, costAvailable, time.Now().UTC()); err != nil {
+			if rootCommitted {
+				payload, _ := json.Marshal(spendSettlePayload{ReservationID: spendReservation.ID, ActualUSD: rec.CostUSD, CostAvailable: costAvailable})
+				return ledgerPending(opSpendSettle, err, string(payload))
+			}
+			return rec, err
+		}
+		spendSettled = true
 	}
 	if infraKind == agents.InfraQuotaExhausted || infraKind == agents.InfraRateLimit {
 		if resetAt, ok := agents.ResetHint(transcriptTail(transcript, 4096), time.Now().UTC()); ok {

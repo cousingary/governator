@@ -174,13 +174,17 @@ func TestAutoRepairRefusedBySpendCapStopsLoopInsteadOfLooping(t *testing.T) {
 	t.Setenv("GOV_HOME", home)
 	t.Setenv("GOV_CLAUDE_BIN", bin)
 	t.Setenv("GOV_CONFIG", filepath.Join(t.TempDir(), "missing-config.yaml"))
-	// The fixture's fake backend always reports $0.25; a $0.20 cap lets the
-	// original run launch (today's spend is $0 at that point) but crosses
-	// the cap on completion, halting before any repair attempt can launch.
-	// The halt file must be sandboxed per test — without this override it
-	// defaults to the real ~/.governator/HALT and would halt every other
-	// `gov run` on the machine, not just this test's disposable ledger.
-	t.Setenv("GOV_SPEND_DAILY_CAP_USD", "0.20")
+	// The fixture's fake backend always reports $0.25, which is also
+	// spend.unboundedEstimateUSD (this contract sets no budget.max_tokens).
+	// Sol P1.4's pre-launch reservation checks that estimate against the cap
+	// before allowing launch, so the cap must be exactly $0.25 for the
+	// original run to be admitted (0 settled + 0.25 estimate <= 0.25 cap)
+	// and then cross the cap once its $0.25 actual cost settles, halting
+	// before the repair attempt can launch. The halt file must be sandboxed
+	// per test — without this override it defaults to the real
+	// ~/.governator/HALT and would halt every other `gov run` on the
+	// machine, not just this test's disposable ledger.
+	t.Setenv("GOV_SPEND_DAILY_CAP_USD", "0.25")
 	t.Setenv("GOV_SPEND_HALT_FILE", filepath.Join(t.TempDir(), "HALT"))
 	t.Setenv("FAKE_ALWAYS_FAIL", "1")
 
