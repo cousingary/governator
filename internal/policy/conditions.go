@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"math"
 	"strconv"
 	"strings"
 )
@@ -161,9 +162,21 @@ func overrideTarget(source string, rule ConditionRule) string {
 }
 
 // ToFloat parses s as a float64 for numeric condition comparisons.
+// ToFloat parses s as a numeric literal, rejecting NaN and +/-Inf even
+// though strconv.ParseFloat itself accepts "nan"/"inf" spellings without
+// error (Sol P1.2, finding #9): a non-finite value can never usefully
+// satisfy a numeric comparison (NaN compares false against everything,
+// silently disarming the rule; Inf trivially wins or loses every
+// comparison), so treating it as unparseable — the same "this condition
+// never matches" fail-closed posture Condition's doc comment already
+// documents for a fact that won't coerce — is safer than letting it through
+// as a real number.
 func ToFloat(s string) (float64, bool) {
 	f, err := strconv.ParseFloat(strings.TrimSpace(s), 64)
-	return f, err == nil
+	if err != nil || math.IsNaN(f) || math.IsInf(f, 0) {
+		return 0, false
+	}
+	return f, true
 }
 
 func factString(facts map[string]any, field string) (string, bool) {

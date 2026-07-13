@@ -46,10 +46,15 @@ type AskResolution struct {
 // subsequent run of the same job re-evaluates the same rule as an immediate
 // ALLOW/DENY instead of pausing again. With res.CreateRule the override is
 // durable (optionally expiring via TTL); without it the override is
-// one-shot: it authorizes exactly one subsequent evaluation and is then
-// consumed (see observability.ConsumePolicyOverride) — this is what makes a
-// bare "approve once" actually unblock the re-run instead of the same rule
-// immediately re-ASKing. This is the session/operator override policy layer
+// one-shot: it authorizes exactly one evaluation whose gate actually
+// unblocks (reserved during evaluation, consumed only immediately before
+// that governed action's execution boundary — see
+// observability.ClaimActivePolicyOverrides/ConsumePolicyOverrideReservation/
+// ReleasePolicyOverrideReservation and PolicyOverride's state-machine doc)
+// — this is what makes a bare "approve once" actually unblock the re-run
+// instead of the same rule immediately re-ASKing, without also silently
+// burning the approval on an evaluation another rule still blocked. This is
+// the session/operator override policy layer
 // (see internal/policy.SourceSessionOverride / EvaluateLayers /
 // ResolveOverrides): "resume from the checkpoint" here means re-running the
 // job — nothing expensive happened before the checkpoint, so there is

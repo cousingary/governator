@@ -1644,10 +1644,11 @@ func TestWallClockBudgetExhaustionQuarantinesSlowValidators(t *testing.T) {
 }
 
 // TestClaimActivePolicyOverridesConcurrentClaimsExactlyOne reproduces High 5:
-// two concurrent policy evaluations racing to consume the same one-shot
+// two concurrent policy evaluations racing to reserve the same one-shot
 // operator override must not both succeed. ClaimActivePolicyOverrides claims
-// the row inside a transaction via an UPDATE ... WHERE consumed_at=”
-// pattern, so exactly one of N concurrent callers may claim it.
+// (reserves — see Sol P1.1) the row inside a transaction via an
+// UPDATE ... WHERE reserved_at=” pattern, so exactly one of N concurrent
+// callers may claim it.
 func TestClaimActivePolicyOverridesConcurrentClaimsExactlyOne(t *testing.T) {
 	home := t.TempDir()
 	db, err := observability.Open(home)

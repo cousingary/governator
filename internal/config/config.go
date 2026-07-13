@@ -6,10 +6,13 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
+	"math"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/cousingary/governator/internal/policy"
 	"gopkg.in/yaml.v3"
@@ -231,6 +234,30 @@ func LoadStrict() (Config, error) {
 		if err := decoder.Decode(&file); err != nil {
 			return Config{}, fmt.Errorf("decode config %s: %w", path, err)
 		}
+		// Sol P1.2 (finding #9): LoadStrict used to decode only the first
+		// YAML document in the file — a second `---`-separated document was
+		// silently ignored rather than rejected. Requiring the next decode
+		// to hit io.EOF closes that: any further document (even an empty
+		// one, which decodes successfully with err == nil) is an error.
+		var extra any
+		if derr := decoder.Decode(&extra); derr != io.EOF {
+			if derr == nil {
+				return Config{}, fmt.Errorf("decode config %s: multiple YAML documents are not supported", path)
+			}
+			return Config{}, fmt.Errorf("decode config %s: %w", path, derr)
+		}
+		// Sol P1.2: merge() only overwrites a built-in default when a
+		// supplied int field is > 0 (see merge's comments below) — a
+		// negative value therefore doesn't get validated at all, it just
+		// silently loses to the default before any check ever sees it. The
+		// strict Config decode above cannot tell "the operator wrote -5"
+		// from "the operator wrote nothing" (both are the Go zero-adjacent
+		// case for these fields), so this raw pass re-reads the same bytes
+		// generically and validates exactly what was actually supplied,
+		// before merge has a chance to hide it.
+		if err := validateRawSuppliedValues(data, path); err != nil {
+			return Config{}, err
+		}
 		merge(&cfg, file)
 	}
 	applyEnv(&cfg)
@@ -247,18 +274,44 @@ func LoadStrict() (Config, error) {
 	if cfg.Minimalism.Mode != "off" && cfg.Minimalism.Mode != "lite" && cfg.Minimalism.Mode != "full" && cfg.Minimalism.Mode != "ultra" {
 		return Config{}, fmt.Errorf("invalid minimalism.mode %q (want off, lite, full, or ultra)", cfg.Minimalism.Mode)
 	}
+	// Sol P1.2 (finding #9): NaN/±Inf pass a bare `< 0` check (NaN compares
+	// false to everything; Inf compares >= 0 fine) and can otherwise reach
+	// Hash()'s JSON marshal, where a non-finite float either round-trips as
+	// a broken value or, in pathological cases, makes the whole document
+	// unmarshalable — silently degrading every run's identity to the
+	// "config-unhashable" sentinel. Reject non-finite values explicitly,
+	// everywhere a float can reach this struct from YAML.
+	if !finite(cfg.Spend.DailyCapUSD) {
+		return Config{}, fmt.Errorf("invalid spend.daily_cap_usd %v (want a finite number >= 0)", cfg.Spend.DailyCapUSD)
+	}
 	if cfg.Spend.DailyCapUSD < 0 {
 		return Config{}, fmt.Errorf("invalid spend.daily_cap_usd %v (want >= 0, 0 = unlimited)", cfg.Spend.DailyCapUSD)
 	}
 	for _, q := range cfg.Quotas {
+		if !finite(q.EstimatedLimit) {
+			return Config{}, fmt.Errorf("invalid quota estimated_limit %v for backend %q (want a finite number)", q.EstimatedLimit, q.Backend)
+		}
 		if q.EstimatedLimit < 0 {
 			return Config{}, fmt.Errorf("invalid quota estimated_limit %v for backend %q (want >= 0)", q.EstimatedLimit, q.Backend)
+		}
+		if !finite(q.Confidence) {
+			return Config{}, fmt.Errorf("invalid quota confidence %v for backend %q (want a finite number)", q.Confidence, q.Backend)
 		}
 		if q.Confidence < 0 || q.Confidence > 1 {
 			return Config{}, fmt.Errorf("invalid quota confidence %v for backend %q (want 0..1)", q.Confidence, q.Backend)
 		}
 		if q.WindowType != "" && q.WindowType != "5h" && q.WindowType != "daily" && q.WindowType != "weekly" && q.WindowType != "monthly" {
 			return Config{}, fmt.Errorf("invalid quota window_type %q (want 5h, daily, weekly, or monthly)", q.WindowType)
+		}
+		// Sol P1.2: a malformed window_started_at/reset_at previously fell
+		// through to quota.parseTimeOrZero, which silently substitutes the
+		// zero time for anything it can't parse — a typo'd timestamp would
+		// quietly reset the window's clock instead of failing to load.
+		if s := strings.TrimSpace(q.WindowStartedAt); s != "" && !parsableTimestamp(s) {
+			return Config{}, fmt.Errorf("invalid quota window_started_at %q for backend %q (want RFC3339 or YYYY-MM-DD)", q.WindowStartedAt, q.Backend)
+		}
+		if s := strings.TrimSpace(q.ResetAt); s != "" && !parsableTimestamp(s) {
+			return Config{}, fmt.Errorf("invalid quota reset_at %q for backend %q (want RFC3339 or YYYY-MM-DD)", q.ResetAt, q.Backend)
 		}
 	}
 	for _, root := range cfg.Credentials.Roots {
@@ -596,4 +649,103 @@ func BackendBin(name string) string {
 		return backend.Bin
 	}
 	return name
+}
+
+// finite reports whether f is a real, representable number — neither NaN
+// nor +/-Inf.
+func finite(f float64) bool {
+	return !math.IsNaN(f) && !math.IsInf(f, 0)
+}
+
+// quotaTimestampLayouts mirrors internal/quota's parseTimeOrZero accepted
+// formats exactly, so a timestamp LoadStrict accepts is guaranteed to be one
+// quota.SeedFromConfig can actually parse (rather than silently zeroing).
+var quotaTimestampLayouts = []string{time.RFC3339Nano, time.RFC3339, "2006-01-02 15:04:05", "2006-01-02"}
+
+func parsableTimestamp(s string) bool {
+	for _, layout := range quotaTimestampLayouts {
+		if _, err := time.Parse(layout, s); err == nil {
+			return true
+		}
+	}
+	return false
+}
+
+// validateRawSuppliedValues re-decodes data generically (no struct, no
+// merge) to see exactly what the operator wrote for the handful of int
+// fields whose merge() gate ("only overwrite the default when > 0" — see
+// merge's own comments) makes a negative supplied value indistinguishable
+// from an omitted one by the time anything downstream could validate it.
+// Sol P1.2 (finding #9) names these four explicitly: defaults.max_minutes,
+// assay.timeout_seconds, and every backend's context_tokens/output_tokens.
+// A zero max_minutes/timeout_seconds is rejected too (a job or assay call
+// cannot run in zero time); zero context/output tokens is left alone — it
+// is this codebase's existing, intentional "not declared" state for those
+// two fields (see Backend's doc comment and the BuiltIn zero default), not
+// a value anyone would ever mean literally.
+func validateRawSuppliedValues(data []byte, path string) error {
+	var raw map[string]any
+	if err := yaml.Unmarshal(data, &raw); err != nil {
+		return fmt.Errorf("decode config %s: %w", path, err)
+	}
+	if raw == nil {
+		return nil
+	}
+	if v, ok := rawNumber(raw, "defaults", "max_minutes"); ok {
+		if v <= 0 {
+			return fmt.Errorf("invalid defaults.max_minutes %v (want > 0)", v)
+		}
+	}
+	if v, ok := rawNumber(raw, "assay", "timeout_seconds"); ok {
+		if v <= 0 {
+			return fmt.Errorf("invalid assay.timeout_seconds %v (want > 0)", v)
+		}
+	}
+	if backends, ok := raw["backends"].(map[string]any); ok {
+		for name, b := range backends {
+			bm, ok := b.(map[string]any)
+			if !ok {
+				continue
+			}
+			if v, ok := rawNumber(bm, "context_tokens"); ok && v < 0 {
+				return fmt.Errorf("invalid backends.%s.context_tokens %v (want >= 0)", name, v)
+			}
+			if v, ok := rawNumber(bm, "output_tokens"); ok && v < 0 {
+				return fmt.Errorf("invalid backends.%s.output_tokens %v (want >= 0)", name, v)
+			}
+		}
+	}
+	return nil
+}
+
+// rawNumber walks path through nested map[string]any values (as produced by
+// yaml.Unmarshal into `any`) and, if the final key is present and holds a
+// YAML scalar number, returns it as a float64. Ok is false if any
+// intermediate key is absent/not a map, or the final value isn't numeric —
+// callers only act when ok is true, so an absent field is silently treated
+// as "not supplied" exactly like the struct decode already does.
+func rawNumber(m map[string]any, path ...string) (float64, bool) {
+	cur := any(m)
+	for _, key := range path {
+		asMap, ok := cur.(map[string]any)
+		if !ok {
+			return 0, false
+		}
+		cur, ok = asMap[key]
+		if !ok {
+			return 0, false
+		}
+	}
+	switch t := cur.(type) {
+	case int:
+		return float64(t), true
+	case int64:
+		return float64(t), true
+	case uint64:
+		return float64(t), true
+	case float64:
+		return t, true
+	default:
+		return 0, false
+	}
 }

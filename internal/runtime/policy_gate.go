@@ -111,21 +111,23 @@ func overrideTargetForResult(res policy.LayerResult) string {
 // after override resolution gets a durable policy_checkpoints row so `gov
 // ask` can list/resolve it — persisted before this function returns, so a
 // crash between evaluation and the caller quarantining the run never loses
-// the checkpoint. Returns the combined decision and every checkpoint
-// created for this call (empty when the decision isn't ASK).
-func evaluatePolicyGate(db *sql.DB, cfg config.Config, c contracts.Contract, workspaceRoot, runID string, facts map[string]any) (policy.PolicyDecision, []observability.PolicyCheckpoint, error) {
+// the checkpoint. Returns the combined decision, every checkpoint created
+// for this call (empty when the decision isn't ASK), and every reserved
+// one-shot override ID this evaluation did NOT already resolve (empty
+// unless decision.Blocks() is false) — see pendingOneShotIDs doc below.
+func evaluatePolicyGate(db *sql.DB, cfg config.Config, c contracts.Contract, workspaceRoot, runID string, facts map[string]any) (policy.PolicyDecision, []observability.PolicyCheckpoint, []int64, error) {
 	var results []policy.LayerResult
 	results = append(results, policy.EvaluateConditionRules(policy.SourceOrgPolicy, cfg.PolicyRules, facts)...)
 
 	projectRules, err := policy.LoadProjectDoctrine(workspaceRoot)
 	if err != nil {
-		return policy.PolicyDecision{}, nil, err
+		return policy.PolicyDecision{}, nil, nil, err
 	}
 	results = append(results, policy.EvaluateConditionRules(policy.SourceProjectDoctrine, projectRules, facts)...)
 
 	contractRules, err := policy.ContractRules(c)
 	if err != nil {
-		return policy.PolicyDecision{}, nil, err
+		return policy.PolicyDecision{}, nil, nil, err
 	}
 	results = append(results, policy.EvaluateConditionRules(policy.SourceJobContract, contractRules, facts)...)
 
@@ -133,7 +135,7 @@ func evaluatePolicyGate(db *sql.DB, cfg config.Config, c contracts.Contract, wor
 	scope := policyOverrideScopeFor(c, cfg, facts, cfg.PolicyRules, projectRules, contractRules)
 	overrideRows, err := observability.ClaimActivePolicyOverrides(db, scope, now)
 	if err != nil {
-		return policy.PolicyDecision{}, nil, err
+		return policy.PolicyDecision{}, nil, nil, err
 	}
 	overrides := make([]policy.Override, 0, len(overrideRows))
 	for _, o := range overrideRows {
@@ -143,27 +145,69 @@ func evaluatePolicyGate(db *sql.DB, cfg config.Config, c contracts.Contract, wor
 	decision := policy.EvaluateLayers(resolved...)
 	decision.PolicyHash = policyHashForGate(facts, cfg.PolicyRules, projectRules, contractRules, resolved, overrideRows)
 
-	// Consume applied one-shot overrides (a bare `gov ask approve/deny`,
-	// no --rule): an ALLOW one-shot is spent only when the whole gate stops
-	// blocking — if another rule still ASKs or DENYs, the run never proceeded
-	// and the operator's single approval must survive for the retry that
-	// actually goes through. A DENY one-shot is spent the moment it is
-	// applied: its entire purpose ("deny this one") is fulfilled by denying
-	// this evaluation, after which the job returns to ASKing.
+	// Release every reserved one-shot row ClaimActivePolicyOverrides claimed
+	// but ResolveOverrides never matched to any rule this evaluation
+	// (applied only lists overrides that actually substituted a result) —
+	// holding an unused reservation would needlessly starve a future
+	// evaluation of an approval that was never even relevant here.
+	appliedIDs := make(map[int64]bool, len(applied))
 	for _, o := range applied {
-		if !o.OneShot {
-			continue
-		}
-		if o.Verdict == policy.VerdictDeny || !decision.Blocks() {
-			if err := observability.ConsumePolicyOverride(db, o.ID, now); err != nil {
-				return policy.PolicyDecision{}, nil, err
+		appliedIDs[o.ID] = true
+	}
+	for _, o := range overrideRows {
+		if o.OneShot && !appliedIDs[o.ID] {
+			if err := observability.ReleasePolicyOverrideReservation(db, o.ID, now); err != nil {
+				return policy.PolicyDecision{}, nil, nil, err
 			}
 		}
 	}
 
+	// Resolve every APPLIED one-shot override (Sol P1.1, finding #8). A DENY
+	// one-shot is spent the moment it is applied — its entire purpose ("deny
+	// this one") is fulfilled by denying this evaluation, and it never
+	// authorizes any execution to wait for, so it is consumed immediately.
+	// An ALLOW one-shot is different: applying it to its own rule can still
+	// leave the overall decision blocked by another, unrelated rule (the
+	// exact reproduction in finding #8 — rule A approved, rule B still
+	// blocks). If the whole gate still blocks, this evaluation authorized
+	// nothing and the reservation is released back to available for the
+	// retry that might actually go through. If the whole gate does NOT
+	// block, this override may be the thing that let a real execution
+	// happen — but "may" is not "did": containment, quota, spend, or any
+	// later pre-launch failure can still abort the run before the governed
+	// action ever crosses its execution boundary. So an unblocking ALLOW
+	// one-shot stays RESERVED here; the caller (runOnce) is responsible for
+	// consuming it via ConsumePolicyOverrideReservation immediately before
+	// launch, or releasing it via ReleasePolicyOverrideReservation on every
+	// abort path in between — see pendingOneShotIDs below.
+	var pendingOneShotIDs []int64
+	for _, o := range applied {
+		if !o.OneShot {
+			continue
+		}
+		if o.Verdict == policy.VerdictDeny {
+			// A DENY one-shot's effect (denying this evaluation) already
+			// happened via the resolved LayerResult above regardless of
+			// this bookkeeping call, so an unexpected zero-rows race here
+			// is not fatal to the decision — only the ledger's record of
+			// consumption, which is not this evaluation's job to enforce.
+			if _, err := observability.ConsumePolicyOverrideReservation(db, o.ID, now); err != nil {
+				return policy.PolicyDecision{}, nil, nil, err
+			}
+			continue
+		}
+		if decision.Blocks() {
+			if err := observability.ReleasePolicyOverrideReservation(db, o.ID, now); err != nil {
+				return policy.PolicyDecision{}, nil, nil, err
+			}
+			continue
+		}
+		pendingOneShotIDs = append(pendingOneShotIDs, o.ID)
+	}
+
 	var checkpoints []observability.PolicyCheckpoint
 	if decision.Verdict != policy.VerdictAsk {
-		return decision, nil, nil
+		return decision, nil, pendingOneShotIDs, nil
 	}
 	costUSD, _ := facts[policy.FactEstimatedCostUSD].(float64)
 	for _, res := range resolved {
@@ -176,10 +220,10 @@ func evaluatePolicyGate(db *sql.DB, cfg config.Config, c contracts.Contract, wor
 		}
 		id, err := observability.RecordPolicyCheckpoint(db, cp)
 		if err != nil {
-			return policy.PolicyDecision{}, checkpoints, err
+			return policy.PolicyDecision{}, checkpoints, pendingOneShotIDs, err
 		}
 		cp.ID = id
 		checkpoints = append(checkpoints, cp)
 	}
-	return decision, checkpoints, nil
+	return decision, checkpoints, pendingOneShotIDs, nil
 }

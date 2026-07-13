@@ -1822,9 +1822,21 @@ func (r *Runner) fallbackEligible(c contracts.Contract, rec RunRecord) (bool, st
 			policy.FactUnusualInfraRetry: true,
 			policy.FactInfraFailureKind:  rec.FailureTaxonomy,
 		})
-		decision, _, gerr := evaluatePolicyGate(db, cfg, c, root, rec.ID, facts)
+		decision, _, pendingOneShotIDs, gerr := evaluatePolicyGate(db, cfg, c, root, rec.ID, facts)
 		if gerr != nil {
 			return false, "", gerr
+		}
+		// This call only answers "is a fallback retry eligible?" — it never
+		// itself launches a governed action (a separate runOnce call does,
+		// with its own independent policy gate evaluation), so any one-shot
+		// override it resolved to ALLOW must be released immediately rather
+		// than held reserved for an execution boundary that will never
+		// happen on this call path.
+		releaseAt := time.Now().UTC().Format(time.RFC3339Nano)
+		for _, oid := range pendingOneShotIDs {
+			if rerr := observability.ReleasePolicyOverrideReservation(db, oid, releaseAt); rerr != nil {
+				return false, "", rerr
+			}
 		}
 		if decision.Blocks() {
 			return false, "", nil
@@ -2045,7 +2057,7 @@ func (r *Runner) runOnce(ctx context.Context, c contracts.Contract) (RunRecord, 
 		policy.FactEstimatedCostUSD: spend.EstimateCostUSD(resolved.Agent, c.Budget.MaxTokens, nil),
 		policy.FactDailyCapUSD:      cfg.Spend.DailyCapUSD,
 	})
-	gateDecision, pendingAsks, gerr := evaluatePolicyGate(db, cfg, c, root, id, policyFacts)
+	gateDecision, pendingAsks, pendingOneShotIDs, gerr := evaluatePolicyGate(db, cfg, c, root, id, policyFacts)
 	if gerr != nil {
 		return RunRecord{}, gerr
 	}
@@ -2053,6 +2065,27 @@ func (r *Runner) runOnce(ctx context.Context, c contracts.Contract) (RunRecord, 
 		refused, err := r.quarantineForPolicy(db, c, resolved.Agent, root, id, hash, head, gateDecision, pendingAsks)
 		return refused, err
 	}
+	// Sol P1.1 (finding #8): pendingOneShotIDs are one-shot ASK overrides the
+	// policy gate reserved and resolved to ALLOW, but has NOT yet consumed —
+	// consumption happens only immediately before the governed action
+	// crosses its execution boundary (right before rn.Launch below), never
+	// at gate-evaluation time. Every return between here and that point is
+	// an "execution never begins" abort, so this defer releases any
+	// still-reserved one-shot back to available unless oneShotConsumed is
+	// set true right after a successful consume just before launch.
+	oneShotConsumed := len(pendingOneShotIDs) == 0
+	defer func() {
+		if oneShotConsumed {
+			return
+		}
+		releaseAt := time.Now().UTC().Format(time.RFC3339Nano)
+		for _, oid := range pendingOneShotIDs {
+			if rerr := observability.ReleasePolicyOverrideReservation(db, oid, releaseAt); rerr != nil {
+				payload, _ := json.Marshal(oneShotOverrideReleasePayload{OverrideID: oid})
+				noteOperationalFailure(db, id, opOneShotOverrideRelease, rerr, string(payload))
+			}
+		}
+	}()
 	quotaUsageEstimate := quota.EstimateUsage(c.Budget.MaxTokens)
 	quotaTTL := time.Duration(c.Budget.MaxMinutes+5) * time.Minute
 	quotaReservation, qerr := quota.Reserve(db, resolved.Agent, quota.DefaultAccount, id, quotaUsageEstimate, quotaTTL, time.Now().UTC())
@@ -2231,6 +2264,27 @@ func (r *Runner) runOnce(ctx context.Context, c contracts.Contract) (RunRecord, 
 		aerr = context.DeadlineExceeded
 		ar.TimedOut = true
 	} else {
+		// Sol P1.1 (finding #8): this is the governed action's execution
+		// boundary — the last point before the backend process actually
+		// starts. Consume every one-shot override the policy gate resolved
+		// to ALLOW right here, atomically, immediately before launch. If a
+		// consume unexpectedly affects zero rows (the reservation was
+		// already released/expired by a race — e.g. this run's own TTL
+		// reclaim on a pathologically slow workspace-prep path), fail
+		// closed and abort rather than launch under an ambiguous
+		// authorization: the run returns an error and the deferred release
+		// above cleans up whatever did stay reserved.
+		for _, oid := range pendingOneShotIDs {
+			consumeAt := time.Now().UTC().Format(time.RFC3339Nano)
+			n, cerr := observability.ConsumePolicyOverrideReservation(db, oid, consumeAt)
+			if cerr != nil {
+				return rec, cerr
+			}
+			if n == 0 {
+				return rec, fmt.Errorf("policy gate: one-shot override %d reservation was lost before launch (released or expired concurrently)", oid)
+			}
+		}
+		oneShotConsumed = true
 		ar, aerr = rn.Launch(ctx, ws, runner.LaunchRequest{Agent: agent, Request: agents.Request{
 			Prompt: prompt, Workdir: work, Transcript: transcript,
 			Timeout: agentTimeout,

@@ -270,6 +270,20 @@ CREATE TABLE IF NOT EXISTS policy_overrides(id INTEGER PRIMARY KEY AUTOINCREMENT
 			return nil, alterErr
 		}
 	}
+	// reserved_at/expired_at (Sol P1.1, finding #8) split the old
+	// claim-equals-consume behavior into the full
+	// available->reserved->consumed|released|expired lifecycle: a one-shot
+	// override is now reserved at gate-evaluation time and only actually
+	// consumed immediately before the governed action it authorized crosses
+	// its execution boundary. Empty defaults on pre-existing rows are
+	// honest — those rows predate the reservation state and were either
+	// already fully consumed (consumed_at set) or never touched.
+	for _, column := range []string{"reserved_at TEXT NOT NULL DEFAULT ''", "expired_at TEXT NOT NULL DEFAULT ''"} {
+		if _, alterErr := db.Exec("ALTER TABLE policy_overrides ADD COLUMN " + column); alterErr != nil && !strings.Contains(strings.ToLower(alterErr.Error()), "duplicate column") {
+			db.Close()
+			return nil, alterErr
+		}
+	}
 	if _, err = db.Exec(`CREATE INDEX IF NOT EXISTS runs_key ON runs(contract_hash, approved_head, status);
 CREATE INDEX IF NOT EXISTS runs_identity ON runs(identity_hash, status);
 CREATE INDEX IF NOT EXISTS runs_failure ON runs(failure_taxonomy, created);

@@ -299,14 +299,27 @@ claims:
   - id: layered-ask-policy
     title: "Four-way policy verdicts (ALLOW/DENY/ASK/FLAG) across org -> project doctrine -> job contract -> session/operator layers, with checkpointed ASK resolved via gov ask approve|deny (optionally as an expiring override) that resumes from checkpoint rather than restarting the agent"
     first_shipped_version: v1.4-session5
-    claimed_maturity: shipped
+    # Sol redteam v3 S8 (P1.1, finding #8) replaced the claim-equals-consume
+    # one-shot override with a real available->reserved->consumed|released|
+    # expired lifecycle (ConsumePolicyOverride -> ConsumePolicyOverrideReservation
+    # + new ReleasePolicyOverrideReservation), fixing the reproduced bug where
+    # rule A's approval was burned even when rule B's still-pending ASK meant
+    # no execution ever happened. That rename invalidates this claim's old
+    # binary_build_evidence historical-symbol proof (commit
+    # 9c25e43e56d02b0f1b679ccd99b66813648bdd91 predates the rename, so it can
+    # never contain the new symbol names) — downgraded shipped -> tested
+    # rather than left overclaiming. binary_build_evidence/acceptance_artifacts
+    # below are kept as an accurate historical record of the v1.4.1 release,
+    # not as current shipped-maturity proof; re-establish "shipped" against a
+    # fresh binary_build_evidence.commit in a future release pass (S14/S15).
+    claimed_maturity: tested
     implementation:
       - file: internal/policy/verdict.go
         symbols: [Verdict, EvaluateLayers, ResolveOverrides, LayerResult]
       - file: internal/policy/decision.go
         symbols: [PolicyDecision]
       - file: internal/observability/policy_checkpoints.go
-        symbols: [RecordPolicyCheckpoint, ResolvePolicyCheckpoint, RecordPolicyOverride, ActivePolicyOverrides, ConsumePolicyOverride]
+        symbols: [RecordPolicyCheckpoint, ResolvePolicyCheckpoint, RecordPolicyOverride, ActivePolicyOverrides, ConsumePolicyOverrideReservation, ReleasePolicyOverrideReservation]
     cli:
       command: "gov ask approve"
     tests:
@@ -323,6 +336,9 @@ claims:
           - TestPolicyGateApprovedOverrideLetsSubsequentRunProceed
           - TestPolicyGateBareApproveUnblocksExactlyOnce
           - TestFallbackEligibleConsultsPolicyGateForUnusualInfraFailure
+      - file: internal/runtime/sol3_ask_lifecycle_test.go
+        funcs:
+          - TestSol3OneShotApprovalSurvivesWhenAnotherRuleStillBlocks
     acceptance_artifacts:
       - path: evidence/release-v1.4.1.json
         pointer: acceptance_evidence.8_ask_policy_lifecycle
@@ -466,7 +482,7 @@ claims:
       - file: internal/runtime/ask.go
         symbols: [AskResolve]
       - file: internal/observability/policy_checkpoints.go
-        symbols: [ClaimActivePolicyOverrides, ConsumePolicyOverride]
+        symbols: [ClaimActivePolicyOverrides, ConsumePolicyOverrideReservation]
       - file: internal/policy/verdict.go
         symbols: [EvaluateLayers]
     tests:
@@ -483,7 +499,7 @@ claims:
           - TestValidateRejectsUnknownConditionField
       - file: internal/observability/policy_checkpoints_test.go
         funcs:
-          - TestClaimActivePolicyOverridesConsumesOneShotExactlyOnce
+          - TestClaimActivePolicyOverridesReservesOneShotExactlyOnce
           - TestPolicyCheckpointLifecycle
       - file: internal/policy/decision_test.go
         funcs:

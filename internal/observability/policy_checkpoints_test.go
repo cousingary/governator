@@ -134,7 +134,12 @@ func TestActivePolicyOverridesExpiry(t *testing.T) {
 	}
 }
 
-func TestClaimActivePolicyOverridesConsumesOneShotExactlyOnce(t *testing.T) {
+func TestClaimActivePolicyOverridesReservesOneShotExactlyOnce(t *testing.T) {
+	// Sol P1.1 (finding #8): claiming no longer consumes at claim time — it
+	// only reserves. A second claim while still reserved sees nothing (the
+	// row isn't "available"), but the override is not yet spent: it becomes
+	// available again on release, or terminally consumed only at the actual
+	// execution boundary via ConsumePolicyOverrideReservation.
 	home := t.TempDir()
 	db, err := Open(home)
 	if err != nil {
@@ -153,8 +158,8 @@ func TestClaimActivePolicyOverridesConsumesOneShotExactlyOnce(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(claimed) != 1 || !claimed[0].OneShot || claimed[0].ConsumedAt != "2026-07-12T00:01:00Z" {
-		t.Fatalf("expected first claim to return and consume the one-shot override, got %+v", claimed)
+	if len(claimed) != 1 || !claimed[0].OneShot || claimed[0].ReservedAt != "2026-07-12T00:01:00Z" || claimed[0].ConsumedAt != "" {
+		t.Fatalf("expected first claim to reserve (not consume) the one-shot override, got %+v", claimed)
 	}
 
 	claimed, err = ClaimActivePolicyOverrides(db, "policy_identity:abc", "2026-07-12T00:02:00Z")
@@ -162,6 +167,86 @@ func TestClaimActivePolicyOverridesConsumesOneShotExactlyOnce(t *testing.T) {
 		t.Fatal(err)
 	}
 	if len(claimed) != 0 {
-		t.Fatalf("expected consumed one-shot override to disappear on second claim, got %+v", claimed)
+		t.Fatalf("expected reserved one-shot override to disappear on second claim while still reserved, got %+v", claimed)
+	}
+
+	// Release: the override returns to available for a future claim.
+	if err := ReleasePolicyOverrideReservation(db, 1, "2026-07-12T00:03:00Z"); err != nil {
+		t.Fatal(err)
+	}
+	claimed, err = ClaimActivePolicyOverrides(db, "policy_identity:abc", "2026-07-12T00:04:00Z")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(claimed) != 1 || claimed[0].ConsumedAt != "" {
+		t.Fatalf("expected the released override to be claimable again, got %+v", claimed)
+	}
+
+	// Consume: terminal, never claimable again.
+	n, err := ConsumePolicyOverrideReservation(db, 1, "2026-07-12T00:05:00Z")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Fatalf("expected 1 row consumed, got %d", n)
+	}
+	claimed, err = ClaimActivePolicyOverrides(db, "policy_identity:abc", "2026-07-12T00:06:00Z")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(claimed) != 0 {
+		t.Fatalf("expected consumed one-shot override to never be claimable again, got %+v", claimed)
+	}
+}
+
+func TestReclaimStaleOneShotReservationExpiresRatherThanReleases(t *testing.T) {
+	// Sol P1.1: a reservation held past oneShotReservationTTL self-heals
+	// into ExpiredAt, never back to available — losing a stale approval is
+	// the fail-closed outcome (the caller might have crashed after actually
+	// starting execution; silently re-issuing the same approval risks a
+	// double-authorization).
+	home := t.TempDir()
+	db, err := Open(home)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	if err := RecordPolicyOverride(db, PolicyOverride{
+		ScopeKey: "policy_identity:stale", Target: "network-enablement", Verdict: "ALLOW", Reason: "approved once",
+		CreatedBy: "operator", CreatedAt: "2026-07-12T00:00:00Z", OneShot: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ClaimActivePolicyOverrides(db, "policy_identity:stale", "2026-07-12T00:00:01Z"); err != nil {
+		t.Fatal(err)
+	}
+
+	// Still within the TTL: not reclaimed, not visible to a new claim.
+	claimed, err := ClaimActivePolicyOverrides(db, "policy_identity:stale", "2026-07-12T00:10:00Z")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(claimed) != 0 {
+		t.Fatalf("expected the still-fresh reservation to stay held, got %+v", claimed)
+	}
+
+	// Past the TTL: reclaimed into expired, permanently unclaimable.
+	claimed, err = ClaimActivePolicyOverrides(db, "policy_identity:stale", "2026-07-12T00:31:00Z")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(claimed) != 0 {
+		t.Fatalf("expected the expired reservation to never become claimable, got %+v", claimed)
+	}
+	if err := ReleasePolicyOverrideReservation(db, 1, "2026-07-12T00:32:00Z"); err != nil {
+		t.Fatal(err)
+	}
+	claimed, err = ClaimActivePolicyOverrides(db, "policy_identity:stale", "2026-07-12T00:33:00Z")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(claimed) != 0 {
+		t.Fatalf("expected an expired reservation to stay unclaimable even after a release attempt, got %+v", claimed)
 	}
 }
