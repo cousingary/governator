@@ -147,6 +147,77 @@ func TestReplayPositiveIdenticalEnvironmentReplays(t *testing.T) {
 	}
 }
 
+// bareBackendReplayEnv is replayEnv's sibling for the Sol Finding 5 /
+// Session 2 corpus #2 reproduction. replayEnv installs the fake backend at an
+// arbitrary absolute path and points GOV_CLAUDE_BIN straight at it — which
+// never exercises the bug, since os.ReadFile(absolutePath) works whether or
+// not PATH resolution is fixed. bareBackendReplayEnv instead leaves
+// GOV_CLAUDE_BIN unset (config.BackendBin("claude-code") then returns the
+// built-in bare name "claude" — the exact `backends: pi: bin: pi` shape the
+// finding describes) and installs the fake backend under that bare name on
+// PATH, so identity/replay must actually resolve it through exec.LookPath.
+func bareBackendReplayEnv(t *testing.T) (root, binPath, home, promptRoot string) {
+	t.Helper()
+	root, fakeBin := fixture(t)
+	script, err := os.ReadFile(fakeBin)
+	if err != nil {
+		t.Fatal(err)
+	}
+	binDir := t.TempDir()
+	binPath = filepath.Join(binDir, "claude")
+	if err := os.WriteFile(binPath, script, 0755); err != nil {
+		t.Fatal(err)
+	}
+	// Prepend (not replace): fixture()'s git commands already ran, but Run()
+	// itself still shells out to git for worktree creation, and prepending
+	// guarantees our fake "claude" is found first even if a real one is also
+	// on PATH somewhere else on the host.
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	home = t.TempDir()
+	t.Setenv("GOV_HOME", home)
+	t.Setenv("FAKE_ALLOWED_COMMAND", "1")
+	promptRoot = t.TempDir()
+	writePromptVersion(t, promptRoot, "claude-code", "surgeon", "v007")
+	t.Setenv("GOV_PROMPTS", promptRoot)
+	return root, binPath, home, promptRoot
+}
+
+// TestSol3ReplayInvalidatedByBarePathBackendSwap is the Session 2 / Sol
+// Finding 5 corpus #2 reproduction. Before the fix, computeExecutionIdentity
+// hashed config.BackendBin("claude-code") (the bare string "claude") via
+// os.ReadFile directly — a relative filename never resolves through PATH, so
+// this always produced the fixed "unreadable:claude" sentinel regardless of
+// which binary "claude" actually pointed to on PATH. A prior APPROVED run
+// therefore replayed forever even after the bare-name-resolved backend was
+// replaced with a different program at the same PATH location — the
+// replacement was never launched. agents.ResolvePath fixes this by resolving
+// through exec.LookPath before hashing, so the swap must mint a fresh
+// identity and the run must NOT replay.
+func TestSol3ReplayInvalidatedByBarePathBackendSwap(t *testing.T) {
+	root, binPath, _, _ := bareBackendReplayEnv(t)
+	r1 := runOnce(t, root)
+	if r1.Status != "APPROVED" {
+		t.Fatalf("first run: %s: %s", r1.Status, r1.Message)
+	}
+	orig, err := os.ReadFile(binPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(binPath, append(orig, []byte("\n# swapped bare-path binary for Sol Finding 5 replay test\n")...), 0755); err != nil {
+		t.Fatal(err)
+	}
+	r2 := runOnce(t, root)
+	if r2.Replayed {
+		t.Fatal("Sol Finding 5 regression: a bare-name PATH-resolved backend was replaced at the same name/path and the run still replayed the stale approval")
+	}
+	if r2.ID == r1.ID {
+		t.Fatalf("expected a fresh run id after the bare-path backend swap, got the stale approval %s", r1.ID)
+	}
+	if r2.Status != "APPROVED" {
+		t.Fatalf("re-run with equivalent binary should still approve: %s: %s", r2.Status, r2.Message)
+	}
+}
+
 // TestReplayInvalidatedByBackendBinaryChange reproduces the Sol reproduction
 // (Critical 1 consequence): a prior approval must NOT be reused after the
 // backend binary content changes. The replay probe now hashes the executable,
@@ -315,9 +386,17 @@ func TestComputeIdentityCapturesBackendBinary(t *testing.T) {
 		t.Fatal(err)
 	}
 	pv := prompts.Version{ID: "builtin"}
-	idA := computeExecutionIdentity(config.BuiltIn(), c, agent, t.TempDir(), "dead", "ch", pv, "attest-1")
+	resA, err := agents.ResolvePath(agent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	idA := computeExecutionIdentity(config.BuiltIn(), c, agent, resA, t.TempDir(), "dead", "ch", pv, "attest-1")
 	t.Setenv("GOV_CLAUDE_BIN", binB)
-	idB := computeExecutionIdentity(config.BuiltIn(), c, agent, t.TempDir(), "dead", "ch", pv, "attest-1")
+	resB, err := agents.ResolvePath(agent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	idB := computeExecutionIdentity(config.BuiltIn(), c, agent, resB, t.TempDir(), "dead", "ch", pv, "attest-1")
 	if idA.BackendBinarySHA256 == idB.BackendBinarySHA256 {
 		t.Fatal("different backend binaries produced the same identity binary hash")
 	}

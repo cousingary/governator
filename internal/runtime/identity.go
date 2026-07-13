@@ -86,9 +86,17 @@ func (id ExecutionIdentity) Hash() string {
 // or re-checks them. Project doctrine is re-read (it is also read inside
 // evaluatePolicyGate) so the identity captures exactly the doctrine file the
 // policy gate consulted — a doctrine change between runs mints a new identity.
-func computeExecutionIdentity(cfg config.Config, c contracts.Contract, agent agents.Agent, root, head, hash string, promptVer prompts.Version, capabilityAttestID string) ExecutionIdentity {
+//
+// resolution is the single canonical backend resolution computed once for
+// this run (Sol Finding 5 / Session 2) — computeExecutionIdentity must never
+// independently re-resolve the configured binary. Its CanonicalPath/SHA256
+// feed BackendBinaryPath/BackendBinarySHA256 in place of the old
+// hashFileContent(config.BackendBin(...)) call, which hashed a bare name like
+// "pi" literally (via os.ReadFile, never through PATH) and always produced
+// the same "unreadable:pi" sentinel regardless of which binary that name
+// actually resolved to — a swapped executable never changed the identity.
+func computeExecutionIdentity(cfg config.Config, c contracts.Contract, agent agents.Agent, resolution agents.PathResolution, root, head, hash string, promptVer prompts.Version, capabilityAttestID string) ExecutionIdentity {
 	doctrine, _ := policy.LoadProjectDoctrine(root)
-	bin := config.BackendBin(agent.Name())
 	return ExecutionIdentity{
 		ContractHash:          hash,
 		ApprovedHead:          head,
@@ -102,8 +110,8 @@ func computeExecutionIdentity(cfg config.Config, c contracts.Contract, agent age
 		AssayerProfileHash:    hashJSON(assayerInputs(cfg, c)),
 		BackendAdapter:        agent.Name(),
 		BackendAdapterVersion: adapterVersion(agent),
-		BackendBinaryPath:     bin,
-		BackendBinarySHA256:   hashFileContent(bin),
+		BackendBinaryPath:     resolution.CanonicalPath,
+		BackendBinarySHA256:   resolution.SHA256,
 		ModelID:               agent.Name(),
 		CapabilityAttestID:    capabilityAttestID,
 		RunnerConfigHash:      hashJSON(runnerConfig(c)),

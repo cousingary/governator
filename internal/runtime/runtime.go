@@ -586,22 +586,34 @@ func validateNoLocalSymlinkEscape(root string) error {
 // config, then delegates to containment.Enforce. Non-high-risk contracts are
 // a no-op. The check runs before quota/workspace acquisition so a denied
 // high-risk run leaves no side effects.
-func enforceContainment(db *sql.DB, c contracts.Contract, agent string, cfg config.Config) (string, error) {
+//
+// agent is the single Agent instance the caller already built for this run
+// (via agents.New) — enforceContainment builds no Agent of its own. It DOES
+// resolve the backend binary itself (Sol Finding 5 / Session 2's
+// agents.ResolvePath), but only inside the native-sandbox branch below: most
+// contracts (non-high-risk, non-native-sandbox, Docker-runner, or signed
+// override) never need the executable's identity to reach a containment
+// verdict, and resolving unconditionally here would force every high-risk
+// contract — including ones correctly rejected on containment grounds alone —
+// to have its backend CLI actually installed just to fail closed for an
+// unrelated reason.
+func enforceContainment(db *sql.DB, c contracts.Contract, agent agents.Agent, cfg config.Config) (string, error) {
 	if strings.TrimSpace(c.RiskClass) != "high" {
 		return "", nil
 	}
-	nativeSandbox := false
+	nativeSandbox := agent.Capabilities().NativeSandbox
 	var attestationID string
-	if a, err := agents.New(agent); err == nil {
-		nativeSandbox = a.Capabilities().NativeSandbox
-	}
 	// Sol Critical 4 / Phase E: a backend name is never sufficient evidence of
 	// native host containment. High-risk local jobs may count a native sandbox
 	// only when the current executable hash/config/model has a fresh ledgered
 	// capability attestation whose probes passed. Docker and signed overrides
 	// keep their existing paths inside containment.Enforce.
 	if c.EffectiveRunner() == "local" && nativeSandbox && !containment.VerifyOverride(c, cfg.Containment.OverridePublicKey) {
-		id, err := attest.VerifyHighRiskNative(db, cfg, agent)
+		resolution, err := agents.ResolvePath(agent)
+		if err != nil {
+			return "", err
+		}
+		id, err := attest.VerifyHighRiskNative(db, cfg, agent, resolution)
 		if err != nil {
 			return "", err
 		}
@@ -1726,6 +1738,10 @@ func (r *Runner) runOnce(ctx context.Context, c contracts.Contract) (RunRecord, 
 	if err := observability.RecordStage(db, id, "ROUTED", resolved.Agent, time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
 		return RunRecord{}, err
 	}
+	agent, err := agents.New(resolved.Agent)
+	if err != nil {
+		return RunRecord{}, err
+	}
 	// Session 3 containment policy (Phase 2): a risk_class: high contract must
 	// not silently resolve to local execution. Qualifying containment is
 	// hardened Docker, a backend with a verified native sandbox, or a signed
@@ -1733,7 +1749,11 @@ func (r *Runner) runOnce(ctx context.Context, c contracts.Contract) (RunRecord, 
 	// (native sandbox is a backend capability, not a contract claim) and
 	// before any quota/workspace side effect, so a failure leaves nothing
 	// behind — exactly the "fails before launch" acceptance for high-risk.
-	capabilityAttestID, err := enforceContainment(db, c, resolved.Agent, cfg)
+	// enforceContainment resolves the backend binary itself, but only when its
+	// native-sandbox attestation branch actually needs it (Sol Finding 5 /
+	// Session 2) — most contracts reach a containment verdict without ever
+	// touching the executable's identity.
+	capabilityAttestID, err := enforceContainment(db, c, agent, cfg)
 	if err != nil {
 		return RunRecord{}, err
 	}
@@ -1832,11 +1852,17 @@ func (r *Runner) runOnce(ctx context.Context, c contracts.Contract) (RunRecord, 
 	if err != nil {
 		return RunRecord{}, err
 	}
-	agent, err := agents.New(resolved.Agent)
+	// Sol Finding 5 / Session 2: resolve the configured backend binary exactly
+	// once here — through PATH, symlink-canonicalized, content-hashed — and
+	// reuse this single record for execution identity, replay, and the actual
+	// launch below. A bare name (backends.pi.bin: pi) resolved independently
+	// at identity time versus launch time let a swapped-then-restored binary
+	// pass a stale replay check that never re-verified the file it hashed.
+	resolution, err := agents.ResolvePath(agent)
 	if err != nil {
 		return RunRecord{}, err
 	}
-	identity := computeExecutionIdentity(cfg, c, agent, root, head, hash, promptVersion, capabilityAttestID)
+	identity := computeExecutionIdentity(cfg, c, agent, resolution, root, head, hash, promptVersion, capabilityAttestID)
 	if priorID, perr := replayMatch(db, identity.Hash()); perr != nil {
 		return RunRecord{}, perr
 	} else if priorID != "" {
@@ -1941,6 +1967,13 @@ func (r *Runner) runOnce(ctx context.Context, c contracts.Contract) (RunRecord, 
 			Prompt: prompt, Workdir: work, Transcript: transcript,
 			Timeout: agentTimeout,
 			Spec:    spec,
+			// Sol Finding 5: hand the host launch the exact canonical path
+			// already resolved above, instead of letting exec.Command silently
+			// re-resolve the bare configured name through PATH a second time at
+			// Start() — a second, independent resolution taken moments later is
+			// the TOCTOU window the finding closes. Ignored by DockerRunner's
+			// executor, which correctly launches the bare in-container name.
+			ResolvedBin: resolution.CanonicalPath,
 		}})
 	}
 	// Session 3a: surface runner observations — limits/provenance as notes,

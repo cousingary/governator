@@ -86,7 +86,7 @@ func (OpenCode) Run(parent context.Context, req Request) (Result, error) {
 	}
 	defer restore()
 	return runCLI(parent, runCLIRequest{
-		bin: bin, workdir: req.Workdir, transcript: req.Transcript,
+		bin: bin, resolvedBin: req.ResolvedBin, workdir: req.Workdir, transcript: req.Transcript,
 		timeout: req.Timeout, prompt: req.Prompt, extraFlags: flags,
 		executor: req.Executor,
 	})

@@ -1273,7 +1273,24 @@ func TestEnforceContainmentHighRiskAcceptanceCriterion(t *testing.T) {
 	base.RiskClass = "high"
 	base.Runner = "" // local default
 
+	// newAgent builds the same Agent instance a real run already has in hand
+	// by this point (via agents.New) — enforceContainment's signature takes
+	// an agents.Agent directly (Sol Finding 5 / Session 2) rather than a bare
+	// name, but it resolves the executable itself, and only inside its
+	// native-sandbox branch, so most of this test never needs glm installed.
+	newAgent := func(name string) agents.Agent {
+		t.Helper()
+		agent, err := agents.New(name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return agent
+	}
+
 	// glm declares no native sandbox capability → high-risk local must fail.
+	// enforceContainment's attestation branch never triggers for a backend
+	// with no native sandbox, so this assertion holds with no glm binary on
+	// PATH at all.
 	c := base
 	c.Agent = "glm"
 	db, err := observability.Open(t.TempDir())
@@ -1281,7 +1298,8 @@ func TestEnforceContainmentHighRiskAcceptanceCriterion(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer db.Close()
-	if _, err := enforceContainment(db, c, "glm", config.Config{}); err == nil {
+	glmAgent := newAgent("glm")
+	if _, err := enforceContainment(db, c, glmAgent, config.Config{}); err == nil {
 		t.Fatal("expected high-risk local glm (no native sandbox, no override) to fail closed, got nil")
 	}
 
@@ -1293,23 +1311,23 @@ func TestEnforceContainmentHighRiskAcceptanceCriterion(t *testing.T) {
 	bin := writeFakeBackend(t, `if [ "${1:-}" = "--version" ]; then echo "claude fake 1.0"; exit 0; fi
 `)
 	t.Setenv("GOV_CLAUDE_BIN", bin)
-	if _, err := enforceContainment(db, c, "claude-code", config.BuiltIn()); err == nil || !strings.Contains(err.Error(), "attestation") {
+	claudeAgent := newAgent("claude-code")
+	if _, err := enforceContainment(db, c, claudeAgent, config.BuiltIn()); err == nil || !strings.Contains(err.Error(), "attestation") {
 		t.Fatalf("native backend without attestation must fail closed, got %v", err)
 	}
-	shaData, err := os.ReadFile(bin)
+	claudeRes, err := agents.ResolvePath(claudeAgent)
 	if err != nil {
 		t.Fatal(err)
 	}
-	sha := sha256.Sum256(shaData)
 	if err := attest.Store(db, attest.Attestation{
 		ID: "test-attest", Backend: "claude-code", AdapterVersion: "claude-code-adapter-v1",
-		ExecutablePath: bin, ExecutableSHA256: hex.EncodeToString(sha[:]), ModelID: "claude-code", ConfigHash: config.BuiltIn().Hash(),
+		ExecutablePath: claudeRes.CanonicalPath, ExecutableSHA256: claudeRes.SHA256, ModelID: "claude-code", ConfigHash: config.BuiltIn().Hash(),
 		SupportedFlags: true, SandboxProbe: true, NetworkProbe: true, TranscriptProbe: true,
 		CreatedAt: time.Now().UTC().Format(time.RFC3339Nano), ExpiresAt: time.Now().UTC().Add(time.Hour).Format(time.RFC3339Nano),
 	}); err != nil {
 		t.Fatal(err)
 	}
-	attID, err := enforceContainment(db, c, "claude-code", config.BuiltIn())
+	attID, err := enforceContainment(db, c, claudeAgent, config.BuiltIn())
 	if err != nil || attID != "test-attest" {
 		t.Fatalf("attested native-sandbox backend should pass high-risk local: id=%q err=%v", attID, err)
 	}
@@ -1329,7 +1347,7 @@ func TestEnforceContainmentHighRiskAcceptanceCriterion(t *testing.T) {
 	}
 	sig := ed25519.Sign(priv, msg)
 	c.Containment.OverrideSignature = hex.EncodeToString(sig)
-	if _, err := enforceContainment(db, c, "glm", config.Config{Containment: config.Containment{OverridePublicKey: hex.EncodeToString(pub)}}); err != nil {
+	if _, err := enforceContainment(db, c, glmAgent, config.Config{Containment: config.Containment{OverridePublicKey: hex.EncodeToString(pub)}}); err != nil {
 		t.Fatalf("valid signed override should rescue high-risk local glm: %v", err)
 	}
 
@@ -1337,7 +1355,7 @@ func TestEnforceContainmentHighRiskAcceptanceCriterion(t *testing.T) {
 	c = base
 	c.RiskClass = "low"
 	c.Agent = "glm"
-	if _, err := enforceContainment(db, c, "glm", config.Config{}); err != nil {
+	if _, err := enforceContainment(db, c, glmAgent, config.Config{}); err != nil {
 		t.Fatalf("low-risk must be a containment no-op: %v", err)
 	}
 }

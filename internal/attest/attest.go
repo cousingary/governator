@@ -11,9 +11,6 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"fmt"
-	"os"
-	"os/exec"
-	"path/filepath"
 	"strings"
 	"time"
 
@@ -62,49 +59,6 @@ func boolInt(v bool) int {
 
 func intBool(v int) bool { return v != 0 }
 
-func canonicalExecutable(bin string) (string, error) {
-	if strings.TrimSpace(bin) == "" {
-		return "", fmt.Errorf("empty backend executable")
-	}
-	path := bin
-	if !filepath.IsAbs(path) {
-		looked, err := exec.LookPath(path)
-		if err != nil {
-			return "", fmt.Errorf("look up backend executable %q: %w", bin, err)
-		}
-		path = looked
-	}
-	abs, err := filepath.Abs(path)
-	if err != nil {
-		return "", err
-	}
-	if eval, err := filepath.EvalSymlinks(abs); err == nil {
-		abs = eval
-	}
-	return abs, nil
-}
-
-func sha256File(path string) (string, error) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return "", err
-	}
-	sum := sha256.Sum256(data)
-	return hex.EncodeToString(sum[:]), nil
-}
-
-func versionOutput(ctx context.Context, path string) (string, bool) {
-	ctx, cancel := context.WithTimeout(ctx, 3*time.Second)
-	defer cancel()
-	cmd := exec.CommandContext(ctx, path, "--version")
-	out, err := cmd.CombinedOutput()
-	text := strings.TrimSpace(string(out))
-	if len(text) > 4096 {
-		text = text[:4096]
-	}
-	return text, err == nil && ctx.Err() == nil
-}
-
 func expectedToken(backend string) string {
 	switch backend {
 	case "claude-code", "claude":
@@ -122,38 +76,45 @@ func expectedToken(backend string) string {
 	}
 }
 
-func adapterVersion(agent agents.Agent) string { return agent.Name() + "-adapter-v1" }
-
 // Generate probes the current configured executable and produces an
 // attestation. The probes are intentionally conservative: a binary that cannot
 // identify itself as the expected backend does not get to inherit native
 // sandbox/network/transcript claims merely because it sits at backends.X.bin.
+//
+// Per Sol Finding 5: resolution (path/canonicalization/hash/version) is
+// delegated entirely to agents.Resolve, the single canonical resolution
+// implementation also used by execution identity and (via GenerateFromResolution
+// below) attestation lookup — Generate no longer maintains its own separate
+// LookPath/hash/version-probe logic that could drift from what identity.go or
+// the actual launch observed.
 func Generate(ctx context.Context, cfg config.Config, backend string) (Attestation, error) {
 	agent, err := agents.New(backend)
 	if err != nil {
 		return Attestation{}, err
 	}
-	bin := config.BackendBin(agent.Name())
-	path, err := canonicalExecutable(bin)
+	res, err := agents.Resolve(ctx, agent)
 	if err != nil {
 		return Attestation{}, err
 	}
-	sha, err := sha256File(path)
-	if err != nil {
-		return Attestation{}, fmt.Errorf("hash backend executable %s: %w", path, err)
-	}
-	version, versionOK := versionOutput(ctx, path)
-	matchesBackend := strings.Contains(strings.ToLower(version), expectedToken(agent.Name()))
+	return GenerateFromResolution(cfg, agent, res), nil
+}
+
+// GenerateFromResolution builds an attestation from a resolution already
+// computed elsewhere in the current run, so a caller that resolved the
+// backend once (Sol Finding 5) never triggers a second independent
+// resolution just to mint an attestation.
+func GenerateFromResolution(cfg config.Config, agent agents.Agent, res agents.Resolution) Attestation {
+	matchesBackend := strings.Contains(strings.ToLower(res.VersionOutput), expectedToken(agent.Name()))
 	cap := agent.Capabilities()
-	supported := versionOK && matchesBackend
+	supported := res.VersionOK && matchesBackend
 	now := time.Now().UTC()
 	a := Attestation{
 		Backend:          agent.Name(),
-		AdapterVersion:   adapterVersion(agent),
-		ExecutablePath:   path,
-		ExecutableSHA256: sha,
-		VersionOutput:    version,
-		ModelID:          agent.Name(),
+		AdapterVersion:   res.AdapterVersion,
+		ExecutablePath:   res.CanonicalPath,
+		ExecutableSHA256: res.SHA256,
+		VersionOutput:    res.VersionOutput,
+		ModelID:          res.ModelID,
 		ConfigHash:       cfg.Hash(),
 		SupportedFlags:   supported,
 		SandboxProbe:     !cap.NativeSandbox || supported,
@@ -163,7 +124,7 @@ func Generate(ctx context.Context, cfg config.Config, backend string) (Attestati
 		ExpiresAt:        now.Add(ttl).Format(time.RFC3339Nano),
 	}
 	a.ID = a.computeID()
-	return a, nil
+	return a
 }
 
 func (a Attestation) computeID() string {
@@ -184,26 +145,20 @@ VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, a.ID, a.Backend, a.AdapterVersion, a.Execu
 	return err
 }
 
-// Current returns the latest attestation matching the current executable hash,
-// model and config hash for backend.
-func Current(db *sql.DB, cfg config.Config, backend string) (Attestation, bool, error) {
+// Current returns the latest attestation matching resolution's canonical
+// path/hash, model and config hash for backend.
+//
+// Per Sol Finding 5: resolution must be the same PathResolution the caller
+// already produced once for this run (e.g. via enforceContainment) — Current
+// never independently re-resolves the configured binary, so a lookup here is
+// guaranteed to be checking the exact file that will attest/launch, not a
+// second, potentially different, PATH resolution taken moments apart.
+func Current(db *sql.DB, cfg config.Config, agent agents.Agent, resolution agents.PathResolution) (Attestation, bool, error) {
 	if err := ensureSchema(db); err != nil {
 		return Attestation{}, false, err
 	}
-	agent, err := agents.New(backend)
-	if err != nil {
-		return Attestation{}, false, err
-	}
-	path, err := canonicalExecutable(config.BackendBin(agent.Name()))
-	if err != nil {
-		return Attestation{}, false, err
-	}
-	sha, err := sha256File(path)
-	if err != nil {
-		return Attestation{}, false, err
-	}
 	row := db.QueryRow(`SELECT id,backend,adapter_version,executable_path,executable_sha256,version_output,model_id,config_hash,supported_flags,sandbox_probe,network_probe,transcript_probe,created_at,expires_at
-FROM capability_attestations WHERE backend=? AND executable_path=? AND executable_sha256=? AND config_hash=? AND model_id=? ORDER BY created_at DESC LIMIT 1`, agent.Name(), path, sha, cfg.Hash(), agent.Name())
+FROM capability_attestations WHERE backend=? AND executable_path=? AND executable_sha256=? AND config_hash=? AND model_id=? ORDER BY created_at DESC LIMIT 1`, agent.Name(), resolution.CanonicalPath, resolution.SHA256, cfg.Hash(), agent.Name())
 	var a Attestation
 	var supported, sandbox, network, transcript int
 	if err := row.Scan(&a.ID, &a.Backend, &a.AdapterVersion, &a.ExecutablePath, &a.ExecutableSHA256, &a.VersionOutput, &a.ModelID, &a.ConfigHash, &supported, &sandbox, &network, &transcript, &a.CreatedAt, &a.ExpiresAt); err != nil {
@@ -217,17 +172,15 @@ FROM capability_attestations WHERE backend=? AND executable_path=? AND executabl
 }
 
 // VerifyHighRiskNative returns the attestation ID that authorizes backend's
-// native sandbox for a high-risk local run, or a fail-closed error.
-func VerifyHighRiskNative(db *sql.DB, cfg config.Config, backend string) (string, error) {
-	agent, err := agents.New(backend)
-	if err != nil {
-		return "", err
-	}
+// native sandbox for a high-risk local run, or a fail-closed error. agent and
+// resolution must be the same values the caller resolved once for this run
+// (Sol Finding 5) — VerifyHighRiskNative performs no resolution of its own.
+func VerifyHighRiskNative(db *sql.DB, cfg config.Config, agent agents.Agent, resolution agents.PathResolution) (string, error) {
 	cap := agent.Capabilities()
 	if !cap.NativeSandbox {
 		return "", fmt.Errorf("backend %q does not declare a native sandbox capability", agent.Name())
 	}
-	a, ok, err := Current(db, cfg, agent.Name())
+	a, ok, err := Current(db, cfg, agent, resolution)
 	if err != nil {
 		return "", err
 	}

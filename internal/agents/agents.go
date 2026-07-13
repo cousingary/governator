@@ -28,6 +28,16 @@ type Request struct {
 	Timeout    time.Duration
 	Spec       BackendSpec
 	Executor   Executor
+	// ResolvedBin is the canonical, PATH-resolved, symlink-evaluated absolute
+	// path a caller already produced once for this run via ResolvePath (Sol
+	// Finding 5) — the same record backing execution identity and any
+	// attestation check. runCLI substitutes it in place of the bare
+	// configured name only for the host launch (Executor nil); an injected
+	// Executor (DockerRunner) launches inside a separate filesystem
+	// namespace and always receives the bare in-container name instead.
+	// Empty is a valid fallback (e.g. gov doctor probes, tests) that leaves
+	// the pre-Finding-5 exec.Command-does-its-own-LookPath behavior intact.
+	ResolvedBin string
 }
 
 type Result struct {
@@ -58,6 +68,10 @@ type runCLIRequest struct {
 	// executor overrides process spawning; nil uses defaultExecutor. Threaded
 	// straight from Request.Executor by every adapter's Run method.
 	executor Executor
+	// resolvedBin is Request.ResolvedBin, threaded straight through by every
+	// adapter's Run method. Only consulted when executor is nil (the host
+	// launch path) — see runCLI.
+	resolvedBin string
 }
 
 // defaultExecutor is the pre-Phase-5 host subprocess launch, extracted
@@ -109,10 +123,20 @@ func runCLI(parent context.Context, r runCLIRequest) (Result, error) {
 	args := append([]string{}, r.extraFlags...)
 	args = append(args, r.prompt)
 	execute := r.executor
+	bin := r.bin
 	if execute == nil {
 		execute = defaultExecutor
+		// Sol Finding 5: the host launch uses the caller's already-resolved
+		// canonical path instead of handing exec.Command a bare name and
+		// letting it perform its own independent PATH lookup at Start() —
+		// that second, later resolution is exactly the TOCTOU window the
+		// finding closes. A Docker (or other injected) executor keeps r.bin,
+		// the bare in-container name, unchanged.
+		if r.resolvedBin != "" {
+			bin = r.resolvedBin
+		}
 	}
-	code, timedOut, runErr := execute(parent, r.bin, args, r.workdir, out, r.timeout)
+	code, timedOut, runErr := execute(parent, bin, args, r.workdir, out, r.timeout)
 	if timedOut {
 		return Result{ExitCode: -1, TimedOut: true}, runErr
 	}
@@ -175,7 +199,7 @@ func (Claude) project(spec BackendSpec) []string {
 func (Claude) Run(parent context.Context, req Request) (Result, error) {
 	bin := config.BackendBin("claude-code")
 	return runCLI(parent, runCLIRequest{
-		bin: bin, workdir: req.Workdir, transcript: req.Transcript,
+		bin: bin, resolvedBin: req.ResolvedBin, workdir: req.Workdir, transcript: req.Transcript,
 		timeout: req.Timeout, prompt: req.Prompt, extraFlags: Claude{}.project(req.Spec),
 		executor: req.Executor,
 	})
