@@ -342,3 +342,72 @@ func TestAssayUnknownEnforcementRejected(t *testing.T) {
 		t.Fatalf("expected assay.enforcement error, got %v", err)
 	}
 }
+
+// TestAssayPerArtifactListAcceptedWithoutContractWideDefault covers Sol
+// audit finding #16: a contract may declare per-artifact assays[] entries
+// covering every produced artifact instead of one contract-wide profile.
+func TestAssayPerArtifactListAcceptedWithoutContractWideDefault(t *testing.T) {
+	withProduces := strings.Replace(validContract, "on_violation: quarantine",
+		"produces: [{name: patch-report, path: .governator/artifacts/patch.json, max_bytes: 1024}]\n"+
+			"assay: {assays: [{artifact: patch-report, profile: coding-output-v2, enforcement: blocking}]}\n"+
+			"on_violation: quarantine", 1)
+	contract, err := Parse([]byte(withProduces))
+	if err != nil {
+		t.Fatalf("per-artifact assays[] without a contract-wide profile must validate: %v", err)
+	}
+	if len(contract.Assay.Artifacts) != 1 || contract.Assay.Artifacts[0].Artifact != "patch-report" {
+		t.Fatalf("expected one parsed per-artifact assay entry, got %+v", contract.Assay.Artifacts)
+	}
+}
+
+// TestAssayNoneExemptionRejectsEnforcement proves an artifact-level "none"
+// exemption cannot also carry an enforcement value (there is nothing to
+// enforce for an artifact explicitly opted out of assay).
+func TestAssayNoneExemptionRejectsEnforcement(t *testing.T) {
+	withProduces := strings.Replace(validContract, "on_violation: quarantine",
+		"produces: [{name: patch-report, path: .governator/artifacts/patch.json, max_bytes: 1024}]\n"+
+			"assay: {assays: [{artifact: patch-report, profile: none, enforcement: blocking}]}\n"+
+			"on_violation: quarantine", 1)
+	_, err := Parse([]byte(withProduces))
+	if err == nil || !strings.Contains(err.Error(), "assays[0].enforcement") {
+		t.Fatalf("expected assays[0].enforcement error for a none exemption carrying enforcement, got %v", err)
+	}
+}
+
+// TestAssayNoneExemptionAcceptedWithoutEnforcement is the no-over-blocking
+// companion: the same exemption, enforcement genuinely omitted, must parse.
+func TestAssayNoneExemptionAcceptedWithoutEnforcement(t *testing.T) {
+	withProduces := strings.Replace(validContract, "on_violation: quarantine",
+		"produces: [{name: patch-report, path: .governator/artifacts/patch.json, max_bytes: 1024}]\n"+
+			"assay: {assays: [{artifact: patch-report, profile: none}]}\n"+
+			"on_violation: quarantine", 1)
+	if _, err := Parse([]byte(withProduces)); err != nil {
+		t.Fatalf("a bare none exemption must validate: %v", err)
+	}
+}
+
+// TestAssayArtifactNameMustMatchProduces catches a typo'd assays[].artifact
+// at contract-validation time rather than letting it silently never match
+// anything at evaluation time.
+func TestAssayArtifactNameMustMatchProduces(t *testing.T) {
+	withProduces := strings.Replace(validContract, "on_violation: quarantine",
+		"produces: [{name: patch-report, path: .governator/artifacts/patch.json, max_bytes: 1024}]\n"+
+			"assay: {assays: [{artifact: typo-name, profile: coding-output-v2, enforcement: blocking}]}\n"+
+			"on_violation: quarantine", 1)
+	_, err := Parse([]byte(withProduces))
+	if err == nil || !strings.Contains(err.Error(), "assays[0].artifact") {
+		t.Fatalf("expected assays[0].artifact error for a name not in produces, got %v", err)
+	}
+}
+
+// TestAssayBlockWithNeitherProfileNorArtifactsRejected: a bare `assay: {}`
+// block (no contract-wide profile, no per-artifact list) would never
+// evaluate anything — rejected the same way a missing profile always was.
+func TestAssayBlockWithNeitherProfileNorArtifactsRejected(t *testing.T) {
+	withAssay := strings.Replace(validContract, "on_violation: quarantine",
+		"assay: {}\non_violation: quarantine", 1)
+	_, err := Parse([]byte(withAssay))
+	if err == nil || !strings.Contains(err.Error(), "assay.profile") {
+		t.Fatalf("expected assay.profile error for an empty assay block, got %v", err)
+	}
+}

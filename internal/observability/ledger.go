@@ -47,6 +47,17 @@ type ArtifactRecord struct {
 	SHA256   string `json:"sha256"`
 	Bytes    int64  `json:"bytes"`
 	SchemaOK bool   `json:"schema_ok"`
+
+	// DeclaredPath/Language/MediaType (Sol audit finding #17) carry the
+	// contract's own workspace-relative ArtifactSpec.Path plus its optional
+	// Language/MediaType through to the Governator<->Assayer bridge
+	// (internal/runtime/assay.go). Not persisted to the artifacts ledger
+	// table — RecordArtifacts names its INSERT columns explicitly and never
+	// touches these — this is an in-memory-only handoff from
+	// collectProducedArtifacts to runAssayStep within the same run.
+	DeclaredPath string `json:"-"`
+	Language     string `json:"-"`
+	MediaType    string `json:"-"`
 }
 
 // PanelMemberRecord maps an anonymous panel label back to the real job/backend
@@ -261,6 +272,20 @@ CREATE TABLE IF NOT EXISTS policy_overrides(id INTEGER PRIMARY KEY AUTOINCREMENT
 			return nil, alterErr
 		}
 	}
+	// artifact_name/artifact_sha256 (Sol P1.7, finding #16) identify which
+	// produced artifact a row evaluated, now that runAssayStep evaluates
+	// every produced artifact instead of only artifactRecords[0]. Empty
+	// defaults on pre-existing rows are honest — those evaluations predate
+	// multi-artifact assay and only ever covered one (unidentified) artifact.
+	for _, column := range []string{
+		"artifact_name TEXT NOT NULL DEFAULT ''",
+		"artifact_sha256 TEXT NOT NULL DEFAULT ''",
+	} {
+		if _, alterErr := db.Exec("ALTER TABLE assay_evaluations ADD COLUMN " + column); alterErr != nil && !strings.Contains(strings.ToLower(alterErr.Error()), "duplicate column") {
+			db.Close()
+			return nil, alterErr
+		}
+	}
 	// one_shot/consumed_at make a bare `gov ask approve` (no --rule) a real
 	// single-use override: applied to exactly one subsequent evaluation of
 	// the same job+rule, then marked consumed. Zero/empty defaults on
@@ -468,9 +493,16 @@ func RecordArtifacts(db *sql.DB, artifacts []ArtifactRecord, created string) err
 // later investigation trace a verdict back to exactly what Assayer code,
 // check profile, and Python interpreter produced it.
 type AssayEvaluationRecord struct {
-	RunID          string
-	AttemptID      string
-	JobID          string
+	RunID     string
+	AttemptID string
+	JobID     string
+	// ArtifactName/ArtifactSHA256 (Sol audit finding #16, "multi-artifact
+	// assay") identify which produced artifact this row evaluated — required
+	// now that a single run can write more than one assay_evaluations row.
+	// Empty for the pre-fix "skipped"/"no artifact produced" rows that have
+	// no specific artifact to name.
+	ArtifactName   string
+	ArtifactSHA256 string
 	Profile        string
 	PolicyVersion  string
 	Verdict        string
@@ -507,8 +539,8 @@ func RecordAssayEvaluation(db *sql.DB, rec AssayEvaluationRecord) error {
 	if err != nil {
 		return err
 	}
-	_, err = db.Exec(`INSERT INTO assay_evaluations(run_id,attempt_id,job_id,profile,policy_version,verdict,failed_checks,checks_hash,duration_ms,created,assayer_commit,profile_hash,validators_hash,python_version,profile_definition_hash,validator_implementation_hash,validator_config_hash) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-		rec.RunID, rec.AttemptID, rec.JobID, rec.Profile, rec.PolicyVersion, rec.Verdict, string(failedJSON), rec.ChecksHash, rec.DurationMS, rec.Created,
+	_, err = db.Exec(`INSERT INTO assay_evaluations(run_id,attempt_id,job_id,artifact_name,artifact_sha256,profile,policy_version,verdict,failed_checks,checks_hash,duration_ms,created,assayer_commit,profile_hash,validators_hash,python_version,profile_definition_hash,validator_implementation_hash,validator_config_hash) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		rec.RunID, rec.AttemptID, rec.JobID, rec.ArtifactName, rec.ArtifactSHA256, rec.Profile, rec.PolicyVersion, rec.Verdict, string(failedJSON), rec.ChecksHash, rec.DurationMS, rec.Created,
 		rec.AssayerCommit, rec.ProfileHash, rec.ValidatorsHash, rec.PythonVersion,
 		rec.ProfileDefinitionHash, rec.ValidatorImplementationHash, rec.ValidatorConfigHash)
 	return err
@@ -517,7 +549,7 @@ func RecordAssayEvaluation(db *sql.DB, rec AssayEvaluationRecord) error {
 // AssayEvaluationsForRun returns every assay_evaluations row for one run,
 // oldest first — for tests and CLI inspection.
 func AssayEvaluationsForRun(db *sql.DB, runID string) ([]AssayEvaluationRecord, error) {
-	rows, err := db.Query(`SELECT run_id,attempt_id,job_id,profile,policy_version,verdict,failed_checks,checks_hash,duration_ms,created,assayer_commit,profile_hash,validators_hash,python_version,profile_definition_hash,validator_implementation_hash,validator_config_hash FROM assay_evaluations WHERE run_id=? ORDER BY id ASC`, runID)
+	rows, err := db.Query(`SELECT run_id,attempt_id,job_id,artifact_name,artifact_sha256,profile,policy_version,verdict,failed_checks,checks_hash,duration_ms,created,assayer_commit,profile_hash,validators_hash,python_version,profile_definition_hash,validator_implementation_hash,validator_config_hash FROM assay_evaluations WHERE run_id=? ORDER BY id ASC`, runID)
 	if err != nil {
 		return nil, err
 	}
@@ -526,7 +558,7 @@ func AssayEvaluationsForRun(db *sql.DB, runID string) ([]AssayEvaluationRecord, 
 	for rows.Next() {
 		var rec AssayEvaluationRecord
 		var failedJSON string
-		if err := rows.Scan(&rec.RunID, &rec.AttemptID, &rec.JobID, &rec.Profile, &rec.PolicyVersion, &rec.Verdict, &failedJSON, &rec.ChecksHash, &rec.DurationMS, &rec.Created,
+		if err := rows.Scan(&rec.RunID, &rec.AttemptID, &rec.JobID, &rec.ArtifactName, &rec.ArtifactSHA256, &rec.Profile, &rec.PolicyVersion, &rec.Verdict, &failedJSON, &rec.ChecksHash, &rec.DurationMS, &rec.Created,
 			&rec.AssayerCommit, &rec.ProfileHash, &rec.ValidatorsHash, &rec.PythonVersion,
 			&rec.ProfileDefinitionHash, &rec.ValidatorImplementationHash, &rec.ValidatorConfigHash); err != nil {
 			return nil, err

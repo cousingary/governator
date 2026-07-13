@@ -68,7 +68,7 @@ PROFILES = {
         ],
     },
     "coding-output-v2": {
-        "version": "2.0.0",
+        "version": "2.1.0",
         "enforcement": "blocking",
         "on_fail": "quarantine",
         "on_error": "quarantine",
@@ -88,7 +88,12 @@ PROFILES = {
             {"kind": "no_placeholder", "args": {"field": "content"}},
             {"kind": "no_boilerplate", "args": {"field": "content"}},
             {"kind": "schema", "name": "artifact_schema", "args": {"required_fields": CODING_OUTPUT_ENVELOPE_FIELDS}},
-            {"kind": "file_path_consistency", "args": {}},
+            # v2.1.0 (Sol audit finding #17): file_path_consistency now keys
+            # off artifact_declared_path (the artifact's real workspace
+            # path) instead of the default artifact_name, which is only ever
+            # a logical handle (e.g. "code") and was never guaranteed to
+            # carry a real file extension.
+            {"kind": "file_path_consistency", "args": {"name_field": "artifact_declared_path"}},
             {"kind": "domain_validator", "args": {}},
         ],
     },

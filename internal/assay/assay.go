@@ -63,24 +63,54 @@ const (
 // wire-shape change, hence the version bump.
 const BridgePolicyVersion = "gov-assay-evaluate-v2"
 
+// ArtifactProtocolVersion identifies the shape of the artifact-identity wire
+// fields below (ArtifactDeclaredPath/ArtifactStoredPath/ArtifactMediaType/
+// ArtifactLanguage — Sol audit finding #17). It is a separate constant from
+// BridgePolicyVersion/PolicyVersion: policy_version is an opaque,
+// caller-supplied tag Assayer only ever echoes back (never validates —
+// tests deliberately send arbitrary values like "test-policy-v1" to prove
+// exactly that), whereas protocol_version is a structural contract this
+// bridge enforces: Evaluate always stamps the current value, and Assayer's
+// cli.py rejects a request whose protocol_version doesn't match exactly
+// (Sol audit P1.7: "an old Assayer talking to a new Governator, or vice
+// versa, must fail closed, not silently skip checks"). Bump only when the
+// artifact-identity field set itself changes shape.
+const ArtifactProtocolVersion = "gov-assay-artifact-protocol-v1"
+
 const defaultTimeout = 60 * time.Second
 
 // Request is the JSON object written to the Assayer subprocess's stdin.
 // Field names/order follow the plan's Phase 3A schema (Sol §6) exactly.
+//
+// ArtifactDeclaredPath/ArtifactStoredPath/ArtifactMediaType/ArtifactLanguage
+// (Sol audit finding #17) let a file-aware Assayer check work from the
+// artifact's real declared workspace path and operator-declared
+// language/media type instead of ArtifactName, which is only ever a logical
+// handle (e.g. "code" for a file whose real path is "result.py") and was
+// never meant to double as a filename. ArtifactStoredPath is the absolute
+// host path in Governator's artifact store — carried on the wire for
+// completeness/audit trail, but Assayer's cli.py deliberately does not copy
+// it into the per-check payload validators see (the audit: "the stored
+// absolute path should not be exposed unnecessarily to validators").
 type Request struct {
-	RunID           string          `json:"run_id"`
-	AttemptID       string          `json:"attempt_id"`
-	JobID           string          `json:"job_id"`
-	ContractHash    string          `json:"contract_hash"`
-	JobType         string          `json:"job_type"`
-	Backend         string          `json:"backend"`
-	Model           string          `json:"model"`
-	RouteDecisionID string          `json:"route_decision_id"`
-	ArtifactName    string          `json:"artifact_name"`
-	ArtifactSHA256  string          `json:"artifact_sha256"`
-	Payload         json.RawMessage `json:"payload"`
-	CheckProfile    string          `json:"check_profile"`
-	PolicyVersion   string          `json:"policy_version"`
+	RunID                string          `json:"run_id"`
+	AttemptID            string          `json:"attempt_id"`
+	JobID                string          `json:"job_id"`
+	ContractHash         string          `json:"contract_hash"`
+	JobType              string          `json:"job_type"`
+	Backend              string          `json:"backend"`
+	Model                string          `json:"model"`
+	RouteDecisionID      string          `json:"route_decision_id"`
+	ArtifactName         string          `json:"artifact_name"`
+	ArtifactSHA256       string          `json:"artifact_sha256"`
+	ArtifactDeclaredPath string          `json:"artifact_declared_path"`
+	ArtifactStoredPath   string          `json:"artifact_stored_path"`
+	ArtifactMediaType    string          `json:"artifact_media_type"`
+	ArtifactLanguage     string          `json:"artifact_language"`
+	Payload              json.RawMessage `json:"payload"`
+	CheckProfile         string          `json:"check_profile"`
+	PolicyVersion        string          `json:"policy_version"`
+	ProtocolVersion      string          `json:"protocol_version"`
 }
 
 // Verdict is the JSON object read from the Assayer subprocess's stdout.
@@ -158,6 +188,9 @@ func Evaluate(ctx context.Context, cfg Config, req Request, artifactPath string)
 	if req.PolicyVersion == "" {
 		req.PolicyVersion = BridgePolicyVersion
 	}
+	// ProtocolVersion is never caller-supplied (no contract YAML field sets
+	// it) — always stamp the binary's own value so Assayer can enforce it.
+	req.ProtocolVersion = ArtifactProtocolVersion
 	payload, err := json.Marshal(req)
 	if err != nil {
 		return errorVerdict(fmt.Sprintf("assay: marshal request: %s", err))

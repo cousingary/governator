@@ -22,6 +22,225 @@ func assayProducerContract(root, enforcement string) contracts.Contract {
 	return c
 }
 
+// multiArtifactProducerContract produces three artifacts (alpha, beta,
+// gamma) instead of artifactProducerContract's one — the fixture for Sol
+// audit finding #16 ("Assayer evaluates only the first produced artifact").
+func multiArtifactProducerContract(root string) contracts.Contract {
+	c := contract(root)
+	c.JobID = "multi-artifact-producer"
+	c.Produces = []contracts.ArtifactSpec{
+		{Name: "alpha", Path: ".governator/artifacts/alpha.json", MaxBytes: 262144},
+		{Name: "beta", Path: ".governator/artifacts/beta.json", MaxBytes: 262144},
+		{Name: "gamma", Path: ".governator/artifacts/gamma.json", MaxBytes: 262144},
+	}
+	return c
+}
+
+func writeMultiArtifactFakeBackend(t *testing.T) string {
+	t.Helper()
+	return writeFakeBackend(t, `mkdir -p output .governator/artifacts
+printf 'ok\n' > output/result.txt
+printf '{"summary":"alpha"}' > .governator/artifacts/alpha.json
+printf '{"summary":"beta"}' > .governator/artifacts/beta.json
+printf '{"summary":"gamma"}' > .governator/artifacts/gamma.json
+printf '{"status":"complete","files_changed":["output/result.txt"],"commands_run":0,"validation":{"self_checked":true},"violations":[],"blockers":[],"next_recommended_action":"none"}\n' > RESULT.json
+printf '{"type":"result","total_cost_usd":0.05}\n'
+`)
+}
+
+// stubAssayerFailsNamedArtifact is a conditional Assayer stub (unlike
+// writeAssayerStub's fixed-response bodies): it reads the real evaluate
+// request off stdin and returns FAIL only for the artifact named
+// failArtifact, PASS for every other artifact — letting a test prove that
+// every produced artifact reached its own independent subprocess call
+// rather than only artifactRecords[0].
+func stubAssayerFailsNamedArtifact(t *testing.T, failArtifact string) string {
+	t.Helper()
+	return writeAssayerStub(t, `import json, sys
+req = json.loads(sys.stdin.read())
+name = req.get("artifact_name")
+if name == "`+failArtifact+`":
+    verdict, failed = "fail", ["no_boilerplate:content"]
+else:
+    verdict, failed = "pass", []
+print(json.dumps({
+    "verdict": verdict, "failed_checks": failed, "had_error": False,
+    "evaluation_id": "e", "trace_id": None, "quarantine_id": "",
+    "checks_result_hash": "h-" + str(name), "profile_definition_hash": "p",
+    "validator_implementation_hash": "vi", "validator_config_hash": "vc",
+    "policy_version": "v1",
+}))
+`)
+}
+
+// TestSol3AssayEvaluatesEveryProducedArtifactThirdFailureBlocks is the
+// literal corpus #12 reproduction: a contract producing three artifacts
+// under a blocking assay where artifact #3 (by evaluation order, "gamma" —
+// alphabetically last, matching collectProducedArtifacts's sort) fails.
+// Pre-fix, runAssayStep evaluated only artifactRecords[0] ("alpha") and
+// would have approved the run outright; the fix must block on gamma's
+// failure and must still have evaluated alpha and beta independently (three
+// ledger rows, not one).
+func TestSol3AssayEvaluatesEveryProducedArtifactThirdFailureBlocks(t *testing.T) {
+	root, _ := fixture(t)
+	home := t.TempDir()
+	t.Setenv("GOV_HOME", home)
+	setAssayEnv(t, stubAssayerFailsNamedArtifact(t, "gamma"))
+	t.Setenv("GOV_CLAUDE_BIN", writeMultiArtifactFakeBackend(t))
+	promptRoot := t.TempDir()
+	writePrompt(t, promptRoot, "claude-code", "surgeon")
+	t.Setenv("GOV_PROMPTS", promptRoot)
+
+	c := multiArtifactProducerContract(root)
+	c.Assay = &contracts.Assay{Profile: "coding-output-v1", Enforcement: "blocking"}
+
+	rec, err := New().Run(context.Background(), c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rec.Status != "QUARANTINED" {
+		t.Fatalf("expected the third artifact's FAIL verdict to quarantine the run, got status=%s message=%s", rec.Status, rec.Message)
+	}
+	if rec.FailureTaxonomy != "ASSAY_FAILED" {
+		t.Fatalf("expected ASSAY_FAILED taxonomy, got %s", rec.FailureTaxonomy)
+	}
+
+	db, err := observability.Open(home)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	rows, err := observability.AssayEvaluationsForRun(db, rec.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 3 {
+		t.Fatalf("expected all three produced artifacts to be independently evaluated (3 ledger rows), got %d: %+v", len(rows), rows)
+	}
+	byName := map[string]observability.AssayEvaluationRecord{}
+	for _, row := range rows {
+		byName[row.ArtifactName] = row
+	}
+	for _, name := range []string{"alpha", "beta"} {
+		if row, ok := byName[name]; !ok || row.Verdict != "pass" {
+			t.Fatalf("expected artifact %q to have an independent pass verdict, got %+v (ok=%v)", name, row, ok)
+		}
+	}
+	if row, ok := byName["gamma"]; !ok || row.Verdict != "fail" {
+		t.Fatalf("expected artifact %q to have a fail verdict, got %+v (ok=%v)", "gamma", row, ok)
+	}
+}
+
+// TestSol3UndeclaredProducedArtifactFailsClosed covers the other half of
+// finding #16: a contract using the new per-artifact assays[] list that
+// does not cover every produced artifact, and declares no contract-wide
+// default profile either, must fail closed on the uncovered artifact — not
+// silently skip it.
+func TestSol3UndeclaredProducedArtifactFailsClosed(t *testing.T) {
+	root, _ := fixture(t)
+	home := t.TempDir()
+	t.Setenv("GOV_HOME", home)
+	setAssayEnv(t, writeAssayerStub(t, stubPassVerdict))
+	t.Setenv("GOV_CLAUDE_BIN", writeMultiArtifactFakeBackend(t))
+	promptRoot := t.TempDir()
+	writePrompt(t, promptRoot, "claude-code", "surgeon")
+	t.Setenv("GOV_PROMPTS", promptRoot)
+
+	c := multiArtifactProducerContract(root)
+	// No contract-wide Profile: alpha and beta are covered, gamma is not —
+	// gamma must be Undeclared and fail closed regardless of enforcement.
+	c.Assay = &contracts.Assay{Artifacts: []contracts.ArtifactAssay{
+		{Artifact: "alpha", Profile: "coding-output-v1", Enforcement: "blocking"},
+		{Artifact: "beta", Profile: "coding-output-v1", Enforcement: "blocking"},
+	}}
+
+	rec, err := New().Run(context.Background(), c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rec.Status != "QUARANTINED" {
+		t.Fatalf("expected the undeclared artifact to quarantine the run, got status=%s message=%s", rec.Status, rec.Message)
+	}
+	if !strings.Contains(rec.Message, "gamma") || !strings.Contains(rec.Message, "no declared assay") {
+		t.Fatalf("expected the quarantine reason to name the undeclared artifact, got message=%q", rec.Message)
+	}
+
+	db, err := observability.Open(home)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	rows, err := observability.AssayEvaluationsForRun(db, rec.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	byName := map[string]observability.AssayEvaluationRecord{}
+	for _, row := range rows {
+		byName[row.ArtifactName] = row
+	}
+	if row, ok := byName["gamma"]; !ok || row.Verdict != "error" {
+		t.Fatalf("expected an error-verdict ledger row for the undeclared artifact, got %+v (ok=%v)", row, ok)
+	}
+	if row, ok := byName["alpha"]; !ok || row.Verdict != "pass" {
+		t.Fatalf("expected alpha (covered by assays[]) to still evaluate normally, got %+v (ok=%v)", row, ok)
+	}
+}
+
+// TestSol3ArtifactAssayNoneExemptsWithoutOverBlocking proves the third valid
+// resolution from finding #16 ("explicitly declare assay: none"): an
+// exempted artifact is recorded as skipped but never blocks, while its
+// siblings still evaluate and gate the merge normally.
+func TestSol3ArtifactAssayNoneExemptsWithoutOverBlocking(t *testing.T) {
+	root, _ := fixture(t)
+	home := t.TempDir()
+	t.Setenv("GOV_HOME", home)
+	setAssayEnv(t, writeAssayerStub(t, stubPassVerdict))
+	t.Setenv("GOV_CLAUDE_BIN", writeMultiArtifactFakeBackend(t))
+	promptRoot := t.TempDir()
+	writePrompt(t, promptRoot, "claude-code", "surgeon")
+	t.Setenv("GOV_PROMPTS", promptRoot)
+
+	c := multiArtifactProducerContract(root)
+	c.Assay = &contracts.Assay{Artifacts: []contracts.ArtifactAssay{
+		{Artifact: "alpha", Profile: "coding-output-v1", Enforcement: "blocking"},
+		{Artifact: "beta", Profile: "coding-output-v1", Enforcement: "blocking"},
+		{Artifact: "gamma", Profile: contracts.AssayProfileNone},
+	}}
+
+	rec, err := New().Run(context.Background(), c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rec.Status != "APPROVED" {
+		t.Fatalf("expected the exempt artifact to never block an otherwise-passing run, got status=%s message=%s", rec.Status, rec.Message)
+	}
+
+	db, err := observability.Open(home)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	rows, err := observability.AssayEvaluationsForRun(db, rec.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 3 {
+		t.Fatalf("expected all three artifacts to have a ledger row (two evaluated, one exempt), got %d: %+v", len(rows), rows)
+	}
+	byName := map[string]observability.AssayEvaluationRecord{}
+	for _, row := range rows {
+		byName[row.ArtifactName] = row
+	}
+	if row, ok := byName["gamma"]; !ok || row.Verdict != "skipped" {
+		t.Fatalf("expected the exempt artifact to be recorded as skipped, got %+v (ok=%v)", row, ok)
+	}
+	for _, name := range []string{"alpha", "beta"} {
+		if row, ok := byName[name]; !ok || row.Verdict != "pass" {
+			t.Fatalf("expected artifact %q to still evaluate and pass, got %+v (ok=%v)", name, row, ok)
+		}
+	}
+}
+
 // writeAssayerStub writes a minimal fake `cli.py` that plays the Assayer
 // subprocess role without depending on the real Python package — this
 // mirrors the plan's "fake/stub python3 script" option (the real CLI is

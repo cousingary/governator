@@ -152,7 +152,10 @@ func collectProducedArtifacts(home, work, runID string, specs []contracts.Artifa
 			violations = append(violations, "artifact store no-follow write: "+spec.Name+": "+err.Error())
 			continue
 		}
-		records = append(records, observability.ArtifactRecord{RunID: runID, Name: spec.Name, Path: dst, SHA256: sha, Bytes: info.Size(), SchemaOK: schemaOK})
+		records = append(records, observability.ArtifactRecord{
+			RunID: runID, Name: spec.Name, Path: dst, SHA256: sha, Bytes: info.Size(), SchemaOK: schemaOK,
+			DeclaredPath: rel, Language: spec.Language, MediaType: spec.MediaType,
+		})
 	}
 	sort.Slice(records, func(i, j int) bool { return records[i].Name < records[j].Name })
 	return records, violations

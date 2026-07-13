@@ -246,3 +246,55 @@ func TestDescribeEnvironmentPythonVersion(t *testing.T) {
 		t.Fatalf("expected PythonVersion to mention python, got %q", env.PythonVersion)
 	}
 }
+
+// TestSol3ArtifactDeclaredPathReachesRealAssayerFilePathCheck is the corpus
+// #12 ".py path reaches Assayer's language checks" item, proven against the
+// real pinned Assayer fixture (not a stub): ArtifactName is a bare logical
+// handle with no extension ("code") — the exact shape Sol audit finding #17
+// reproduced — while ArtifactDeclaredPath carries the real "result.py". The
+// real coding-output-v2 file_path_consistency check must key off the
+// declared path, not the name, and pass.
+func TestSol3ArtifactDeclaredPathReachesRealAssayerFilePathCheck(t *testing.T) {
+	requirePython3(t)
+	repo, err := filepath.Abs(filepath.Join("testdata", "assayer_fixture"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	dir := t.TempDir()
+	content := `{"content":"def add(a, b):\n    return a + b\n","language":"python"}`
+	path, sha := writeArtifact(t, dir, content)
+
+	req := Request{
+		RunID: "run-1", AttemptID: "run-1", JobID: "job-1", ContractHash: "deadbeef",
+		JobType: "coding", Backend: "claude-code",
+		ArtifactName: "code", ArtifactSHA256: sha,
+		ArtifactDeclaredPath: "result.py",
+		Payload:              json.RawMessage(content),
+		CheckProfile:         "coding-output-v2",
+	}
+
+	v := Evaluate(context.Background(), Config{Repo: repo, Python: "python3"}, req, path)
+	if v.Verdict != VerdictPass {
+		t.Fatalf("expected pass verdict keying off artifact_declared_path against the real assayer CLI, got %+v", v)
+	}
+
+	// Negative companion, same call: a declared path that mismatches the
+	// declared language must still fail file_path_consistency — proving
+	// the real CLI is actually checking the field, not ignoring it.
+	mismatched := req
+	mismatched.ArtifactDeclaredPath = "result.js"
+	badV := Evaluate(context.Background(), Config{Repo: repo, Python: "python3"}, mismatched, path)
+	if badV.Verdict != VerdictFail {
+		t.Fatalf("expected fail verdict for a declared-path/language mismatch, got %+v", badV)
+	}
+	found := false
+	for _, fc := range badV.FailedChecks {
+		if fc == "file_path_consistency" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("expected file_path_consistency in failed_checks, got %v", badV.FailedChecks)
+	}
+}

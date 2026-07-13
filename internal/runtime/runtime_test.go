@@ -1404,6 +1404,15 @@ func TestRequiresCompleteTranscript(t *testing.T) {
 		{"blocking assay, no flag", contracts.Contract{Assay: &contracts.Assay{Profile: "coding-output-v1", Enforcement: "blocking"}}, true},
 		{"advisory assay, no flag", contracts.Contract{Assay: &contracts.Assay{Profile: "coding-output-v1", Enforcement: "advisory"}}, false},
 		{"telemetry assay, no flag", contracts.Contract{Assay: &contracts.Assay{Profile: "coding-output-v1", Enforcement: "telemetry"}}, false},
+		// Sol audit finding #16: a contract declaring blocking only via a
+		// per-artifact assays[] entry (no contract-wide default) is just as
+		// evidence-bearing as one declaring it contract-wide.
+		{"per-artifact blocking only, no contract-wide default", contracts.Contract{Assay: &contracts.Assay{
+			Artifacts: []contracts.ArtifactAssay{{Artifact: "patch-report", Profile: "coding-output-v1", Enforcement: "blocking"}},
+		}}, true},
+		{"per-artifact advisory only, no contract-wide default", contracts.Contract{Assay: &contracts.Assay{
+			Artifacts: []contracts.ArtifactAssay{{Artifact: "patch-report", Profile: "coding-output-v1", Enforcement: "advisory"}},
+		}}, false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

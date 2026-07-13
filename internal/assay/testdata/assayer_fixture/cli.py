@@ -38,6 +38,19 @@ _SINCE_RE = re.compile(r"^(\d+)([dh])$")
 # "incompatible JSON field change" this constant exists to flag.
 EVALUATE_PROTOCOL_VERSION = "gov-assay-evaluate-v2"
 
+# ARTIFACT_PROTOCOL_VERSION (Sol audit finding #17 / P1.7) is a distinct
+# version from EVALUATE_PROTOCOL_VERSION/policy_version above. policy_version
+# is an opaque caller-supplied tag this CLI only ever echoes back (never
+# validates); protocol_version is the artifact-identity wire shape
+# (artifact_declared_path/artifact_stored_path/artifact_media_type/
+# artifact_language) that Governator's internal/assay.Evaluate always
+# stamps. A request whose protocol_version doesn't match exactly is rejected
+# outright (see _cmd_evaluate) rather than silently evaluated against
+# whichever fields happen to be present — an old Governator (missing these
+# fields) or a mismatched one must fail closed, not silently skip the
+# file-aware checks that depend on them.
+ARTIFACT_PROTOCOL_VERSION = "gov-assay-artifact-protocol-v1"
+
 
 def parse_since(value: str) -> str:
     """Parse Nd / Nh (e.g. '7d', '24h') into a UTC ISO cutoff timestamp."""
@@ -324,6 +337,26 @@ def _cmd_evaluate(args, stdin_text=None):
     # Echo the caller's policy_version if given; otherwise fall back to this
     # bridge's own wire-protocol version so the field is never silently null.
     policy_version = request.get("policy_version") or EVALUATE_PROTOCOL_VERSION
+
+    # Sol audit finding #17 / P1.7: the artifact-identity wire shape is a
+    # separate, strictly-enforced protocol version from policy_version above
+    # (see ARTIFACT_PROTOCOL_VERSION's doc comment). A missing or mismatched
+    # value fails closed here, before any check profile or payload is even
+    # looked at — an old Governator not sending these fields, or a
+    # mismatched one, must not silently evaluate with whatever partial
+    # artifact identity happens to be present.
+    request_protocol_version = request.get("protocol_version")
+    if request_protocol_version != ARTIFACT_PROTOCOL_VERSION:
+        _emit(_verdict_payload(
+            "error", [], True,
+            checks_result_hash=_checks_result_hash({}), policy_version=policy_version,
+            reason=(
+                f"artifact protocol_version mismatch: governator sent "
+                f"{request_protocol_version!r}, assayer expects {ARTIFACT_PROTOCOL_VERSION!r}"
+            ),
+        ))
+        return 0
+
     profile_name = args.profile or request.get("check_profile") or ""
     profile = profiles_mod.get_profile(profile_name)
     if profile is None:
@@ -340,6 +373,17 @@ def _cmd_evaluate(args, stdin_text=None):
     item = dict(payload)
     item["artifact_name"] = request.get("artifact_name")
     item["artifact_sha256"] = request.get("artifact_sha256")
+    # artifact_declared_path (Sol audit finding #17) is the artifact's real
+    # workspace-relative path — what file_path_consistency should check a
+    # declared language's extension against, not artifact_name (a logical
+    # handle that was never meant to double as a filename). Media
+    # type/language are also made available to validators (reserved for
+    # future file-aware checks); artifact_stored_path is deliberately NOT
+    # copied here — the audit: "the stored absolute path should not be
+    # exposed unnecessarily to validators."
+    item["artifact_declared_path"] = request.get("artifact_declared_path")
+    item["artifact_media_type"] = request.get("artifact_media_type")
+    item["artifact_language"] = request.get("artifact_language")
 
     live_checks = profiles_mod.build_checks(profile)
     result = verify_scored(item, live_checks, enforcement=profile["enforcement"])

@@ -137,6 +137,15 @@ type ArtifactSpec struct {
 	Path     string `yaml:"path" json:"path"`
 	Schema   string `yaml:"schema,omitempty" json:"schema,omitempty"`
 	MaxBytes int64  `yaml:"max_bytes" json:"max_bytes"`
+
+	// Language and MediaType (Sol audit finding #17) are optional operator
+	// declarations that flow into the Governator<->Assayer wire protocol as
+	// artifact_language/artifact_media_type, alongside the artifact's real
+	// declared workspace path (artifact_declared_path) — so a file-aware
+	// Assayer check has something more precise than the artifact's logical
+	// Name (e.g. "code") to check against.
+	Language  string `yaml:"language,omitempty" json:"language,omitempty"`
+	MediaType string `yaml:"media_type,omitempty" json:"media_type,omitempty"`
 }
 
 // Assay is the optional block a contract uses to opt into the
@@ -146,13 +155,41 @@ type ArtifactSpec struct {
 // into the existing quarantine path exactly like a failed validator;
 // "advisory"/"telemetry" record the verdict in the assay_evaluations ledger
 // table but never block the merge.
+// Profile/Enforcement here are the contract-wide default: any produced
+// artifact not named in Artifacts inherits them. Artifacts (Sol audit
+// finding #16, "Assayer evaluates only the first produced artifact") lets a
+// contract with several `produces` entries give each one its own profile
+// and enforcement instead of one block applying blindly to all of them
+// (or, pre-fix, silently only to artifactRecords[0]). Profile/Enforcement
+// may be left unset only when every produced artifact is covered by an
+// Artifacts entry — see validateAssay.
 type Assay struct {
-	Profile     string `yaml:"profile" json:"profile"`
-	Enforcement string `yaml:"enforcement" json:"enforcement"`
+	Profile     string          `yaml:"profile,omitempty" json:"profile,omitempty"`
+	Enforcement string          `yaml:"enforcement,omitempty" json:"enforcement,omitempty"`
+	Artifacts   []ArtifactAssay `yaml:"assays,omitempty" json:"assays,omitempty"`
 }
 
-// AssayEnforcements are the valid Assay.Enforcement values (fail-closed:
-// anything else is a validation error, same pattern as OnViolation/RiskClass).
+// ArtifactAssay declares assay handling for one specific produced artifact
+// (matched by ArtifactSpec.Name), overriding the contract-wide default.
+// Profile == AssayProfileNone ("none") explicitly exempts this artifact from
+// assay evaluation entirely — Enforcement must be left unset in that case.
+// Otherwise both Profile and Enforcement are required, exactly like the
+// contract-wide block.
+type ArtifactAssay struct {
+	Artifact    string `yaml:"artifact" json:"artifact"`
+	Profile     string `yaml:"profile,omitempty" json:"profile,omitempty"`
+	Enforcement string `yaml:"enforcement,omitempty" json:"enforcement,omitempty"`
+}
+
+// AssayProfileNone is the ArtifactAssay.Profile sentinel that explicitly
+// exempts one produced artifact from assay evaluation (Sol audit finding
+// #16: "every produced artifact should either map to a declared assay,
+// explicitly declare assay: none, or inherit a contract-wide profile").
+const AssayProfileNone = "none"
+
+// AssayEnforcements are the valid Assay.Enforcement/ArtifactAssay.Enforcement
+// values (fail-closed: anything else is a validation error, same pattern as
+// OnViolation/RiskClass).
 var AssayEnforcements = map[string]bool{"blocking": true, "advisory": true, "telemetry": true}
 
 // DockerRunnerConfig configures the Phase 5 DockerRunner: host-level
@@ -959,15 +996,65 @@ func validateArtifacts(c Contract, add func(string, string)) {
 // an unset Assay block is fine (assay is opt-in), but a present one must
 // name a profile and a known enforcement mode — an unrecognized enforcement
 // value must never be silently treated as "off" or "advisory".
+//
+// assay.profile is the contract-wide default and may be omitted only when
+// every produced artifact is instead covered by an assays[] entry — a bare
+// `assay:` block with neither is meaningless (nothing would ever be
+// evaluated) and is rejected. Each assays[] entry either exempts its
+// artifact (profile: none, enforcement must be unset) or names a profile
+// and a valid enforcement, same rule as the contract-wide default. artifact
+// names are validated against c.Produces when Produces is non-empty, so a
+// typo'd artifact name is caught here rather than silently never matching
+// anything at evaluation time.
 func validateAssay(c Contract, add func(string, string)) {
 	if c.Assay == nil {
 		return
 	}
-	if strings.TrimSpace(c.Assay.Profile) == "" {
-		add("assay.profile", "is required when the assay block is present")
+	hasDefault := strings.TrimSpace(c.Assay.Profile) != ""
+	if hasDefault {
+		if !AssayEnforcements[c.Assay.Enforcement] {
+			add("assay.enforcement", "must be one of blocking, advisory, telemetry")
+		}
+	} else {
+		if len(c.Assay.Artifacts) == 0 {
+			add("assay.profile", "is required when the assay block is present and no per-artifact assays[] are declared")
+		}
+		if c.Assay.Enforcement != "" {
+			add("assay.enforcement", "must not be set without assay.profile")
+		}
 	}
-	if !AssayEnforcements[c.Assay.Enforcement] {
-		add("assay.enforcement", "must be one of blocking, advisory, telemetry")
+
+	producesNames := map[string]bool{}
+	for _, artifact := range c.Produces {
+		producesNames[strings.TrimSpace(artifact.Name)] = true
+	}
+	seenArtifacts := map[string]bool{}
+	for i, aa := range c.Assay.Artifacts {
+		field := fmt.Sprintf("assay.assays[%d]", i)
+		name := strings.TrimSpace(aa.Artifact)
+		if name == "" {
+			add(field+".artifact", "is required")
+		} else {
+			if seenArtifacts[name] {
+				add(field+".artifact", "duplicates another per-artifact assay declaration")
+			}
+			seenArtifacts[name] = true
+			if len(producesNames) > 0 && !producesNames[name] {
+				add(field+".artifact", "must name an artifact declared in produces")
+			}
+		}
+		if strings.TrimSpace(aa.Profile) == AssayProfileNone {
+			if aa.Enforcement != "" {
+				add(field+".enforcement", `must not be set when profile is "none"`)
+			}
+			continue
+		}
+		if strings.TrimSpace(aa.Profile) == "" {
+			add(field+".profile", `is required (or set to "none" to exempt this artifact)`)
+		}
+		if !AssayEnforcements[aa.Enforcement] {
+			add(field+".enforcement", "must be one of blocking, advisory, telemetry")
+		}
 	}
 }
 

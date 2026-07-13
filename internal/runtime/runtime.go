@@ -24,7 +24,6 @@ import (
 	"time"
 
 	"github.com/cousingary/governator/internal/agents"
-	"github.com/cousingary/governator/internal/assay"
 	"github.com/cousingary/governator/internal/attest"
 	"github.com/cousingary/governator/internal/breaker"
 	"github.com/cousingary/governator/internal/config"
@@ -705,7 +704,10 @@ func enforceContainment(db *sql.DB, c contracts.Contract, agent agents.Agent, cf
 // in explicitly (docker.require_complete_transcript, or local's equivalent
 // require_complete_transcript for runner: local — Sol High 11) or the run is
 // evidence-bearing by construction — a blocking assay's verdict gates the
-// merge, so the audit trail behind that verdict must be whole.
+// merge, so the audit trail behind that verdict must be whole. Checks both
+// the contract-wide default and any per-artifact assays[] override (Sol
+// audit finding #16) — a contract declaring blocking only per-artifact is
+// just as evidence-bearing as one declaring it contract-wide.
 func requiresCompleteTranscript(c contracts.Contract) bool {
 	if c.Docker != nil && c.Docker.RequireCompleteTranscript {
 		return true
@@ -713,7 +715,7 @@ func requiresCompleteTranscript(c contracts.Contract) bool {
 	if c.Local != nil && c.Local.RequireCompleteTranscript {
 		return true
 	}
-	return c.Assay != nil && c.Assay.Enforcement == assay.EnforcementBlocking
+	return c.Assay != nil && assayDeclaresBlocking(c.Assay)
 }
 
 const workspaceCleanupTimeout = 2 * time.Minute
