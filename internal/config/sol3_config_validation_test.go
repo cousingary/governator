@@ -237,3 +237,31 @@ func TestSol3LoadStrictAllowsDuplicateYAMLMapKeysIsAlreadyRejected(t *testing.T)
 		t.Fatalf("expected a duplicate-key decode error, got: %v", err)
 	}
 }
+
+// attest.probe_timeout_seconds is merged only when positive, so — exactly like
+// the P1.2 findings for max_minutes/assay.timeout_seconds — a supplied bad value
+// would be silently replaced by the default unless raw validation rejects it.
+func TestSol3LoadStrictRejectsInvalidAttestProbeTimeout(t *testing.T) {
+	cleanEnv(t)
+	for _, tc := range []struct {
+		name  string
+		value string
+	}{
+		{"zero", "0"},
+		{"negative", "-5"},
+		{"nan", ".nan"},
+		{"positive infinity", ".inf"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cleanEnv(t)
+			path := filepath.Join(t.TempDir(), "config.yaml")
+			t.Setenv("GOV_CONFIG", path)
+			if err := os.WriteFile(path, []byte("attest: {probe_timeout_seconds: "+tc.value+"}\n"), 0644); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := LoadStrict(); err == nil {
+				t.Fatalf("expected %s probe_timeout_seconds to be rejected, got nil error", tc.name)
+			}
+		})
+	}
+}

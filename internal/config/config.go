@@ -160,6 +160,22 @@ type Assay struct {
 	TimeoutSeconds int    `yaml:"timeout_seconds"`
 }
 
+// Attest bounds the S4 behavioral capability probes. ProbeTimeoutSeconds is a
+// per-probe wall-clock budget: each probe drives a REAL backend agent through a
+// multi-step task (write in-workspace, attempt a sibling write, attempt a
+// protected-host read, attempt four network egress targets, emit a completion
+// marker), so the budget must cover a genuine agent turn, not a subprocess
+// call. A budget too small to complete an honest probe is not a safe default:
+// every probe times out, every capability is recorded unattested, and — because
+// containment tiering refuses medium/high-risk local work on an unattested
+// backend — no local job can ever run. The probe still fails CLOSED on timeout
+// (a timed-out capability is never assumed present); the timeout is recorded
+// distinctly in ProbeNotes so an operator can tell "we could not observe this"
+// from "the backend failed the check."
+type Attest struct {
+	ProbeTimeoutSeconds int `yaml:"probe_timeout_seconds"`
+}
+
 type Config struct {
 	ProtectedManifest string             `yaml:"protected_manifest"`
 	SnapshotDir       string             `yaml:"snapshot_dir"`
@@ -174,6 +190,7 @@ type Config struct {
 	Doctrine          Doctrine           `yaml:"doctrine"`
 	Defaults          Defaults           `yaml:"defaults"`
 	Assay             Assay              `yaml:"assay"`
+	Attest            Attest             `yaml:"attest"`
 	Containment       Containment        `yaml:"containment"`
 	Credentials       Credentials        `yaml:"credentials"`
 	// PolicyRules is the Session 5 (Sol Phase 4) organization layer of the
@@ -226,6 +243,12 @@ func BuiltIn() Config {
 		// (see Assay's doc comment). Python/TimeoutSeconds default sensibly
 		// so a config that only sets `assay.repo` gets a working invocation.
 		Assay: Assay{Python: "python3", TimeoutSeconds: 60},
+		// 300s: a real agent turn. Measured 2026-07-13, claude-code needs ~19s
+		// for a ONE-step probe task; the sandbox probe is five steps including
+		// four network egress attempts. The original 30s constant timed out
+		// every multi-step probe on every real backend, which recorded sandbox,
+		// network and transcript as unattested across the board.
+		Attest: Attest{ProbeTimeoutSeconds: 300},
 		// No override key means risky jobs must qualify for containment on their
 		// own (fail-closed). Session 6's medium/high effectful local-run gate is
 		// enforced by default and can only be relaxed explicitly.
@@ -511,6 +534,9 @@ func merge(dst *Config, src Config) {
 	if src.Assay.Python != "" {
 		dst.Assay.Python = src.Assay.Python
 	}
+	if src.Attest.ProbeTimeoutSeconds > 0 {
+		dst.Attest.ProbeTimeoutSeconds = src.Attest.ProbeTimeoutSeconds
+	}
 	if src.Assay.TimeoutSeconds > 0 {
 		dst.Assay.TimeoutSeconds = src.Assay.TimeoutSeconds
 	}
@@ -742,6 +768,11 @@ func validateRawSuppliedValues(data []byte, path string) error {
 	if v, ok := rawNumber(raw, "assay", "timeout_seconds"); ok {
 		if v <= 0 {
 			return fmt.Errorf("invalid assay.timeout_seconds %v (want > 0)", v)
+		}
+	}
+	if v, ok := rawNumber(raw, "attest", "probe_timeout_seconds"); ok {
+		if v <= 0 {
+			return fmt.Errorf("invalid attest.probe_timeout_seconds %v (want > 0)", v)
 		}
 	}
 	if backends, ok := raw["backends"].(map[string]any); ok {

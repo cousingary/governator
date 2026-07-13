@@ -120,8 +120,14 @@ func sha256File(path string) (string, error) {
 	return hex.EncodeToString(sum[:]), nil
 }
 
+// versionProbeTimeout must cover a cold Node/Bun CLI start, not just an exec.
+// Measured 2026-07-13: `pi --version` takes ~8.8s on this machine, so the old
+// 3s budget marked pi's version probe failed, which zeroed SupportedFlags,
+// which made pi permanently unattestable (RequiredProbesPassed requires it).
+const versionProbeTimeout = 30 * time.Second
+
 func probeVersion(ctx context.Context, path string) (string, bool) {
-	probeCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	probeCtx, cancel := context.WithTimeout(ctx, versionProbeTimeout)
 	defer cancel()
 	cmd := exec.CommandContext(probeCtx, path, "--version")
 	out, err := cmd.CombinedOutput()
