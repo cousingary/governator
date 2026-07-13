@@ -1320,9 +1320,12 @@ func TestEnforceContainmentHighRiskAcceptanceCriterion(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := attest.Store(db, attest.Attestation{
-		ID: "test-attest", Backend: "claude-code", AdapterVersion: "claude-code-adapter-v1",
-		ExecutablePath: claudeRes.CanonicalPath, ExecutableSHA256: claudeRes.SHA256, ModelID: "claude-code", ConfigHash: config.BuiltIn().Hash(),
-		SupportedFlags: true, SandboxProbe: true, NetworkProbe: true, TranscriptProbe: true,
+		ID: "test-attest", Backend: "claude-code", AdapterID: "claude-code", AdapterVersion: "claude-code-adapter-v1",
+		RequestedExecutable: claudeRes.Requested, ResolvedExecutable: claudeRes.ResolvedPath,
+		ExecutablePath: claudeRes.CanonicalPath, ExecutableFileIdentity: claudeRes.FileIdentity, ExecutableSHA256: claudeRes.SHA256,
+		ModelID: "claude-code", AccountID: "default", ConfigHash: config.BuiltIn().Hash(), BackendConfigHash: attest.EffectiveBackendConfigHash(config.BuiltIn(), "claude-code"),
+		ProbeSuiteVersion: attest.ProbeSuiteVersion,
+		SupportedFlags:    true, SandboxProbe: true, ReadOnlyProbe: true, NetworkProbe: true, TranscriptProbe: true, ApprovalProbe: true,
 		CreatedAt: time.Now().UTC().Format(time.RFC3339Nano), ExpiresAt: time.Now().UTC().Add(time.Hour).Format(time.RFC3339Nano),
 	}); err != nil {
 		t.Fatal(err)

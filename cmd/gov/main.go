@@ -800,7 +800,7 @@ func attestCmd(args []string) int {
 		return 1
 	}
 	_ = json.NewEncoder(os.Stdout).Encode(a)
-	if !a.SupportedFlags || !a.SandboxProbe || !a.TranscriptProbe {
+	if !attest.RequiredProbesPassedForBackend(a, args[0]) {
 		fmt.Fprintln(os.Stderr, "attest: required capability probe failed")
 		return 1
 	}
