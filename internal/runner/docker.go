@@ -17,6 +17,67 @@ import (
 	"github.com/cousingary/governator/internal/contracts"
 )
 
+// ImageIdentity is the resolved, replay-bindable identity of a Docker image
+// reference (Sol P1-1). Reference is whatever the operator configured --
+// commonly a mutable tag, which can be repointed at a different image
+// between an attested run and a later replay. ID (the image's content-
+// addressed config hash) and RepoDigests (immutable repo@sha256:... registry
+// references, when the image was pulled/pushed rather than only built
+// locally) cannot be silently repointed the way a tag can; Entrypoint/Cmd/
+// User record what will actually execute inside the container, so
+// attestation binds to the in-container reality instead of assuming it
+// matches whatever the host CLI reports.
+type ImageIdentity struct {
+	Reference   string
+	ID          string
+	RepoDigests []string
+	Entrypoint  []string
+	Cmd         []string
+	User        string
+}
+
+// dockerImageInspect is the subset of `docker image inspect` this package
+// reads to build an ImageIdentity.
+type dockerImageInspect struct {
+	ID          string   `json:"Id"`
+	RepoDigests []string `json:"RepoDigests"`
+	Config      struct {
+		Entrypoint []string `json:"Entrypoint"`
+		Cmd        []string `json:"Cmd"`
+		User       string   `json:"User"`
+	} `json:"Config"`
+}
+
+// ResolveImageIdentity inspects image (a tag or digest reference) and
+// returns its content-addressed identity. Fails closed -- never a
+// sentinel -- when the image cannot be inspected: not present locally,
+// daemon unreachable, or a malformed reference. Callers needing a
+// replay-safe identity must use ID/RepoDigests here, never Reference alone.
+func ResolveImageIdentity(ctx context.Context, image string) (ImageIdentity, error) {
+	if strings.TrimSpace(image) == "" {
+		return ImageIdentity{}, fmt.Errorf("resolve image identity: empty image reference")
+	}
+	out, err := exec.CommandContext(ctx, "docker", "image", "inspect", image, "--format", "{{json .}}").Output()
+	if err != nil {
+		return ImageIdentity{}, fmt.Errorf("resolve image identity %q: %w", image, err)
+	}
+	var insp dockerImageInspect
+	if err := json.Unmarshal(out, &insp); err != nil {
+		return ImageIdentity{}, fmt.Errorf("resolve image identity %q: parse inspect output: %w", image, err)
+	}
+	if insp.ID == "" {
+		return ImageIdentity{}, fmt.Errorf("resolve image identity %q: inspect returned no image ID", image)
+	}
+	return ImageIdentity{
+		Reference:   image,
+		ID:          insp.ID,
+		RepoDigests: append([]string(nil), insp.RepoDigests...),
+		Entrypoint:  append([]string(nil), insp.Config.Entrypoint...),
+		Cmd:         append([]string(nil), insp.Config.Cmd...),
+		User:        insp.Config.User,
+	}, nil
+}
+
 // CheckDockerAvailable reports whether a working `docker` CLI and a
 // reachable daemon exist, so New can fail closed: a contract that asks for
 // runner: docker without a usable Docker install must error, never silently

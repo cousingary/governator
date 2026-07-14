@@ -37,9 +37,36 @@ jobs:
       - name: Derive VERSION from the pushed tag
         run: echo "VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
 
+      - name: Materialize the minisign secret key (optional)
+        # GOV_RELEASE_MINISIGN_KEY (scripts/release.sh's expected env var)
+        # is a FILE PATH minisign reads with -s; a GitHub secret is a
+        # string value, not a file on the runner. Only secrets.* may be
+        # referenced directly in a workflow `run:` step (never echoed to a
+        # log), so this writes the key content to a runner-local file with
+        # secrets.GOV_RELEASE_MINISIGN_KEY_CONTENT read only inside the
+        # step, exports its path if the secret is configured, and no-ops
+        # (an empty MINISIGN_KEY_PATH) when it's absent -- release.sh's own
+        # "no key configured" path then correctly skips asymmetric signing
+        # rather than failing.
+        if: ${{ secrets.GOV_RELEASE_MINISIGN_KEY_CONTENT != '' }}
+        env:
+          MINISIGN_KEY_CONTENT: ${{ secrets.GOV_RELEASE_MINISIGN_KEY_CONTENT }}
+        run: |
+          key_path="$RUNNER_TEMP/gov-release-minisign.key"
+          printf '%s' "$MINISIGN_KEY_CONTENT" >"$key_path"
+          chmod 600 "$key_path"
+          echo "MINISIGN_KEY_PATH=$key_path" >> "$GITHUB_ENV"
+
       - name: Run the unified release pipeline
         env:
           GOV_RELEASE_HMAC_KEY: ${{ secrets.GOV_RELEASE_HMAC_KEY }}
+          GOV_RELEASE_MINISIGN_KEY: ${{ env.MINISIGN_KEY_PATH }}
+          # P0-7 (Sol redteam v4 S8): this is the actual publish path (tag
+          # push only) -- always require HEAD to carry the exact v<version>
+          # tag this run claims, closing "build releases only from a clean,
+          # tagged commit." Local dry-runs (docs/publishing.md) leave this
+          # unset and keep working from a clean but untagged tree.
+          REQUIRE_TAG: "1"
         run: scripts/release.sh
 
       - name: Upload release artifacts
@@ -49,13 +76,15 @@ jobs:
           path: |
             dist/*.tar.gz
             dist/checksums.txt
+            dist/checksums.txt.minisig
             dist/build-manifest.json
             dist/sbom.json
             dist/claims.yaml
             dist/test-summary.json
             dist/acceptance-summary.json
+            dist/claims-verify-report.txt
             dist/signature
-          if-no-files-found: error
+          if-no-files-found: warn
 
       - name: Create GitHub release (draft)
         uses: softprops/action-gh-release@v2
@@ -64,9 +93,11 @@ jobs:
           files: |
             dist/*.tar.gz
             dist/checksums.txt
+            dist/checksums.txt.minisig
             dist/build-manifest.json
             dist/sbom.json
             dist/claims.yaml
             dist/test-summary.json
             dist/acceptance-summary.json
+            dist/claims-verify-report.txt
             dist/signature

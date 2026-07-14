@@ -2,6 +2,7 @@ package observability
 
 import (
 	"database/sql"
+	"fmt"
 	"time"
 )
 
@@ -292,6 +293,42 @@ func ConsumePolicyOverrideReservation(db *sql.DB, id int64, now string) (int64, 
 		return 0, err
 	}
 	return res.RowsAffected()
+}
+
+// ConsumePolicyOverrideReservations terminalizes every one-shot override id
+// in ids as a single atomic transaction (Sol P1-5 / report §9 attack 18).
+// Before this fix, a caller authorizing an execution against a *set* of
+// resolved one-shot ALLOW overrides consumed each id with its own top-level
+// ConsumePolicyOverrideReservation call: if the Nth id in the set had already
+// been released or expired by a race, every id before it in the loop was
+// already durably consumed even though the governed action it authorized
+// never launched (the caller aborts on the first failure) — an approval
+// burned for an execution that never happened. Verify-all -> consume-all ->
+// commit in one transaction: a single id failing rolls back every consume in
+// the set, so a non-nil return here guarantees none of ids were consumed.
+func ConsumePolicyOverrideReservations(db *sql.DB, ids []int64, now string) error {
+	if len(ids) == 0 {
+		return nil
+	}
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	for _, id := range ids {
+		res, err := tx.Exec(`UPDATE policy_overrides SET consumed_at=? WHERE id=? AND one_shot=1 AND reserved_at<>'' AND consumed_at=''`, now, id)
+		if err != nil {
+			return err
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			return err
+		}
+		if n != 1 {
+			return fmt.Errorf("policy override %d reservation was lost before launch (released or expired concurrently)", id)
+		}
+	}
+	return tx.Commit()
 }
 
 // ReleasePolicyOverrideReservation returns a reserved one-shot override to

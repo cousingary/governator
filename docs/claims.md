@@ -50,34 +50,50 @@ penalized for lacking acceptance evidence it never promised.
 ## Usage
 
 ```
-gov claims verify [--file <path>] [--repo <path>] [--artifact <path>] [--manifest <path>]
+gov claims verify [--file <path>] [--repo <path>] [--artifact <path>] [--manifest <path>] [--release]
 ```
 
 Defaults to `docs/claims.yaml` against the current directory. Exits non-zero
 if any claim's computed maturity falls short of its claimed maturity.
 
+`--release` (Sol redteam v4 S8 / P0-7) asserts this invocation is gating an
+actual release, not a day-to-day source check: it refuses to run at all
+unless both `--artifact` and `--manifest` are also given. The bare CI/local
+pre-commit form (no `--release`, no artifact) is unaffected — it verifies
+claim-to-source consistency and has nothing to do with a built binary.
+`scripts/release_verify.sh` is the only caller that passes `--release`.
+
 ## Release artifact provenance
 
-Session 4 adds a canonical release builder:
+`scripts/release.sh` is the canonical release builder. It refuses a dirty
+tree, runs the full test/fuzz/Assayer matrix, builds every platform into
+`dist/`, then writes `dist/build-manifest.json` — the one document every
+other release file's identity must agree with: version, source commit, build
+timestamp, claims hash, adapter protocol version, every platform artifact,
+plus (S8) the host-platform artifact's own path/SHA-256, Go buildinfo,
+`test_result`/`test_run_id`, and `acceptance_result`/`acceptance_run_id`.
+The manifest is written only after the acceptance smoke test (extract, check
+the binary is exactly mode `0755`, hash-match, self-reported version/commit/
+claims-hash match) has already run — never before both are known.
 
-```
-scripts/release.sh
-```
-
-The script refuses a dirty tree, runs `go test ./...`, builds exactly one
-artifact from the current commit with `-ldflags` embedding version, source
-commit, build timestamp, claims hash, and adapter protocol version, then writes
-`dist/build-manifest-<version>-<commit>.json`. The manifest records the
-artifact path and SHA-256, Go version/build flags/buildinfo, the claims hash,
-a concrete test run ID/result, and a concrete acceptance self-check ID/result
-from running the built artifact's `gov version --json`.
-
-`gov claims verify --artifact <path> --manifest <path>` uses that manifest to
-inspect the exact binary. A binary that self-reports `1.0.0-rc1` while the
-claim/manifest expects `v1.4.1` fails verification even if all symbols and YAML
-keys exist.
+As the pipeline's last release-blocking gate, `scripts/release_verify.sh`
+extracts the host archive fresh (independently of the acceptance step's own
+extraction), re-asserts mode `0755`, and runs
+`gov claims verify --release --artifact <path> --manifest <path>` against
+it — full claims verification against the *exact archived artifact*, every
+release, no exceptions. A binary that self-reports `1.0.0-rc1` while the
+claim/manifest expects `v1.4.1`, or whose embedded `source_commit`/Go
+buildinfo `vcs.revision` drifts from the manifest's, fails verification even
+if every symbol and YAML key exists — this is what closes report attack 25
+(a shipped binary two commits behind its submitted source). Report attack 24
+(the archived binary shipping at mode `0777`) is closed by the exact-mode
+assertion in both the acceptance step and `release_verify.sh`.
 
 If `GOV_RELEASE_HMAC_KEY` is present, `scripts/release.sh` adds a
-`manifest_hmac_sha256` over the unsigned manifest JSON. That local environment
-variable is the current trust root for CI summary signing until dedicated
-signing infrastructure exists; do not commit the key.
+`manifest_hmac_sha256` over the unsigned manifest JSON. If
+`GOV_RELEASE_MINISIGN_KEY` (path to an unencrypted minisign secret key) and
+the `minisign` binary are both available, it additionally writes
+`checksums.txt.minisig` — an Ed25519 signature verifiable by anyone holding
+only the public key, unlike the shared-secret HMAC. Neither is fabricated
+when unconfigured: an unsigned release says so in plain text, and a missing
+minisign key simply means no `.minisig` file ships.

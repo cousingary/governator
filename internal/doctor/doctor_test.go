@@ -88,6 +88,11 @@ exit 1
 	t.Setenv("GOV_GRAPH_MODE", "required")
 	t.Setenv("GOV_GRAPH_PROVIDER", "codegraph")
 	t.Setenv("GOV_GRAPH_BIN", fake)
+	reg := filepath.Join(t.TempDir(), "tools.yaml")
+	if err := os.WriteFile(reg, []byte("tools:\n  - name: codegraph\n    kind: trusted_controller\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("GOV_TOOLREGISTRY_FILE", reg)
 
 	check := checkContextGraph()
 	if check.Status != StatusOK {
@@ -97,6 +102,100 @@ exit 1
 		if !strings.Contains(check.Detail, want) {
 			t.Fatalf("detail %q missing %q", check.Detail, want)
 		}
+	}
+}
+
+// TestGitCheckFailsLoudlyOnUntrustedGit is report S4's explicit doctor exit
+// criterion: "gov doctor fails loudly on an untrusted git." Pinning git to
+// a binary whose content no longer matches the registry's declared hash
+// simulates the state a hostile substitution (or simple tampering) would
+// leave behind — checkGit must FAIL, not silently pass a stale trust
+// declaration.
+func TestGitCheckFailsLoudlyOnUntrustedGit(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	fakeGit := filepath.Join(t.TempDir(), "git")
+	if err := os.WriteFile(fakeGit, []byte("#!/bin/sh\necho fake\n"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	reg := filepath.Join(t.TempDir(), "tools.yaml")
+	regBody := "tools:\n  - name: git\n    kind: trusted_controller\n    path: " + fakeGit + "\n    sha256: " + strings.Repeat("0", 64) + "\n"
+	if err := os.WriteFile(reg, []byte(regBody), 0644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("GOV_TOOLREGISTRY_FILE", reg)
+
+	check := checkGit()
+	if check.Status != StatusFail || !check.Required {
+		t.Fatalf("check = %+v, want a required failure", check)
+	}
+	if !strings.Contains(check.Detail, "untrusted") {
+		t.Fatalf("detail = %q, want it to say untrusted", check.Detail)
+	}
+}
+
+// TestGitCheckPinsRealGitOnFirstSuccess proves checkGit's trust-on-first-use
+// step: a registry with no path pinned for git yet, after one successful
+// checkGit() call, has git's exact resolved path persisted — so a later
+// PATH change cannot silently redirect what any later run considers "git"
+// (report attack 10 depends on this pin already existing).
+func TestGitCheckPinsRealGitOnFirstSuccess(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	reg := filepath.Join(t.TempDir(), "tools.yaml")
+	t.Setenv("GOV_TOOLREGISTRY_FILE", reg)
+
+	if _, err := os.Stat(reg); !os.IsNotExist(err) {
+		t.Fatalf("expected no registry file yet, stat err=%v", err)
+	}
+	check := checkGit()
+	if check.Status != StatusOK {
+		t.Fatalf("expected checkGit to succeed against the real installed git: %+v", check)
+	}
+	data, err := os.ReadFile(reg)
+	if err != nil {
+		t.Fatalf("expected checkGit to have pinned a registry file: %v", err)
+	}
+	if !strings.Contains(string(data), "name: git") || !strings.Contains(string(data), "path:") {
+		t.Fatalf("registry file does not look pinned: %s", data)
+	}
+}
+
+// TestToolRegistryCheckReportsTrustedGit exercises the new doctor
+// aggregate check report S4 asks for ("add registry checks to gov
+// doctor"): git should show as trusted by default (shipped entry, real
+// binary resolves and verifies).
+func TestToolRegistryCheckReportsTrustedGit(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("GOV_CONFIG", "")
+	t.Setenv("GOV_GRAPH_MODE", "off")
+	t.Setenv("GOV_TOOLREGISTRY_FILE", filepath.Join(t.TempDir(), "tools.yaml"))
+
+	check := checkToolRegistry()
+	if check.Status != StatusOK {
+		t.Fatalf("expected git to resolve as trusted with graph disabled: %+v", check)
+	}
+	if !strings.Contains(check.Detail, "git") {
+		t.Fatalf("detail = %q, want it to mention git", check.Detail)
+	}
+}
+
+// TestToolRegistryCheckWarnsOnUnregisteredGraphProvider proves the check
+// surfaces an operator-configured-but-unregistered tool as a WARN (not a
+// silent pass) — the same "outside the trust model" state report attack 9
+// exploited before contextgraph.Resolve started gating through this
+// registry.
+func TestToolRegistryCheckWarnsOnUnregisteredGraphProvider(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("GOV_CONFIG", "")
+	t.Setenv("GOV_GRAPH_MODE", "auto")
+	t.Setenv("GOV_GRAPH_PROVIDER", "codegraph")
+	t.Setenv("GOV_TOOLREGISTRY_FILE", filepath.Join(t.TempDir(), "tools.yaml"))
+
+	check := checkToolRegistry()
+	if check.Status != StatusWarn || check.Required {
+		t.Fatalf("check = %+v, want an optional warning", check)
+	}
+	if !strings.Contains(check.Detail, "codegraph") {
+		t.Fatalf("detail = %q, want it to mention the unregistered provider", check.Detail)
 	}
 }
 

@@ -21,7 +21,10 @@ import (
 	"time"
 
 	"github.com/cousingary/governator/internal/agents"
+	"github.com/cousingary/governator/internal/containment"
 	"github.com/cousingary/governator/internal/contracts"
+	"github.com/cousingary/governator/internal/enforce"
+	"github.com/cousingary/governator/internal/gitplumb"
 )
 
 // Workspace is what Prepare hands back and every later stage (Launch,
@@ -117,8 +120,17 @@ func New(mode string, dockerCfg *contracts.DockerRunnerConfig, localCfg *contrac
 // helper — both packages need the same "run a git plumbing command, honor
 // ctx cancellation" primitive, and runner must not import runtime.
 func shell(ctx context.Context, dir, command string) (int, string, error) {
+	// Sol report attack 10 / P0-5: see internal/runtime's identical helper
+	// for why this prepends the trusted-tool registry's verified git
+	// directory to the subprocess's PATH rather than trusting whatever the
+	// calling process's own PATH resolves "git" to.
+	gitPath, gerr := gitplumb.TrustedGitPath()
+	if gerr != nil {
+		return -1, "", gerr
+	}
 	cmd := exec.CommandContext(ctx, "bash", "-lc", command)
 	cmd.Dir = dir
+	cmd.Env = append(os.Environ(), "PATH="+filepath.Dir(gitPath)+string(os.PathListSeparator)+os.Getenv("PATH"))
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	out, err := cmd.CombinedOutput()
 	if ctx.Err() != nil && cmd.Process != nil {
@@ -200,10 +212,13 @@ func (r *LocalWorktreeRunner) Prepare(ctx context.Context, req PrepareRequest) (
 	return prepareWorktree(ctx, req.Root, req.Home, req.ID, req.Git)
 }
 
-// Launch adds no host containment beyond what the worktree itself already
-// provides — local runs isolate the repo, never the OS the agent runs
-// against (see docs/containment.md) — but it does bound the transcript size
-// via req.Request.Executor, matching DockerRunner.executor's cappedWriter.
+// Launch itself adds no host containment beyond what the worktree provides
+// — local runs isolate the repo, never the OS the agent runs against, on
+// their own (see docs/containment.md) — but its executor (below) wraps the
+// launch in Governator's own externally enforced sandbox (Session 5, Sol
+// P0-3: internal/enforce) whenever enforceContainment attached an active
+// Plan to ctx, and it does bound the transcript size via req.Request.Executor,
+// matching DockerRunner.executor's cappedWriter.
 func (r *LocalWorktreeRunner) Launch(ctx context.Context, ws Workspace, req LaunchRequest) (agents.Result, error) {
 	launchReq := req.Request
 	launchReq.Executor = r.executor()
@@ -220,13 +235,38 @@ func (r *LocalWorktreeRunner) executor() agents.Executor {
 	return func(ctx context.Context, bin string, args []string, workdir string, out io.Writer, timeout time.Duration) (int, bool, error) {
 		runCtx, cancel := context.WithTimeout(ctx, timeout)
 		defer cancel()
-		cmd := exec.CommandContext(runCtx, bin, args...)
-		cmd.Dir = workdir
+		handle, _ := agents.HandleFromContext(runCtx)
+		var cmd *exec.Cmd
+		var launchErr error
+		scope, hasScope := containment.ScopeFromContext(runCtx)
+		plan, _ := enforce.PlanFromContext(runCtx)
+		if hasScope {
+			cmd, launchErr = agents.LaunchCommand(runCtx, handle, bin, args, func(c context.Context, b string, a []string) *exec.Cmd {
+				// Session 5 (Sol P0-3): wrap bin/args in Governator's own
+				// externally enforced sandbox (Landlock + network namespace)
+				// BEFORE the S2 descendant-owning Scope wraps the launch
+				// again -- identical composition to agents.defaultExecutor.
+				// A no-op Plan (most runs) returns b/a unchanged.
+				wb, wa := plan.Wrap(b, a)
+				return scope.Command(c, wb, wa, workdir)
+			})
+		} else {
+			cmd, launchErr = agents.LaunchCommand(runCtx, handle, bin, args, nil)
+			if launchErr == nil {
+				cmd.Dir = workdir
+				cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+			}
+		}
+		if launchErr != nil {
+			return 0, false, launchErr
+		}
 		capped := &cappedWriter{w: out, remaining: r.Config.EffectiveOutputCapBytes()}
 		cmd.Stdout, cmd.Stderr = capped, capped
-		cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 		if err := cmd.Start(); err != nil {
 			return 0, false, err
+		}
+		if hasScope && cmd.Process != nil {
+			scope.Started(cmd.Process.Pid)
 		}
 		done := make(chan error, 1)
 		go func() { done <- cmd.Wait() }()

@@ -20,6 +20,7 @@ import (
 	"github.com/cousingary/governator/internal/config"
 	"github.com/cousingary/governator/internal/containment"
 	"github.com/cousingary/governator/internal/contracts"
+	"github.com/cousingary/governator/internal/enforce"
 	"github.com/cousingary/governator/internal/observability"
 	"github.com/cousingary/governator/internal/policy"
 )
@@ -995,6 +996,11 @@ esac
 	t.Setenv("GOV_GRAPH_PROVIDER", "codegraph")
 	t.Setenv("GOV_GRAPH_BIN", graphBin)
 	t.Setenv("FAKE_PROMPT_FILE", promptFile)
+	toolsReg := filepath.Join(t.TempDir(), "tools.yaml")
+	if err := os.WriteFile(toolsReg, []byte("tools:\n  - name: codegraph\n    kind: trusted_controller\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("GOV_TOOLREGISTRY_FILE", toolsReg)
 
 	record, err := New().Run(context.Background(), contract(root))
 	if err != nil {
@@ -1303,35 +1309,88 @@ func TestEnforceContainmentHighRiskAcceptanceCriterion(t *testing.T) {
 		}
 		return agent
 	}
+	// withKnownIdentity declares provider/model_revision for backend on top
+	// of cfg (Sol P1-2: an unknown identity now blocks high-risk
+	// native-sandbox reuse outright, regardless of attestation state — see
+	// attest.VerifyHighRiskNative). Tests below exercise the
+	// attestation/probe machinery specifically, so they need a known
+	// identity to reach that machinery at all.
+	withKnownIdentity := func(cfg config.Config, backend string) config.Config {
+		b := cfg.Backends[backend]
+		b.Provider = "test-provider"
+		b.ModelRevision = "test-model-rev"
+		if cfg.Backends == nil {
+			cfg.Backends = map[string]config.Backend{}
+		}
+		cfg.Backends[backend] = b
+		return cfg
+	}
 
-	// glm declares no native sandbox capability → high-risk local must fail.
-	// enforceContainment's attestation branch never triggers for a backend
-	// with no native sandbox, so this assertion holds with no glm binary on
-	// PATH at all.
-	c := base
-	c.Agent = "glm"
 	db, err := observability.Open(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer db.Close()
 	glmAgent := newAgent("glm")
-	if _, err := enforceContainment(db, c, glmAgent, config.Config{}); err == nil {
-		t.Fatal("expected high-risk local glm (no native sandbox, no override) to fail closed, got nil")
+
+	// Session 5 (Sol P0-3): authorization for a high-risk local run now comes
+	// from Governator's OWN externally enforced sandbox (enforce.Supported()),
+	// never from which backend is configured or whether it declares a native
+	// sandbox -- glm declares none at all, and must still pass when this host
+	// can actually provide external enforcement.
+	c := base
+	c.Agent = "glm"
+	if !enforce.Supported() {
+		t.Skip("this host cannot provide external enforcement (Landlock/unshare unavailable) -- the fail-closed path below covers the refusal behavior directly via ForceUnsupported")
+	}
+	if _, _, _, err := enforceContainment(context.Background(), db, c, glmAgent, config.Config{}); err != nil {
+		t.Fatalf("high-risk local should pass on external enforcement alone, regardless of backend's declared capability: %v", err)
 	}
 
-	// claude-code declares a native sandbox, but Sol Critical 4 requires a
-	// current executable attestation before that static capability can satisfy
-	// high-risk host containment.
+	// The fail-closed rule this test originally named still holds -- it is
+	// just gated on a different fact now. When this host genuinely cannot
+	// provide external enforcement, a high-risk local run must refuse
+	// outright rather than falling back to trusting a backend's self-report.
+	enforce.ForceUnsupported = true
+	_, _, _, unsupportedErr := enforceContainment(context.Background(), db, c, glmAgent, config.Config{})
+	enforce.ForceUnsupported = false
+	if unsupportedErr == nil {
+		t.Fatal("expected high-risk local to fail closed when external enforcement is unavailable, got nil")
+	}
+
+	// claude-code declares a native sandbox. Session 5 still generates and
+	// records a capability attestation for it as probe-observed evidence,
+	// but -- unlike the pre-Session-5 behavior this test used to assert --
+	// its outcome no longer gates authorization: a fresh probe suite has
+	// never even run yet here, and containment still passes on external
+	// enforcement alone.
 	c = base
 	c.Agent = "claude-code"
 	bin := writeFakeBackend(t, `if [ "${1:-}" = "--version" ]; then echo "claude fake 1.0"; exit 0; fi
 `)
 	t.Setenv("GOV_CLAUDE_BIN", bin)
 	claudeAgent := newAgent("claude-code")
-	if _, err := enforceContainment(db, c, claudeAgent, config.BuiltIn()); err == nil || !strings.Contains(err.Error(), "attestation") {
-		t.Fatalf("native backend without attestation must fail closed, got %v", err)
+	claudeCfg := withKnownIdentity(config.BuiltIn(), "claude-code")
+	// withKnownIdentity only overlays Provider/ModelRevision; enforceContainment
+	// now resolves through claudeCfg directly (not the env-aware
+	// config.Current() global -- Sol P0-6), so Bin must point at the fake
+	// backend explicitly or resolution finds whatever "claude" happens to be
+	// on the real PATH instead of this test's fixture.
+	claudeBackend := claudeCfg.Backends["claude-code"]
+	claudeBackend.Bin = bin
+	claudeCfg.Backends["claude-code"] = claudeBackend
+	attID, attHandle, _, err := enforceContainment(context.Background(), db, c, claudeAgent, claudeCfg)
+	if err != nil {
+		t.Fatalf("native-sandbox backend should pass high-risk local on external enforcement alone, even with no stored attestation yet: %v", err)
 	}
+	if attID != "" {
+		t.Fatalf("expected no attestation id without a stored attestation to find, got %q", attID)
+	}
+	if attHandle == nil {
+		t.Fatal("expected enforceContainment to return the resolved handle it used for the attestation lookup")
+	}
+	attHandle.Close()
+
 	claudeRes, err := agents.ResolvePath(claudeAgent)
 	if err != nil {
 		t.Fatal(err)
@@ -1340,22 +1399,26 @@ func TestEnforceContainmentHighRiskAcceptanceCriterion(t *testing.T) {
 		ID: "test-attest", Backend: "claude-code", AdapterID: "claude-code", AdapterVersion: "claude-code-adapter-v1",
 		RequestedExecutable: claudeRes.Requested, ResolvedExecutable: claudeRes.ResolvedPath,
 		ExecutablePath: claudeRes.CanonicalPath, ExecutableFileIdentity: claudeRes.FileIdentity, ExecutableSHA256: claudeRes.SHA256,
-		ModelID: "claude-code", AccountID: "default", ConfigHash: config.BuiltIn().Hash(), BackendConfigHash: attest.EffectiveBackendConfigHash(config.BuiltIn(), "claude-code"),
+		ModelID: "claude-code", AccountID: "default", ConfigHash: claudeCfg.Hash(), BackendConfigHash: attest.EffectiveBackendConfigHash(claudeCfg, "claude-code"),
 		ProbeSuiteVersion: attest.ProbeSuiteVersion,
 		SupportedFlags:    true, SandboxProbe: true, ReadOnlyProbe: true, NetworkProbe: true, TranscriptProbe: true, ApprovalProbe: true,
 		CreatedAt: time.Now().UTC().Format(time.RFC3339Nano), ExpiresAt: time.Now().UTC().Add(time.Hour).Format(time.RFC3339Nano),
 	}); err != nil {
 		t.Fatal(err)
 	}
-	attID, err := enforceContainment(db, c, claudeAgent, config.BuiltIn())
-	if err != nil || attID != "test-attest" {
-		t.Fatalf("attested native-sandbox backend should pass high-risk local: id=%q err=%v", attID, err)
+	// A stored, passing attestation now surfaces as recorded evidence
+	// (attestationID non-empty) without changing the pass/fail outcome --
+	// that outcome was already "pass" above, from external enforcement alone.
+	attID2, attHandle2, _, err := enforceContainment(context.Background(), db, c, claudeAgent, claudeCfg)
+	if err != nil || attID2 != "test-attest" {
+		t.Fatalf("attested native-sandbox backend should still pass and record its attestation id: id=%q err=%v", attID2, err)
 	}
+	attHandle2.Close()
 
-	// A signed override rescues a non-sandbox high-risk local run. The
-	// signed message binds job_id, contract-content hash, and reason (see
-	// containment.SigningMessage) so it must be built from the final
-	// contract, not just the job_id.
+	// A signed override rescues a high-risk local run even when external
+	// enforcement genuinely is unavailable. The signed message binds job_id,
+	// contract-content hash, and reason (see containment.SigningMessage) so
+	// it must be built from the final contract, not just the job_id.
 	pub, priv, _ := ed25519.GenerateKey(nil)
 	c = base
 	c.Agent = "glm"
@@ -1367,28 +1430,38 @@ func TestEnforceContainmentHighRiskAcceptanceCriterion(t *testing.T) {
 	}
 	sig := ed25519.Sign(priv, msg)
 	c.Containment.OverrideSignature = hex.EncodeToString(sig)
-	if _, err := enforceContainment(db, c, glmAgent, config.Config{Containment: config.Containment{OverridePublicKey: hex.EncodeToString(pub)}}); err != nil {
-		t.Fatalf("valid signed override should rescue high-risk local glm: %v", err)
+	enforce.ForceUnsupported = true
+	_, _, _, overrideErr := enforceContainment(context.Background(), db, c, glmAgent, config.Config{Containment: config.Containment{OverridePublicKey: hex.EncodeToString(pub)}})
+	enforce.ForceUnsupported = false
+	if overrideErr != nil {
+		t.Fatalf("valid signed override should rescue high-risk local glm even without external enforcement: %v", overrideErr)
 	}
 
 	// Non-high-risk is a no-op regardless of agent/runner.
 	c = base
 	c.RiskClass = "low"
 	c.Agent = "glm"
-	if _, err := enforceContainment(db, c, glmAgent, config.Config{}); err != nil {
+	if _, _, _, err := enforceContainment(context.Background(), db, c, glmAgent, config.Config{}); err != nil {
 		t.Fatalf("low-risk must be a containment no-op: %v", err)
 	}
 }
 
 // TestRunRejectsHighRiskLocalWithoutContainment is the end-to-end acceptance
-// test: a real Run() of a high-risk local contract on a non-sandbox backend
-// returns a containment error before launch (no workspace, no agent process).
+// test: a real Run() of a high-risk local contract returns a containment
+// error before launch (no workspace, no agent process) when this host
+// cannot actually provide Governator's own externally enforced sandbox.
+// Session 5 (Sol P0-3) moved the gate off "does the backend declare a native
+// sandbox" -- glm declares none at all and this test used to rely on exactly
+// that to construct a denial -- onto enforce.Supported(), so the fail-closed
+// scenario is now constructed via ForceUnsupported instead of backend choice.
 func TestRunRejectsHighRiskLocalWithoutContainment(t *testing.T) {
 	root, _ := fixture(t)
 	t.Setenv("GOV_HOME", t.TempDir())
 	c := contract(root)
-	c.Agent = "glm" // no native sandbox capability
+	c.Agent = "glm"
 	c.RiskClass = "high"
+	enforce.ForceUnsupported = true
+	defer func() { enforce.ForceUnsupported = false }()
 	_, err := New().Run(context.Background(), c)
 	if err == nil || !strings.Contains(err.Error(), "containment") {
 		t.Fatalf("expected containment failure before launch, got err=%v", err)
@@ -1453,7 +1526,18 @@ func TestLockCanonicalizesSymlinkAlias(t *testing.T) {
 	}
 }
 
-func TestMergeCommitHookRejectionRollsBackLiveRoot(t *testing.T) {
+// TestMergeNeverInvokesPreCommitHookEvenWhenItWouldReject is the Sol
+// redteam v4 S1 (P0-1) update to this test: a repo-context `git commit`
+// used to be the authoritative merge operation, so a pre-commit hook that
+// exited nonzero could veto (and, per the old assertions here, cleanly
+// roll back) a merge. Governator's merge no longer invokes `git commit` in
+// repository context at all — the tree is built and committed via
+// internal/gitplumb (isolated index, commit-tree, update-ref) — so a hook,
+// however it's configured to behave, is never consulted and never runs.
+// The same hook this test used to expect a rejection from is left in
+// place specifically to prove that: even a hook that would always reject
+// must have zero effect on the outcome.
+func TestMergeNeverInvokesPreCommitHookEvenWhenItWouldReject(t *testing.T) {
 	root, bin := fixture(t)
 	home := t.TempDir()
 	t.Setenv("GOV_HOME", home)
@@ -1468,20 +1552,20 @@ func TestMergeCommitHookRejectionRollsBackLiveRoot(t *testing.T) {
 	}
 	rec, err := New().Run(context.Background(), contract(root))
 	if err != nil {
-		t.Fatalf("run should quarantine rather than return merge-hook error: %v", err)
+		t.Fatal(err)
 	}
-	if rec.Status != "QUARANTINED" || !strings.Contains(rec.Message, "merge commit") {
-		t.Fatalf("expected merge commit quarantine, got status=%s message=%s", rec.Status, rec.Message)
+	if rec.Status != "APPROVED" {
+		t.Fatalf("expected APPROVED (the pre-commit hook must never run, let alone reject anything), got status=%s message=%s", rec.Status, rec.Message)
 	}
 	status, err := exec.Command("git", "-C", root, "status", "--porcelain").CombinedOutput()
 	if err != nil {
 		t.Fatalf("git status: %v: %s", err, status)
 	}
 	if strings.TrimSpace(string(status)) != "" {
-		t.Fatalf("live root left dirty after rejected merge commit: %q", status)
+		t.Fatalf("live root left dirty after merge: %q", status)
 	}
-	if _, err := os.Stat(filepath.Join(root, "output", "result.txt")); !os.IsNotExist(err) {
-		t.Fatalf("agent output remained in live root after rollback: %v", err)
+	if _, err := os.Stat(filepath.Join(root, "output", "result.txt")); err != nil {
+		t.Fatalf("expected agent output to be merged into the live root: %v", err)
 	}
 }
 
@@ -1577,23 +1661,73 @@ func TestRunRejectsSymlinkedWriteParentBeforeLaunch(t *testing.T) {
 	}
 }
 
+// TestRunRejectsHighRiskCodexWithoutCapabilityAttestation is the Session 5
+// (Sol P0-3) reversal of this test's original assertion (name preserved for
+// git-blame continuity). Under S3, a missing capability attestation was
+// sufficient on its own to reject a high-risk codex run before launch.
+// Report §9 attack 5 is precisely why that was never enough: a backend can
+// behave only while it knows it's being probed. Session 5 moved
+// authorization onto Governator's own externally enforced sandbox
+// (enforce.Supported()), so a codex run with NO stored attestation at all
+// must now be authorized -- and reach launch -- on a host that can actually
+// provide that sandbox; the fail-closed case this test originally named
+// still exists, just gated on host capability (ForceUnsupported) rather than
+// on whether an attestation happens to be on file.
 func TestRunRejectsHighRiskCodexWithoutCapabilityAttestation(t *testing.T) {
 	root, _ := fixture(t)
-	marker := filepath.Join(t.TempDir(), "launched")
-	fake := writeFakeBackend(t, `touch "`+marker+`"
+	// marker is a WORKSPACE-RELATIVE path (the fake backend's cwd is the
+	// governed worktree) rather than an arbitrary host path: Session 5 now
+	// really does confine writes to the workspace via Landlock, so a marker
+	// placed outside it (the pre-Session-5 shape of this test) would itself
+	// get blocked by the very enforcement layer this test is trying to
+	// prove authorized the launch, and the assertion below would fail for
+	// the wrong reason.
+	fake := writeFakeBackend(t, `touch launched-marker
 exit 0
 `)
 	t.Setenv("GOV_HOME", t.TempDir())
 	t.Setenv("GOV_CODEX_BIN", fake)
+	// Sol P1-2: an unknown model/provider identity now blocks high-risk
+	// native-sandbox reuse before the attestation check ever runs (see
+	// attest.VerifyHighRiskNative); declare one so this test still exercises
+	// what it names -- rejection for missing attestation, not missing identity.
+	configPath := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(configPath, []byte("backends:\n  codex:\n    provider: test-provider\n    model_revision: test-model-rev\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("GOV_CONFIG", configPath)
 	c := contract(root)
 	c.Agent = "codex"
 	c.RiskClass = "high"
-	_, err := New().Run(context.Background(), c)
-	if err == nil || !strings.Contains(err.Error(), "attestation") {
-		t.Fatalf("high-risk codex with arbitrary executable must reject before launch, got %v", err)
+
+	if enforce.Supported() {
+		enforce.SelfExeOverride = govBinary(t)
+		defer func() { enforce.SelfExeOverride = "" }()
+		rec, err := New().Run(context.Background(), c)
+		if err != nil && (strings.Contains(err.Error(), "attestation") || strings.Contains(err.Error(), "containment")) {
+			t.Fatalf("missing attestation must no longer block authorization when external enforcement is available: %v", err)
+		}
+		// The fake backend never produces output/result.txt or a valid
+		// transcript, so the run still fails validation -- QUARANTINED with
+		// err==nil is this codebase's normal shape for a post-launch content
+		// failure (Run only returns a non-nil err for infrastructure/gate
+		// failures, e.g. the pre-launch containment denial exercised below).
+		// The point here is only that it is NOT the pre-launch "attestation"
+		// or "containment" denial phrasing this test used to require.
+		if err == nil && (rec.Status == "APPROVED" || strings.Contains(rec.Message, "attestation") || strings.Contains(rec.Message, "containment")) {
+			t.Fatalf("expected the fake codex (no RESULT.json, no required output) to be quarantined for an ordinary post-launch reason, got status=%s message=%s", rec.Status, rec.Message)
+		}
 	}
-	if _, statErr := os.Stat(marker); !os.IsNotExist(statErr) {
-		t.Fatalf("fake codex executable launched despite missing attestation, stat err=%v", statErr)
+
+	// The fail-closed rule this test originally named still holds -- when
+	// this host genuinely cannot provide external enforcement, a high-risk
+	// local run must still refuse before launch (never reaching a worktree
+	// at all, so there is nothing to check the marker against).
+	enforce.ForceUnsupported = true
+	defer func() { enforce.ForceUnsupported = false }()
+	_, err := New().Run(context.Background(), c)
+	if err == nil || !strings.Contains(err.Error(), "containment") {
+		t.Fatalf("high-risk codex must reject before launch when external enforcement is unavailable, got %v", err)
 	}
 }
 

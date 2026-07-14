@@ -2,6 +2,7 @@ package contracts
 
 import (
 	"fmt"
+	"math"
 	"strings"
 	"testing"
 )
@@ -55,6 +56,13 @@ func TestRejectsMalformedContractsWithFieldErrors(t *testing.T) {
 		{"unsupported direct-root worktree", strings.Replace(validContract, "worktree: auto", "worktree: none", 1), "workspace.worktree"},
 		{"path escape", strings.Replace(validContract, "output/clipart/**", "../outside/**", 1), "allowed.write[0]"},
 		{"zero budget", strings.Replace(validContract, "max_minutes: 20", "max_minutes: 0", 1), "budget.max_minutes"},
+		// Sol P1-16 / report §9 attack 21: math.MaxInt32 minutes already
+		// overflows time.Duration(minutes)*time.Minute (int64 nanoseconds) --
+		// Validate must reject it outright rather than let it reach that
+		// conversion. See internal/runtime's SafeMinutesDuration usage and
+		// TestValidateRejectsBudgetMaxMinutesLargeEnoughToOverflowDuration
+		// below for the direct Validate()/SafeMinutesDuration-level proof.
+		{"huge budget minutes overflow", strings.Replace(validContract, "max_minutes: 20", fmt.Sprintf("max_minutes: %d", math.MaxInt32), 1), "budget.max_minutes"},
 		{"unsupported halt action", strings.Replace(validContract, "on_violation: quarantine", "on_violation: halt", 1), "on_violation"},
 		{"unsupported rollback action", strings.Replace(validContract, "on_violation: quarantine", "on_violation: rollback", 1), "on_violation"},
 		{"invalid violation action", strings.Replace(validContract, "on_violation: quarantine", "on_violation: ignore", 1), "on_violation"},

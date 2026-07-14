@@ -19,6 +19,7 @@ import (
 	"github.com/cousingary/governator/internal/observability"
 	"github.com/cousingary/governator/internal/protectedpaths"
 	"github.com/cousingary/governator/internal/tokenoptimizer"
+	"github.com/cousingary/governator/internal/toolregistry"
 )
 
 type Status string
@@ -49,6 +50,7 @@ func Run() []Check {
 		checkLedgerDirectory(),
 		checkLandlock(),
 		checkDrvfs(),
+		checkToolRegistry(),
 		// Phase 5: backend CLI flag-drift probes. Each adapter depends on a
 		// small set of native flags that the backend can rename under us; the
 		// probe runs the backend with --help/version and asserts the flags
@@ -79,13 +81,37 @@ func Passed(checks []Check) bool {
 	return true
 }
 
+// checkGit is report S4's explicit exit criterion: "gov doctor fails
+// loudly on an untrusted git." A bare exec.LookPath trusts whatever PATH
+// currently resolves "git" to, with no verification and (worse) no memory
+// across invocations — exactly the P0-5 gap report attack 10 exploits.
+// Resolving through the trusted-tool registry instead verifies canonical
+// path, content hash, owner, mode and non-writable parent directories
+// every time, and — on the first successful resolution when no path is
+// pinned yet — persists that exact file as the pin (toolregistry.Pin), so
+// every later run (in this process or any future one) checks that same
+// file rather than repeating an ambient PATH lookup a subsequently
+// poisoned PATH could redirect.
 func checkGit() Check {
 	check := Check{Name: "git", Required: true}
-	path, err := exec.LookPath("git")
+	registry, err := toolregistry.Load()
 	if err != nil {
-		check.Status, check.Detail = StatusFail, "not found in PATH"
+		check.Status, check.Detail = StatusFail, err.Error()
 		return check
 	}
+	entry, _ := registry.Entry("git")
+	identity, err := registry.Resolve("git", "git")
+	if err != nil {
+		check.Status, check.Detail = StatusFail, "untrusted: "+err.Error()
+		return check
+	}
+	if entry.Path == "" {
+		if perr := toolregistry.Pin("git", identity.CanonicalPath); perr != nil {
+			check.Status, check.Detail = StatusFail, fmt.Sprintf("resolved %s but failed to pin it in the trust registry: %v", identity.CanonicalPath, perr)
+			return check
+		}
+	}
+	path := identity.CanonicalPath
 	output, err := exec.Command(path, "--version").Output()
 	if err != nil {
 		check.Status, check.Detail = StatusFail, err.Error()
@@ -413,6 +439,43 @@ func governorHome() (string, error) {
 		return "", err
 	}
 	return cfg.LedgerDir, nil
+}
+
+// checkToolRegistry surfaces every declared trusted-tool entry (shipped
+// defaults plus any operator additions in ~/.governator/tools.yaml) and
+// whether each currently resolves and verifies. checkGit above is the
+// hard, required gate for git specifically; this is the broader audit
+// surface report S4 asks for ("bind every tool identity into the run
+// record") — WARN, not FAIL, since an operator may have declared a
+// provider (e.g. a context-graph tool) that simply isn't installed on this
+// box, which is not itself a health problem.
+func checkToolRegistry() Check {
+	check := Check{Name: "trusted tool registry", Required: false}
+	registry, err := toolregistry.Load()
+	if err != nil {
+		check.Status, check.Detail = StatusFail, err.Error()
+		return check
+	}
+	names := []string{"git"}
+	if cfg, cerr := config.Load(); cerr == nil && cfg.Graph.Mode != "off" && cfg.Graph.Provider != "" {
+		names = append(names, cfg.Graph.Provider)
+	}
+	var trusted, untrusted []string
+	for _, name := range names {
+		if _, terr := registry.Resolve(name, name); terr != nil {
+			untrusted = append(untrusted, name)
+		} else {
+			trusted = append(trusted, name)
+		}
+	}
+	if len(untrusted) > 0 {
+		check.Status = StatusWarn
+		check.Detail = fmt.Sprintf("trusted: %s; not currently trusted/resolvable: %s", strings.Join(trusted, ", "), strings.Join(untrusted, ", "))
+		return check
+	}
+	check.Status = StatusOK
+	check.Detail = fmt.Sprintf("trusted: %s (%s)", strings.Join(trusted, ", "), toolregistry.FilePath())
+	return check
 }
 
 func checkConfig() Check {

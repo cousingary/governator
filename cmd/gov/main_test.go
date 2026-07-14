@@ -233,9 +233,28 @@ func TestGateCheckDialectRoundTrip(t *testing.T) {
 			}
 		})
 	}
+	// Sol P1-11 / report §9 attack 15: malformed input must fail closed --
+	// nonzero exit, a structured DENY carrying an explicit PROTOCOL_ERROR
+	// finding, never the old exit=0/output="" shape a caller could mistake
+	// for "no decision" (== approval). See TestAttack15GateCheckMalformedInputFailsClosed
+	// for the full contract (also durable audit record).
 	code, output := captureRunInput(t, []string{"gate", "check"}, "{")
-	if code != 0 || output != "" {
-		t.Fatalf("malformed: exit=%d output=%q", code, output)
+	if code == 0 {
+		t.Fatalf("malformed: expected nonzero exit, got exit=%d output=%q", code, output)
+	}
+	var malformed struct {
+		Allow   bool   `json:"allow"`
+		Reason  string `json:"reason"`
+		Finding string `json:"finding"`
+	}
+	if err := json.Unmarshal([]byte(output), &malformed); err != nil {
+		t.Fatalf("malformed: output=%q: %v", output, err)
+	}
+	if malformed.Allow {
+		t.Fatalf("malformed: expected allow=false, got %+v", malformed)
+	}
+	if !strings.Contains(malformed.Finding, "PROTOCOL_ERROR") || !strings.Contains(malformed.Reason, "DENY") {
+		t.Fatalf("malformed: expected a PROTOCOL_ERROR finding and a DENY reason, got %+v", malformed)
 	}
 
 	neutral := govruntime.NeutralGateDecide(govruntime.NeutralGateInput{
@@ -567,5 +586,54 @@ func TestSol3HookProtocolEmergencyJournal(t *testing.T) {
 	}
 	if rec.RunID != "sol3-s1-journal" || rec.Decision != "deny" || rec.Finding != "HOOK_PROTOCOL_ERROR" {
 		t.Fatalf("journal record=%+v, want run_id=sol3-s1-journal decision=deny finding=HOOK_PROTOCOL_ERROR", rec)
+	}
+}
+
+// TestAttack15GateCheckMalformedInputFailsClosed is Sol P1-11's regression
+// test / report §9 attack 15: `printf '{broken' | gov gate check` used to
+// exit 0 with empty output -- a caller reading "no denial" as approval would
+// silently ALLOW. Proves the full fixed contract: nonzero exit, a structured
+// DENY on stdout with an explicit PROTOCOL_ERROR finding, and a durable audit
+// record in the hook_events ledger (the emergency journal is the fallback
+// for when that ledger itself is unavailable -- TestSol3HookProtocolEmergencyJournal
+// above covers that path; this test exercises the normal, healthy-ledger case).
+func TestAttack15GateCheckMalformedInputFailsClosed(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("GOV_HOME", home)
+	t.Setenv("GOV_CONFIG", filepath.Join(t.TempDir(), "missing-config.yaml"))
+
+	code, output := captureRunInput(t, []string{"gate", "check"}, "{broken")
+	if code == 0 {
+		t.Fatalf("expected nonzero exit for malformed gate check input, got exit=0 output=%q", output)
+	}
+	var decision struct {
+		Allow   bool   `json:"allow"`
+		Reason  string `json:"reason"`
+		Finding string `json:"finding"`
+	}
+	if err := json.Unmarshal([]byte(output), &decision); err != nil {
+		t.Fatalf("output=%q: %v", output, err)
+	}
+	if decision.Allow {
+		t.Fatalf("expected allow=false, got %+v", decision)
+	}
+	if !strings.Contains(decision.Finding, "PROTOCOL_ERROR") {
+		t.Fatalf("expected a PROTOCOL_ERROR finding, got %+v", decision)
+	}
+	if !strings.Contains(decision.Reason, "DENY") {
+		t.Fatalf("expected an explicit DENY in the reason, got %+v", decision)
+	}
+
+	db, err := observability.Open(home)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	var tool, dbDecision, finding string
+	if err := db.QueryRow(`SELECT tool, decision, finding FROM hook_events ORDER BY rowid DESC LIMIT 1`).Scan(&tool, &dbDecision, &finding); err != nil {
+		t.Fatalf("expected a durable hook_events audit record, got: %v", err)
+	}
+	if dbDecision != "deny" || !strings.Contains(finding, "PROTOCOL_ERROR") {
+		t.Fatalf("audit record tool=%q decision=%q finding=%q, want decision=deny finding containing PROTOCOL_ERROR", tool, dbDecision, finding)
 	}
 }

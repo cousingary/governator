@@ -30,6 +30,9 @@ import (
 	"github.com/cousingary/governator/internal/containment"
 	"github.com/cousingary/governator/internal/contextgraph"
 	"github.com/cousingary/governator/internal/contracts"
+	"github.com/cousingary/governator/internal/enforce"
+	"github.com/cousingary/governator/internal/gitplumb"
+	"github.com/cousingary/governator/internal/lifecycle"
 	"github.com/cousingary/governator/internal/minimalism"
 	"github.com/cousingary/governator/internal/observability"
 	"github.com/cousingary/governator/internal/policy"
@@ -587,8 +590,22 @@ func matchesAny(ps []string, n string) bool {
 }
 
 func shell(ctx context.Context, dir, command string) (int, string, error) {
+	// Sol report attack 10 / P0-5: every command this helper runs is a git
+	// invocation (or, in runner.go's copy, a plain cp — prepending is a
+	// no-op for it). bash resolves "git" via its own inherited PATH, so a
+	// hostile binary earlier on the calling process's PATH would otherwise
+	// silently redirect it. Prepending the trusted-tool registry's
+	// verified git directory makes bash's own lookup find that file first,
+	// regardless of what PATH otherwise contains. Fails closed: if git
+	// itself cannot be resolved and verified, no command this helper runs
+	// proceeds blind.
+	gitPath, gerr := gitplumb.TrustedGitPath()
+	if gerr != nil {
+		return -1, "", gerr
+	}
 	cmd := exec.CommandContext(ctx, "bash", "-lc", command)
 	cmd.Dir = dir
+	cmd.Env = append(os.Environ(), "PATH="+filepath.Dir(gitPath)+string(os.PathListSeparator)+os.Getenv("PATH"))
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	out, err := cmd.CombinedOutput()
 	if ctx.Err() != nil && cmd.Process != nil {
@@ -656,47 +673,71 @@ func appendRuntimePathScanViolation(violations []string, stage, work string) []s
 }
 
 // enforceContainment applies the Session 3 (Phase 2) risk-class containment
-// policy. It resolves the backend's native-sandbox capability (a verified
-// agent-layer fact, not a contract claim) and the operator override key from
-// config, then delegates to containment.EnforcePolicy. Contracts that do not
-// require host containment are a no-op. The check runs before quota/workspace
-// acquisition so a denied high-risk or medium-risk effectful run leaves no side
-// effects.
+// policy, as re-grounded by Session 5 (Sol P0-3, report §9 attack 5):
+// authorization for a "local" runner now comes from Governator's OWN
+// externally enforced sandbox (enforce.Supported() — Landlock LSM + network
+// namespace, applied outside the backend and independent of anything it
+// claims about itself), never from a backend's declared or probe-attested
+// native sandbox alone. The check runs before quota/workspace acquisition so
+// a denied high-risk or medium-risk effectful run leaves no side effects.
 //
 // agent is the single Agent instance the caller already built for this run
-// (via agents.New) — enforceContainment builds no Agent of its own. It DOES
-// resolve the backend binary itself (Sol Finding 5 / Session 2's
-// agents.ResolvePath), but only inside the native-sandbox branch below: most
-// contracts (non-high-risk, non-native-sandbox, Docker-runner, or signed
-// override) never need the executable's identity to reach a containment
-// verdict, and resolving unconditionally here would force every high-risk
-// contract — including ones correctly rejected on containment grounds alone —
-// to have its backend CLI actually installed just to fail closed for an
-// unrelated reason.
-func enforceContainment(db *sql.DB, c contracts.Contract, agent agents.Agent, cfg config.Config) (string, error) {
+// (via agents.New) — enforceContainment builds no Agent of its own. It
+// resolves the backend binary itself (into a *agents.BackendExecutionHandle,
+// Sol P0-6 / Session 3), but only when the backend declares a native sandbox
+// worth recording attestation evidence for: authorization itself (Session 5)
+// no longer depends on the backend's identity at all, only on whether this
+// host can provide Governator's own externally enforced sandbox, so a
+// backend that declares no native sandbox never needs to be resolvable (or
+// even installed) just to be correctly denied or approved on host-capability
+// grounds alone. enforce.Plan.Wrap (attached by the caller once it has a
+// workspace path, below) needs no BackendExecutionHandle either — it wraps
+// bin/args generically at the launch site.
+//
+// The returned handle, when non-nil, is the ONE resolution performed for
+// this run — the caller (runOnce) must reuse it for execution identity and
+// launch rather than resolving again; when nil, the caller resolves once,
+// later, itself (the existing fallback already does this unconditionally
+// before launch). This is what closes P0-6's "resolved twice" gap: exactly
+// one of enforceContainment or its caller ever calls agents.ResolveHandle
+// for a given run.
+//
+// The final bool return, requiresEnforcementWrap, tells the caller (runOnce,
+// once it has a workspace path and BackendSpec to build one) whether it must
+// construct and attach an enforce.Plan before launch: true exactly when this
+// is a "local" runner that needed host containment and was not authorized by
+// a signed override — the same condition already evaluated once here, not
+// recomputed independently at the launch site.
+func enforceContainment(ctx context.Context, db *sql.DB, c contracts.Contract, agent agents.Agent, cfg config.Config) (string, *agents.BackendExecutionHandle, bool, error) {
 	enforceLocalEffectful := containment.LocalEffectfulTieringEnforced(cfg.Containment.LocalEffectfulTiering)
 	if !containment.RequiresHostContainment(c, enforceLocalEffectful) {
-		return "", nil
+		return "", nil, false, nil
 	}
-	nativeSandbox := agent.Capabilities().NativeSandbox
+	nativeSandboxDeclared := agent.Capabilities().NativeSandbox
+	requiresEnforcementWrap := c.EffectiveRunner() == "local" && !containment.VerifyOverride(c, cfg.Containment.OverridePublicKey)
 	var attestationID string
-	// Sol Critical 4 / Phase E: a backend name is never sufficient evidence of
-	// native host containment. High-risk local jobs may count a native sandbox
-	// only when the current executable hash/config/model has a fresh ledgered
-	// capability attestation whose probes passed. Docker and signed overrides
-	// keep their existing paths inside containment.Enforce.
-	if c.EffectiveRunner() == "local" && nativeSandbox && !containment.VerifyOverride(c, cfg.Containment.OverridePublicKey) {
-		resolution, err := agents.ResolvePath(agent)
+	var handle *agents.BackendExecutionHandle
+	// Sol P0-3 (Session 5): a fresh ledgered capability attestation is still
+	// generated and recorded when the backend declares a native sandbox — it
+	// remains useful probe-observed evidence and audit history — but its
+	// outcome no longer gates authorization below. Only
+	// containment.EnforcePolicy's externallyEnforced argument (Governator's
+	// own sandbox, not the backend's self-report) does.
+	if requiresEnforcementWrap && nativeSandboxDeclared {
+		h, err := agents.ResolveHandle(ctx, cfg, agent)
 		if err != nil {
-			return "", err
+			return "", nil, false, err
 		}
-		id, err := attest.VerifyHighRiskNative(db, cfg, agent, resolution)
-		if err != nil {
-			return "", err
+		handle = h
+		if id, aerr := attest.VerifyHighRiskNative(db, cfg, agent, handle.PathResolution, handle.Identity); aerr == nil {
+			attestationID = id
 		}
-		attestationID = id
 	}
-	return attestationID, containment.EnforcePolicy(c, nativeSandbox, cfg.Containment.OverridePublicKey, enforceLocalEffectful)
+	externallyEnforced := c.EffectiveRunner() == "local" && enforce.Supported()
+	if err := containment.EnforcePolicy(c, externallyEnforced, cfg.Containment.OverridePublicKey, enforceLocalEffectful); err != nil {
+		return "", nil, false, err
+	}
+	return attestationID, handle, requiresEnforcementWrap, nil
 }
 
 // requiresCompleteTranscript reports whether c may never be approved on an
@@ -882,21 +923,29 @@ func gitControlFingerprint(root string) (snapshot, error) {
 	return out, nil
 }
 
-func gitStatusPorcelain(ctx context.Context, root string) (string, error) {
-	code, out, err := shell(ctx, root, "git status --porcelain")
-	if err != nil || code != 0 {
-		return out, fmt.Errorf("git status --porcelain: %s", strings.TrimSpace(out))
+// statusSummary renders porcelain=v2 entries as a compact, safe error
+// string: Path is printed exactly as Git returned it (no shell-style
+// unquoting was ever applied), so a hostile filename can't inject anything
+// beyond its own bytes into this message (P1-9).
+func statusSummary(entries []gitplumb.StatusEntry) string {
+	parts := make([]string, 0, len(entries))
+	for _, e := range entries {
+		if e.Kind == '2' {
+			parts = append(parts, string(e.Kind)+" "+e.XY+" "+e.OrigPath+" -> "+e.Path)
+			continue
+		}
+		parts = append(parts, string(e.Kind)+" "+e.XY+" "+e.Path)
 	}
-	return strings.TrimSpace(out), nil
+	return strings.Join(parts, "; ")
 }
 
 func requireCleanLiveRoot(ctx context.Context, root string) error {
-	status, err := gitStatusPorcelain(ctx, root)
+	entries, err := gitplumb.StatusPorcelainV2(ctx, root)
 	if err != nil {
 		return err
 	}
-	if status != "" {
-		return fmt.Errorf("live root dirty before merge: %s", status)
+	if len(entries) > 0 {
+		return fmt.Errorf("live root dirty before merge: %s", statusSummary(entries))
 	}
 	return nil
 }
@@ -1062,60 +1111,146 @@ func finalStateDeltaViolations(approved, final finalStateMeasurement) []string {
 	return violations
 }
 
-func gitAddExactPaths(ctx context.Context, work string, paths []string) error {
-	seen := map[string]bool{}
-	args := make([]string, 0, len(paths))
-	for _, p := range paths {
-		if p == "" || seen[p] {
-			continue
-		}
-		seen[p] = true
-		args = append(args, shQuote(p))
-	}
-	if len(args) == 0 {
-		return nil
-	}
-	code, out, err := shell(ctx, work, "git add -- "+strings.Join(args, " "))
-	if err != nil || code != 0 {
-		return fmt.Errorf("git add exact paths: %s", strings.TrimSpace(out))
-	}
-	return nil
+// approvedMergeResult carries the built-and-verified tree plus the
+// isolated gitplumb session used to build it, so the caller can commit it
+// and, only then, sync the live root's working tree and real index.
+type approvedMergeResult struct {
+	session   *gitplumb.Session
+	mergeTree string
 }
 
-func verifyOnlyApprovedGitChanges(ctx context.Context, work string, approved []string) error {
-	allowed := map[string]bool{}
-	for _, p := range approved {
-		allowed[p] = true
-	}
-	status, err := gitStatusPorcelain(ctx, work)
+// buildApprovedMergeTree is the Sol redteam v4 S1 replacement for the old
+// gitAddExactPaths/verifyOnlyApprovedGitChanges pair (P0-1/P0-2/P1-6/P1-9).
+// It never touches the real .git/index and never invokes `git add` or
+// `git commit` in repository context, so no hook, filter, or signing
+// program ever runs with Governator's authority. It builds the merge tree
+// in an isolated temporary index seeded from head's tree, hashing each
+// approved changed file directly off work's filesystem (--no-filters
+// --literally: P0-1's clean-filter vector) and staging it under its exact,
+// literal path (a cacheinfo entry, never a pathspec: P0-2/P1-9's
+// filename-as-magic vector) — then independently verifies the result: the
+// tree's diff from baseline must be exactly the approved change set, no
+// more and no less, and .governator/.codegraph must be completely absent
+// from the final tree regardless of what the diff says (never skip
+// verification for Governator's own internal paths — that skip is exactly
+// what P0-2 exploited). The caller must Close() the returned session's
+// session field once done (commitAndSyncRoot does this).
+func buildApprovedMergeTree(ctx context.Context, root, work, head string, changed, deleted []string) (*approvedMergeResult, error) {
+	sess, err := gitplumb.NewSession(ctx, root)
 	if err != nil {
-		return err
+		return nil, fmt.Errorf("git merge: open plumbing session: %w", err)
 	}
-	if status == "" {
-		return nil
+	baseline, err := sess.RevParseTree(ctx, head)
+	if err != nil {
+		sess.Close()
+		return nil, fmt.Errorf("git merge: resolve baseline tree: %w", err)
 	}
-	for _, line := range strings.Split(status, "\n") {
-		if strings.TrimSpace(line) == "" {
+	if err := sess.ReadTreeIntoIndex(ctx, baseline); err != nil {
+		sess.Close()
+		return nil, fmt.Errorf("git merge: seed isolated index: %w", err)
+	}
+	approved := map[string]bool{}
+	for _, p := range changed {
+		if p == "" {
 			continue
 		}
-		if len(line) < 4 {
-			return fmt.Errorf("unparseable git status after precise add: %s", line)
-		}
-		path := strings.TrimSpace(line[3:])
-		if strings.Contains(path, " -> ") {
-			parts := strings.Split(path, " -> ")
-			path = parts[len(parts)-1]
-		}
-		path = strings.Trim(path, "\"")
-		path = filepath.ToSlash(path)
-		if isGovernatorInternalPath(path) || path == ".codegraph" || strings.HasPrefix(path, ".codegraph/") {
-			continue
-		}
-		if !allowed[path] {
-			return fmt.Errorf("unapproved worktree change after precise add: %s", path)
+		approved[p] = true
+		diskPath := filepath.Join(work, filepath.FromSlash(p))
+		if err := sess.UpdateIndexAddFile(ctx, diskPath, p); err != nil {
+			sess.Close()
+			return nil, fmt.Errorf("git merge: stage %s: %w", p, err)
 		}
 	}
-	return nil
+	for _, p := range deleted {
+		if p == "" {
+			continue
+		}
+		approved[p] = true
+		if err := sess.UpdateIndexRemove(ctx, p); err != nil {
+			sess.Close()
+			return nil, fmt.Errorf("git merge: unstage %s: %w", p, err)
+		}
+	}
+	mergeTree, err := sess.WriteTree(ctx)
+	if err != nil {
+		sess.Close()
+		return nil, fmt.Errorf("git merge: write-tree: %w", err)
+	}
+
+	diff, err := sess.DiffTreePaths(ctx, baseline, mergeTree)
+	if err != nil {
+		sess.Close()
+		return nil, fmt.Errorf("git merge: diff baseline/merge tree: %w", err)
+	}
+	for _, p := range diff {
+		if !approved[p] {
+			sess.Close()
+			return nil, fmt.Errorf("git merge: unapproved tree diff: %s", p)
+		}
+	}
+	finalPaths, err := sess.LsTreePaths(ctx, mergeTree)
+	if err != nil {
+		sess.Close()
+		return nil, fmt.Errorf("git merge: list final tree: %w", err)
+	}
+	for _, p := range finalPaths {
+		if isGovernatorInternalPath(p) || p == ".codegraph" || strings.HasPrefix(p, ".codegraph/") {
+			sess.Close()
+			return nil, fmt.Errorf("git merge: internal path present in final tree: %s", p)
+		}
+	}
+	return &approvedMergeResult{session: sess, mergeTree: mergeTree}, nil
+}
+
+// commitAndSyncRoot commits result's verified tree as a child of head,
+// atomically advances root's HEAD (compare-and-swap against head — P1-6:
+// nothing else may have moved the branch since the pre-run measurement),
+// re-verifies the landed commit's tree matches exactly what was approved,
+// then materializes the change set into root's actual working directory
+// and real index. The working-tree sync is a plain byte copy (never `git
+// checkout`/`read-tree -u`), so no clean/smudge filter runs on the way
+// back out to disk either. Always closes result's session, even on error.
+func commitAndSyncRoot(ctx context.Context, result *approvedMergeResult, root, work, head, message string, changed, deleted []string) (string, error) {
+	defer result.session.Close()
+	commit, err := result.session.CommitTree(ctx, result.mergeTree, head, message)
+	if err != nil {
+		return "", fmt.Errorf("git merge: commit-tree: %w", err)
+	}
+	if err := result.session.UpdateRefCAS(ctx, root, "HEAD", commit, head); err != nil {
+		return "", fmt.Errorf("git merge: update-ref: %w", err)
+	}
+	verifyTree, err := result.session.RevParseTree(ctx, commit)
+	if err != nil {
+		return "", fmt.Errorf("git merge: re-verify commit tree: %w", err)
+	}
+	if verifyTree != result.mergeTree {
+		return "", fmt.Errorf("git merge: committed tree %s does not match approved tree %s", verifyTree, result.mergeTree)
+	}
+	for _, p := range changed {
+		if p == "" {
+			continue
+		}
+		src := filepath.Join(work, filepath.FromSlash(p))
+		dst := filepath.Join(root, filepath.FromSlash(p))
+		if err := os.MkdirAll(filepath.Dir(dst), 0755); err != nil {
+			return "", fmt.Errorf("git merge: sync %s: %w", p, err)
+		}
+		if err := copyFile(src, dst); err != nil {
+			return "", fmt.Errorf("git merge: sync %s: %w", p, err)
+		}
+	}
+	for _, p := range deleted {
+		if p == "" {
+			continue
+		}
+		if err := os.Remove(filepath.Join(root, filepath.FromSlash(p))); err != nil && !os.IsNotExist(err) {
+			return "", fmt.Errorf("git merge: remove %s: %w", p, err)
+		}
+	}
+	if err := result.session.SyncRealIndex(ctx, root, result.mergeTree); err != nil {
+		return "", fmt.Errorf("git merge: sync real index: %w", err)
+	}
+	return commit, nil
 }
 
 func rollbackLiveRoot(ctx context.Context, root, previousHead string, before snapshot, mergePaths []string) error {
@@ -1132,12 +1267,12 @@ func rollbackLiveRoot(ctx context.Context, root, previousHead string, before sna
 		// run a broad git clean over the operator's repository.
 		_, _, _ = shell(ctx, root, "git clean -fd -- "+shQuote(p))
 	}
-	status, err := gitStatusPorcelain(ctx, root)
+	entries, err := gitplumb.StatusPorcelainV2(ctx, root)
 	if err != nil {
 		return err
 	}
-	if status != "" {
-		return fmt.Errorf("rollback left live root dirty: %s", status)
+	if len(entries) > 0 {
+		return fmt.Errorf("rollback left live root dirty: %s", statusSummary(entries))
 	}
 	after, err := fingerprint(root)
 	if err != nil {
@@ -1683,6 +1818,32 @@ func readSelfReview(work string) (*contracts.ResultDocument, string) {
 	return &review, string(normalized)
 }
 
+// undisclosedChanges returns every EXTERNALLY measured changed/deleted path
+// (the actual worktree diff, never trusted from the backend) that the
+// backend's own self-reported RESULT.json files_changed never listed (Sol
+// P1-15: the transcript/self-report is explanatory evidence, never
+// authoritative). A nil review is not itself a mismatch -- a missing
+// self-report is its own, separately caught failure (required-file/validator
+// checks); this only flags a review that DID run but suppressed a real
+// change.
+func undisclosedChanges(review *contracts.ResultDocument, changed, deleted []string) []string {
+	if review == nil {
+		return nil
+	}
+	claimed := make(map[string]bool, len(review.FilesChanged))
+	for _, p := range review.FilesChanged {
+		claimed[p] = true
+	}
+	var undisclosed []string
+	for _, p := range append(append([]string{}, changed...), deleted...) {
+		if p == "RESULT.json" || claimed[p] {
+			continue
+		}
+		undisclosed = append(undisclosed, p)
+	}
+	return undisclosed
+}
+
 type diffMetrics struct {
 	Lines    int
 	NewFiles int
@@ -1911,7 +2072,11 @@ func (r *Runner) fallbackEligible(c contracts.Contract, rec RunRecord) (bool, st
 			policy.FactUnusualInfraRetry: true,
 			policy.FactInfraFailureKind:  rec.FailureTaxonomy,
 		})
-		decision, _, pendingOneShotIDs, gerr := evaluatePolicyGate(db, cfg, c, root, rec.ID, facts)
+		bundle, err := loadPolicyBundle(cfg, c, root)
+		if err != nil {
+			return false, "", err
+		}
+		decision, _, pendingOneShotIDs, gerr := evaluatePolicyGate(db, cfg, c, bundle, rec.ID, facts)
 		if gerr != nil {
 			return false, "", gerr
 		}
@@ -1977,7 +2142,18 @@ func (r *Runner) runOnce(ctx context.Context, c contracts.Contract) (RunRecord, 
 	id := fmt.Sprintf("%s-%d", c.JobID, time.Now().UTC().UnixNano())
 	runStarted := time.Now().UTC()
 	if c.Budget.MaxMinutes > 0 {
-		runCtx, cancel := context.WithTimeout(ctx, time.Duration(c.Budget.MaxMinutes)*time.Minute)
+		// Sol P1-16 / report §9 attack 21: contracts.Validate now rejects an
+		// out-of-range budget.max_minutes before a contract ever reaches
+		// here, but a contract built directly in Go (bypassing Validate, as
+		// most in-process callers and tests do) has no other guard — a raw
+		// time.Duration(minutes)*time.Minute multiply silently overflows and
+		// wraps for a large enough value instead of producing the huge
+		// timeout the caller asked for. SafeMinutesDuration refuses instead.
+		dur, ok := contracts.SafeMinutesDuration(c.Budget.MaxMinutes)
+		if !ok {
+			return RunRecord{}, fmt.Errorf("budget.max_minutes %d exceeds the safe duration-conversion bound (%d)", c.Budget.MaxMinutes, contracts.MaxSafeBudgetMinutes)
+		}
+		runCtx, cancel := context.WithTimeout(ctx, dur)
 		defer cancel()
 		ctx = runCtx
 	}
@@ -2014,10 +2190,10 @@ func (r *Runner) runOnce(ctx context.Context, c contracts.Contract) (RunRecord, 
 		return RunRecord{}, err
 	}
 	defer db.Close()
-	if err := observability.RecordStage(db, id, "PARSED", "", time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
+	if err := lifecycle.Record(db, id, lifecycle.Parsed, "", lifecycle.Now()); err != nil {
 		return RunRecord{}, err
 	}
-	if err := observability.RecordStage(db, id, "PREFLIGHTED", "", time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
+	if err := lifecycle.Record(db, id, lifecycle.Preflighted, "", lifecycle.Now()); err != nil {
 		return RunRecord{}, err
 	}
 	hash, err := contracts.ContractHash(c)
@@ -2064,7 +2240,7 @@ func (r *Runner) runOnce(ctx context.Context, c contracts.Contract) (RunRecord, 
 		}); err != nil {
 			return refused, err
 		}
-		if err := observability.RecordStage(db, id, "QUARANTINED", "", time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
+		if err := lifecycle.Record(db, id, lifecycle.Quarantined, "", lifecycle.Now()); err != nil {
 			return refused, err
 		}
 		return refused, nil
@@ -2104,7 +2280,7 @@ func (r *Runner) runOnce(ctx context.Context, c contracts.Contract) (RunRecord, 
 				c.Agent, snap.EffectiveState, snap.FailureKind)
 		}
 	}
-	if err := observability.RecordStage(db, id, "ROUTED", resolved.Agent, time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
+	if err := lifecycle.Record(db, id, lifecycle.Routed, resolved.Agent, lifecycle.Now()); err != nil {
 		return RunRecord{}, err
 	}
 	agent, err := agents.New(resolved.Agent)
@@ -2121,8 +2297,11 @@ func (r *Runner) runOnce(ctx context.Context, c contracts.Contract) (RunRecord, 
 	// enforceContainment resolves the backend binary itself, but only when its
 	// native-sandbox attestation branch actually needs it (Sol Finding 5 /
 	// Session 2) — most contracts reach a containment verdict without ever
-	// touching the executable's identity.
-	capabilityAttestID, err := enforceContainment(db, c, agent, cfg)
+	// touching the executable's identity. handle is non-nil only when the
+	// native-sandbox attestation branch resolved it; runOnce reuses it below
+	// instead of resolving again (Sol P0-6 / Session 3: exactly one
+	// agents.ResolveHandle call per run).
+	capabilityAttestID, handle, requiresEnforcementWrap, err := enforceContainment(ctx, db, c, agent, cfg)
 	if err != nil {
 		return RunRecord{}, err
 	}
@@ -2147,7 +2326,17 @@ func (r *Runner) runOnce(ctx context.Context, c contracts.Contract) (RunRecord, 
 		policy.FactEstimatedCostUSD: estimatedCostUSD,
 		policy.FactDailyCapUSD:      cfg.Spend.DailyCapUSD,
 	})
-	gateDecision, pendingAsks, pendingOneShotIDs, gerr := evaluatePolicyGate(db, cfg, c, root, id, policyFacts)
+	// Sol P1-3: the bundle is built exactly once, here, before the first gate
+	// call — and reused unchanged for computeExecutionIdentity below, even
+	// though substantial pre-launch work (spend/quota reservation, prompt
+	// resolution, handle resolution) separates the two. Neither call may load
+	// project doctrine or contract rules independently; see PolicyBundle's
+	// doc comment in policy_gate.go for the race this closes.
+	policyBundle, err := loadPolicyBundle(cfg, c, root)
+	if err != nil {
+		return RunRecord{}, err
+	}
+	gateDecision, pendingAsks, pendingOneShotIDs, gerr := evaluatePolicyGate(db, cfg, c, policyBundle, id, policyFacts)
 	if gerr != nil {
 		return RunRecord{}, gerr
 	}
@@ -2208,7 +2397,7 @@ func (r *Runner) runOnce(ctx context.Context, c contracts.Contract) (RunRecord, 
 		}); err != nil {
 			return refused, err
 		}
-		if err := observability.RecordStage(db, id, "QUARANTINED", "", time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
+		if err := lifecycle.Record(db, id, lifecycle.Quarantined, "", lifecycle.Now()); err != nil {
 			return refused, err
 		}
 		return refused, nil
@@ -2252,14 +2441,14 @@ func (r *Runner) runOnce(ctx context.Context, c contracts.Contract) (RunRecord, 
 				payload, _ := json.Marshal(breakerFeedbackPayload{Agent: refused.Agent, FailureKind: refused.FailureTaxonomy})
 				noteOperationalFailure(db, refused.ID, opBreakerFailure, err, string(payload))
 			}
-			if err := observability.RecordStage(db, id, "QUARANTINED", "", time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
+			if err := lifecycle.Record(db, id, lifecycle.Quarantined, "", lifecycle.Now()); err != nil {
 				return refused, err
 			}
 			return refused, nil
 		}
 		return RunRecord{}, qerr
 	}
-	if err := observability.RecordStage(db, id, "QUOTA_RESERVED", "", time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
+	if err := lifecycle.Record(db, id, lifecycle.QuotaReserved, "", lifecycle.Now()); err != nil {
 		return RunRecord{}, err
 	}
 	quotaSettled := false
@@ -2292,17 +2481,39 @@ func (r *Runner) runOnce(ctx context.Context, c contracts.Contract) (RunRecord, 
 	if err != nil {
 		return RunRecord{}, err
 	}
-	// Sol Finding 5 / Session 2: resolve the configured backend binary exactly
-	// once here — through PATH, symlink-canonicalized, content-hashed — and
-	// reuse this single record for execution identity, replay, and the actual
-	// launch below. A bare name (backends.pi.bin: pi) resolved independently
-	// at identity time versus launch time let a swapped-then-restored binary
-	// pass a stale replay check that never re-verified the file it hashed.
-	resolution, err := agents.ResolvePath(agent)
-	if err != nil {
-		return RunRecord{}, err
+	// Sol P0-6 / Session 3: resolve the configured backend binary exactly
+	// once for this run — through PATH, symlink-canonicalized, opened, and
+	// content-hashed from that one open descriptor — and reuse the single
+	// resulting handle for execution identity, replay, and the actual launch
+	// below. handle is already set when enforceContainment's native-sandbox
+	// attestation branch needed it above; otherwise this is the run's one
+	// and only resolution. A bare name (backends.pi.bin: pi) resolved
+	// independently at identity time versus launch time let a
+	// swapped-then-restored binary pass a stale replay check that never
+	// re-verified the file it hashed.
+	if handle == nil {
+		handle, err = agents.ResolveHandle(ctx, cfg, agent)
+		if err != nil {
+			return RunRecord{}, err
+		}
 	}
-	identity := computeExecutionIdentity(cfg, c, agent, resolution, root, head, hash, promptVersion, capabilityAttestID)
+	defer handle.Close()
+	// Sol P1-1: a docker-runner contract's identity must bind to the resolved
+	// image ID/digest, never the operator's configured tag string alone — a
+	// mutable tag can be repointed at a different image between an attested
+	// run and a later replay. Resolved once here, before the container ever
+	// starts, so a run whose image can't be inspected (not pulled locally,
+	// daemon unreachable) fails before any workspace/launch side effect,
+	// exactly like every other pre-launch identity input.
+	var dockerImage *runner.ImageIdentity
+	if c.EffectiveRunner() == "docker" && c.Docker != nil {
+		img, ierr := runner.ResolveImageIdentity(ctx, c.Docker.Image)
+		if ierr != nil {
+			return RunRecord{}, ierr
+		}
+		dockerImage = &img
+	}
+	identity := computeExecutionIdentity(cfg, c, agent, handle.PathResolution, handle.Identity, dockerImage, agents.EnvPolicyHash(handle.AllowedEnv), head, hash, promptVersion, capabilityAttestID, policyBundle)
 	if priorID, perr := replayMatch(db, identity.Hash()); perr != nil {
 		return RunRecord{}, perr
 	} else if priorID != "" {
@@ -2346,7 +2557,7 @@ func (r *Runner) runOnce(ctx context.Context, c contracts.Contract) (RunRecord, 
 	if err != nil {
 		return rec, err
 	}
-	if err := observability.RecordStage(db, id, "WORKSPACE_READY", string(wsDescriptorJSON), time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
+	if err := lifecycle.Record(db, id, lifecycle.WorkspaceReady, string(wsDescriptorJSON), lifecycle.Now()); err != nil {
 		return rec, err
 	}
 	graphSnapshot, err := contextgraph.Prepare(ctx, work)
@@ -2369,7 +2580,7 @@ func (r *Runner) runOnce(ctx context.Context, c contracts.Contract) (RunRecord, 
 	if err := os.WriteFile(canaryPath, []byte(id+"\n"), 0400); err != nil {
 		return RunRecord{}, fmt.Errorf("create canary: %w", err)
 	}
-	stagedArtifacts, err := stageConsumedArtifacts(db, work, c)
+	stagedArtifacts, err := stageConsumedArtifacts(db, r.Home, work, c)
 	if err != nil {
 		return RunRecord{}, err
 	}
@@ -2409,9 +2620,38 @@ func (r *Runner) runOnce(ctx context.Context, c contracts.Contract) (RunRecord, 
 	// "the agent was mid-edit when it died" (digest no longer matches) without
 	// needing that in-memory snapshot to have survived the crash.
 	agentRunningDetail, _ := json.Marshal(map[string]string{"worktree_digest": snapshotDigest(workBefore)})
-	if err := observability.RecordStage(db, id, "AGENT_RUNNING", string(agentRunningDetail), time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
+	if err := lifecycle.Record(db, id, lifecycle.AgentRunning, string(agentRunningDetail), lifecycle.Now()); err != nil {
 		return rec, err
 	}
+	// Session 2 (P0-4): construct the descendant-owning containment scope
+	// before launch, exactly once, and thread it via ctx to whichever
+	// executor rn.Launch ends up calling. Extinguish (below, after Observe)
+	// is the DESCENDANTS_TERMINATED lifecycle stage -- it runs
+	// unconditionally on every path (success, backend error, timeout), and
+	// approval is impossible without a recorded successful extinction proof.
+	descendants, descScopeErr := containment.NewScope(id, strings.TrimSpace(c.RiskClass) == "high")
+	if descScopeErr != nil {
+		return RunRecord{}, fmt.Errorf("descendant containment: %w", descScopeErr)
+	}
+	ctx = containment.WithScope(ctx, descendants)
+	// Session 5 (Sol P0-3): the externally enforced sandbox (Landlock +
+	// network namespace) requiring construction is exactly the condition
+	// enforceContainment already evaluated once above (requiresEnforcementWrap)
+	// -- not recomputed here. NewPlan refuses outright for a high-risk run on
+	// a host that cannot actually provide it, the same fail-closed posture as
+	// containment.NewScope just above for the descendant-owning primitive.
+	enforcePlan, enforcePlanErr := enforce.NewPlan(requiresEnforcementWrap, work, spec.Sandbox == agents.SandboxReadOnly, spec.Network, strings.TrimSpace(c.RiskClass) == "high")
+	if enforcePlanErr != nil {
+		return RunRecord{}, fmt.Errorf("external enforcement: %w", enforcePlanErr)
+	}
+	ctx = enforce.WithPlan(ctx, enforcePlan)
+	// Sol P0-6 / Session 3: thread the run's single resolved handle to
+	// whichever executor rn.Launch ends up calling (agents.defaultExecutor
+	// or runner.LocalWorktreeRunner's executor both read it via
+	// agents.HandleFromContext), so the launch execs the exact descriptor
+	// already hashed above rather than a bare path a second time.
+	ctx = agents.ContextWithHandle(ctx, handle)
+
 	agentTimeout := remainingRunBudget(ctx)
 	var ar agents.Result
 	var aerr error
@@ -2419,25 +2659,23 @@ func (r *Runner) runOnce(ctx context.Context, c contracts.Contract) (RunRecord, 
 		aerr = context.DeadlineExceeded
 		ar.TimedOut = true
 	} else {
-		// Sol P1.1 (finding #8): this is the governed action's execution
-		// boundary — the last point before the backend process actually
-		// starts. Consume every one-shot override the policy gate resolved
-		// to ALLOW right here, atomically, immediately before launch. If a
-		// consume unexpectedly affects zero rows (the reservation was
-		// already released/expired by a race — e.g. this run's own TTL
-		// reclaim on a pathologically slow workspace-prep path), fail
-		// closed and abort rather than launch under an ambiguous
-		// authorization: the run returns an error and the deferred release
-		// above cleans up whatever did stay reserved.
-		for _, oid := range pendingOneShotIDs {
-			consumeAt := time.Now().UTC().Format(time.RFC3339Nano)
-			n, cerr := observability.ConsumePolicyOverrideReservation(db, oid, consumeAt)
-			if cerr != nil {
-				return rec, cerr
-			}
-			if n == 0 {
-				return rec, fmt.Errorf("policy gate: one-shot override %d reservation was lost before launch (released or expired concurrently)", oid)
-			}
+		// Sol P1.1 (finding #8) / Sol P1-5 (attack 18): this is the governed
+		// action's execution boundary — the last point before the backend
+		// process actually starts. Consume every one-shot override the
+		// policy gate resolved to ALLOW right here, as a single atomic
+		// transaction (ConsumePolicyOverrideReservations), never one at a
+		// time. Consuming the set one id per top-level statement let an
+		// earlier id in the set be durably burned even when a later id's
+		// consume failed and the whole launch aborted — an approval spent
+		// for an execution that never happened. Atomic consume-all means a
+		// single lost reservation (released/expired by a race — e.g. this
+		// run's own TTL reclaim on a pathologically slow workspace-prep
+		// path) leaves every id in the set exactly as it was: the run
+		// returns an error and the deferred release above cleans up
+		// whatever did stay reserved.
+		consumeAt := time.Now().UTC().Format(time.RFC3339Nano)
+		if cerr := observability.ConsumePolicyOverrideReservations(db, pendingOneShotIDs, consumeAt); cerr != nil {
+			return rec, cerr
 		}
 		oneShotConsumed = true
 		ar, aerr = rn.Launch(ctx, ws, runner.LaunchRequest{Agent: agent, Request: agents.Request{
@@ -2450,7 +2688,7 @@ func (r *Runner) runOnce(ctx context.Context, c contracts.Contract) (RunRecord, 
 			// Start() — a second, independent resolution taken moments later is
 			// the TOCTOU window the finding closes. Ignored by DockerRunner's
 			// executor, which correctly launches the bare in-container name.
-			ResolvedBin: resolution.CanonicalPath,
+			ResolvedBin: handle.CanonicalPath,
 		}})
 	}
 	// Session 3a: surface runner observations — limits/provenance as notes,
@@ -2465,16 +2703,84 @@ func (r *Runner) runOnce(ctx context.Context, c contracts.Contract) (RunRecord, 
 		}
 		if obs.OutputTruncated {
 			truncDetail := fmt.Sprintf("accepted=%d discarded=%d", obs.BytesAccepted, obs.BytesDiscarded)
-			if err := observability.RecordStage(db, id, "OUTPUT_TRUNCATED", truncDetail, time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
+			if err := lifecycle.Record(db, id, lifecycle.OutputTruncated, truncDetail, lifecycle.Now()); err != nil {
 				payload, _ := json.Marshal(stageEventPayload{RunID: id, Stage: "OUTPUT_TRUNCATED", Detail: truncDetail})
 				noteOperationalFailure(db, id, opStageEvent, err, string(payload))
 			}
 			rec.Notes = appendNote(rec.Notes, fmt.Sprintf("output_truncated: %d bytes discarded of %d total", obs.BytesDiscarded, obs.BytesAccepted+obs.BytesDiscarded))
 		}
 	}
+	// Session 2 (P0-4): DESCENDANTS_TERMINATED. Freeze, kill, and wait for
+	// kernel-confirmed extinction of the whole owned process tree -- setsid,
+	// double fork, nohup, all of it -- before any final-state validation
+	// runs. This must happen on every path (normal completion, backend
+	// error, timeout alike); "the process exited" is never treated as proof
+	// on its own. A failed/unconfirmed extinction is a hard stop: the run
+	// never reaches S1's final-state fingerprint/tree capture.
+	descProof, descErr := descendants.Extinguish(ctx, containment.DefaultExtinctionDeadline, work)
+	descDetail, _ := json.Marshal(descProof)
+	if err := lifecycle.Record(db, id, lifecycle.DescendantsTerminated, string(descDetail), lifecycle.Now()); err != nil {
+		return rec, err
+	}
+	if descErr != nil {
+		return RunRecord{}, fmt.Errorf("descendant containment: extinction not confirmed before final-state capture: %w", descErr)
+	}
+	// Sol P0-3/P1-15 (Session 5) effect ledger: when this launch went through
+	// Governator's own externally enforced sandbox, record what that
+	// enforcement actually was and what the kernel observed -- independent
+	// of anything the backend's own transcript claims. A best-effort,
+	// non-blocking write: this is audit evidence, not a gate, so a ledger
+	// write failure must never turn an otherwise-successful run into a
+	// failure.
+	if enforcePlan.Active {
+		method := "landlock"
+		if !enforcePlan.AllowNetwork {
+			method = "landlock+netns"
+		}
+		enfRec := observability.EnforcementRecord{
+			RunID: id, Method: method, NetworkNamespaced: !enforcePlan.AllowNetwork,
+			ProcessesObservedPeak: descProof.ProcessesObservedPeak, Created: time.Now().UTC().Format(time.RFC3339Nano),
+		}
+		if err := observability.RecordEnforcement(db, enfRec); err != nil {
+			payload, _ := json.Marshal(enfRec)
+			noteOperationalFailure(db, id, opStageEvent, err, string(payload))
+		}
+	}
+	// Sol redteam v4 S9 unified effect ledger: process_creation and
+	// executable_launch rows are recorded for every run (descProof and
+	// handle are always available once a backend actually launched),
+	// independent of whether enforcePlan.Active gated this particular run —
+	// EnforcementRecord above stays scoped to "was this run sandboxed and
+	// how," this ledger is the lower-level "what did the kernel actually
+	// see." file_write rows land later, once the workspace diff is final
+	// (see the FINAL_VALIDATION_BARRIER block below) — changed/deleted
+	// aren't known yet at this point in the pipeline. Same best-effort,
+	// non-blocking posture as every other post-hoc ledger write in this
+	// function.
+	{
+		now := time.Now().UTC().Format(time.RFC3339Nano)
+		effects := make([]observability.EffectRecord, 0, 2)
+		effects = append(effects, observability.EffectRecord{
+			RunID: id, Kind: observability.EffectProcessCreation, Detail: string(descDetail), Created: now,
+		})
+		if handle != nil {
+			launchDetail, _ := json.Marshal(handle.PathResolution)
+			effects = append(effects, observability.EffectRecord{
+				RunID: id, Kind: observability.EffectExecutableLaunch, Detail: string(launchDetail), Created: now,
+			})
+		}
+		netDetail, _ := json.Marshal(map[string]bool{"namespaced": enforcePlan.Active && !enforcePlan.AllowNetwork})
+		effects = append(effects, observability.EffectRecord{
+			RunID: id, Kind: observability.EffectNetwork, Detail: string(netDetail), Created: now,
+		})
+		if err := observability.RecordEffects(db, effects); err != nil {
+			payload, _ := json.Marshal(effects)
+			noteOperationalFailure(db, id, opStageEvent, err, string(payload))
+		}
+	}
 	redactErr := redact(transcript)
 	audit := auditTranscript(transcript, agent.Capabilities().TranscriptFormat, work, c, env.ProtectedPatterns, env.Config.Doctrine.UnenforceableRuleAction, env.Config.Doctrine.TranscriptConformanceAction)
-	if err := observability.RecordStage(db, id, "AUDITED", "", time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
+	if err := lifecycle.Record(db, id, lifecycle.Audited, "", lifecycle.Now()); err != nil {
 		return rec, err
 	}
 	if len(audit.RuleViolations) > 0 {
@@ -2627,6 +2933,20 @@ func (r *Runner) runOnce(ctx context.Context, c contracts.Contract) (RunRecord, 
 			violations = append(violations, "write outside intended_writes: "+p)
 		}
 	}
+	// Sol P1-15 (Session 5): the backend's self-reported RESULT.json
+	// files_changed is explanatory evidence only -- every enforcement
+	// decision above and below already keys off changed/deleted, the
+	// EXTERNALLY measured worktree diff, never the transcript's claim.
+	// Surfaced as a note, not a blocking violation: an undisclosed path that
+	// is ALSO out of scope is already caught (and blocks) via the
+	// allowlist/forbidden/intended-writes checks above, on the external diff
+	// alone -- this note exists for a permitted change the backend simply
+	// never bothered to list, which is sloppy bookkeeping, not evidence of
+	// concealment, and turning it into a hard quarantine would make an
+	// incomplete self-report as costly as a malicious one.
+	if undisclosed := undisclosedChanges(rec.SelfReview, changed, deleted); len(undisclosed) > 0 {
+		rec.Notes = appendNote(rec.Notes, "transcript_effect_mismatch: self-reported files_changed omitted "+strings.Join(undisclosed, ","))
+	}
 	if len(changed)+len(deleted) > c.Budget.MaxFilesChanged {
 		violations = append(violations, "max_files_changed exceeded")
 	}
@@ -2652,7 +2972,7 @@ func (r *Runner) runOnce(ctx context.Context, c contracts.Contract) (RunRecord, 
 			violations = append(violations, "required file missing: "+p)
 		}
 	}
-	if err := observability.RecordStage(db, id, "VALIDATING", "", time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
+	if err := lifecycle.Record(db, id, lifecycle.Validating, "", lifecycle.Now()); err != nil {
 		return rec, err
 	}
 	for _, v := range c.Success.Validators {
@@ -2756,7 +3076,7 @@ func (r *Runner) runOnce(ctx context.Context, c contracts.Contract) (RunRecord, 
 		violations = append(violations, finalViolations...)
 	}
 	if len(violations) == 0 && c.Assay != nil {
-		if err := observability.RecordStage(db, id, "ASSAYING", "", time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
+		if err := lifecycle.Record(db, id, lifecycle.Assaying, "", lifecycle.Now()); err != nil {
 			return rec, err
 		}
 		runAssayStep(ctx, db, cfg, c, id, hash, rec.Agent, artifactRecords, &violations)
@@ -2775,7 +3095,7 @@ func (r *Runner) runOnce(ctx context.Context, c contracts.Contract) (RunRecord, 
 		}
 		if len(violations) == 0 {
 			detail, _ := json.Marshal(map[string]any{"worktree_digest": snapshotDigest(finalAfterAssay.work), "paths": append(append([]string{}, changed...), deleted...)})
-			if err := observability.RecordStage(db, id, "FINAL_VALIDATION_BARRIER", string(detail), time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
+			if err := lifecycle.Record(db, id, lifecycle.FinalValidationBarrier, string(detail), lifecycle.Now()); err != nil {
 				violations = append(violations, "final barrier ledger: "+err.Error())
 			}
 		}
@@ -2792,39 +3112,39 @@ func (r *Runner) runOnce(ctx context.Context, c contracts.Contract) (RunRecord, 
 			}
 			if len(violations) == 0 {
 				detail, _ := json.Marshal(map[string]any{"previous_head": head, "paths": mergePaths})
-				if err := observability.RecordStage(db, id, "MERGE_INTENT", string(detail), time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
+				if err := lifecycle.Record(db, id, lifecycle.MergeIntent, string(detail), lifecycle.Now()); err != nil {
 					violations = append(violations, "merge intent ledger: "+err.Error())
 				}
 			}
+			// Sol redteam v4 S1: the merge tree is built and independently
+			// verified via internal/gitplumb, in an isolated index outside any
+			// worktree — never `git add`/`git commit` in repository context
+			// (P0-1: no hook, filter, or signing program can run with
+			// Governator's authority; P0-2/P1-9: every path is literal, never a
+			// pathspec, checked byte-wise, never shell-parsed).
+			var mergeResult *approvedMergeResult
 			if len(violations) == 0 {
-				if err := gitAddExactPaths(ctx, work, mergePaths); err != nil {
+				built, err := buildApprovedMergeTree(ctx, root, work, head, changed, deleted)
+				if err != nil {
 					violations = append(violations, err.Error())
-				} else if err := verifyOnlyApprovedGitChanges(ctx, work, mergePaths); err != nil {
+				} else {
+					mergeResult = built
+				}
+			}
+			if len(violations) == 0 {
+				cm := fmt.Sprintf("Governator job %s\n\nGov-Run: %s", c.JobID, id)
+				commit, err := commitAndSyncRoot(ctx, mergeResult, root, work, head, cm, changed, deleted)
+				if err != nil {
 					violations = append(violations, err.Error())
+				} else {
+					rec.Commit = commit
 				}
-			}
-			cm := fmt.Sprintf("Governator job %s\n\nGov-Run: %s", c.JobID, id)
-			if len(violations) == 0 {
-				code, out, e := shell(ctx, work, "git commit --allow-empty -m "+shQuote(cm))
-				if e != nil || code != 0 {
-					violations = append(violations, "branch commit: "+out)
-				}
+			} else if mergeResult != nil {
+				mergeResult.session.Close()
 			}
 			if len(violations) == 0 {
-				code, out, e := shell(ctx, root, "git merge --squash "+shQuote(branch))
-				if e != nil || code != 0 {
-					violations = append(violations, "squash merge: "+out)
-				}
-			}
-			if len(violations) == 0 {
-				if err := observability.RecordStage(db, id, "MERGE_APPLIED", "", time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
+				if err := lifecycle.Record(db, id, lifecycle.MergeApplied, "", lifecycle.Now()); err != nil {
 					violations = append(violations, "merge applied ledger: "+err.Error())
-				}
-			}
-			if len(violations) == 0 {
-				code, out, e := shell(ctx, root, "git commit --allow-empty -m "+shQuote(cm))
-				if e != nil || code != 0 {
-					violations = append(violations, "merge commit: "+out)
 				}
 			}
 			if len(violations) > 0 {
@@ -2834,8 +3154,7 @@ func (r *Runner) runOnce(ctx context.Context, c contracts.Contract) (RunRecord, 
 			}
 			if len(violations) == 0 {
 				rootCommitted = true
-				rec.Commit, _ = gitHead(root)
-				if err := observability.RecordStage(db, id, "ROOT_COMMITTED", rec.Commit, time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
+				if err := lifecycle.Record(db, id, lifecycle.RootCommitted, rec.Commit, lifecycle.Now()); err != nil {
 					payload, _ := json.Marshal(stageEventPayload{RunID: id, Stage: "ROOT_COMMITTED", Detail: rec.Commit})
 					noteOperationalFailure(db, id, opStageEvent, err, string(payload))
 				}
@@ -2844,15 +3163,37 @@ func (r *Runner) runOnce(ctx context.Context, c contracts.Contract) (RunRecord, 
 			if err := captureRecall(r.Home, id, root, append(append([]string{}, changed...), deleted...)); err != nil {
 				violations = append(violations, "recall snapshot: "+err.Error())
 			}
-			violations = append(violations, mergeCopyChanged(work, root, changed)...)
-			for _, p := range deleted {
-				if err := os.Remove(filepath.Join(root, filepath.FromSlash(p))); err != nil && !os.IsNotExist(err) {
-					violations = append(violations, "merge delete: "+err.Error())
+			// Sol P1-8 / report §9 attack 23: mergeCopyChanged applies
+			// changed paths to the live (non-git) root sequentially with no
+			// atomicity -- an error partway through (a destination parent
+			// blocked by a plain file, disk full, permission denied) used to
+			// leave the root with only some of the approved changes landed:
+			// a QUARANTINED run that still mutated the live root, never an
+			// all-or-nothing merge (the guarantee the git branch above
+			// already has via buildApprovedMergeTree + rollbackLiveRoot).
+			// Fixed by wiring the recall snapshot captured just above into
+			// an automatic rollback on any violation from the copy/delete
+			// loops, mirroring the git branch's rollback-on-violation shape.
+			// captureRecall must have succeeded first (checked below) -- a
+			// failed snapshot means there is nothing safe to roll back to,
+			// so nothing gets copied at all rather than risking an
+			// unrecoverable partial merge.
+			if len(violations) == 0 {
+				violations = append(violations, mergeCopyChanged(work, root, changed)...)
+				for _, p := range deleted {
+					if err := os.Remove(filepath.Join(root, filepath.FromSlash(p))); err != nil && !os.IsNotExist(err) {
+						violations = append(violations, "merge delete: "+err.Error())
+					}
+				}
+				if len(violations) > 0 {
+					if err := restoreRecall(r.Home, id, root); err != nil {
+						violations = append(violations, "non-git merge rollback: "+err.Error())
+					}
 				}
 			}
 		}
 		if len(violations) == 0 {
-			if err := observability.RecordStage(db, id, "MERGED", "", time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
+			if err := lifecycle.Record(db, id, lifecycle.Merged, "", lifecycle.Now()); err != nil {
 				if rootCommitted {
 					payload, _ := json.Marshal(stageEventPayload{RunID: id, Stage: "MERGED", Detail: ""})
 					noteOperationalFailure(db, id, opStageEvent, err, string(payload))
@@ -2906,16 +3247,16 @@ func (r *Runner) runOnce(ctx context.Context, c contracts.Contract) (RunRecord, 
 		rec.Status = "MERGED_LEDGER_PENDING"
 		rec.Message = "root committed; ledger finalization pending: " + opErr.Error()
 		_, _ = db.Exec(`UPDATE runs SET status=?,message=?,commit_hash=?,identity_hash=? WHERE id=?`, rec.Status, rec.Message, rec.Commit, rec.IdentityHash, rec.ID)
-		_ = observability.RecordStage(db, id, "MERGED_LEDGER_PENDING", opKind+": "+opErr.Error(), time.Now().UTC().Format(time.RFC3339Nano))
+		_ = lifecycle.Record(db, id, lifecycle.MergedLedgerPending, opKind+": "+opErr.Error(), lifecycle.Now())
 		return rec, nil
 	}
 	if rootCommitted {
-		if err := observability.RecordStage(db, id, "LEDGER_FINALIZING", "", time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
+		if err := lifecycle.Record(db, id, lifecycle.LedgerFinalizing, "", lifecycle.Now()); err != nil {
 			payload, _ := json.Marshal(stageEventPayload{RunID: id, Stage: "LEDGER_FINALIZING", Detail: ""})
 			return ledgerPending(opStageEvent, err, string(payload))
 		}
 	}
-	if err := observability.RecordStage(db, id, rec.Status, "", time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
+	if err := lifecycle.Record(db, id, lifecycle.Stage(rec.Status), "", lifecycle.Now()); err != nil {
 		if rootCommitted {
 			payload, _ := json.Marshal(stageEventPayload{RunID: id, Stage: rec.Status, Detail: ""})
 			return ledgerPending(opStageEvent, err, string(payload))
@@ -3037,7 +3378,7 @@ func (r *Runner) runOnce(ctx context.Context, c contracts.Contract) (RunRecord, 
 		noteOperationalFailure(db, rec.ID, opSpendHaltCheck, err, "{}")
 	}
 	if rootCommitted {
-		if err := observability.RecordStage(db, id, "COMPLETE", "", time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
+		if err := lifecycle.Record(db, id, lifecycle.Complete, "", lifecycle.Now()); err != nil {
 			payload, _ := json.Marshal(stageEventPayload{RunID: id, Stage: "COMPLETE", Detail: ""})
 			noteOperationalFailure(db, id, opStageEvent, err, string(payload))
 		}
@@ -3172,7 +3513,7 @@ func Rollback(ctx context.Context, id string) (RunRecord, error) {
 		_, openErr = db.Exec(`UPDATE runs SET status='ROLLED_BACK',message=? WHERE id=?`, "restored recall snapshot", r.ID)
 		r.Status, r.Message = "ROLLED_BACK", "restored recall snapshot"
 		if openErr == nil {
-			openErr = observability.RecordStage(db, r.ID, "ROLLED_BACK", "", time.Now().UTC().Format(time.RFC3339Nano))
+			openErr = lifecycle.Record(db, r.ID, lifecycle.RolledBack, "", lifecycle.Now())
 		}
 		return r, openErr
 	}
@@ -3192,7 +3533,7 @@ func Rollback(ctx context.Context, id string) (RunRecord, error) {
 	defer db.Close()
 	_, e = db.Exec(`UPDATE runs SET status='ROLLED_BACK',message=? WHERE id=?`, "reverted "+r.Commit, r.ID)
 	if e == nil {
-		e = observability.RecordStage(db, r.ID, "ROLLED_BACK", "", time.Now().UTC().Format(time.RFC3339Nano))
+		e = lifecycle.Record(db, r.ID, lifecycle.RolledBack, "", lifecycle.Now())
 	}
 	r.Status = "ROLLED_BACK"
 	r.Message = "reverted " + r.Commit

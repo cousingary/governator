@@ -265,3 +265,32 @@ func TestSol3LoadStrictRejectsInvalidAttestProbeTimeout(t *testing.T) {
 		})
 	}
 }
+
+// attest.total_deadline_seconds (Sol P1-17) gets the identical raw-validation
+// treatment as its sibling probe_timeout_seconds above, for the same reason:
+// merged only when positive, so a bad supplied value would otherwise be
+// silently replaced by the default instead of rejected.
+func TestSol3LoadStrictRejectsInvalidAttestTotalDeadline(t *testing.T) {
+	cleanEnv(t)
+	for _, tc := range []struct {
+		name  string
+		value string
+	}{
+		{"zero", "0"},
+		{"negative", "-5"},
+		{"nan", ".nan"},
+		{"positive infinity", ".inf"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cleanEnv(t)
+			path := filepath.Join(t.TempDir(), "config.yaml")
+			t.Setenv("GOV_CONFIG", path)
+			if err := os.WriteFile(path, []byte("attest: {total_deadline_seconds: "+tc.value+"}\n"), 0644); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := LoadStrict(); err == nil {
+				t.Fatalf("expected %s total_deadline_seconds to be rejected, got nil error", tc.name)
+			}
+		})
+	}
+}

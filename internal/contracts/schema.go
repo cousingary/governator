@@ -8,6 +8,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 )
 
 type Mode string
@@ -639,6 +640,51 @@ type Budget struct {
 	MaxTokens       int `yaml:"max_tokens,omitempty" json:"max_tokens,omitempty"`
 }
 
+// Sol P1-16 / report §9 attack 21: contracts.Validate previously rejected
+// only budget.max_minutes <= 0, with no upper bound. internal/runtime's
+// time.Duration(maxMinutes) * time.Minute conversion overflows int64 for a
+// large enough value, silently wrapping into a bogus (possibly negative or
+// tiny) duration instead of the huge timeout the contract author wrote —
+// and a bogus negative/near-zero context deadline can make a run appear to
+// time out instantly, or (worse) a wrapped-positive-but-wrong value can
+// silently grant far more or less time than intended. MaxSafeBudgetMinutes
+// is set at one year: enormous headroom for any real job, but small enough
+// that MaxSafeBudgetMinutes*time.Minute (and the +5 minute spend/quota TTL
+// grace period added on top of it) stay orders of magnitude below the
+// actual int64-nanosecond overflow threshold (~153,722,867 minutes / ~292
+// years), so the schema bound is the thing that actually fails first. The
+// other Budget/ArtifactSpec maximums below are the same category of
+// mechanical sanity bound the plan calls for (file/line/command/token/byte
+// counts) — generous enough not to constrain any real contract, small
+// enough to keep every count comfortably inside ordinary int arithmetic.
+const (
+	MaxSafeBudgetMinutes  = 365 * 24 * 60 // ~1 year, in minutes
+	maxSafeBudgetCommands = 1_000_000
+	maxSafeBudgetFiles    = 1_000_000
+	maxSafeBudgetLines    = 1_000_000_000
+	maxSafeBudgetTokens   = 1_000_000_000
+	// maxSafeArtifactBytes is a mechanical sanity bound on artifact.max_bytes
+	// (int64, compared not multiplied, so it has no wraparound risk at
+	// realistic values) rather than an overflow fix — kept in the same
+	// "explicit schema maximums" sweep the plan calls for.
+	maxSafeArtifactBytes = 10 << 30 // 10 GiB
+)
+
+// SafeMinutesDuration converts minutes to a time.Duration, refusing
+// (ok=false) rather than silently overflowing/wrapping when minutes is
+// negative or exceeds MaxSafeBudgetMinutes. Callers computing a
+// timeout/TTL/deadline from Budget.MaxMinutes must use this instead of a
+// raw time.Duration(minutes)*time.Minute multiply — contracts.Validate
+// rejects an out-of-range value before it ever reaches runtime code, but a
+// contract built directly in Go (bypassing Validate, as most in-process
+// callers and tests do) has no other guard at the point of conversion.
+func SafeMinutesDuration(minutes int) (time.Duration, bool) {
+	if minutes < 0 || minutes > MaxSafeBudgetMinutes {
+		return 0, false
+	}
+	return time.Duration(minutes) * time.Minute, true
+}
+
 type Preflight struct {
 	IntendedWrites  []string `yaml:"intended_writes" json:"intended_writes"`
 	ScoutCompleted  bool     `yaml:"scout_completed,omitempty" json:"scout_completed,omitempty"`
@@ -787,15 +833,23 @@ func (c Contract) Validate() error {
 
 	if c.Budget.MaxMinutes <= 0 {
 		add("budget.max_minutes", "must be greater than zero")
+	} else if c.Budget.MaxMinutes > MaxSafeBudgetMinutes {
+		add("budget.max_minutes", fmt.Sprintf("must not exceed %d (its time.Duration conversion would overflow)", MaxSafeBudgetMinutes))
 	}
 	if c.Budget.MaxCommands <= 0 {
 		add("budget.max_commands", "must be greater than zero")
+	} else if c.Budget.MaxCommands > maxSafeBudgetCommands {
+		add("budget.max_commands", fmt.Sprintf("must not exceed %d", maxSafeBudgetCommands))
 	}
 	if c.Budget.MaxFilesChanged <= 0 {
 		add("budget.max_files_changed", "must be greater than zero")
+	} else if c.Budget.MaxFilesChanged > maxSafeBudgetFiles {
+		add("budget.max_files_changed", fmt.Sprintf("must not exceed %d", maxSafeBudgetFiles))
 	}
 	if c.Budget.MaxLinesChanged <= 0 {
 		add("budget.max_lines_changed", "must be greater than zero")
+	} else if c.Budget.MaxLinesChanged > maxSafeBudgetLines {
+		add("budget.max_lines_changed", fmt.Sprintf("must not exceed %d", maxSafeBudgetLines))
 	}
 	if c.Budget.MaxNewFiles < 0 {
 		add("budget.max_new_files", "must be zero or greater")
@@ -804,9 +858,13 @@ func (c Contract) Validate() error {
 	}
 	if c.Budget.MaxDeleted < 0 {
 		add("budget.max_deleted", "must be zero or greater")
+	} else if c.Budget.MaxDeleted > maxSafeBudgetFiles {
+		add("budget.max_deleted", fmt.Sprintf("must not exceed %d", maxSafeBudgetFiles))
 	}
 	if c.Budget.MaxTokens < 0 {
 		add("budget.max_tokens", "must be zero or greater")
+	} else if c.Budget.MaxTokens > maxSafeBudgetTokens {
+		add("budget.max_tokens", fmt.Sprintf("must not exceed %d", maxSafeBudgetTokens))
 	}
 	if !telemetryModes[c.TelemetryMode] {
 		add("telemetry_mode", "must be one of strict, estimated, advisory when set")
@@ -976,6 +1034,8 @@ func validateArtifacts(c Contract, add func(string, string)) {
 		}
 		if artifact.MaxBytes <= 0 {
 			add(field+".max_bytes", "must be greater than zero")
+		} else if artifact.MaxBytes > maxSafeArtifactBytes {
+			add(field+".max_bytes", fmt.Sprintf("must not exceed %d", maxSafeArtifactBytes))
 		}
 		if artifact.Schema != "" {
 			validateArtifactSchemaPath(field+".schema", artifact.Schema, add)

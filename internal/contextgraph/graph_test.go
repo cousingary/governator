@@ -17,6 +17,20 @@ func graphEnv(t *testing.T, mode, bin string) {
 	t.Setenv("GOV_GRAPH_BIN", bin)
 }
 
+// trustCodegraph registers "codegraph" as a trusted controller tool for
+// this test (Sol S4 / P0-5: Resolve now refuses to run any provider absent
+// an explicit trust declaration — see toolregistry). Tests exercising a
+// deliberately untrusted/unregistered provider (report attack 9) must NOT
+// call this.
+func trustCodegraph(t *testing.T) {
+	t.Helper()
+	reg := filepath.Join(t.TempDir(), "tools.yaml")
+	if err := os.WriteFile(reg, []byte("tools:\n  - name: codegraph\n    kind: trusted_controller\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("GOV_TOOLREGISTRY_FILE", reg)
+}
+
 func TestResolveAutoMissing(t *testing.T) {
 	graphEnv(t, "auto", "codegraph-not-present")
 	t.Setenv("PATH", t.TempDir())
@@ -48,6 +62,7 @@ exit 1
 		t.Fatal(err)
 	}
 	graphEnv(t, "required", bin)
+	trustCodegraph(t)
 	status, err := Resolve()
 	if err != nil {
 		t.Fatal(err)
@@ -94,6 +109,7 @@ esac
 		t.Fatal(err)
 	}
 	graphEnv(t, "required", bin)
+	trustCodegraph(t)
 	project := t.TempDir()
 
 	snapshot, err := Prepare(context.Background(), project)
@@ -129,6 +145,7 @@ func TestPrepareAutoDegradesOnProviderFailure(t *testing.T) {
 		t.Fatal(err)
 	}
 	graphEnv(t, "auto", bin)
+	trustCodegraph(t)
 	snapshot, err := Prepare(context.Background(), t.TempDir())
 	if err != nil {
 		t.Fatal(err)

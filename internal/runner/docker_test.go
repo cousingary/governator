@@ -723,3 +723,79 @@ func TestDockerObserveHardenedLiveMismatchBlocks(t *testing.T) {
 		t.Fatal("expected Observe to block approval for a container that doesn't match its declared hardened config")
 	}
 }
+
+// TestResolveImageIdentityReturnsContentAddressedID proves ResolveImageIdentity
+// (Sol P1-1) reports the image's real content-addressed ID, matching what
+// `docker image inspect` itself reports -- not a sentinel or the bare
+// reference string.
+func TestResolveImageIdentityReturnsContentAddressedID(t *testing.T) {
+	requireDocker(t)
+	out, err := exec.Command("docker", "image", "inspect", dockerTestImage, "--format", "{{.Id}}").Output()
+	if err != nil {
+		t.Fatalf("docker image inspect: %v", err)
+	}
+	want := strings.TrimSpace(string(out))
+
+	got, err := ResolveImageIdentity(context.Background(), dockerTestImage)
+	if err != nil {
+		t.Fatalf("ResolveImageIdentity: %v", err)
+	}
+	if got.ID != want {
+		t.Fatalf("ID = %q, want %q (from docker image inspect directly)", got.ID, want)
+	}
+	if !strings.HasPrefix(got.ID, "sha256:") {
+		t.Fatalf("ID = %q, want a sha256: content-addressed identity", got.ID)
+	}
+	if got.Reference != dockerTestImage {
+		t.Fatalf("Reference = %q, want %q", got.Reference, dockerTestImage)
+	}
+}
+
+// TestResolveImageIdentityFailsClosedForUnknownImage proves an image
+// reference that cannot be inspected (never pulled/built locally) is a hard
+// error, never a sentinel value that lets a run proceed as if resolution
+// quietly succeeded.
+func TestResolveImageIdentityFailsClosedForUnknownImage(t *testing.T) {
+	requireDocker(t)
+	if _, err := ResolveImageIdentity(context.Background(), "gov-test-definitely-not-a-real-image:latest"); err == nil {
+		t.Fatal("expected ResolveImageIdentity to fail closed for an unresolvable image reference, got nil error")
+	}
+}
+
+// TestResolveImageIdentityDetectsRetaggedMutableTag is the direct proof of
+// report P1-1's core claim: a mutable tag can be repointed at a completely
+// different image between an attested run and a later replay, and the tag
+// string alone never reveals this. It creates a local tag pointing at
+// dockerTestImage, resolves it, retags the SAME name at a different image,
+// and resolves again -- the two resolved IDs must differ even though the
+// configured "image" string (the tag) never changed.
+func TestResolveImageIdentityDetectsRetaggedMutableTag(t *testing.T) {
+	requireDocker(t)
+	if err := exec.Command("docker", "image", "inspect", "hello-world:latest").Run(); err != nil {
+		t.Skip("hello-world:latest not available locally, skipping retag test")
+	}
+	tag := "gov-test-mutable-tag:latest"
+	t.Cleanup(func() { _ = exec.Command("docker", "rmi", tag).Run() })
+
+	if out, err := exec.Command("docker", "tag", dockerTestImage, tag).CombinedOutput(); err != nil {
+		t.Fatalf("docker tag (initial): %v: %s", err, out)
+	}
+	first, err := ResolveImageIdentity(context.Background(), tag)
+	if err != nil {
+		t.Fatalf("ResolveImageIdentity (first): %v", err)
+	}
+
+	// Repoint the exact same tag at a different image -- no change to
+	// whatever "image: gov-test-mutable-tag:latest" a contract had on file.
+	if out, err := exec.Command("docker", "tag", "hello-world:latest", tag).CombinedOutput(); err != nil {
+		t.Fatalf("docker tag (retag): %v: %s", err, out)
+	}
+	second, err := ResolveImageIdentity(context.Background(), tag)
+	if err != nil {
+		t.Fatalf("ResolveImageIdentity (second): %v", err)
+	}
+
+	if first.ID == second.ID {
+		t.Fatal("resolved image ID did not change after the tag was repointed at a different image -- replay would not detect the swap")
+	}
+}

@@ -24,6 +24,22 @@ fi
 
 VERSION=${VERSION:-1.0.0}
 COMMIT=$(git rev-parse HEAD)
+
+# P0-7 (Sol redteam v4 S8): "build releases only from a clean, tagged
+# commit." REQUIRE_TAG defaults off so docs/publishing.md's documented local
+# dry-run ("check the pipeline is clean before tagging") keeps working
+# unchanged; .github/workflows/release.yml -- the actual publish path,
+# triggered only by a v* tag push -- sets REQUIRE_TAG=1, so the one pipeline
+# that ships a real release always asserts HEAD carries the exact tag this
+# VERSION claims.
+REQUIRE_TAG=${REQUIRE_TAG:-0}
+if [ "$REQUIRE_TAG" = 1 ]; then
+  TAG_AT_HEAD=$(git tag --points-at HEAD | grep -x "v${VERSION}" || true)
+  if [ -z "$TAG_AT_HEAD" ]; then
+    echo "release: REQUIRE_TAG=1 but HEAD is not tagged v${VERSION}" >&2
+    exit 1
+  fi
+fi
 BUILD_TS=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 CLAIMS_HASH=$(sha256sum docs/claims.yaml | awk '{print $1}')
 ADAPTER_PROTOCOL_VERSION=${ADAPTER_PROTOCOL_VERSION:-adapter-protocol-v1}
@@ -62,11 +78,19 @@ echo "release: version=${VERSION} commit=${COMMIT} go=${GO_VERSION}" >&2
 # (success, since it read two words fine), never the substituted command's,
 # so a failing tier was silently swallowed and the release packaged anyway.
 # Direct string comparison against an explicit global avoids that trap.
+# P0-7 (Sol redteam v4 S8): "fresh, uncached test evidence is mandatory...
+# recording exact commit, toolchain, dependency lock state, test command,
+# start/end time, exit status, log hash." start/end are now real ISO-8601
+# timestamps (not just an elapsed-seconds delta), and log_sha_var records the
+# sha256 of the tier's own captured output -- so test-summary.json's record
+# of "this tier passed" is bound to one specific, hashable transcript, not
+# just a PASS/FAIL word a later edit could quietly detach from the evidence.
 run_tier() {
-  local name=$1 log=$2 result_var=$3 seconds_var=$4
-  shift 4
-  local start end
+  local name=$1 log=$2 result_var=$3 seconds_var=$4 started_var=$5 ended_var=$6 log_sha_var=$7
+  shift 7
+  local start end started_at ended_at
   start=$(date +%s)
+  started_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
   if "$@" >"$log" 2>&1; then
     end=$(date +%s)
     echo "release: tier ${name} PASS ($((end - start))s)" >&2
@@ -77,20 +101,26 @@ run_tier() {
     cat "$log" >&2
     printf -v "$result_var" '%s' FAIL
   fi
+  ended_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
   printf -v "$seconds_var" '%s' "$((end - start))"
+  printf -v "$started_var" '%s' "$started_at"
+  printf -v "$ended_var" '%s' "$ended_at"
+  printf -v "$log_sha_var" '%s' "$(sha256sum "$log" | awk '{print $1}')"
 }
 
+GO_SUM_HASH=$(sha256sum go.sum | awk '{print $1}')
+
 UNIT_LOG="$OUT_DIR/test-unit.log"
-run_tier unit "$UNIT_LOG" UNIT_RESULT UNIT_SECONDS go test -count=1 ./...
+run_tier unit "$UNIT_LOG" UNIT_RESULT UNIT_SECONDS UNIT_STARTED UNIT_ENDED UNIT_LOG_SHA go test -count=1 ./...
 
 RACE_LOG="$OUT_DIR/test-race.log"
-run_tier race "$RACE_LOG" RACE_RESULT RACE_SECONDS go test -race -count=1 ./...
+run_tier race "$RACE_LOG" RACE_RESULT RACE_SECONDS RACE_STARTED RACE_ENDED RACE_LOG_SHA go test -race -count=1 ./...
 
 INTEGRATION_LOG="$OUT_DIR/test-integration.log"
-run_tier integration "$INTEGRATION_LOG" INTEGRATION_RESULT INTEGRATION_SECONDS go test -tags integration -count=1 ./internal/assay/...
+run_tier integration "$INTEGRATION_LOG" INTEGRATION_RESULT INTEGRATION_SECONDS INTEGRATION_STARTED INTEGRATION_ENDED INTEGRATION_LOG_SHA go test -tags integration -count=1 ./internal/assay/...
 
 CORPUS_LOG="$OUT_DIR/test-corpus.log"
-run_tier black_box_corpus "$CORPUS_LOG" CORPUS_RESULT CORPUS_SECONDS go test -run 'Sol3' -v -count=1 ./...
+run_tier black_box_corpus "$CORPUS_LOG" CORPUS_RESULT CORPUS_SECONDS CORPUS_STARTED CORPUS_ENDED CORPUS_LOG_SHA go test -run 'Sol3' -v -count=1 ./...
 CORPUS_TESTS_RUN=$(grep -c '^--- PASS\|^--- FAIL' "$CORPUS_LOG" || true)
 CORPUS_TESTS_FAILED=$(grep -c '^--- FAIL' "$CORPUS_LOG" || true)
 
@@ -121,9 +151,14 @@ for entry in "${FUZZ_TARGETS[@]}"; do
 done
 
 # Assayer's own pytest matrix lives in a separate repo/checkout (not a
-# submodule of this one) — best-effort, honestly reported as SKIPPED with a
-# reason when that checkout isn't present on this machine, never silently
-# omitted from test-summary.json.
+# submodule of this one), honestly reported as SKIPPED with a reason when
+# that checkout isn't present on this machine, never silently omitted from
+# test-summary.json. P0-7 (Sol redteam v4 S8): "Assayer must be a blocking
+# release gate. SKIPPED is not a passing state for a release that ships
+# blocking Assayer behavior" — SKIPPED now blocks the release exactly like
+# FAIL does, below. This is a real operational requirement change: a release
+# built on a machine without ASSAYER_REPO checked out now refuses to ship,
+# where it previously shipped with an honestly-labeled but unenforced gap.
 ASSAYER_LOG="$OUT_DIR/test-assayer.log"
 if [ -d "$ASSAYER_REPO" ]; then
   if (cd "$ASSAYER_REPO" && python3 -m pytest -q) >"$ASSAYER_LOG" 2>&1; then
@@ -143,18 +178,18 @@ if [ "$UNIT_RESULT" != PASS ] || [ "$RACE_RESULT" != PASS ] || [ "$INTEGRATION_R
   echo "release: refusing to package — a required test tier failed" >&2
   exit 1
 fi
-# Assayer's matrix is advisory to *this* pipeline (it's proof for the
-# Assayer repo's own release, not Governator's), but a FAIL (as opposed to
-# SKIPPED) here means the checkout is present and broke — that must not be
-# silently packaged over.
-if [ "$ASSAYER_RESULT" = FAIL ]; then
-  echo "release: refusing to package — the Assayer matrix is present and failing" >&2
+if [ "$ASSAYER_RESULT" != PASS ]; then
+  echo "release: refusing to package — the Assayer matrix is ${ASSAYER_RESULT}, not PASS (blocking release gate, P0-7)" >&2
   exit 1
 fi
 
 # ---------------------------------------------------------------------------
 # Build every platform into the same empty staging directory.
 # ---------------------------------------------------------------------------
+HOST_PLATFORM_ID="$(go env GOOS)_$(go env GOARCH)"
+HOST_ARCHIVE_NAME=""
+HOST_BIN_SHA=""
+
 ARTIFACTS_JSON="$OUT_DIR/.artifacts.jsonl"
 : >"$ARTIFACTS_JSON"
 for platform in $PLATFORMS; do
@@ -185,13 +220,16 @@ print(json.dumps({
     'binary_sha256': sys.argv[4], 'size_bytes': int(sys.argv[5]),
 }))" "$PLATFORM_ID" "$ARCHIVE_NAME" "$ARCHIVE_SHA" "$BIN_SHA" "$SIZE" >>"$ARTIFACTS_JSON"
   echo "release: built ${ARCHIVE_NAME} (${ARCHIVE_SHA})" >&2
+  if [ "$PLATFORM_ID" = "$HOST_PLATFORM_ID" ]; then
+    HOST_ARCHIVE_NAME=$ARCHIVE_NAME
+    HOST_BIN_SHA=$BIN_SHA
+  fi
 done
 
 # Host-platform binary stays unpacked in the staging root too, so the
 # acceptance smoke test below (and any local `./dist/gov version`) doesn't
 # need to extract an archive just to sanity-check the build that matches
 # this machine.
-HOST_PLATFORM_ID="$(go env GOOS)_$(go env GOARCH)"
 if [ -f "$OUT_DIR/stage-${HOST_PLATFORM_ID}/gov" ]; then
   cp "$OUT_DIR/stage-${HOST_PLATFORM_ID}/gov" "$OUT_DIR/gov"
 fi
@@ -260,58 +298,27 @@ rm -f "$OUT_DIR/.modules.json"
 echo "release: wrote sbom.json ($(python3 -c "import json;print(len(json.load(open('$SBOM'))['components']))") components)" >&2
 
 # ---------------------------------------------------------------------------
-# build-manifest.json — the one document every other file's identity must
-# agree with: version, source commit, build timestamp, claims hash, adapter
-# protocol version, plus every artifact this release actually produced.
-# ---------------------------------------------------------------------------
-MANIFEST="$OUT_DIR/build-manifest.json"
-python3 - "$MANIFEST" "$VERSION" "$COMMIT" "$BUILD_TS" "$GO_VERSION" "$LDFLAGS" "$CLAIMS_HASH" "$ADAPTER_PROTOCOL_VERSION" "$TEST_RUN_ID" "$ARTIFACTS_JSON" <<'PYMANIFEST'
-import json, pathlib, sys
-
-(manifest, version, commit, build_ts, go_version, build_flags, claims_hash,
- adapter_protocol_version, test_run_id, artifacts_path) = sys.argv[1:]
-
-artifacts = []
-for line in pathlib.Path(artifacts_path).read_text().splitlines():
-    if line.strip():
-        artifacts.append(json.loads(line))
-
-data = {
-    "version": version,
-    "source_commit": commit,
-    "build_timestamp": build_ts,
-    "go_version": go_version,
-    "build_flags": build_flags,
-    "claims_hash": claims_hash,
-    "adapter_protocol_version": adapter_protocol_version,
-    "test_run_id": test_run_id,
-    "artifacts": artifacts,
-}
-key = pathlib.os.environ.get("GOV_RELEASE_HMAC_KEY", "")
-if key:
-    import hmac, hashlib
-    unsigned = json.dumps(data, sort_keys=True, separators=(",", ":")).encode()
-    data["manifest_hmac_sha256"] = hmac.new(key.encode(), unsigned, hashlib.sha256).hexdigest()
-pathlib.Path(manifest).write_text(json.dumps(data, indent=2, sort_keys=True) + "\n")
-PYMANIFEST
-rm -f "$ARTIFACTS_JSON"
-
-# ---------------------------------------------------------------------------
 # test-summary.json — a real record of the tiers this invocation actually
 # ran above, not an assertion that test functions merely exist (audit P2.3:
-# "test-function existence and cached logs are not release proof").
+# "test-function existence and cached logs are not release proof"). P0-7
+# (Sol redteam v4 S8) additionally records the exact dependency lock state
+# (go.sum hash) and, per suite, real start/end timestamps and a hash of the
+# tier's own captured log — "fresh, uncached test evidence."
 # ---------------------------------------------------------------------------
 TEST_SUMMARY="$OUT_DIR/test-summary.json"
-python3 - "$TEST_SUMMARY" "$COMMIT" "$GO_VERSION" "$BUILD_TS" \
-  "$UNIT_RESULT" "$UNIT_SECONDS" "$RACE_RESULT" "$RACE_SECONDS" \
-  "$INTEGRATION_RESULT" "$INTEGRATION_SECONDS" \
-  "$CORPUS_RESULT" "$CORPUS_SECONDS" "$CORPUS_TESTS_RUN" "$CORPUS_TESTS_FAILED" \
+python3 - "$TEST_SUMMARY" "$COMMIT" "$GO_VERSION" "$BUILD_TS" "$GO_SUM_HASH" \
+  "$UNIT_RESULT" "$UNIT_SECONDS" "$UNIT_STARTED" "$UNIT_ENDED" "$UNIT_LOG_SHA" \
+  "$RACE_RESULT" "$RACE_SECONDS" "$RACE_STARTED" "$RACE_ENDED" "$RACE_LOG_SHA" \
+  "$INTEGRATION_RESULT" "$INTEGRATION_SECONDS" "$INTEGRATION_STARTED" "$INTEGRATION_ENDED" "$INTEGRATION_LOG_SHA" \
+  "$CORPUS_RESULT" "$CORPUS_SECONDS" "$CORPUS_STARTED" "$CORPUS_ENDED" "$CORPUS_LOG_SHA" "$CORPUS_TESTS_RUN" "$CORPUS_TESTS_FAILED" \
   "$FUZZ_RESULTS_JSON" "$ASSAYER_RESULT" "$ASSAYER_SUMMARY" <<'PYTESTSUMMARY'
 import json, pathlib, sys
 
-(summary_path, commit, go_version, build_ts, unit_result, unit_seconds,
- race_result, race_seconds, integration_result, integration_seconds,
- corpus_result, corpus_seconds, corpus_tests_run, corpus_tests_failed,
+(summary_path, commit, go_version, build_ts, go_sum_sha256,
+ unit_result, unit_seconds, unit_started, unit_ended, unit_log_sha,
+ race_result, race_seconds, race_started, race_ended, race_log_sha,
+ integration_result, integration_seconds, integration_started, integration_ended, integration_log_sha,
+ corpus_result, corpus_seconds, corpus_started, corpus_ended, corpus_log_sha, corpus_tests_run, corpus_tests_failed,
  fuzz_results_path, assayer_result, assayer_summary) = sys.argv[1:]
 
 fuzz = []
@@ -323,14 +330,18 @@ data = {
     "generated_at": build_ts,
     "source_commit": commit,
     "go_version": go_version,
+    "go_sum_sha256": go_sum_sha256,
     "suites": {
-        "unit": {"command": "go test -count=1 ./...", "result": unit_result, "duration_seconds": int(unit_seconds)},
-        "race": {"command": "go test -race -count=1 ./...", "result": race_result, "duration_seconds": int(race_seconds)},
-        "integration": {"command": "go test -tags integration -count=1 ./internal/assay/...", "result": integration_result, "duration_seconds": int(integration_seconds)},
+        "unit": {"command": "go test -count=1 ./...", "result": unit_result, "duration_seconds": int(unit_seconds), "started_at": unit_started, "ended_at": unit_ended, "log_sha256": unit_log_sha},
+        "race": {"command": "go test -race -count=1 ./...", "result": race_result, "duration_seconds": int(race_seconds), "started_at": race_started, "ended_at": race_ended, "log_sha256": race_log_sha},
+        "integration": {"command": "go test -tags integration -count=1 ./internal/assay/...", "result": integration_result, "duration_seconds": int(integration_seconds), "started_at": integration_started, "ended_at": integration_ended, "log_sha256": integration_log_sha},
         "black_box_corpus": {
             "command": "go test -run Sol3 -v -count=1 ./...",
             "result": corpus_result,
             "duration_seconds": int(corpus_seconds),
+            "started_at": corpus_started,
+            "ended_at": corpus_ended,
+            "log_sha256": corpus_log_sha,
             "tests_run": int(corpus_tests_run),
             "tests_failed": int(corpus_tests_failed),
         },
@@ -345,7 +356,7 @@ for suite in ("unit", "race", "integration", "black_box_corpus"):
 for f in fuzz:
     if f["result"] != "PASS":
         overall = "FAIL"
-if assayer_result == "FAIL":
+if assayer_result != "PASS":
     overall = "FAIL"
 data["overall_result"] = overall
 pathlib.Path(summary_path).write_text(json.dumps(data, indent=2, sort_keys=True) + "\n")
@@ -356,6 +367,12 @@ rm -f "$FUZZ_RESULTS_JSON" "$UNIT_LOG" "$RACE_LOG" "$INTEGRATION_LOG" "$CORPUS_L
 # Acceptance smoke test: extract the exact distributable archive for THIS
 # host's platform on a clean path (never trust the staging tree we just
 # built from), then exercise it exactly like an operator installing it would.
+# This step deliberately stops at binary self-consistency (mode, hash,
+# self-reported version/commit/claims-hash) — it does NOT call
+# `gov claims verify` itself (P0-7 / report attack 25: that used to happen
+# here, without --artifact/--manifest, which is exactly how a claims-verify
+# gap stayed invisible). Full claims verification against the finalized
+# manifest is its own, later, independently release-blocking stage below.
 # ---------------------------------------------------------------------------
 ACCEPTANCE="$OUT_DIR/acceptance-summary.json"
 SMOKE_DIR=$(mktemp -d)
@@ -370,12 +387,19 @@ VERSION_MATCH_OK=true
 ARCHIVE_EXTRACTED=false
 if [ -f "$HOST_ARCHIVE" ]; then
   ARCHIVE_EXTRACTED=true
-  tar -xzf "$HOST_ARCHIVE" -C "$SMOKE_DIR"
+  # -p: see scripts/release_verify.sh's identical comment -- without it, a
+  # restrictive umask on the extracting machine silently masks a hostile
+  # archived mode bit, making the mode assertion below meaningless.
+  tar -xzf "$HOST_ARCHIVE" -C "$SMOKE_DIR" -p
   EXTRACTED_BIN="$SMOKE_DIR/gov"
-  if [ ! -x "$EXTRACTED_BIN" ]; then
+  # Report attack 24: the archived binary shipped at mode 0777. Assert the
+  # EXACT mode after extraction (not "is it executable at all" — 0777 is
+  # also executable) and fail on any group/world write bit.
+  EXTRACTED_MODE=$(stat -c '%a' "$EXTRACTED_BIN" 2>/dev/null || stat -f '%OLp' "$EXTRACTED_BIN")
+  if [ "$EXTRACTED_MODE" != "755" ]; then
     ACCEPT_OK=false
     EXECUTABLE_BIT_OK=false
-    echo "extracted binary is not executable — executable bit not preserved in archive" >>"$NOTES_FILE"
+    echo "extracted binary mode is ${EXTRACTED_MODE}, must be exactly 755 (no group/world write bit)" >>"$NOTES_FILE"
   fi
   EXTRACTED_SHA=$(sha256sum "$EXTRACTED_BIN" | awk '{print $1}')
   STAGE_SHA=$(sha256sum "$OUT_DIR/stage-${HOST_PLATFORM_ID}/gov" | awk '{print $1}')
@@ -398,16 +422,8 @@ if [ -f "$HOST_ARCHIVE" ]; then
     VERSION_MATCH_OK=false
     echo "gov version --json failed: $VERSION_OUT" >>"$NOTES_FILE"
   fi
-  if CLAIMS_LOG=$("$EXTRACTED_BIN" claims verify --file "$OUT_DIR/claims.yaml" --repo "$ROOT" 2>&1); then
-    CLAIMS_RESULT=PASS
-  else
-    CLAIMS_RESULT=FAIL
-    ACCEPT_OK=false
-    echo "gov claims verify failed: $CLAIMS_LOG" >>"$NOTES_FILE"
-  fi
 else
   ACCEPT_OK=false
-  CLAIMS_RESULT=SKIPPED
   EXECUTABLE_BIT_OK=false
   HASH_MATCH_OK=false
   VERSION_MATCH_OK=false
@@ -416,10 +432,10 @@ fi
 
 if [ "$ACCEPT_OK" = true ]; then ACCEPTANCE_RESULT=PASS; else ACCEPTANCE_RESULT=FAIL; fi
 
-python3 - "$ACCEPTANCE" "$ACCEPTANCE_RUN_ID" "$ACCEPTANCE_RESULT" "$HOST_PLATFORM_ID" "$CLAIMS_RESULT" "$BUILD_TS" "$ARCHIVE_EXTRACTED" "$EXECUTABLE_BIT_OK" "$HASH_MATCH_OK" "$VERSION_MATCH_OK" "$NOTES_FILE" <<'PYACCEPT'
+python3 - "$ACCEPTANCE" "$ACCEPTANCE_RUN_ID" "$ACCEPTANCE_RESULT" "$HOST_PLATFORM_ID" "$BUILD_TS" "$ARCHIVE_EXTRACTED" "$EXECUTABLE_BIT_OK" "$HASH_MATCH_OK" "$VERSION_MATCH_OK" "$NOTES_FILE" <<'PYACCEPT'
 import json, pathlib, sys
 
-(path, run_id, result, platform, claims_result, generated_at,
+(path, run_id, result, platform, generated_at,
  archive_extracted, executable_bit_ok, hash_match_ok, version_match_ok, notes_file) = sys.argv[1:]
 
 notes = [line for line in pathlib.Path(notes_file).read_text().splitlines() if line.strip()]
@@ -436,7 +452,6 @@ data = {
         "executable_bit_preserved": as_bool(executable_bit_ok),
         "binary_hash_matches_build": as_bool(hash_match_ok),
         "version_json_matches_manifest": as_bool(version_match_ok),
-        "claims_verify": claims_result,
     },
     "notes": notes,
     "overall_result": result,
@@ -450,24 +465,109 @@ if [ "$ACCEPTANCE_RESULT" != PASS ]; then
   exit 1
 fi
 
+# ---------------------------------------------------------------------------
+# build-manifest.json — the one document every other file's identity must
+# agree with: version, source commit, build timestamp, claims hash, adapter
+# protocol version, every artifact this release actually produced, AND (P0-7
+# / Sol redteam v4 S8) the finalized identity of the host-platform artifact
+# (the one every check above just exercised) plus this run's real test and
+# acceptance evidence — written only now, after both are known, so nothing
+# downstream can read a manifest describing a run that hasn't finished yet.
+# ---------------------------------------------------------------------------
+MANIFEST="$OUT_DIR/build-manifest.json"
+python3 - "$MANIFEST" "$VERSION" "$COMMIT" "$BUILD_TS" "$GO_VERSION" "$LDFLAGS" "$CLAIMS_HASH" "$ADAPTER_PROTOCOL_VERSION" "$ARTIFACTS_JSON" \
+  "$HOST_ARCHIVE_NAME" "$HOST_BIN_SHA" "$TEST_RUN_ID" "$ACCEPTANCE_RUN_ID" "$ACCEPTANCE_RESULT" <<'PYMANIFEST'
+import json, pathlib, sys
+
+(manifest, version, commit, build_ts, go_version, build_flags, claims_hash,
+ adapter_protocol_version, artifacts_path,
+ host_archive_name, host_bin_sha, test_run_id, acceptance_run_id, acceptance_result) = sys.argv[1:]
+
+artifacts = []
+for line in pathlib.Path(artifacts_path).read_text().splitlines():
+    if line.strip():
+        artifacts.append(json.loads(line))
+
+data = {
+    "version": version,
+    "source_commit": commit,
+    "build_timestamp": build_ts,
+    "go_version": go_version,
+    "build_flags": build_flags,
+    "claims_hash": claims_hash,
+    "adapter_protocol_version": adapter_protocol_version,
+    "artifacts": artifacts,
+    # Host-platform artifact identity: the specific archive/binary the
+    # acceptance smoke test and the full claims-verification stage below
+    # both extract and inspect. internal/claims.verifyArtifactManifest reads
+    # artifact_path/artifact_sha256 directly off this manifest.
+    "artifact_path": host_archive_name,
+    "artifact_sha256": host_bin_sha,
+    "build_info": {"vcs_revision": commit},
+    "test_run_id": test_run_id,
+    "test_result": "PASS",
+    "acceptance_run_id": acceptance_run_id,
+    "acceptance_result": acceptance_result,
+}
+key = pathlib.os.environ.get("GOV_RELEASE_HMAC_KEY", "")
+if key:
+    import hmac, hashlib
+    unsigned = json.dumps(data, sort_keys=True, separators=(",", ":")).encode()
+    data["manifest_hmac_sha256"] = hmac.new(key.encode(), unsigned, hashlib.sha256).hexdigest()
+pathlib.Path(manifest).write_text(json.dumps(data, indent=2, sort_keys=True) + "\n")
+PYMANIFEST
+rm -f "$ARTIFACTS_JSON"
+
+# ---------------------------------------------------------------------------
+# Full claims verification against the exact archived artifact (P0-7 / Sol
+# redteam v4 S8, report attack 25). This is the release-blocking gate the
+# audit found missing: the acceptance step above never called
+# `gov claims verify --artifact --manifest`, so a shipped binary could drift
+# from both the submitted source and the claims ledger without CI ever
+# noticing. scripts/release_verify.sh extracts the host archive fresh (a
+# second, independent extraction from the acceptance step's) and runs
+# `claims verify --release`, which cmd/gov/main.go refuses to run at all
+# without --artifact/--manifest.
+# ---------------------------------------------------------------------------
+CLAIMS_VERIFY_REPORT="$OUT_DIR/claims-verify-report.txt"
+if ! "$ROOT/scripts/release_verify.sh" --out-dir "$OUT_DIR" --repo "$ROOT" --platform "$HOST_PLATFORM_ID" >"$CLAIMS_VERIFY_REPORT" 2>&1; then
+  echo "release: full claims verification FAILED — see ${CLAIMS_VERIFY_REPORT}" >&2
+  cat "$CLAIMS_VERIFY_REPORT" >&2
+  exit 1
+fi
+echo "release: full claims verification OK — see ${CLAIMS_VERIFY_REPORT}" >&2
+
 # Staging subdirectories (stage-<platform>/) held the unpacked binary used
 # to build each archive; they're not part of the shipped file set.
 rm -rf "$OUT_DIR"/stage-*
 
 # ---------------------------------------------------------------------------
 # checksums.txt covers every file this release actually ships (every
-# platform archive, the manifest, the SBOM, claims.yaml, both summaries) —
-# generated last, over the final directory contents, so it can never omit
-# an artifact the way the audit found ("checksums covering the stale
-# snapshot archives but not the current production binary").
+# platform archive, the manifest, the SBOM, claims.yaml, both summaries, the
+# full claims-verification report) — generated last, over the final
+# directory contents, so it can never omit an artifact the way the audit
+# found ("checksums covering the stale snapshot archives but not the current
+# production binary").
 # ---------------------------------------------------------------------------
 CHECKSUMS="$OUT_DIR/checksums.txt"
-(cd "$OUT_DIR" && sha256sum -- *.tar.gz build-manifest.json sbom.json claims.yaml test-summary.json acceptance-summary.json gov >"$(basename "$CHECKSUMS")")
+(cd "$OUT_DIR" && sha256sum -- *.tar.gz build-manifest.json sbom.json claims.yaml test-summary.json acceptance-summary.json claims-verify-report.txt gov >"$(basename "$CHECKSUMS")")
 
 # ---------------------------------------------------------------------------
 # signature — HMAC-SHA256 over checksums.txt, keyed by an operator-supplied
 # secret. Never fabricated: an unsigned release says so in plain text rather
 # than shipping a signature file that isn't one.
+#
+# P0-7 (Sol redteam v4 S8): docs/security.md flagged this as the release's
+# real gap — "HMAC with a shared secret is not publicly verifiable." An HMAC
+# key that signs is also a key that can forge; anyone who can verify a
+# release can also mint a fake one. When GOV_RELEASE_MINISIGN_KEY (path to
+# an UNENCRYPTED minisign secret key — `minisign -G -W`, no interactive
+# password prompt to automate around) and the `minisign` binary are both
+# available, this additionally produces checksums.txt.minisig: an Ed25519
+# signature verifiable by anyone holding only the corresponding *public*
+# key, with no shared secret in the loop. This augments, not replaces, the
+# HMAC signature above (existing tooling/docs keep working); when minisign
+# isn't configured, no .minisig file is written — never a fabricated one.
 # ---------------------------------------------------------------------------
 SIGNATURE="$OUT_DIR/signature"
 if [ -n "${GOV_RELEASE_HMAC_KEY:-}" ]; then
@@ -479,6 +579,18 @@ print('hmac-sha256:' + hmac.new(key, data, hashlib.sha256).hexdigest())
 " "$CHECKSUMS" >"$SIGNATURE"
 else
   echo "UNSIGNED: set GOV_RELEASE_HMAC_KEY to sign checksums.txt for this release" >"$SIGNATURE"
+fi
+
+MINISIG="$OUT_DIR/checksums.txt.minisig"
+if [ -n "${GOV_RELEASE_MINISIGN_KEY:-}" ] && command -v minisign >/dev/null 2>&1; then
+  if minisign -S -s "$GOV_RELEASE_MINISIGN_KEY" -m "$CHECKSUMS" -x "$MINISIG" -c "gov release ${VERSION} ${COMMIT}" </dev/null >&2; then
+    echo "release: signed checksums.txt with minisign (asymmetric, publicly verifiable)" >&2
+  else
+    echo "release: minisign signing failed (is GOV_RELEASE_MINISIGN_KEY an unencrypted key?) — continuing HMAC-only" >&2
+    rm -f "$MINISIG"
+  fi
+else
+  echo "release: no asymmetric signature — set GOV_RELEASE_MINISIGN_KEY (+ minisign on PATH) to add one" >&2
 fi
 
 echo "release: OK — $OUT_DIR" >&2

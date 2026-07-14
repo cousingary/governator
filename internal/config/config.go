@@ -33,6 +33,32 @@ type Backend struct {
 	LocalOnly     bool   `yaml:"local_only,omitempty"`
 	ContextTokens int    `yaml:"context_tokens,omitempty"`
 	OutputTokens  int    `yaml:"output_tokens,omitempty"`
+
+	// Sol P1-2: model/provider identity. A CLI wrapper name is not identity —
+	// "model = backend name, account = default" lets a swapped account or
+	// model behind the same wrapper pass as unchanged. These are the
+	// operator's declared facts about what actually sits behind Bin;
+	// agents.Identity leaves any undeclared field empty, which
+	// computeExecutionIdentity/attest.VerifyHighRiskNative (Session 3) then
+	// treat as unknown — blocking strict replay and high-risk native-sandbox
+	// capability reuse rather than silently trusting the backend name.
+	Provider      string `yaml:"provider,omitempty"`
+	AccountID     string `yaml:"account_id,omitempty"`
+	OrgID         string `yaml:"org_id,omitempty"`
+	ModelRevision string `yaml:"model_revision,omitempty"`
+	Endpoint      string `yaml:"endpoint,omitempty"`
+	ReasoningMode string `yaml:"reasoning_mode,omitempty"`
+	ApprovalMode  string `yaml:"approval_mode,omitempty"`
+	SandboxMode   string `yaml:"sandbox_mode,omitempty"`
+
+	// Sol P1-14: the backend launch inherited the FULL parent environment
+	// unconditionally — cloud credentials, unrelated provider keys, SSH
+	// agent sockets, everything — with no allowlist at all. AllowedEnv is
+	// this adapter's declared list of additional variable NAMES (beyond
+	// agents.BuildAllowedEnv's small fixed baseline: PATH/HOME/LANG/etc.)
+	// it actually needs; every other inherited variable is stripped by
+	// default rather than passed opaquely to a governed backend process.
+	AllowedEnv []string `yaml:"allowed_env,omitempty"`
 }
 
 type RTK struct {
@@ -166,14 +192,30 @@ type Assay struct {
 // protected-host read, attempt four network egress targets, emit a completion
 // marker), so the budget must cover a genuine agent turn, not a subprocess
 // call. A budget too small to complete an honest probe is not a safe default:
-// every probe times out, every capability is recorded unattested, and — because
-// containment tiering refuses medium/high-risk local work on an unattested
-// backend — no local job can ever run. The probe still fails CLOSED on timeout
-// (a timed-out capability is never assumed present); the timeout is recorded
-// distinctly in ProbeNotes so an operator can tell "we could not observe this"
-// from "the backend failed the check."
+// every probe times out, every capability is recorded unattested — but
+// (Session 5, Sol P0-3) that no longer blocks any local work on its own, since
+// containment tiering now authorizes on Governator's own externally enforced
+// sandbox, never on probe-observed evidence alone. The probe still fails
+// CLOSED on timeout (a timed-out capability is never assumed present); the
+// timeout is recorded distinctly in ProbeNotes so an operator can tell "we
+// could not observe this" from "the backend failed the check."
+//
+// TotalDeadlineSeconds (Sol P1-17) is the whole probe suite's wall-clock
+// ceiling: previously each of the 3 probes (sandbox, read-only, approval) got
+// its own independent ProbeTimeoutSeconds budget with nothing bounding their
+// sum, so a slow-but-honest backend (or one probe stalling near its own
+// budget) could let a single Generate call run for up to 3x ProbeTimeoutSeconds
+// with no overall ceiling. Each probe's effective budget is
+// min(ProbeTimeoutSeconds, time remaining in TotalDeadlineSeconds) — the
+// per-probe budget above still applies unchanged when the total has headroom,
+// preserving "a budget too small for a genuine agent turn is not a safe
+// default"; TotalDeadlineSeconds only starts trimming once the suite has
+// already spent that much wall-clock. Zero means the default, 3x
+// ProbeTimeoutSeconds's default (i.e. today's actual worst case, now enforced
+// rather than merely possible).
 type Attest struct {
-	ProbeTimeoutSeconds int `yaml:"probe_timeout_seconds"`
+	ProbeTimeoutSeconds  int `yaml:"probe_timeout_seconds"`
+	TotalDeadlineSeconds int `yaml:"total_deadline_seconds"`
 }
 
 type Config struct {
@@ -248,7 +290,11 @@ func BuiltIn() Config {
 		// four network egress attempts. The original 30s constant timed out
 		// every multi-step probe on every real backend, which recorded sandbox,
 		// network and transcript as unattested across the board.
-		Attest: Attest{ProbeTimeoutSeconds: 300},
+		// TotalDeadlineSeconds: 900s (3x the per-probe default) preserves
+		// today's actual worst case for the 3-probe suite (sandbox,
+		// read-only, approval) as a hard ceiling rather than an unenforced
+		// possibility -- see Attest's doc comment (Sol P1-17).
+		Attest: Attest{ProbeTimeoutSeconds: 300, TotalDeadlineSeconds: 900},
 		// No override key means risky jobs must qualify for containment on their
 		// own (fail-closed). Session 6's medium/high effectful local-run gate is
 		// enforced by default and can only be relaxed explicitly.
@@ -478,6 +524,33 @@ func merge(dst *Config, src Config) {
 		if backend.OutputTokens > 0 {
 			existing.OutputTokens = backend.OutputTokens
 		}
+		if backend.Provider != "" {
+			existing.Provider = backend.Provider
+		}
+		if backend.AccountID != "" {
+			existing.AccountID = backend.AccountID
+		}
+		if backend.OrgID != "" {
+			existing.OrgID = backend.OrgID
+		}
+		if backend.ModelRevision != "" {
+			existing.ModelRevision = backend.ModelRevision
+		}
+		if backend.Endpoint != "" {
+			existing.Endpoint = backend.Endpoint
+		}
+		if backend.ReasoningMode != "" {
+			existing.ReasoningMode = backend.ReasoningMode
+		}
+		if backend.ApprovalMode != "" {
+			existing.ApprovalMode = backend.ApprovalMode
+		}
+		if backend.SandboxMode != "" {
+			existing.SandboxMode = backend.SandboxMode
+		}
+		if backend.AllowedEnv != nil {
+			existing.AllowedEnv = append([]string(nil), backend.AllowedEnv...)
+		}
 		dst.Backends[name] = existing
 	}
 	if src.RTK.Mode != "" {
@@ -536,6 +609,9 @@ func merge(dst *Config, src Config) {
 	}
 	if src.Attest.ProbeTimeoutSeconds > 0 {
 		dst.Attest.ProbeTimeoutSeconds = src.Attest.ProbeTimeoutSeconds
+	}
+	if src.Attest.TotalDeadlineSeconds > 0 {
+		dst.Attest.TotalDeadlineSeconds = src.Attest.TotalDeadlineSeconds
 	}
 	if src.Assay.TimeoutSeconds > 0 {
 		dst.Assay.TimeoutSeconds = src.Assay.TimeoutSeconds
@@ -773,6 +849,11 @@ func validateRawSuppliedValues(data []byte, path string) error {
 	if v, ok := rawNumber(raw, "attest", "probe_timeout_seconds"); ok {
 		if v <= 0 {
 			return fmt.Errorf("invalid attest.probe_timeout_seconds %v (want > 0)", v)
+		}
+	}
+	if v, ok := rawNumber(raw, "attest", "total_deadline_seconds"); ok {
+		if v <= 0 {
+			return fmt.Errorf("invalid attest.total_deadline_seconds %v (want > 0)", v)
 		}
 	}
 	if backends, ok := raw["backends"].(map[string]any); ok {

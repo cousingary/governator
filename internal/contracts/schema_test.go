@@ -1,10 +1,54 @@
 package contracts
 
 import (
+	"math"
 	"sort"
 	"strings"
 	"testing"
+	"time"
 )
+
+// TestValidateRejectsBudgetMaxMinutesLargeEnoughToOverflowDuration is Sol
+// P1-16's regression test / report §9 attack 21: math.MaxInt32 minutes
+// already overflows time.Duration(minutes)*time.Minute (int64 nanoseconds:
+// MaxInt32 * 60e9 vastly exceeds MaxInt64). Validate must reject this
+// outright rather than let a contract carrying it ever reach that
+// conversion in internal/runtime.
+func TestValidateRejectsBudgetMaxMinutesLargeEnoughToOverflowDuration(t *testing.T) {
+	c, err := Parse([]byte(validContract))
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.Budget.MaxMinutes = math.MaxInt32
+	if err := c.Validate(); err == nil {
+		t.Fatal("expected Validate to reject a budget.max_minutes large enough to overflow its duration conversion, got no error")
+	} else if !strings.Contains(err.Error(), "budget.max_minutes") {
+		t.Fatalf("expected the error to name budget.max_minutes, got: %v", err)
+	}
+	// The boundary itself must still be accepted -- this is an upper bound,
+	// not an accidental tightening of ordinary large-but-safe values.
+	c.Budget.MaxMinutes = MaxSafeBudgetMinutes
+	if err := c.Validate(); err != nil {
+		t.Fatalf("expected MaxSafeBudgetMinutes itself to be accepted, got: %v", err)
+	}
+}
+
+// TestSafeMinutesDuration is Sol P1-16's direct unit-level proof that the
+// conversion helper itself refuses rather than silently overflows/wraps.
+func TestSafeMinutesDuration(t *testing.T) {
+	if dur, ok := SafeMinutesDuration(20); !ok || dur != 20*time.Minute {
+		t.Fatalf("SafeMinutesDuration(20) = %v, %v; want 20m, true", dur, ok)
+	}
+	if _, ok := SafeMinutesDuration(-1); ok {
+		t.Fatal("expected SafeMinutesDuration to refuse a negative value")
+	}
+	if _, ok := SafeMinutesDuration(math.MaxInt32); ok {
+		t.Fatal("expected SafeMinutesDuration to refuse a value large enough to overflow the conversion")
+	}
+	if dur, ok := SafeMinutesDuration(MaxSafeBudgetMinutes); !ok || dur <= 0 {
+		t.Fatalf("expected the boundary value itself to succeed with a positive duration, got %v, %v", dur, ok)
+	}
+}
 
 func TestRepairEffectiveMaxAttemptsClampsAndDefaults(t *testing.T) {
 	cases := []struct {

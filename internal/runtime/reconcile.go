@@ -12,6 +12,7 @@ import (
 
 	"github.com/cousingary/governator/internal/breaker"
 	"github.com/cousingary/governator/internal/config"
+	"github.com/cousingary/governator/internal/lifecycle"
 	"github.com/cousingary/governator/internal/observability"
 	"github.com/cousingary/governator/internal/quota"
 	"github.com/cousingary/governator/internal/runner"
@@ -334,7 +335,7 @@ func dispatchReconcile(ctx context.Context, db *sql.DB, cfg config.Config, item 
 		if err := json.Unmarshal([]byte(item.Payload), &p); err != nil {
 			return err
 		}
-		return observability.RecordStage(db, p.RunID, p.Stage, p.Detail, time.Now().UTC().Format(time.RFC3339Nano))
+		return lifecycle.Record(db, p.RunID, lifecycle.Stage(p.Stage), p.Detail, lifecycle.Now())
 	case opPanelMembers:
 		var p panelMembersPayload
 		if err := json.Unmarshal([]byte(item.Payload), &p); err != nil {

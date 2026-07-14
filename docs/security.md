@@ -73,7 +73,7 @@ Per the audit's §11 non-goals, none of the fixes above: disabled replay entirel
 
 ## Known open items
 
-- **HMAC-only release signing.** `scripts/release.sh`'s `manifest_hmac_sha256` (when `GOV_RELEASE_HMAC_KEY` is set) is write-only provenance today — `gov claims verify` does not yet verify it. No asymmetric signing (minisign/ed25519) exists for release manifests. Documented as the current trust root in [docs/claims.md](claims.md#release-artifact-provenance), not a defect, but not a strong signing guarantee either.
+- ~~**HMAC-only release signing.**~~ **Closed by Sol redteam v4 S8 (P0-7).** `scripts/release.sh`'s `manifest_hmac_sha256` (when `GOV_RELEASE_HMAC_KEY` is set) remains write-only provenance — `gov claims verify` does not verify it, and an HMAC key that signs can also forge. `scripts/release.sh` now additionally produces `checksums.txt.minisig` (Ed25519, via `minisign`) whenever `GOV_RELEASE_MINISIGN_KEY` (an unencrypted secret key path) is configured — a signature publicly verifiable from the corresponding public key alone, with no shared secret. This augments rather than replaces the HMAC signature; when minisign isn't configured, no `.minisig` file is fabricated. See [docs/claims.md](claims.md#release-artifact-provenance).
 - **Sol §9 (P3 strategic enhancements)** — external backend adapter protocol, a capability-attestation registry beyond the current per-backend attestation, versioned harness profile registry, profile-plus-backend routing, panel independence across provider/account/model lineage/prompt/policy, an offline Governator Evolver Lab, and profile drift detection with champion/challenger promotion remain unbuilt roadmap items, not defects. See the README roadmap section.
 
 ---

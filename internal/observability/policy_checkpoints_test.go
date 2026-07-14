@@ -199,6 +199,79 @@ func TestClaimActivePolicyOverridesReservesOneShotExactlyOnce(t *testing.T) {
 	}
 }
 
+// TestConsumePolicyOverrideReservationsIsAllOrNothing is Sol P1-5's
+// regression test / report §9 attack 18: before this fix, a caller
+// authorizing an execution against a set of resolved one-shot ALLOW
+// overrides consumed each id with its own top-level
+// ConsumePolicyOverrideReservation call. If a later id in the set had
+// already been released or expired by a race, every id before it in the
+// loop was already durably consumed even though the whole launch aborted on
+// the first failure -- an approval burned for an execution that never
+// happened. ConsumePolicyOverrideReservations must be all-or-nothing: a
+// single lost reservation anywhere in the set rolls back every consume in
+// the same call.
+func TestConsumePolicyOverrideReservationsIsAllOrNothing(t *testing.T) {
+	home := t.TempDir()
+	db, err := Open(home)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	if err := RecordPolicyOverride(db, PolicyOverride{
+		ScopeKey: "job_id:job-1", Target: "network-enablement", Verdict: "ALLOW", Reason: "approved once",
+		CreatedBy: "operator", CreatedAt: "2026-07-12T00:00:00Z", OneShot: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := RecordPolicyOverride(db, PolicyOverride{
+		ScopeKey: "job_id:job-2", Target: "cost-threshold", Verdict: "ALLOW", Reason: "approved once",
+		CreatedBy: "operator", CreatedAt: "2026-07-12T00:00:00Z", OneShot: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	claimed1, err := ClaimActivePolicyOverrides(db, "job_id:job-1", "2026-07-12T00:01:00Z")
+	if err != nil || len(claimed1) != 1 {
+		t.Fatalf("expected to reserve override 1, got %+v err=%v", claimed1, err)
+	}
+	claimed2, err := ClaimActivePolicyOverrides(db, "job_id:job-2", "2026-07-12T00:01:00Z")
+	if err != nil || len(claimed2) != 1 {
+		t.Fatalf("expected to reserve override 2, got %+v err=%v", claimed2, err)
+	}
+	id1, id2 := claimed1[0].ID, claimed2[0].ID
+
+	// Simulate the race: id2's reservation is lost (released concurrently by
+	// another evaluation's abort path, or self-healed by TTL reclaim) before
+	// this evaluation reaches its execution boundary.
+	if err := ReleasePolicyOverrideReservation(db, id2, "2026-07-12T00:02:00Z"); err != nil {
+		t.Fatal(err)
+	}
+
+	// This evaluation still believes both ids are its reserved set (the
+	// policy gate resolved both to ALLOW before the race happened) and
+	// attempts to consume both together, atomically, at the execution
+	// boundary.
+	if err := ConsumePolicyOverrideReservations(db, []int64{id1, id2}, "2026-07-12T00:03:00Z"); err == nil {
+		t.Fatal("expected an error consuming a set containing a lost reservation")
+	}
+
+	// The critical assertion: id1 -- which would have succeeded if consumed
+	// alone -- must NOT have been burned by the failed atomic call. Confirm
+	// by releasing it (a no-op if it were already consumed, since Release's
+	// WHERE clause requires consumed_at='') and re-claiming it.
+	if err := ReleasePolicyOverrideReservation(db, id1, "2026-07-12T00:04:00Z"); err != nil {
+		t.Fatal(err)
+	}
+	reclaimed, err := ClaimActivePolicyOverrides(db, "job_id:job-1", "2026-07-12T00:05:00Z")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(reclaimed) != 1 || reclaimed[0].ConsumedAt != "" {
+		t.Fatalf("expected override 1 to have survived the failed atomic consume unconsumed, got %+v", reclaimed)
+	}
+}
+
 func TestReclaimStaleOneShotReservationExpiresRatherThanReleases(t *testing.T) {
 	// Sol P1.1: a reservation held past oneShotReservationTTL self-heals
 	// into ExpiredAt, never back to available — losing a stale approval is

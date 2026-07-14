@@ -14,7 +14,6 @@ import (
 	"reflect"
 	"sort"
 	"strings"
-	"syscall"
 
 	"github.com/cousingary/governator/internal/contracts"
 	"github.com/cousingary/governator/internal/observability"
@@ -27,7 +26,7 @@ type stagedArtifact struct {
 	Bytes  int64
 }
 
-func stageConsumedArtifacts(db *sql.DB, work string, c contracts.Contract) ([]stagedArtifact, error) {
+func stageConsumedArtifacts(db *sql.DB, home, work string, c contracts.Contract) ([]stagedArtifact, error) {
 	if len(c.Consumes) == 0 {
 		return nil, nil
 	}
@@ -37,6 +36,16 @@ func stageConsumedArtifacts(db *sql.DB, work string, c contracts.Contract) ([]st
 	dir := filepath.Join(work, ".governator", "consumed")
 	if err := os.MkdirAll(dir, 0700); err != nil {
 		return nil, fmt.Errorf("stage consumed artifacts: %w", err)
+	}
+	// Sol P1-7 / report §9 attack 22: every read/write below resolves beneath
+	// a fixed base directory via openBeneath (openat2 RESOLVE_BENEATH|
+	// RESOLVE_NO_SYMLINKS|RESOLVE_NO_MAGICLINKS) rather than opening an
+	// already-joined absolute path with a bare O_NOFOLLOW, which only ever
+	// guarded the final path component. artifactsRoot is the fixed base every
+	// ledger-recorded artifact path lives beneath (see collectProducedArtifacts).
+	artifactsRoot, err := filepath.Abs(filepath.Join(home, "artifacts"))
+	if err != nil {
+		return nil, err
 	}
 	out := make([]stagedArtifact, 0, len(c.Consumes))
 	for _, name := range c.Consumes {
@@ -56,9 +65,17 @@ func stageConsumedArtifacts(db *sql.DB, work string, c contracts.Contract) ([]st
 		if cleanSlash(name) != name || name == "." || strings.Contains(name, "/") || strings.Contains(name, `\`) {
 			return nil, fmt.Errorf("consumed artifact %q is not a safe basename", name)
 		}
-		data, info, err := readRegularNoFollowAbsolute(src)
+		srcAbs, err := filepath.Abs(src)
 		if err != nil {
-			return nil, fmt.Errorf("stage consumed artifact %q no-follow read: %w", name, err)
+			return nil, err
+		}
+		srcRel, err := filepath.Rel(artifactsRoot, srcAbs)
+		if err != nil || srcRel == ".." || strings.HasPrefix(srcRel, ".."+string(os.PathSeparator)) {
+			return nil, fmt.Errorf("consumed artifact %q ledger path escapes artifacts root: %s", name, src)
+		}
+		data, info, err := readRegularBeneath(artifactsRoot, filepath.ToSlash(srcRel))
+		if err != nil {
+			return nil, fmt.Errorf("stage consumed artifact %q beneath-root read: %w", name, err)
 		}
 		if size >= 0 && info.Size() != size {
 			return nil, fmt.Errorf("stage consumed artifact %q size mismatch: ledger=%d actual=%d", name, size, info.Size())
@@ -68,9 +85,8 @@ func stageConsumedArtifacts(db *sql.DB, work string, c contracts.Contract) ([]st
 		if sha != "" && actualSHA != sha {
 			return nil, fmt.Errorf("stage consumed artifact %q sha256 mismatch", name)
 		}
-		dst := filepath.Join(dir, name)
-		if err := writeNewNoFollow(dst, data, 0400); err != nil {
-			return nil, fmt.Errorf("stage consumed artifact %q no-follow write: %w", name, err)
+		if err := writeNewBeneath(dir, name, data, 0400); err != nil {
+			return nil, fmt.Errorf("stage consumed artifact %q beneath-root write: %w", name, err)
 		}
 		out = append(out, stagedArtifact{Name: name, Path: filepath.ToSlash(filepath.Join(".governator", "consumed", name)), SHA256: actualSHA, Bytes: info.Size()})
 	}
@@ -108,18 +124,19 @@ func collectProducedArtifacts(home, work, runID string, specs []contracts.Artifa
 	}
 	var records []observability.ArtifactRecord
 	var violations []string
+	artifactsRoot := filepath.Join(home, "artifacts")
 	for _, spec := range specs {
 		rel, err := safeWorkspaceRel(spec.Path)
 		if err != nil {
 			violations = append(violations, "artifact path invalid: "+spec.Name+": "+err.Error())
 			continue
 		}
-		data, info, err := readWorkspaceFileNoFollow(work, rel)
+		data, info, err := readRegularBeneath(work, rel)
 		if err != nil {
 			if os.IsNotExist(err) {
 				violations = append(violations, "artifact missing: "+spec.Name+" at "+rel)
 			} else {
-				violations = append(violations, "artifact no-follow read: "+spec.Name+": "+err.Error())
+				violations = append(violations, "artifact beneath-root read: "+spec.Name+": "+err.Error())
 			}
 			continue
 		}
@@ -135,21 +152,22 @@ func collectProducedArtifacts(home, work, runID string, specs []contracts.Artifa
 			if err != nil {
 				schemaOK = false
 				violations = append(violations, "artifact schema invalid: "+spec.Name+": "+err.Error())
-			} else if schemaData, _, err := readWorkspaceFileNoFollow(work, schemaRel); err != nil {
+			} else if schemaData, _, err := readRegularBeneath(work, schemaRel); err != nil {
 				schemaOK = false
-				violations = append(violations, "artifact schema invalid: "+spec.Name+": no-follow read: "+err.Error())
+				violations = append(violations, "artifact schema invalid: "+spec.Name+": beneath-root read: "+err.Error())
 			} else if err := validateJSONSchemaData(schemaData, data); err != nil {
 				schemaOK = false
 				violations = append(violations, "artifact schema invalid: "+spec.Name+": "+err.Error())
 			}
 		}
-		dst := filepath.Join(home, "artifacts", runID, filepath.FromSlash(rel))
+		dstRel := filepath.Join(runID, filepath.FromSlash(rel))
+		dst := filepath.Join(artifactsRoot, dstRel)
 		if err := os.MkdirAll(filepath.Dir(dst), 0700); err != nil {
 			violations = append(violations, "artifact store mkdir: "+spec.Name+": "+err.Error())
 			continue
 		}
-		if err := writeFileNoFollowOverwrite(dst, data, 0600); err != nil {
-			violations = append(violations, "artifact store no-follow write: "+spec.Name+": "+err.Error())
+		if err := writeOverwriteBeneath(artifactsRoot, dstRel, data, 0600); err != nil {
+			violations = append(violations, "artifact store beneath-root write: "+spec.Name+": "+err.Error())
 			continue
 		}
 		records = append(records, observability.ArtifactRecord{
@@ -193,115 +211,88 @@ func safeWorkspaceRel(raw string) (string, error) {
 	return cleaned, nil
 }
 
-func readWorkspaceFileNoFollow(work, rel string) ([]byte, os.FileInfo, error) {
-	cleanRel, err := safeWorkspaceRel(rel)
-	if err != nil {
-		return nil, nil, err
-	}
-	abs := filepath.Join(work, filepath.FromSlash(cleanRel))
-	workAbs, err := filepath.Abs(work)
-	if err != nil {
-		return nil, nil, err
-	}
-	abs, err = filepath.Abs(abs)
-	if err != nil {
-		return nil, nil, err
-	}
-	relToWork, err := filepath.Rel(workAbs, abs)
-	if err != nil {
-		return nil, nil, err
-	}
-	if relToWork == ".." || strings.HasPrefix(relToWork, ".."+string(os.PathSeparator)) {
-		return nil, nil, fmt.Errorf("path escapes workspace: %s", rel)
-	}
-	return readRegularNoFollowAbsolute(abs)
-}
+// readRegularBeneath, writeNewBeneath and writeOverwriteBeneath (below) are
+// Sol P1-7's replacement for this file's old *NoFollow helpers, which opened
+// an already-joined absolute path with a bare O_NOFOLLOW -- protecting only
+// the final path component against a symlink swap, never a parent directory
+// component (report §9 attack 22). Each now resolves relPath beneath baseDir
+// via openBeneath (openat2 RESOLVE_BENEATH|RESOLVE_NO_SYMLINKS|
+// RESOLVE_NO_MAGICLINKS, openbeneath.go), which makes the kernel validate
+// every component of the path as one atomic operation -- there is no
+// separate "check" step for a race to land between.
 
-func readRegularNoFollowAbsolute(abs string) ([]byte, os.FileInfo, error) {
-	info, err := os.Lstat(abs)
+func readRegularBeneath(baseDir, relPath string) ([]byte, os.FileInfo, error) {
+	f, err := openBeneath(baseDir, relPath, os.O_RDONLY, 0)
 	if err != nil {
 		return nil, nil, err
 	}
-	mode := info.Mode()
-	if mode&os.ModeSymlink != 0 {
-		return nil, nil, fmt.Errorf("symlink refused: %s", abs)
-	}
-	if !mode.IsRegular() {
-		return nil, nil, fmt.Errorf("non-regular artifact refused: %s", abs)
-	}
-	fd, err := syscall.Open(abs, syscall.O_RDONLY|syscall.O_NOFOLLOW, 0)
-	if err != nil {
-		return nil, nil, err
-	}
-	f := os.NewFile(uintptr(fd), abs)
 	defer f.Close()
-	openedInfo, err := f.Stat()
+	info, err := f.Stat()
 	if err != nil {
 		return nil, nil, err
 	}
-	if !openedInfo.Mode().IsRegular() {
-		return nil, nil, fmt.Errorf("non-regular artifact refused after open: %s", abs)
-	}
-	if !sameFileIdentity(info, openedInfo) {
-		return nil, nil, fmt.Errorf("artifact changed during no-follow open: %s", abs)
+	if !info.Mode().IsRegular() {
+		return nil, nil, fmt.Errorf("non-regular artifact refused: %s beneath %s", relPath, baseDir)
 	}
 	data, err := io.ReadAll(f)
 	if err != nil {
 		return nil, nil, err
 	}
-	return data, openedInfo, nil
+	return data, info, nil
 }
 
-func writeNewNoFollow(abs string, data []byte, perm os.FileMode) error {
-	fd, err := syscall.Open(abs, syscall.O_WRONLY|syscall.O_CREAT|syscall.O_EXCL|syscall.O_NOFOLLOW, uint32(perm))
+func writeNewBeneath(baseDir, relPath string, data []byte, perm os.FileMode) error {
+	f, err := openBeneath(baseDir, relPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, perm)
 	if err != nil {
 		return err
 	}
-	f := os.NewFile(uintptr(fd), abs)
 	_, writeErr := f.Write(data)
+	if writeErr == nil {
+		writeErr = f.Chmod(perm)
+	}
 	closeErr := f.Close()
 	if writeErr != nil {
 		return writeErr
 	}
-	if closeErr != nil {
-		return closeErr
-	}
-	return os.Chmod(abs, perm)
+	return closeErr
 }
 
-func writeFileNoFollowOverwrite(abs string, data []byte, perm os.FileMode) error {
-	flags := syscall.O_WRONLY | syscall.O_CREAT | syscall.O_EXCL | syscall.O_NOFOLLOW
+func writeOverwriteBeneath(baseDir, relPath string, data []byte, perm os.FileMode) error {
+	flags := os.O_WRONLY | os.O_CREATE | os.O_EXCL
+	openMode := perm
+	abs := filepath.Join(baseDir, filepath.FromSlash(relPath))
 	if info, err := os.Lstat(abs); err == nil {
+		// Advisory only: openBeneath's RESOLVE_NO_SYMLINKS re-resolves every
+		// component fresh inside the actual open call below regardless of
+		// what this Lstat sees, so a swap landing between this check and
+		// that call is refused there, not here. This Lstat exists only to
+		// pick O_TRUNC vs O_EXCL -- picking the wrong one just produces an
+		// ordinary "file exists"/"no such file" error, never an unsafe open.
 		if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
 			return fmt.Errorf("existing destination is not a regular file: %s", abs)
 		}
-		flags = syscall.O_WRONLY | syscall.O_TRUNC | syscall.O_NOFOLLOW
+		flags = os.O_WRONLY | os.O_TRUNC
+		// No O_CREATE on this branch, so openBeneath's mode argument must be
+		// 0 (openat2 rejects a nonzero mode without O_CREATE/O_TMPFILE with
+		// EINVAL, unlike legacy open()). f.Chmod(perm) below still forces the
+		// exact permission bits after open, via the fd, so this loses nothing.
+		openMode = 0
 	} else if !os.IsNotExist(err) {
 		return err
 	}
-	fd, err := syscall.Open(abs, flags, uint32(perm))
+	f, err := openBeneath(baseDir, relPath, flags, openMode)
 	if err != nil {
 		return err
 	}
-	f := os.NewFile(uintptr(fd), abs)
 	_, writeErr := f.Write(data)
+	if writeErr == nil {
+		writeErr = f.Chmod(perm)
+	}
 	closeErr := f.Close()
 	if writeErr != nil {
 		return writeErr
 	}
-	if closeErr != nil {
-		return closeErr
-	}
-	return os.Chmod(abs, perm)
-}
-
-func sameFileIdentity(a, b os.FileInfo) bool {
-	as, okA := a.Sys().(*syscall.Stat_t)
-	bs, okB := b.Sys().(*syscall.Stat_t)
-	if !okA || !okB {
-		return true
-	}
-	return as.Dev == bs.Dev && as.Ino == bs.Ino
+	return closeErr
 }
 
 func validateJSONSchemaData(schemaData, data []byte) error {

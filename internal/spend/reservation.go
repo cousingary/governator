@@ -104,9 +104,25 @@ WHERE (
 // comment) so the ledger stays honest about its blind spots, but the daily
 // cap must not read that honesty as "no money was spent" — a strict cost
 // contract's whole point is that an unmetered backend shrinks the remaining
-// budget, not bypasses it (audit finding #11). The claim is a single
-// conditional UPDATE (WHERE status='pending'), so a concurrent Settle,
-// Release or expiry of the same row can never double-apply.
+// budget, not bypasses it (audit finding #11).
+//
+// Sol P1-10 / report §9 attack 20: the previous implementation read
+// estimated_usd in one top-level statement, then updated status='settled' in
+// a second, separate top-level statement — a concurrent
+// expireStaleReservations (or another Settle/Release call for the same row)
+// landing in the gap between those two statements could flip the row out of
+// 'pending' before the UPDATE ran. The UPDATE's WHERE clause then silently
+// matched zero rows, and the result was discarded (RowsAffected was never
+// checked), so the settle silently no-op'd and the run's actual cost was
+// never recorded anywhere. Fixed to mirror quota.Settle's existing
+// claimReservation shape: one transaction, one UPDATE ... RETURNING that
+// both claims the pending->settled transition and reads the row's own
+// current estimated_usd atomically as part of the same statement — there is
+// no separate read step left for a race to land in. sql.ErrNoRows means
+// another transition already claimed this reservation (settled, released, or
+// expired concurrently) — the normal, safe outcome of a race, not an error
+// the caller should fail the run over (same convention as
+// quota.claimReservation's ok=false, silent no-op path).
 func SettleGlobal(ledger *sql.DB, reservationID int64, actualUSD float64, costAvailable bool, now time.Time) error {
 	if ledger == nil || reservationID == 0 {
 		return nil
@@ -114,23 +130,28 @@ func SettleGlobal(ledger *sql.DB, reservationID int64, actualUSD float64, costAv
 	if actualUSD < 0 {
 		actualUSD = 0
 	}
+	tx, err := ledger.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	var estimated float64
+	err = tx.QueryRow(`UPDATE spend_reservations SET status='settled', settled_at=? WHERE id=? AND status='pending' RETURNING estimated_usd`,
+		formatSpendTime(now), reservationID).Scan(&estimated)
+	if err == sql.ErrNoRows {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
 	settleUSD := actualUSD
 	if !costAvailable {
-		var estimated float64
-		err := ledger.QueryRow(`SELECT estimated_usd FROM spend_reservations WHERE id=? AND status='pending'`, reservationID).Scan(&estimated)
-		switch {
-		case err == nil:
-			settleUSD = estimated
-		case err == sql.ErrNoRows:
-			// Already settled/released/expired by someone else — the UPDATE
-			// below will correctly no-op.
-		default:
-			return err
-		}
+		settleUSD = estimated
 	}
-	_, err := ledger.Exec(`UPDATE spend_reservations SET status='settled', actual_usd=?, settled_at=? WHERE id=? AND status='pending'`,
-		settleUSD, formatSpendTime(now), reservationID)
-	return err
+	if _, err := tx.Exec(`UPDATE spend_reservations SET actual_usd=? WHERE id=?`, settleUSD, reservationID); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 // ReleaseGlobal cancels a reservation that never launched, or whose run

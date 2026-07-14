@@ -43,17 +43,25 @@ func RequiresHostContainment(c contracts.Contract, enforceLocalEffectful bool) b
 // Enforce applies the default risk-class containment policy. It preserves the
 // historical call shape while enabling Session 6's enforced-by-default
 // medium/high effectful local-run gate.
-func Enforce(c contracts.Contract, nativeSandbox bool, pubKeyHex string) error {
-	return EnforcePolicy(c, nativeSandbox, pubKeyHex, true)
+func Enforce(c contracts.Contract, externallyEnforced bool, pubKeyHex string) error {
+	return EnforcePolicy(c, externallyEnforced, pubKeyHex, true)
 }
 
 // EnforcePolicy applies the risk-class containment policy and returns a
 // non-nil error when a contract lacks qualifying containment. It is
-// fail-closed by construction: nativeSandbox reports whether the resolved
-// backend declares a native sandbox capability (verified at the agent layer,
-// never trusted from the contract alone), and pubKeyHex is the operator
-// override public key from config — empty means overrides are refused.
-func EnforcePolicy(c contracts.Contract, nativeSandbox bool, pubKeyHex string, enforceLocalEffectful bool) error {
+// fail-closed by construction: pubKeyHex is the operator override public key
+// from config — empty means overrides are refused.
+//
+// externallyEnforced reports whether Governator's OWN external-enforcement
+// layer is available for a "local" runner (internal/enforce: Landlock LSM
+// filesystem confinement + a network namespace with no route, applied to the
+// launched process from outside it, independent of anything the backend
+// claims about itself). Per Sol P0-3 (Session 5, report §9 attack 5): a
+// backend's declared or probe-attested native sandbox is evidence, never
+// proof — a program that knows it is being tested can behave only during the
+// test. It no longer qualifies a "local" runner on its own; only this
+// externally-enforced boundary or a signed operator override does.
+func EnforcePolicy(c contracts.Contract, externallyEnforced bool, pubKeyHex string, enforceLocalEffectful bool) error {
 	if !RequiresHostContainment(c, enforceLocalEffectful) {
 		return nil
 	}
@@ -70,16 +78,18 @@ func EnforcePolicy(c contracts.Contract, nativeSandbox bool, pubKeyHex string, e
 				"(non-root user, read-only rootfs, cap-drop=ALL, no-new-privileges, pinned image, network=deny) "+
 				"or a signed operator override; the declared docker config is not hardened", strings.TrimSpace(c.RiskClass))
 	case "local":
-		if nativeSandbox {
+		if externallyEnforced {
 			return nil
 		}
 		if VerifyOverride(c, pubKeyHex) {
 			return nil
 		}
 		return fmt.Errorf(
-			"containment: risk_class %q effectful runner: local requires hardened docker, "+
-				"a backend with a verified native OS sandbox, or a signed operator override; "+
-				"%q does not declare a native sandbox capability", strings.TrimSpace(c.RiskClass), c.Agent)
+			"containment: risk_class %q effectful runner: local requires Governator's own externally "+
+				"enforced sandbox (Landlock LSM + network namespace; see internal/enforce), hardened docker, "+
+				"or a signed operator override; this host cannot provide that enforcement layer, and %q's own "+
+				"declared/attested native sandbox is evidence, not proof, and no longer qualifies on its own "+
+				"(Sol P0-3)", strings.TrimSpace(c.RiskClass), c.Agent)
 	default:
 		return fmt.Errorf("containment: risk_class %q does not support runner %q", strings.TrimSpace(c.RiskClass), c.EffectiveRunner())
 	}

@@ -23,6 +23,7 @@ import (
 	"github.com/cousingary/governator/internal/contextgraph"
 	"github.com/cousingary/governator/internal/contracts"
 	"github.com/cousingary/governator/internal/doctor"
+	"github.com/cousingary/governator/internal/enforce"
 	"github.com/cousingary/governator/internal/observability"
 	"github.com/cousingary/governator/internal/panel"
 	"github.com/cousingary/governator/internal/policy"
@@ -50,6 +51,16 @@ func run(args []string) int {
 	if len(args) == 0 {
 		usage()
 		return 2
+	}
+	// Session 5 (Sol P0-3): the sandbox-exec wrapper is not a user-facing
+	// command -- it is the process that applies Landlock to itself and then
+	// execs into the real governed backend (see internal/enforce). It must
+	// be intercepted before every other branch below, including the config
+	// guard: by design it carries no config dependency, the same posture
+	// "hook" already has for the same reason (a high-frequency internal
+	// path must stay resilient to an unrelated config problem).
+	if args[0] == enforce.SandboxExecArg {
+		return enforce.RunSandboxExec(args[1:])
 	}
 	// Sol Critical 2: a malformed configuration must fail the process at
 	// startup, never be silently replaced by defaults inside Current(). init
@@ -1874,12 +1885,13 @@ func versionCmd(args []string) int {
 // fail when a claim is unwired, untested, stale, missing its acceptance
 // artifact, or absent from the shipped binary).
 func claimsCmd(args []string) int {
-	usage := "usage: gov claims verify [--file <path>] [--repo <path>] [--artifact <path>] [--manifest <path>]"
+	usage := "usage: gov claims verify [--file <path>] [--repo <path>] [--artifact <path>] [--manifest <path>] [--release]"
 	if len(args) < 1 || args[0] != "verify" {
 		return bad(usage)
 	}
 	file := "docs/claims.yaml"
 	repo := "."
+	release := false
 	opts := claims.VerifyOptions{}
 	rest := args[1:]
 	for len(rest) > 0 {
@@ -1908,9 +1920,27 @@ func claimsCmd(args []string) int {
 			}
 			opts.ManifestPath = rest[1]
 			rest = rest[2:]
+		case "--release":
+			release = true
+			rest = rest[1:]
 		default:
 			return bad(usage)
 		}
+	}
+	// P0-7 (Sol redteam v4 S8): a release pipeline invoking this in --release
+	// mode is asserting "this is the full, exact-artifact claims check that
+	// gates whether a release ships" -- the specific failure mode the report
+	// found was that release.sh's own acceptance step called `claims verify`
+	// WITHOUT --artifact/--manifest, so the binary-identity/commit-drift
+	// checks in verifyArtifactManifest never actually ran against the shipped
+	// artifact. --release refuses to silently degrade into the bare
+	// source-only check that mode would otherwise produce. It does not
+	// change the bare (no --release) invocation CI and local pre-commit runs
+	// use every day to check claim-to-source consistency -- that check has
+	// nothing to do with a built artifact and must keep working without one.
+	if release && (opts.ArtifactPath == "" || opts.ManifestPath == "") {
+		fmt.Fprintln(os.Stderr, "claims: --release requires both --artifact and --manifest")
+		return bad(usage)
 	}
 	doc, err := claims.Load(file)
 	if err != nil {
@@ -2156,17 +2186,27 @@ func parityCmd(args []string) int {
 	return 0
 }
 
+// gateCmd implements `gov gate check`. Sol P1-11 / report §9 attack 15: a
+// malformed/empty/oversized payload (`printf '{broken' | gov gate check`)
+// used to hit an early `return 0` on either the stdin read or the
+// json.Unmarshal/tool-name check — exit 0 with no output at all, which any
+// integration reading "no denial" as approval treats as a silent ALLOW.
+// "No decision" is reserved for *valid* input the gate simply has no
+// applicable rule for; a payload that couldn't even be parsed must never
+// reach that path. Fixed to fail closed via denyGateProtocolError, reusing
+// the exact readHookPayload/hookProtocolError machinery `gov hook
+// pre-tool-use` already uses correctly for the identical class of input.
 func gateCmd(args []string) int {
 	if len(args) != 1 || args[0] != "check" {
 		return bad("usage: gov gate check")
 	}
-	data, err := io.ReadAll(os.Stdin)
-	if err != nil {
-		return 0
+	data, protoErr := readHookPayload(os.Stdin, hookProtocolMaxBytes)
+	if protoErr != nil {
+		return denyGateProtocolError(protoErr)
 	}
 	var input govruntime.NeutralGateInput
 	if json.Unmarshal(data, &input) != nil || strings.TrimSpace(input.Tool) == "" {
-		return 0
+		return denyGateProtocolError(&hookProtocolError{"HOOK_PROTOCOL_ERROR", "malformed or incomplete gate check input"})
 	}
 	decision := govruntime.NeutralGateDecide(input)
 	output := struct {
@@ -2176,6 +2216,28 @@ func gateCmd(args []string) int {
 	}{decision.Allow, decision.Reason, decision.Finding}
 	_ = json.NewEncoder(os.Stdout).Encode(output)
 	return 0
+}
+
+// denyGateProtocolError is P1-11's fail-closed path for `gov gate check`
+// (report §9 attack 15). Unlike `gov hook pre-tool-use` (which must always
+// exit 0 to satisfy Claude Code's documented hook contract, carrying its
+// denial only in stdout JSON), `gate check` has no such external exit-code
+// constraint, so a malformed payload gets the plainer contract the plan
+// calls for: a structured DENY on stdout (in the same {allow,reason,finding}
+// shape a normal decision uses, so callers don't need a second parser), an
+// explicit PROTOCOL_ERROR-class finding, a nonzero exit code the caller can
+// act on directly without parsing stdout at all, and a durable emergency
+// audit record via the same hook_events/emergency-journal fallback `gov hook
+// pre-tool-use` already uses when the ledger itself is unavailable.
+func denyGateProtocolError(pe *hookProtocolError) int {
+	output := struct {
+		Allow   bool   `json:"allow"`
+		Reason  string `json:"reason"`
+		Finding string `json:"finding"`
+	}{false, "DENY: " + pe.Error(), pe.Code}
+	_ = json.NewEncoder(os.Stdout).Encode(output)
+	recordHookDecision("", govruntime.GateInput{ToolName: "<unparseable>"}, govruntime.GateDecision{Allow: false, Finding: pe.Code, Reason: pe.Error()})
+	return 2
 }
 
 func hookCmd(args []string) int {
@@ -2513,6 +2575,6 @@ Usage:
   gov attest <backend>
   gov doctor
   gov health [reset <backend>]
-  gov claims verify [--file <path>] [--repo <path>] [--artifact <path>] [--manifest <path>]
+  gov claims verify [--file <path>] [--repo <path>] [--artifact <path>] [--manifest <path>] [--release]
   gov version`)
 }

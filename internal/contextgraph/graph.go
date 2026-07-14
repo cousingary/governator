@@ -14,6 +14,7 @@ import (
 	"strings"
 
 	"github.com/cousingary/governator/internal/config"
+	"github.com/cousingary/governator/internal/toolregistry"
 )
 
 type Status struct {
@@ -56,6 +57,19 @@ type Snapshot struct {
 	BinaryPath  string `json:"-"`
 }
 
+// Resolve determines whether the configured graph provider is available.
+// Sol report P0-5/attack 9: a context-graph helper is a controller
+// component that runs on the host before the backend and before baseline
+// measurement, with no sandbox of its own — so it must never be trusted
+// merely because it resolved via PATH. Resolve gates through the
+// trusted-tool registry keyed on status.Provider (e.g. "codegraph"):
+// absent a registry entry (shipped default, or an operator's own
+// ~/.governator/tools.yaml declaration), the provider is treated exactly
+// like "not found" for "auto"/"off" — silently disabled, never invoked —
+// and as a hard failure for "required", the same shape as today's "not
+// found in PATH" error. A registered provider is still independently
+// verified every resolution: canonical path, content hash, owner, mode,
+// non-writable parent directories (registry.Resolve).
 func Resolve() (Status, error) {
 	cfg, err := config.Load()
 	if err != nil {
@@ -65,14 +79,18 @@ func Resolve() (Status, error) {
 	if status.Mode == "off" {
 		return status, nil
 	}
-	path, err := exec.LookPath(status.Bin)
+	registry, err := toolregistry.Load()
 	if err != nil {
+		return status, err
+	}
+	identity, terr := registry.Resolve(status.Provider, status.Bin)
+	if terr != nil {
 		if status.Mode == "required" {
-			return status, fmt.Errorf("%s graph provider is required but %q was not found in PATH", status.Provider, status.Bin)
+			return status, fmt.Errorf("%s graph provider is required but not trusted: %w", status.Provider, terr)
 		}
 		return status, nil
 	}
-	status.Path = path
+	status.Path = identity.CanonicalPath
 	status.Enabled = true
 	return status, nil
 }

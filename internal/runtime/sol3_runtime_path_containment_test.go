@@ -7,8 +7,16 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/cousingary/governator/internal/enforce"
 )
 
+// TestSol3MediumEffectfulLocalDeniedBeforeLaunch: Session 5 (Sol P0-3) moved
+// "local" containment authorization onto Governator's own externally
+// enforced sandbox (enforce.Supported()), not the backend's declared native
+// sandbox -- glm alone no longer denies this on a host that can actually
+// provide external enforcement, so the denial this test checks now needs
+// ForceUnsupported to construct the "this host cannot provide it" case.
 func TestSol3MediumEffectfulLocalDeniedBeforeLaunch(t *testing.T) {
 	root, _ := fixture(t)
 	home := t.TempDir()
@@ -22,6 +30,8 @@ func TestSol3MediumEffectfulLocalDeniedBeforeLaunch(t *testing.T) {
 	c.Agent = "glm"
 	c.RiskClass = "medium"
 
+	enforce.ForceUnsupported = true
+	defer func() { enforce.ForceUnsupported = false }()
 	_, err := New().Run(context.Background(), c)
 	if err == nil || !strings.Contains(err.Error(), "risk_class \"medium\"") {
 		t.Fatalf("expected medium-risk effectful local containment denial, got %v", err)

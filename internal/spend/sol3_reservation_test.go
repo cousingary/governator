@@ -212,6 +212,68 @@ func TestSol3SettleVersusReleaseGlobalMutualExclusion(t *testing.T) {
 	}
 }
 
+// TestSol3SettleGlobalRacingExpiryNeverSilentlyLosesSettlement is Sol
+// P1-10's regression test / report §9 attack 20: SettleGlobal used to read
+// estimated_usd in one top-level statement, then update status='settled' in
+// a second, separate top-level statement. A concurrent
+// expireStaleReservations landing in the gap between those two statements
+// could flip the row to 'expired' before the UPDATE ran, and the UPDATE's
+// WHERE clause then matched zero rows silently -- no error was surfaced
+// (RowsAffected was never checked), so the run's actual cost vanished from
+// the ledger. Races SettleGlobal directly against expireStaleReservations
+// (real goroutines, no mock) many times and asserts the reservation always
+// lands in exactly one clean terminal state: either "settled" with
+// actual_usd correctly populated, or "expired" with no partial write of any
+// kind -- never a status that doesn't match what the API contract promises.
+func TestSol3SettleGlobalRacingExpiryNeverSilentlyLosesSettlement(t *testing.T) {
+	db, _ := openLedger(t)
+	cfg := config.BuiltIn()
+	cfg.Spend.DailyCapUSD = 0
+	now := time.Date(2026, 7, 13, 12, 0, 0, 0, time.UTC)
+
+	const trials = 20
+	for i := 0; i < trials; i++ {
+		res, ok, _, err := ReserveGlobal(db, cfg, fmt.Sprintf("run-race-%d", i), 0.25, time.Millisecond, now)
+		if err != nil || !ok {
+			t.Fatalf("trial %d: reserve failed: ok=%v err=%v", i, ok, err)
+		}
+		// The reservation's TTL (1ms) has already elapsed relative to
+		// expireAt, so expireStaleReservations is guaranteed to match this
+		// row the instant it runs -- the only open question is which of the
+		// two concurrent statements commits first.
+		expireAt := now.Add(time.Hour)
+
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			_ = SettleGlobal(db, res.ID, 0.30, true, expireAt)
+		}()
+		go func() {
+			defer wg.Done()
+			_ = expireStaleReservations(db, expireAt)
+		}()
+		wg.Wait()
+
+		var status string
+		var actualUSD float64
+		if err := db.QueryRow(`SELECT status, COALESCE(actual_usd,0) FROM spend_reservations WHERE id=?`, res.ID).Scan(&status, &actualUSD); err != nil {
+			t.Fatal(err)
+		}
+		switch status {
+		case "settled":
+			if actualUSD != 0.30 {
+				t.Fatalf("trial %d: settled but actual_usd=%v, want 0.30", i, actualUSD)
+			}
+		case "expired":
+			// Settle lost the race cleanly: no partial or silently-dropped
+			// write of any kind.
+		default:
+			t.Fatalf("trial %d: unexpected terminal status %q", i, status)
+		}
+	}
+}
+
 // TestSol3ReleaseForRunOnlyTouchesThatRun mirrors quota.ReleaseForRun's
 // crash-recovery contract: releasing an interrupted run's reservations must
 // not disturb any other run's still-open reservation.

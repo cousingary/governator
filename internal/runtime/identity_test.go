@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/cousingary/governator/internal/agents"
@@ -11,6 +12,7 @@ import (
 	"github.com/cousingary/governator/internal/contracts"
 	"github.com/cousingary/governator/internal/policy"
 	"github.com/cousingary/governator/internal/prompts"
+	"github.com/cousingary/governator/internal/runner"
 )
 
 // writePromptVersion writes a single prompt file at <root>/<agent>/<mode>/<ver>.md
@@ -112,9 +114,9 @@ func TestRunnerConfigHashesLocalConfig(t *testing.T) {
 	tightened := contracts.Contract{Local: &contracts.LocalRunnerConfig{RequireCompleteTranscript: true}}
 	capped := contracts.Contract{Local: &contracts.LocalRunnerConfig{OutputCapBytes: 1024}}
 
-	baseHash := hashJSON(runnerConfig(base))
-	tightenedHash := hashJSON(runnerConfig(tightened))
-	cappedHash := hashJSON(runnerConfig(capped))
+	baseHash := hashJSON(runnerConfig(base, nil, ""))
+	tightenedHash := hashJSON(runnerConfig(tightened, nil, ""))
+	cappedHash := hashJSON(runnerConfig(capped, nil, ""))
 
 	if baseHash == tightenedHash {
 		t.Fatal("setting local.require_complete_transcript did not change runnerConfig's hash")
@@ -390,17 +392,57 @@ func TestComputeIdentityCapturesBackendBinary(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	idA := computeExecutionIdentity(config.BuiltIn(), c, agent, resA, t.TempDir(), "dead", "ch", pv, "attest-1")
+	idA := computeExecutionIdentity(config.BuiltIn(), c, agent, resA, agents.BackendIdentity{}, nil, "", "dead", "ch", pv, "attest-1", PolicyBundle{})
 	t.Setenv("GOV_CLAUDE_BIN", binB)
 	resB, err := agents.ResolvePath(agent)
 	if err != nil {
 		t.Fatal(err)
 	}
-	idB := computeExecutionIdentity(config.BuiltIn(), c, agent, resB, t.TempDir(), "dead", "ch", pv, "attest-1")
+	idB := computeExecutionIdentity(config.BuiltIn(), c, agent, resB, agents.BackendIdentity{}, nil, "", "dead", "ch", pv, "attest-1", PolicyBundle{})
 	if idA.BackendBinarySHA256 == idB.BackendBinarySHA256 {
 		t.Fatal("different backend binaries produced the same identity binary hash")
 	}
 	if idA.Hash() == idB.Hash() {
 		t.Fatal("a backend binary change did not change the full identity hash")
+	}
+}
+
+// TestComputeIdentityCapturesDockerImageIdentity is report P1-1's unit-level
+// proof: a resolved Docker image identity feeds the execution identity hash,
+// so a retagged mutable tag (same contract, same c.Docker.Image string, but
+// a different resolved image ID/digest) mints a different identity and never
+// replays a prior approval against the swapped image. Uses fabricated
+// runner.ImageIdentity values -- internal/runner's own docker_test.go proves
+// ResolveImageIdentity itself detects a real retag against a live daemon.
+func TestComputeIdentityCapturesDockerImageIdentity(t *testing.T) {
+	bin := filepath.Join(t.TempDir(), "fake")
+	if err := os.WriteFile(bin, []byte("#!/bin/sh\necho a\n"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("GOV_CLAUDE_BIN", bin)
+	c := contract(t.TempDir())
+	c.Docker = &contracts.DockerRunnerConfig{Image: "example/agent:latest"}
+	agent, err := agents.New("claude-code")
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, err := agents.ResolvePath(agent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pv := prompts.Version{ID: "builtin"}
+
+	imgA := &runner.ImageIdentity{Reference: "example/agent:latest", ID: "sha256:" + strings.Repeat("a", 64)}
+	imgB := &runner.ImageIdentity{Reference: "example/agent:latest", ID: "sha256:" + strings.Repeat("b", 64)}
+
+	idA := computeExecutionIdentity(config.BuiltIn(), c, agent, res, agents.BackendIdentity{}, imgA, "", "dead", "ch", pv, "attest-1", PolicyBundle{})
+	idB := computeExecutionIdentity(config.BuiltIn(), c, agent, res, agents.BackendIdentity{}, imgB, "", "dead", "ch", pv, "attest-1", PolicyBundle{})
+	if idA.Hash() == idB.Hash() {
+		t.Fatal("a different resolved Docker image ID (same configured tag) did not change the full identity hash")
+	}
+
+	idNone := computeExecutionIdentity(config.BuiltIn(), c, agent, res, agents.BackendIdentity{}, nil, "", "dead", "ch", pv, "attest-1", PolicyBundle{})
+	if idA.Hash() == idNone.Hash() {
+		t.Fatal("a resolved image identity vs. none (same tag) did not change the full identity hash")
 	}
 }

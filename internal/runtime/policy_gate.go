@@ -9,6 +9,7 @@ import (
 
 	"github.com/cousingary/governator/internal/config"
 	"github.com/cousingary/governator/internal/contracts"
+	"github.com/cousingary/governator/internal/lifecycle"
 	"github.com/cousingary/governator/internal/observability"
 	"github.com/cousingary/governator/internal/policy"
 )
@@ -60,7 +61,7 @@ func (r *Runner) quarantineForPolicy(db *sql.DB, c contracts.Contract, agent, ro
 	}); err != nil {
 		return refused, err
 	}
-	if err := observability.RecordStage(db, id, "QUARANTINED", "", time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
+	if err := lifecycle.Record(db, id, lifecycle.Quarantined, "", lifecycle.Now()); err != nil {
 		return refused, err
 	}
 	return refused, nil
@@ -103,36 +104,63 @@ func overrideTargetForResult(res policy.LayerResult) string {
 	return res.RuleID
 }
 
-// evaluatePolicyGate runs the Session 5 (Sol Phase 4) layered policy engine
-// for one gate call: organization (config.PolicyRules) -> project doctrine
-// (workspaceRoot/.governator-doctrine.yaml) -> job contract (c.Policy.Rules)
-// -> session/operator override (active internal/observability policy_overrides
-// rows scoped to this job). Any rule whose effective verdict is still ASK
-// after override resolution gets a durable policy_checkpoints row so `gov
-// ask` can list/resolve it — persisted before this function returns, so a
-// crash between evaluation and the caller quarantining the run never loses
-// the checkpoint. Returns the combined decision, every checkpoint created
-// for this call (empty when the decision isn't ASK), and every reserved
-// one-shot override ID this evaluation did NOT already resolve (empty
-// unless decision.Blocks() is false) — see pendingOneShotIDs doc below.
-func evaluatePolicyGate(db *sql.DB, cfg config.Config, c contracts.Contract, workspaceRoot, runID string, facts map[string]any) (policy.PolicyDecision, []observability.PolicyCheckpoint, []int64, error) {
-	var results []policy.LayerResult
-	results = append(results, policy.EvaluateConditionRules(policy.SourceOrgPolicy, cfg.PolicyRules, facts)...)
+// PolicyBundle is every policy-rule source resolved exactly once and frozen
+// for the remainder of the decision point it was built for (Sol P1-3). Before
+// this existed, evaluatePolicyGate loaded project doctrine (and contract
+// rules) from disk at evaluation time, while computeExecutionIdentity — called
+// later, after spend/quota reservation, prompt resolution and handle
+// resolution have all run — independently re-loaded project doctrine again.
+// A doctrine file edited in that window meant the identity hash (the replay
+// key) described a different doctrine than the one the gate actually
+// evaluated against, breaking the invariant identity.go's own doc comment
+// claims ("the identity captures exactly the doctrine file the policy gate
+// consulted"). Building this bundle once, before the first gate, and passing
+// the same object to both the gate and the identity computation closes that
+// window entirely — same pattern as RunEnvironment (environment.go) for
+// configuration.
+type PolicyBundle struct {
+	OrgRules      []policy.ConditionRule
+	ProjectRules  []policy.ConditionRule
+	ContractRules []policy.ConditionRule
+}
 
+// loadPolicyBundle resolves every policy-rule source for one decision point.
+// Called once per decision point (runOnce's main gate, or fallbackEligible's
+// separate retry-eligibility check) — never once per read.
+func loadPolicyBundle(cfg config.Config, c contracts.Contract, workspaceRoot string) (PolicyBundle, error) {
 	projectRules, err := policy.LoadProjectDoctrine(workspaceRoot)
 	if err != nil {
-		return policy.PolicyDecision{}, nil, nil, err
+		return PolicyBundle{}, err
 	}
-	results = append(results, policy.EvaluateConditionRules(policy.SourceProjectDoctrine, projectRules, facts)...)
-
 	contractRules, err := policy.ContractRules(c)
 	if err != nil {
-		return policy.PolicyDecision{}, nil, nil, err
+		return PolicyBundle{}, err
 	}
-	results = append(results, policy.EvaluateConditionRules(policy.SourceJobContract, contractRules, facts)...)
+	return PolicyBundle{OrgRules: cfg.PolicyRules, ProjectRules: projectRules, ContractRules: contractRules}, nil
+}
+
+// evaluatePolicyGate runs the Session 5 (Sol Phase 4) layered policy engine
+// for one gate call: organization (bundle.OrgRules) -> project doctrine
+// (bundle.ProjectRules) -> job contract (bundle.ContractRules) ->
+// session/operator override (active internal/observability policy_overrides
+// rows scoped to this job). bundle is resolved once by the caller (Sol P1-3)
+// — this function never re-reads doctrine or contract rules from disk itself.
+// Any rule whose effective verdict is still ASK after override resolution
+// gets a durable policy_checkpoints row so `gov ask` can list/resolve it —
+// persisted before this function returns, so a crash between evaluation and
+// the caller quarantining the run never loses the checkpoint. Returns the
+// combined decision, every checkpoint created for this call (empty when the
+// decision isn't ASK), and every reserved one-shot override ID this
+// evaluation did NOT already resolve (empty unless decision.Blocks() is
+// false) — see pendingOneShotIDs doc below.
+func evaluatePolicyGate(db *sql.DB, cfg config.Config, c contracts.Contract, bundle PolicyBundle, runID string, facts map[string]any) (policy.PolicyDecision, []observability.PolicyCheckpoint, []int64, error) {
+	var results []policy.LayerResult
+	results = append(results, policy.EvaluateConditionRules(policy.SourceOrgPolicy, bundle.OrgRules, facts)...)
+	results = append(results, policy.EvaluateConditionRules(policy.SourceProjectDoctrine, bundle.ProjectRules, facts)...)
+	results = append(results, policy.EvaluateConditionRules(policy.SourceJobContract, bundle.ContractRules, facts)...)
 
 	now := time.Now().UTC().Format(time.RFC3339Nano)
-	scope := policyOverrideScopeFor(c, cfg, facts, cfg.PolicyRules, projectRules, contractRules)
+	scope := policyOverrideScopeFor(c, cfg, facts, bundle.OrgRules, bundle.ProjectRules, bundle.ContractRules)
 	overrideRows, err := observability.ClaimActivePolicyOverrides(db, scope, now)
 	if err != nil {
 		return policy.PolicyDecision{}, nil, nil, err
@@ -143,7 +171,7 @@ func evaluatePolicyGate(db *sql.DB, cfg config.Config, c contracts.Contract, wor
 	}
 	resolved, applied := policy.ResolveOverrides(results, overrides)
 	decision := policy.EvaluateLayers(resolved...)
-	decision.PolicyHash = policyHashForGate(facts, cfg.PolicyRules, projectRules, contractRules, resolved, overrideRows)
+	decision.PolicyHash = policyHashForGate(facts, bundle.OrgRules, bundle.ProjectRules, bundle.ContractRules, resolved, overrideRows)
 
 	// Release every reserved one-shot row ClaimActivePolicyOverrides claimed
 	// but ResolveOverrides never matched to any rule this evaluation

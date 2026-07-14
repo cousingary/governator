@@ -10,6 +10,7 @@ import (
 	"sort"
 	"time"
 
+	"github.com/cousingary/governator/internal/lifecycle"
 	"github.com/cousingary/governator/internal/observability"
 	"github.com/cousingary/governator/internal/quota"
 	"github.com/cousingary/governator/internal/runner"
@@ -212,7 +213,7 @@ func recoverInterruptedRun(ctx context.Context, db *sql.DB, r RunRecord, forced 
 	// below.
 	if ok := destroyLeftoverWorkspace(ctx, db, r, stages); !ok {
 		detail := "workspace/container cleanup failed; retry enqueued to maintenance_outbox, run left RUNNING pending cleanup"
-		if err := observability.RecordStage(db, r.ID, "CLEANUP_PENDING", detail, now.Format(time.RFC3339Nano)); err != nil {
+		if err := lifecycle.Record(db, r.ID, lifecycle.CleanupPending, detail, now.Format(time.RFC3339Nano)); err != nil {
 			return RecoveryVerdict{RunID: r.ID}, err
 		}
 		return RecoveryVerdict{RunID: r.ID, Action: "cleanup_pending", Detail: detail}, nil
@@ -226,7 +227,7 @@ func recoverInterruptedRun(ctx context.Context, db *sql.DB, r RunRecord, forced 
 	if _, err := db.Exec(`UPDATE runs SET status=?, message=? WHERE id=?`, status, reason, r.ID); err != nil {
 		return RecoveryVerdict{RunID: r.ID}, err
 	}
-	if err := observability.RecordStage(db, r.ID, status, reason, now.Format(time.RFC3339Nano)); err != nil {
+	if err := lifecycle.Record(db, r.ID, lifecycle.Stage(status), reason, now.Format(time.RFC3339Nano)); err != nil {
 		return RecoveryVerdict{RunID: r.ID}, err
 	}
 	return RecoveryVerdict{RunID: r.ID, Action: action, Detail: reason}, nil

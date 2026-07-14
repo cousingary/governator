@@ -124,7 +124,7 @@ gov cleanup --stale [--max-attempts N]
 gov ask list|show <id>|approve <id>|deny <id> [--rule] [--ttl <duration>] [--by <name>] [--note <text>]
 gov doctor
 gov health [reset <backend>]
-gov claims verify [--file <path>] [--repo <path>]
+gov claims verify [--file <path>] [--repo <path>] [--artifact <path>] [--manifest <path>] [--release]
 gov version
 ```
 

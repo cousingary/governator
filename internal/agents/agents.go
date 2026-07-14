@@ -11,6 +11,8 @@ import (
 	"time"
 
 	"github.com/cousingary/governator/internal/config"
+	"github.com/cousingary/governator/internal/containment"
+	"github.com/cousingary/governator/internal/enforce"
 )
 
 // Executor overrides how a backend's CLI process is actually spawned. Nil
@@ -81,12 +83,52 @@ type runCLIRequest struct {
 func defaultExecutor(ctx context.Context, bin string, args []string, workdir string, out io.Writer, timeout time.Duration) (int, bool, error) {
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, bin, args...)
-	cmd.Dir = workdir
+	handle, _ := HandleFromContext(ctx)
+	var cmd *exec.Cmd
+	var err error
+	scope, hasScope := containment.ScopeFromContext(ctx)
+	plan, _ := enforce.PlanFromContext(ctx)
+	if hasScope {
+		cmd, err = LaunchCommand(ctx, handle, bin, args, func(c context.Context, b string, a []string) *exec.Cmd {
+			// Session 5 (Sol P0-3): wrap bin/args in Governator's own
+			// externally enforced sandbox (Landlock + network namespace)
+			// BEFORE the S2 descendant-owning Scope wraps the launch again.
+			// A no-op Plan (Active false -- most runs, which never require
+			// host containment) returns b/a unchanged, so this composes with
+			// every Scope method identically to before Session 5 existed.
+			wb, wa := plan.Wrap(b, a)
+			return scope.Command(c, wb, wa, workdir)
+		})
+	} else {
+		// No Scope in context means this launch never went through a
+		// governed runtime.Runner (doctor probes, direct adapter tests) --
+		// keep the pre-S2 process-group behavior rather than requiring
+		// every caller to construct a Scope.
+		cmd, err = LaunchCommand(ctx, handle, bin, args, nil)
+		if err == nil {
+			cmd.Dir = workdir
+			cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+		}
+	}
+	if err != nil {
+		return 0, false, err
+	}
+	if handle != nil {
+		// Sol P1-14: filter the launched process's environment down to a
+		// fixed baseline plus this backend's own declared extras, applied
+		// unconditionally regardless of whether this is a scoped
+		// (systemd-run/unshare wrapper) or direct launch -- see
+		// baselineAllowedEnvKeys' doc comment for why the wrapper's own
+		// session-bus variables are part of that baseline rather than an
+		// adapter concern.
+		cmd.Env = BuildAllowedEnv(handle.AllowedEnv)
+	}
 	cmd.Stdout, cmd.Stderr = out, out
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	if err := cmd.Start(); err != nil {
 		return 0, false, err
+	}
+	if hasScope && cmd.Process != nil {
+		scope.Started(cmd.Process.Pid)
 	}
 	done := make(chan error, 1)
 	go func() { done <- cmd.Wait() }()
@@ -100,6 +142,11 @@ func defaultExecutor(ctx context.Context, bin string, args []string, workdir str
 		}
 		return 0, false, nil
 	case <-ctx.Done():
+		// Best-effort immediate stop on cancellation; this signal alone
+		// does not prove the whole descendant tree is dead (that is
+		// exactly the bug report P0-4 describes) -- the runtime's
+		// containment.Scope.Extinguish call after Launch returns is the
+		// actual authority, run unconditionally regardless of this path.
 		if cmd.Process != nil {
 			_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
 		}

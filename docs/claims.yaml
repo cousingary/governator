@@ -434,7 +434,7 @@ claims:
       - file: internal/runtime/runtime_test.go
         funcs:
           - TestLockCanonicalizesSymlinkAlias
-          - TestMergeCommitHookRejectionRollsBackLiveRoot
+          - TestMergeNeverInvokesPreCommitHookEvenWhenItWouldReject
           - TestWorkspaceCleanupGuardRemovesGraphPrepareFailureResources
 
   - id: sol-s3-host-containment-attestation
@@ -652,7 +652,7 @@ claims:
           - TestSol3FakeCodexVersionStringDoesNotAttestCapabilities
       - file: internal/runtime/sol3_attestation_test.go
         funcs:
-          - TestSol3FakeCodexAttestationCannotAuthorizeHighRiskLocal
+          - TestSol3FakeCodexFailedProbesNoLongerBlockAuthorizationAlone
 
   - id: sol3-s5-final-state-validation-barrier
     title: "After the final validator/cleanup/Assayer stage, a complete re-measurement barrier (symlink scan, worktree fingerprint, changed/deleted paths, budgets, protected-path checks, artifact re-hash) runs before merge; any delta from the approved measurement quarantines with the live root untouched, and staging uses exact approved paths (never git add -A)"
@@ -671,12 +671,14 @@ claims:
           - TestSol3FinalBarrierQuarantinesValidatorLineBudgetOverflow
 
   - id: sol3-s6-runtime-path-containment
-    title: "Runtime-created symlinks/junctions/special files are rejected before merge (scanned after execution, after each validator, and at the final barrier); produced/consumed artifact collection uses Lstat+no-follow and refuses symlinked targets; risk_class:medium effectful jobs are tiered into the same host-containment requirement as high-risk jobs by default"
+    title: "Runtime-created symlinks/junctions/special files are rejected before merge (scanned after execution, after each validator, and at the final barrier); produced/consumed artifact collection resolves every path beneath its base directory via openat2 (RESOLVE_BENEATH|RESOLVE_NO_SYMLINKS|RESOLVE_NO_MAGICLINKS, Sol redteam v4 S7 P1-7) and refuses symlinked targets at any path component, not just the final one; risk_class:medium effectful jobs are tiered into the same host-containment requirement as high-risk jobs by default"
     first_shipped_version: v1.5.0-sol3-repair-s6
     claimed_maturity: tested
     implementation:
       - file: internal/runtime/artifacts.go
-        symbols: [collectProducedArtifacts, readRegularNoFollowAbsolute, writeNewNoFollow, writeFileNoFollowOverwrite]
+        symbols: [collectProducedArtifacts, readRegularBeneath, writeNewBeneath, writeOverwriteBeneath]
+      - file: internal/runtime/openbeneath.go
+        symbols: [openBeneath]
       - file: internal/containment/containment.go
         symbols: [LocalEffectfulTieringEnforced, Effectful, RequiresHostContainment, EnforcePolicy]
     tests:

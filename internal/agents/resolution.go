@@ -129,7 +129,17 @@ const versionProbeTimeout = 30 * time.Second
 func probeVersion(ctx context.Context, path string) (string, bool) {
 	probeCtx, cancel := context.WithTimeout(ctx, versionProbeTimeout)
 	defer cancel()
+	// A disposable scratch cwd, never whatever directory the caller happens
+	// to be in: this executes path with --version, and a backend that
+	// doesn't special-case that flag (or a hostile one that ignores it
+	// entirely) must not be able to write anywhere real.
+	scratch, err := os.MkdirTemp("", "gov-resolve-probe-")
+	if err != nil {
+		return "", false
+	}
+	defer os.RemoveAll(scratch)
 	cmd := exec.CommandContext(probeCtx, path, "--version")
+	cmd.Dir = scratch
 	out, err := cmd.CombinedOutput()
 	text := strings.TrimSpace(string(out))
 	if len(text) > 4096 {
