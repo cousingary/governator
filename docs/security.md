@@ -78,6 +78,76 @@ Per the audit's §11 non-goals, none of the fixes above: disabled replay entirel
 
 ---
 
+# Sol redteam v4 findings register
+
+This is the audit-closure artifact for Sol's third redteam pass (`agents/governator-sol-upgrade4.md`), which
+reproduced a 25-item black-box attack corpus against the v1.0.0 binary the v3 repair round shipped —
+git-tree sovereignty, descendant/process containment, executable identity, externally enforced (not
+self-reported) capability attestation, and release/supply-chain integrity. Repair plan:
+`agents/governator-sol-upgrade4-plan.md`, executed as ten sessions (S0–S9); full per-session narrative,
+design decisions, and exact fix commits: `agents/governator-sol-upgrade4-findings.md` — this register is
+the same audit-finding → session → corpus-item index format as the v2/v3 tables above, kept intentionally
+short (pointing into the findings log for detail) rather than re-deriving a full per-finding table from a
+program this session didn't execute start to finish.
+
+Unlike v2/v3, this round's corpus lives in-repo as executable tests, not just a document: `internal/redteam/`
+(build tag `redteam`), run via `scripts/redteam.sh`. The skip count it prints is the literal project
+burn-down — S0 landed all 25 attacks with the not-yet-fixed ones `t.Skip`-marked with a session tag; each
+session's fix removes its own skips. **Closed 2026-07-14: `scripts/redteam.sh` reports 25/25 attacks green,
+zero skips, zero failures**, both plain and `-race`, at commit `d289bf3` (tag `v1.0.0`).
+
+## Session ↔ report-item map
+
+| S | Theme | Report items closed | Corpus attacks |
+|---|---|---|---|
+| 0 | Attack harness + ground truth; P1-4 triage | — (P1-4: false positive, see below) | scaffolding for all 25 |
+| 1 | Git tree sovereignty (`internal/gitplumb/`) | P0-1, P0-2, P1-6, P1-9 | 1, 2, 3, 4, 19 |
+| 2 | Descendant containment (`internal/containment/descendants.go`) | P0-4 | 8 |
+| 3 | Executable identity (`internal/agents/handle.go`) | P0-6, P1-1, P1-2 | 6, 7, 10, 11, 12 |
+| 4 | Trusted tool registry (`internal/toolregistry/`) | P0-5, P1-14 | 9 |
+| 5 | Externally enforced attestation (`internal/enforce/`, `internal/observability/enforcement.go`) | P0-3, P1-15, P1-17 | 5 |
+| 6 | Assayer outbox/languages/evidence (companion repo) | P0-8, P1-12, P1-13 | 13, 14, 16 |
+| 7 | Correctness/concurrency P1s | P1-3, P1-4, P1-5, P1-7, P1-8, P1-10, P1-11, P1-16 | 15, 17, 18, 20, 21, 22, 23 |
+| 8 | Release/supply chain (`scripts/release_verify.sh`) | P0-7 | 24, 25 |
+| 9 | Lifecycle state machine, effect ledger, chaos suite, close-out | — (formalization + property/chaos tests over prior sessions' fixes) | corpus stays 25/25; no new attacks added |
+
+**P1-4 (duplicate org-policy evaluation) — verdict: false positive**, triaged in S0. Sol's finding described
+two things that share a source *label* but are different rule sets evaluated on different code paths
+(`internal/runtime/policy_gate.go`'s `evaluatePolicyGate` vs. `internal/policy/preflight.go`) — not the same
+rule set evaluated twice. `internal/redteam/policy_race_test.go` asserts the exact count and source of
+evaluated rules regardless of the verdict.
+
+## S9 additions to the enforcement surface (this session)
+
+Not report findings — S9 formalizes and property-tests the lifecycle the S0–S8 fixes above actually produce,
+and closes two chaos-scenario gaps the plan named:
+
+- `internal/lifecycle/` — the run state machine as an explicit `Stage` type with a validated transition
+  graph, wired live into every `RecordStage` call site in `internal/runtime` (out-of-order stage writes are
+  now rejected at record time). Three transition-graph bugs found and fixed by re-running the full suite and
+  redteam corpus after wiring the validator in (see findings log for exact detail): `ASSAYING`'s conditional
+  skip, `QUARANTINED`'s direct reachability from a mid-pipeline failure, `MERGED`'s reachability from a
+  non-git root.
+- `internal/observability/effects.go` — a kernel-observed effect ledger (`process_creation`, `network`,
+  `executable_launch`) recorded independent of the transcript, alongside the pre-existing `files_touched`
+  table (file writes) and `EnforcementRecord` (S5's per-run enforcement summary).
+- New chaos tests: real concurrent-`*sql.DB` contention against one on-disk ledger, a hung validator killed
+  at its context deadline, forward/backward system-clock jumps against the spend reservation ledger (no
+  defect found — confirmed clock-jump-safe by construction). "Hook failures" and "disk full" have no test
+  added — see the findings log for why (no scenario/seam exists to test against).
+
+## Sol's v4 non-goals — confirmed not violated
+
+Per the same non-goals discipline the v2/v3 registers above check: no fix in this round disabled tree
+sovereignty for a documented convenience path, weakened descendant containment to a process-group-only
+fallback for a "usually fine" case, let a probe's self-report stand in for external enforcement, or shipped
+a release-identity check that trusted the requested version string over the actual artifact. The
+containment/attestation posture established in v2/v3 (enforce by default, disclosed opt-outs only) is
+unchanged; this round adds sovereignty over the *mechanism* (git plumbing, process trees, executable
+identity) that posture depends on, it doesn't relax it.
+
+---
+
 # Sol redteam v3 findings register (2026-07-13)
 
 This is the audit-closure artifact for Sol's second, deeper redteam pass (`agents/governator-sol-upgrade3.md`), which reproduced 20 new findings against the v1.0.0 binary the first repair round shipped — mostly transaction/concurrency, identity, and containment gaps the first pass's fixes didn't reach. Repair plan: `agents/governator-sol3-repair-plan.md`, executed as 15 sessions (S1–S15) plus one standalone flake fix; closure report: `agents/governator-sol3-repair-report.md`. Every finding below reproduces against the pre-fix code per the audit or the session's own report (most sessions verified failing-before/passing-after by temporarily reverting the fix file and re-running the regression test — see the closure report for exactly which). `docs/claims.yaml`'s `sol3-s*` entries mechanically re-derive most of these from the repository at `tested` maturity.

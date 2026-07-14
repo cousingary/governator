@@ -248,11 +248,7 @@ func (s *Scope) Command(ctx context.Context, bin string, args []string, dir stri
 		cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	case ScopeCgroupDirect:
 		cmd = exec.CommandContext(ctx, bin, args...)
-		cmd.SysProcAttr = &syscall.SysProcAttr{
-			Setpgid:     true,
-			UseCgroupFD: true,
-			CgroupFD:    int(s.cgroupFile.Fd()),
-		}
+		cmd.SysProcAttr = cgroupDirectSysProcAttr(s.cgroupFile.Fd())
 	case ScopePIDNamespace:
 		full := []string{
 			"--user",
