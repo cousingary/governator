@@ -193,7 +193,7 @@ func ResolveHandle(ctx context.Context, cfg config.Config, agent Agent) (h *Back
 		OwnerUID:       ownerUID,
 		OwnerGID:       ownerGID,
 		Mode:           info.Mode(),
-		ParentWritable: parentTrustState(canonical),
+		ParentWritable: parentTrustState(canonical) || ForceParentWritable,
 		file:           f,
 	}
 
@@ -317,6 +317,16 @@ func (h *BackendExecutionHandle) probeVersion(ctx context.Context) (string, bool
 	}
 	return text, err == nil && probeCtx.Err() == nil
 }
+
+// ForceParentWritable is a test-only seam, mirroring
+// enforce.ForceUnsupported/SelfExeOverride: parentTrustState has no
+// meaningful way to be mocked (a real untrusted-owner, group/world-writable
+// ancestor directory requires a second real uid, which an unprivileged test
+// process cannot construct), so the post-v4 hardening plan's Session 3 (item
+// D) redteam attack proving effectLedgerViolations' executable_launch gate
+// actually reaches quarantine end-to-end sets this true for the run instead
+// of faking a whole hostile multi-user filesystem. Never set outside a test.
+var ForceParentWritable bool
 
 // parentTrustState reports whether any directory in path's ancestry (up to
 // the filesystem root) is writable by a party other than its owner --

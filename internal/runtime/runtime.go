@@ -1855,6 +1855,55 @@ func undisclosedChanges(review *contracts.ResultDocument, changed, deleted []str
 	return undisclosed
 }
 
+// effectLedgerViolations is the post-v4 hardening plan's Session 3 (item D)
+// gate over the kernel-observed effect ledger S9 started recording
+// (internal/observability/effects.go) but never wired into a decision.
+//
+// Investigated all three named effect kinds against the actual reachable
+// states of this codebase (not just the report's abstract framing) before
+// writing this function -- see agents/governator-post-v4-hardening-plan.md
+// Session 3 findings:
+//
+//   - executable_launch: handle.ParentWritable (Sol P0-6's "parent-directory
+//     trust state," computed by agents.ResolveHandle since before this
+//     session) was never read by anything -- a backend binary reachable only
+//     because an untrusted party could rewrite something upstream of it in
+//     its own directory chain sailed through unexamined. Gated here. The
+//     trusted-tool registry (Session 2, item C) already resolves every
+//     OTHER controller-invoked binary (git/unshare/bash/docker/python3/
+//     systemd-run) with this exact check built in and reporting
+//     ParentWritable=false unconditionally (internal/toolregistry), so this
+//     can only ever fire for the one path Session 2 didn't cover: the
+//     governed backend's own executable.
+//   - network: the only reachable state where the recorded effect shows
+//     "not kernel-namespaced" while the contract forbids network is exactly
+//     when containment.RequiresHostContainment was false for this run's risk
+//     tier -- i.e. containment was never policy-required, the deliberate,
+//     tested default for ordinary (non-high/medium-risk) contracts.
+//     Wherever containment IS required, containment.EnforcePolicy already
+//     fails the run closed before launch (externally enforced or a valid
+//     signed override, nothing else) -- there is no surviving gap for this
+//     function to catch without changing risk-tiering policy, which is a
+//     separate decision, not this session's.
+//   - process_creation: TestAttack8DetachedSetsidChildCannotWriteAfterApproval
+//     (internal/redteam) is the existing, deliberately-still-green proof
+//     that "kernel observed a live descendant process, self-report/transcript
+//     never mentioned any command" is not on its own a violation -- P0-4's
+//     whole design is that detecting and confirming extinction of an
+//     undisclosed descendant IS the safety property, not evidence of
+//     concealment requiring a second, separate penalty. Every peak-process-
+//     count-based mismatch this function's author could construct fires on
+//     that exact fixture; none is added. Closing this further needs new
+//     per-descendant identity instrumentation (matching each live PID back
+//     to a resolved, trusted binary), not a threshold over the existing
+//     aggregate count -- real follow-on work, not attempted here.
+func effectLedgerViolations(handle *agents.BackendExecutionHandle) []string {
+	if handle != nil && handle.ParentWritable {
+		return []string{fmt.Sprintf("executable_launch: backend executable %s has an untrusted-writable directory in its ancestry (no proof this exact binary could not have been substituted before resolution)", handle.CanonicalPath)}
+	}
+	return nil
+}
+
 type diffMetrics struct {
 	Lines    int
 	NewFiles int
@@ -2843,6 +2892,7 @@ func (r *Runner) runOnce(ctx context.Context, c contracts.Contract) (RunRecord, 
 	violations := append([]string{}, audit.Violations...)
 	violations = appendRuntimePathScanViolation(violations, "after agent execution", work)
 	violations = append(violations, telemetryViolations(c, audit)...)
+	violations = append(violations, effectLedgerViolations(handle)...)
 	if redactErr != nil {
 		violations = append(violations, "transcript redaction failed: "+redactErr.Error())
 	}
