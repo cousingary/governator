@@ -799,3 +799,43 @@ func TestResolveImageIdentityDetectsRetaggedMutableTag(t *testing.T) {
 		t.Fatal("resolved image ID did not change after the tag was repointed at a different image -- replay would not detect the swap")
 	}
 }
+
+// TestResolveDockerHonorsRegistryPin is Session 2 (post-v4 hardening plan
+// item C): every DockerRunner call site used to hand exec.CommandContext
+// the bare literal "docker", letting os/exec's own ambient PATH lookup
+// resolve it -- a hostile "docker" placed earlier on Governator's own
+// process PATH would run with full authority instead of the real one (and,
+// since the attacker only needs to write a self-owned file somewhere on
+// PATH, the registry's owner/mode hygiene checks alone would not have
+// caught it -- only a pin, read before the poisoned PATH entry is ever
+// consulted, closes this). This test pins docker's path in the trusted-tool
+// registry, then prepends a different, hostile "docker" earlier on PATH,
+// and asserts resolveDocker() still returns the pinned path.
+func TestResolveDockerHonorsRegistryPin(t *testing.T) {
+	registryFile := filepath.Join(t.TempDir(), "tools.yaml")
+	t.Setenv("GOV_TOOLREGISTRY_FILE", registryFile)
+
+	pinnedDocker := filepath.Join(t.TempDir(), "real-docker")
+	if err := os.WriteFile(pinnedDocker, []byte("#!/bin/sh\nexit 0\n"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	yaml := "tools:\n  - name: docker\n    kind: trusted_controller\n    path: " + pinnedDocker + "\n"
+	if err := os.WriteFile(registryFile, []byte(yaml), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	hostileDir := t.TempDir()
+	hostileDocker := filepath.Join(hostileDir, "docker")
+	if err := os.WriteFile(hostileDocker, []byte("#!/bin/sh\nexit 1\n"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", hostileDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	bin, err := resolveDocker()
+	if err != nil {
+		t.Fatalf("resolveDocker: %v", err)
+	}
+	if bin != pinnedDocker {
+		t.Fatalf("resolveDocker returned %q, want the registry-pinned %q (ambient PATH would have resolved the hostile one first)", bin, pinnedDocker)
+	}
+}

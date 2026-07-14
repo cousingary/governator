@@ -43,6 +43,7 @@ import (
 	"github.com/cousingary/governator/internal/runner"
 	"github.com/cousingary/governator/internal/spend"
 	"github.com/cousingary/governator/internal/tokenoptimizer"
+	"github.com/cousingary/governator/internal/toolregistry"
 )
 
 type RunRecord struct {
@@ -603,7 +604,17 @@ func shell(ctx context.Context, dir, command string) (int, string, error) {
 	if gerr != nil {
 		return -1, "", gerr
 	}
-	cmd := exec.CommandContext(ctx, "bash", "-lc", command)
+	// Session 2 (post-v4 hardening plan item C): see runner.go's identical
+	// helper -- bash itself is the controller tool actually running this
+	// command string (including every deterministic validator/formatter/
+	// linter a job contract declares), so it needs the same
+	// registry-verified resolution git already got, not a bare argv0
+	// os/exec would resolve via ambient PATH.
+	bashIdentity, berr := toolregistry.ResolveTrusted("bash", "bash")
+	if berr != nil {
+		return -1, "", fmt.Errorf("resolve trusted bash: %w", berr)
+	}
+	cmd := exec.CommandContext(ctx, bashIdentity.CanonicalPath, "-lc", command)
 	cmd.Dir = dir
 	cmd.Env = append(os.Environ(), "PATH="+filepath.Dir(gitPath)+string(os.PathListSeparator)+os.Getenv("PATH"))
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}

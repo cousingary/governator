@@ -42,6 +42,9 @@ func Run() []Check {
 		checkConfig(),
 		checkGit(),
 		checkPython(),
+		checkBash(),
+		checkDocker(),
+		checkUnshare(),
 		checkRTK(),
 		checkContextGraph(),
 		checkMinimalism(),
@@ -131,20 +134,72 @@ func checkGit() Check {
 	return check
 }
 
-func checkPython() Check {
-	check := Check{Name: "python3", Required: true}
-	path, err := exec.LookPath("python3")
-	if err != nil {
-		check.Status, check.Detail = StatusFail, "not found in PATH"
-		return check
-	}
-	output, err := exec.Command(path, "--version").CombinedOutput()
+// checkTrustedTool resolves+verifies name through the trusted-tool registry
+// -- pinning it on first successful resolution, mirroring checkGit's
+// trust-on-first-use pattern -- and records versionArgs' output as the
+// check's detail. Shared by every controller tool added in Session 2
+// (post-v4 hardening plan item C: unshare/bash/docker/python3 were
+// previously resolved via a bare ambient PATH lookup at their call sites,
+// same class of gap S4 closed for git) so each gets identical treatment
+// without duplicating checkGit's resolve/pin/version boilerplate per tool.
+func checkTrustedTool(name string, required bool, versionArgs ...string) Check {
+	check := Check{Name: name, Required: required}
+	registry, err := toolregistry.Load()
 	if err != nil {
 		check.Status, check.Detail = StatusFail, err.Error()
 		return check
 	}
+	entry, _ := registry.Entry(name)
+	identity, err := registry.Resolve(name, name)
+	if err != nil {
+		status := StatusFail
+		if !required {
+			status = StatusWarn
+		}
+		check.Status, check.Detail = status, "untrusted: "+err.Error()
+		return check
+	}
+	if entry.Path == "" {
+		if perr := toolregistry.Pin(name, identity.CanonicalPath); perr != nil {
+			check.Status, check.Detail = StatusFail, fmt.Sprintf("resolved %s but failed to pin it in the trust registry: %v", identity.CanonicalPath, perr)
+			return check
+		}
+	}
+	output, verr := exec.Command(identity.CanonicalPath, versionArgs...).CombinedOutput()
+	if verr != nil {
+		check.Status, check.Detail = StatusOK, fmt.Sprintf("trusted at %s but %s failed: %v", identity.CanonicalPath, strings.Join(versionArgs, " "), verr)
+		return check
+	}
 	check.Status, check.Detail = StatusOK, strings.TrimSpace(string(output))
 	return check
+}
+
+func checkPython() Check {
+	return checkTrustedTool("python3", true, "--version")
+}
+
+// checkBash is required: every job contract's success.validators (schema.go
+// mandates at least one) runs as a bash -lc command -- see runner.go/
+// runtime.go's shell() helpers -- so an unresolvable/untrusted bash means no
+// governed run can ever reach a success determination.
+func checkBash() Check {
+	return checkTrustedTool("bash", true, "--version")
+}
+
+// checkDocker is non-required: only contracts that declare `runner: docker`
+// need it (CheckDockerAvailable already gates that path separately); a box
+// that never uses the Docker runner need not have docker installed at all.
+func checkDocker() Check {
+	return checkTrustedTool("docker", false, "--version")
+}
+
+// checkUnshare is non-required: enforce.NewPlan/containment.NewScope already
+// degrade gracefully when unshare is unavailable for anything but a
+// high-risk local run (which fails closed at launch time, not at doctor
+// time) -- mirrors checkLandlock's WARN-not-FAIL severity for the same
+// reason.
+func checkUnshare() Check {
+	return checkTrustedTool("unshare", false, "--version")
 }
 
 func checkRTK() Check {
@@ -456,7 +511,7 @@ func checkToolRegistry() Check {
 		check.Status, check.Detail = StatusFail, err.Error()
 		return check
 	}
-	names := []string{"git"}
+	names := []string{"git", "unshare", "systemd-run", "bash", "docker", "python3"}
 	if cfg, cerr := config.Load(); cerr == nil && cfg.Graph.Mode != "off" && cfg.Graph.Provider != "" {
 		names = append(names, cfg.Graph.Provider)
 	}

@@ -21,6 +21,7 @@ import (
 
 	"github.com/cousingary/governator/internal/agents"
 	"github.com/cousingary/governator/internal/config"
+	"github.com/cousingary/governator/internal/gitplumb"
 )
 
 const ttl = 24 * time.Hour
@@ -350,7 +351,14 @@ func runBehavioralProbes(ctx context.Context, agent agents.Agent, res agents.Res
 	// writes and no transcript and every probe recorded a denial-shaped failure
 	// that was really "the backend never ran." Probe the environment we actually
 	// launch into.
-	if err := exec.CommandContext(ctx, "git", "init", "-q", workspace).Run(); err != nil {
+	// Session 2 (post-v4 hardening plan item C): route through the trusted-
+	// tool registry like every other git invocation, rather than a bare
+	// "git" argv0 -- failure here is already just a recorded note, not
+	// fatal to the probe, so an unresolvable/untrusted git degrades the
+	// same way any other init failure here does.
+	if gitPath, gerr := gitplumb.TrustedGitPath(); gerr != nil {
+		out.notes = append(out.notes, "resolve trusted git for probe workspace: "+gerr.Error())
+	} else if err := exec.CommandContext(ctx, gitPath, "init", "-q", workspace).Run(); err != nil {
 		out.notes = append(out.notes, "git init probe workspace: "+err.Error())
 	}
 	if err := os.MkdirAll(protectedDir, 0700); err != nil {

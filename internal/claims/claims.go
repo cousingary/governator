@@ -28,6 +28,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/cousingary/governator/internal/gitplumb"
 	"gopkg.in/yaml.v3"
 )
 
@@ -716,9 +717,15 @@ func containsPlatformHash(v any, platform string) bool {
 }
 
 func gitCheck(repoRoot string, args ...string) error {
+	// Session 2 (post-v4 hardening plan item C): route through the trusted-
+	// tool registry like every other git invocation in this codebase.
+	gitPath, gerr := gitplumb.TrustedGitPath()
+	if gerr != nil {
+		return fmt.Errorf("resolve trusted git: %w", gerr)
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), probeTimeout)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, "git", append([]string{"-C", repoRoot}, args...)...)
+	cmd := exec.CommandContext(ctx, gitPath, append([]string{"-C", repoRoot}, args...)...)
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
@@ -732,12 +739,16 @@ func gitCheck(repoRoot string, args ...string) error {
 }
 
 func gitShow(repoRoot, commit, path string) ([]byte, error) {
+	gitPath, gerr := gitplumb.TrustedGitPath()
+	if gerr != nil {
+		return nil, fmt.Errorf("resolve trusted git: %w", gerr)
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), probeTimeout)
 	defer cancel()
 	// Historical file paths are always repo-relative with forward slashes,
 	// regardless of host OS path separators.
 	ref := commit + ":" + filepath.ToSlash(path)
-	cmd := exec.CommandContext(ctx, "git", "-C", repoRoot, "show", ref)
+	cmd := exec.CommandContext(ctx, gitPath, "-C", repoRoot, "show", ref)
 	var out, stderr bytes.Buffer
 	cmd.Stdout = &out
 	cmd.Stderr = &stderr

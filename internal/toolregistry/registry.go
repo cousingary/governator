@@ -79,13 +79,27 @@ type Identity struct {
 	AllowedEnv     []string
 }
 
-// defaultEntries ships baseline trust for the one controller tool
-// Governator cannot function without: git. Everything else -- including any
-// configured context-graph provider -- has no shipped default and requires
-// an explicit operator registration; an unregistered tool must never
-// execute with controller authority (report attack 9).
+// defaultEntries ships baseline trust for the controller tools Governator
+// cannot function without: git (S4), and -- Session 2 of the post-v4
+// hardening plan (item C) -- unshare/systemd-run (the descendant- and
+// network-containment primitives enforce/containment wrap launches in),
+// bash (the shell every deterministic validator/formatter/linter command a
+// job contract declares actually runs through), docker (the DockerRunner
+// containment boundary), and python3 (the Assayer interpreter). Each of
+// these was previously resolved via a bare ambient PATH lookup at its call
+// site -- the same "PATH-resolved codegraph helper ran before any
+// verification" shape S4 closed for git, just not yet applied beyond it.
+// Everything else -- including any configured context-graph provider -- has
+// no shipped default and requires an explicit operator registration; an
+// unregistered tool must never execute with controller authority (report
+// attack 9).
 var defaultEntries = []Entry{
 	{Name: "git", Kind: KindTrustedController},
+	{Name: "unshare", Kind: KindTrustedController},
+	{Name: "systemd-run", Kind: KindTrustedController},
+	{Name: "bash", Kind: KindTrustedController},
+	{Name: "docker", Kind: KindTrustedController},
+	{Name: "python3", Kind: KindTrustedController},
 }
 
 // Registry is an immutable, loaded view of tools.yaml merged over the
@@ -230,6 +244,21 @@ func (r *Registry) Resolve(name, requestedBin string) (Identity, error) {
 		OwnerUID: ownerUID, OwnerGID: ownerGID, Mode: info.Mode(),
 		ParentWritable: false, AllowedEnv: entry.AllowedEnv,
 	}, nil
+}
+
+// ResolveTrusted loads the registry and resolves name/requestedBin in one
+// step -- the common case for a call site that only needs the resolved
+// Identity, not the Registry object itself afterward. Load()+Resolve() are
+// kept as two steps on Registry itself (see gitplumb.TrustedGitPath) for
+// callers that already hold a Registry across several resolutions; this is
+// purely a convenience wrapper for everyone else, with identical fail-closed
+// behavior.
+func ResolveTrusted(name, requestedBin string) (Identity, error) {
+	registry, err := Load()
+	if err != nil {
+		return Identity{}, fmt.Errorf("load trusted-tool registry: %w", err)
+	}
+	return registry.Resolve(name, requestedBin)
 }
 
 // Pin persists path as name's registered Path, creating a default

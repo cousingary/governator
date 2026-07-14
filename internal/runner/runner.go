@@ -25,6 +25,7 @@ import (
 	"github.com/cousingary/governator/internal/contracts"
 	"github.com/cousingary/governator/internal/enforce"
 	"github.com/cousingary/governator/internal/gitplumb"
+	"github.com/cousingary/governator/internal/toolregistry"
 )
 
 // Workspace is what Prepare hands back and every later stage (Launch,
@@ -128,7 +129,19 @@ func shell(ctx context.Context, dir, command string) (int, string, error) {
 	if gerr != nil {
 		return -1, "", gerr
 	}
-	cmd := exec.CommandContext(ctx, "bash", "-lc", command)
+	// Session 2 (post-v4 hardening plan item C): bash itself is the
+	// controller tool actually running this command string (including
+	// every deterministic validator/formatter/linter a job contract
+	// declares) -- the PATH-prepend above only protects "git" once bash is
+	// already running, so bash's own resolution needs the same
+	// registry-verified treatment git already got, or a hostile bash
+	// earlier on this process's PATH would run with full Governator
+	// authority before the prepend ever mattered.
+	bashIdentity, berr := toolregistry.ResolveTrusted("bash", "bash")
+	if berr != nil {
+		return -1, "", fmt.Errorf("resolve trusted bash: %w", berr)
+	}
+	cmd := exec.CommandContext(ctx, bashIdentity.CanonicalPath, "-lc", command)
 	cmd.Dir = dir
 	cmd.Env = append(os.Environ(), "PATH="+filepath.Dir(gitPath)+string(os.PathListSeparator)+os.Getenv("PATH"))
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}

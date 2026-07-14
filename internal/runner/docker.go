@@ -15,6 +15,7 @@ import (
 
 	"github.com/cousingary/governator/internal/agents"
 	"github.com/cousingary/governator/internal/contracts"
+	"github.com/cousingary/governator/internal/toolregistry"
 )
 
 // ImageIdentity is the resolved, replay-bindable identity of a Docker image
@@ -57,7 +58,11 @@ func ResolveImageIdentity(ctx context.Context, image string) (ImageIdentity, err
 	if strings.TrimSpace(image) == "" {
 		return ImageIdentity{}, fmt.Errorf("resolve image identity: empty image reference")
 	}
-	out, err := exec.CommandContext(ctx, "docker", "image", "inspect", image, "--format", "{{json .}}").Output()
+	bin, berr := resolveDocker()
+	if berr != nil {
+		return ImageIdentity{}, fmt.Errorf("resolve image identity %q: %w", image, berr)
+	}
+	out, err := exec.CommandContext(ctx, bin, "image", "inspect", image, "--format", "{{json .}}").Output()
 	if err != nil {
 		return ImageIdentity{}, fmt.Errorf("resolve image identity %q: %w", image, err)
 	}
@@ -78,14 +83,31 @@ func ResolveImageIdentity(ctx context.Context, image string) (ImageIdentity, err
 	}, nil
 }
 
+// resolveDocker resolves and verifies the docker CLI through the
+// trusted-tool registry (Session 2, post-v4 hardening plan item C) --
+// docker is the DockerRunner containment boundary itself, so every one of
+// its own invocations trusting a bare ambient "docker" argv0 would let a
+// PATH substitution defeat the containment DockerRunner exists to provide.
+// Resolved fresh at each call site rather than cached, matching every other
+// registry-backed call site in this codebase (gitplumb.TrustedGitPath,
+// enforce.NewPlan): callers must see the current trust state, not a stale
+// snapshot from earlier in the process's life.
+func resolveDocker() (string, error) {
+	identity, err := toolregistry.ResolveTrusted("docker", "docker")
+	if err != nil {
+		return "", fmt.Errorf("resolve trusted docker: %w", err)
+	}
+	return identity.CanonicalPath, nil
+}
+
 // CheckDockerAvailable reports whether a working `docker` CLI and a
 // reachable daemon exist, so New can fail closed: a contract that asks for
 // runner: docker without a usable Docker install must error, never silently
 // fall back to LocalWorktreeRunner.
 func CheckDockerAvailable() error {
-	bin, err := exec.LookPath("docker")
+	bin, err := resolveDocker()
 	if err != nil {
-		return fmt.Errorf("docker binary not found on PATH: %w", err)
+		return err
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -176,7 +198,11 @@ func (d *DockerRunner) executor(ws Workspace) agents.Executor {
 		if err != nil {
 			return 0, false, err
 		}
-		cmd := exec.CommandContext(runCtx, "docker", dockerArgs...)
+		dockerBin, dberr := resolveDocker()
+		if dberr != nil {
+			return 0, false, dberr
+		}
+		cmd := exec.CommandContext(runCtx, dockerBin, dockerArgs...)
 		capped := &cappedWriter{w: out, remaining: d.Config.EffectiveOutputCapBytes()}
 		cmd.Stdout, cmd.Stderr = capped, capped
 		if err := cmd.Start(); err != nil {
@@ -592,7 +618,15 @@ func (d *DockerRunner) Observe(ctx context.Context, ws Workspace) (ObserveResult
 		}
 		return base, nil
 	}
-	out, err := exec.CommandContext(ctx, "docker", "inspect", ws.Container, "--format", "{{json .}}").Output()
+	dockerBin, dberr := resolveDocker()
+	if dberr != nil {
+		base.Notes = appendDockerNote(base.Notes, "docker_inspect_failed: "+dberr.Error())
+		if hardened {
+			return base, fmt.Errorf("docker hardened observation: resolve trusted docker: %w", dberr)
+		}
+		return base, nil
+	}
+	out, err := exec.CommandContext(ctx, dockerBin, "inspect", ws.Container, "--format", "{{json .}}").Output()
 	if err != nil {
 		base.Notes = appendDockerNote(base.Notes, "docker_inspect_failed: "+err.Error())
 		if hardened {
@@ -639,7 +673,11 @@ func (d *DockerRunner) Stop(ctx context.Context, ws Workspace) error {
 	if ws.Container == "" {
 		return nil
 	}
-	return exec.CommandContext(ctx, "docker", "stop", "-t", "5", ws.Container).Run()
+	bin, err := resolveDocker()
+	if err != nil {
+		return err
+	}
+	return exec.CommandContext(ctx, bin, "stop", "-t", "5", ws.Container).Run()
 }
 
 // Destroy removes the container and then the worktree, identically to
@@ -665,7 +703,11 @@ func (d *DockerRunner) Destroy(ctx context.Context, ws Workspace, approved bool)
 // may still be alive. Exposed so internal/runtime's reconciler and this
 // runner cannot drift on what counts as tolerable.
 func RemoveContainer(ctx context.Context, name string) error {
-	out, err := exec.CommandContext(ctx, "docker", "rm", "-f", name).CombinedOutput()
+	bin, berr := resolveDocker()
+	if berr != nil {
+		return berr
+	}
+	out, err := exec.CommandContext(ctx, bin, "rm", "-f", name).CombinedOutput()
 	if err != nil && !containerAlreadyGone(string(out)) {
 		return fmt.Errorf("docker rm -f %s: %v: %s", name, err, trimmed(out))
 	}

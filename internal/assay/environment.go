@@ -10,6 +10,9 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/cousingary/governator/internal/gitplumb"
+	"github.com/cousingary/governator/internal/toolregistry"
 )
 
 // environmentProbeTimeout bounds every local subprocess this file runs (git
@@ -73,14 +76,22 @@ func assayerCommit(repo string) string {
 	// when repo directly owns a .git entry (a real clone, or a worktree/
 	// submodule pointer file — both live directly at the repo root).
 	if _, err := os.Stat(filepath.Join(repo, ".git")); err == nil {
-		ctx, cancel := context.WithTimeout(context.Background(), environmentProbeTimeout)
-		defer cancel()
-		cmd := exec.CommandContext(ctx, "git", "-C", repo, "rev-parse", "HEAD")
-		var out bytes.Buffer
-		cmd.Stdout = &out
-		if err := cmd.Run(); err == nil {
-			if commit := strings.TrimSpace(out.String()); commit != "" {
-				return commit
+		// Session 2 (post-v4 hardening plan item C): route through the same
+		// trusted-tool registry resolution every other git invocation in
+		// this codebase uses, rather than a bare "git" argv0 -- this probe
+		// is best-effort diagnostic metadata (see the doc comment above), so
+		// an unresolvable/untrusted git just leaves AssayerCommit empty,
+		// same as any other failure here.
+		if gitPath, gerr := gitplumb.TrustedGitPath(); gerr == nil {
+			ctx, cancel := context.WithTimeout(context.Background(), environmentProbeTimeout)
+			defer cancel()
+			cmd := exec.CommandContext(ctx, gitPath, "-C", repo, "rev-parse", "HEAD")
+			var out bytes.Buffer
+			cmd.Stdout = &out
+			if err := cmd.Run(); err == nil {
+				if commit := strings.TrimSpace(out.String()); commit != "" {
+					return commit
+				}
 			}
 		}
 	}
@@ -107,6 +118,14 @@ func pythonVersion(python string) string {
 	if python == "" {
 		python = "python3"
 	}
+	// Session 2 (post-v4 hardening plan item C): resolve+verify through the
+	// trusted-tool registry; best-effort like the rest of this file, so an
+	// unresolvable/untrusted python3 just leaves PythonVersion empty.
+	identity, ierr := toolregistry.ResolveTrusted("python3", python)
+	if ierr != nil {
+		return ""
+	}
+	python = identity.CanonicalPath
 	ctx, cancel := context.WithTimeout(context.Background(), environmentProbeTimeout)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, python, "--version")

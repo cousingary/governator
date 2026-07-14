@@ -19,8 +19,9 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
+
+	"github.com/cousingary/governator/internal/toolregistry"
 )
 
 // SandboxExecArg is the hidden gov subcommand name that applies the Landlock
@@ -54,6 +55,11 @@ type Plan struct {
 	AllowNetwork bool
 
 	selfExe string
+	// unsharePath is the trusted-tool registry's verified canonical path to
+	// unshare(1), resolved once at NewPlan time and bound into this Plan so
+	// Wrap never falls back to a bare "unshare" argv0 that os/exec would
+	// resolve via ambient PATH (Session 2, post-v4 hardening plan item C).
+	unsharePath string
 }
 
 // SelfExeOverride is a test-only seam. NewPlan wraps a launch by re-executing
@@ -97,7 +103,7 @@ func Supported() bool {
 	if !landlockUsable() {
 		return false
 	}
-	_, err := exec.LookPath("unshare")
+	_, err := toolregistry.ResolveTrusted("unshare", "unshare")
 	return err == nil
 }
 
@@ -122,6 +128,15 @@ func NewPlan(active bool, workspace string, readOnly, allowNetwork, highRisk boo
 	if err != nil {
 		return Plan{}, fmt.Errorf("enforce: resolve gov executable for sandbox wrapper: %w", err)
 	}
+	// Resolved again here (Supported() above already resolved it once to
+	// answer "does unshare exist and verify") rather than reusing that
+	// result: this is the trust decision that actually gets bound into the
+	// Plan and later executed by Wrap, so it gets its own fresh, fully
+	// fail-closed resolution rather than trusting an earlier boolean.
+	unshareIdentity, err := toolregistry.ResolveTrusted("unshare", "unshare")
+	if err != nil {
+		return Plan{}, fmt.Errorf("enforce: resolve trusted unshare: %w", err)
+	}
 	abs := workspace
 	if !readOnly && workspace != "" {
 		if a, aerr := filepath.Abs(workspace); aerr == nil {
@@ -134,6 +149,7 @@ func NewPlan(active bool, workspace string, readOnly, allowNetwork, highRisk boo
 		ReadOnly:     readOnly,
 		AllowNetwork: allowNetwork,
 		selfExe:      self,
+		unsharePath:  unshareIdentity.CanonicalPath,
 	}, nil
 }
 
@@ -159,8 +175,12 @@ func (p Plan) Wrap(bin string, args []string) (string, []string) {
 	// No configured route inside the namespace means every connect()/bind()
 	// past loopback fails at the kernel level -- this is not a policy the
 	// backend can be asked to honor, it structurally cannot reach anywhere.
+	// p.unsharePath (not a bare "unshare" argv0) so the process that
+	// actually launches is the exact binary NewPlan verified, never
+	// whatever a PATH substitution after that point would redirect a bare
+	// name to (Session 2, post-v4 hardening plan item C).
 	full := append([]string{"--net", "--map-root-user", "--"}, inner...)
-	return "unshare", full
+	return p.unsharePath, full
 }
 
 type planContextKey struct{}

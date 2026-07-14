@@ -25,6 +25,8 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/cousingary/governator/internal/toolregistry"
 )
 
 // Verdict states Assayer's evaluate subcommand can return, plus one
@@ -207,9 +209,18 @@ func Evaluate(ctx context.Context, cfg Config, req Request, artifactPath string)
 	if python == "" {
 		python = "python3"
 	}
+	// Session 2 (post-v4 hardening plan item C): python3 is the Assayer
+	// interpreter -- resolve+verify through the trusted-tool registry
+	// rather than a bare argv0, using cfg.Python (or the "python3" default
+	// above) as the requested binary so an operator's configured
+	// interpreter path is still honored, just now verified too.
+	pythonIdentity, perr := toolregistry.ResolveTrusted("python3", python)
+	if perr != nil {
+		return errorVerdict(fmt.Sprintf("assay: resolve trusted python3: %s", perr))
+	}
 	cliPath := filepath.Join(cfg.Repo, "cli.py")
 
-	cmd := exec.CommandContext(runCtx, python, cliPath, "evaluate", "--profile", req.CheckProfile)
+	cmd := exec.CommandContext(runCtx, pythonIdentity.CanonicalPath, cliPath, "evaluate", "--profile", req.CheckProfile)
 	cmd.Dir = cfg.Repo
 	cmd.Stdin = bytes.NewReader(payload)
 	var stdout, stderr bytes.Buffer

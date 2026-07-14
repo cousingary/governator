@@ -82,3 +82,28 @@ func TestScopeExtinguishNoopWhenNothingStarted(t *testing.T) {
 		t.Fatalf("expected vacuous success, got %+v", proof)
 	}
 }
+
+// TestScopeCommandUsesResolvedPrimitivePath is Session 2 (post-v4 hardening
+// plan item C): Command used to hand exec.CommandContext the bare literal
+// "systemd-run"/"unshare" for these two methods, letting os/exec's own
+// ambient PATH lookup resolve the primitive binary -- a hostile binary
+// placed earlier on Governator's own process PATH would run with full
+// authority instead of the real one. newSystemdUserScope/
+// newPIDNamespaceScope now resolve+verify through the trusted-tool registry
+// once and store the canonical path on the Scope; this test constructs a
+// Scope directly (bypassing the constructors' real systemd/kernel
+// dependencies, which this host may not have) and asserts Command's argv0
+// is exactly that stored path for both primitive-backed methods, never the
+// bare tool name.
+func TestScopeCommandUsesResolvedPrimitivePath(t *testing.T) {
+	for _, method := range []ScopeMethod{ScopeSystemdUserScope, ScopePIDNamespace} {
+		t.Run(string(method), func(t *testing.T) {
+			pinned := filepath.Join(t.TempDir(), "primitive-binary")
+			s := &Scope{method: method, runID: "unit-test", unitName: "unit-test-unit", primitivePath: pinned}
+			cmd := s.Command(context.Background(), "some-backend", []string{"--flag"}, t.TempDir())
+			if cmd.Path != pinned {
+				t.Fatalf("Command built argv0=%q for method %s, want the registry-resolved path %q (a bare tool name would let ambient PATH redirect it)", cmd.Path, method, pinned)
+			}
+		})
+	}
+}

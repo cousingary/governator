@@ -30,6 +30,8 @@ import (
 	"sync"
 	"syscall"
 	"time"
+
+	"github.com/cousingary/governator/internal/toolregistry"
 )
 
 // cgroupGone reports whether err indicates the cgroup directory (or a file
@@ -112,6 +114,14 @@ type Scope struct {
 	method   ScopeMethod
 	runID    string
 	unitName string // ScopeSystemdUserScope only
+	// primitivePath is the trusted-tool registry's verified canonical path
+	// to this Scope's underlying primitive binary (systemd-run for
+	// ScopeSystemdUserScope, unshare for ScopePIDNamespace) -- resolved
+	// once when the Scope is constructed and used by Command instead of a
+	// bare argv0 os/exec would resolve via ambient PATH (Session 2,
+	// post-v4 hardening plan item C). Unused for ScopeCgroupDirect/
+	// scopeDegraded, which never exec a controller-tool binary of their own.
+	primitivePath string
 
 	mu         sync.Mutex
 	pid        int // outer-namespace pid of the launched wrapper/process
@@ -147,16 +157,18 @@ func NewScope(runID string, highRisk bool) (*Scope, error) {
 func (s *Scope) Method() ScopeMethod { return s.method }
 
 func newSystemdUserScope(runID string) (*Scope, error) {
-	if _, err := exec.LookPath("systemd-run"); err != nil {
-		return nil, fmt.Errorf("containment: systemd-run not found: %w", err)
+	identity, err := toolregistry.ResolveTrusted("systemd-run", "systemd-run")
+	if err != nil {
+		return nil, fmt.Errorf("containment: resolve trusted systemd-run: %w", err)
 	}
 	if _, err := os.Stat("/run/systemd/system"); err != nil {
 		return nil, fmt.Errorf("containment: systemd is not PID 1 (no /run/systemd/system): %w", err)
 	}
 	return &Scope{
-		method:   ScopeSystemdUserScope,
-		runID:    runID,
-		unitName: "governator-" + sanitizeName(runID) + "-" + nonce(),
+		method:        ScopeSystemdUserScope,
+		runID:         runID,
+		unitName:      "governator-" + sanitizeName(runID) + "-" + nonce(),
+		primitivePath: identity.CanonicalPath,
 	}, nil
 }
 
@@ -197,10 +209,11 @@ func newDirectCgroupScope(runID string) (*Scope, error) {
 }
 
 func newPIDNamespaceScope(runID string) (*Scope, error) {
-	if _, err := exec.LookPath("unshare"); err != nil {
-		return nil, fmt.Errorf("containment: unshare not found: %w", err)
+	identity, err := toolregistry.ResolveTrusted("unshare", "unshare")
+	if err != nil {
+		return nil, fmt.Errorf("containment: resolve trusted unshare: %w", err)
 	}
-	return &Scope{method: ScopePIDNamespace, runID: runID}, nil
+	return &Scope{method: ScopePIDNamespace, runID: runID, primitivePath: identity.CanonicalPath}, nil
 }
 
 func sanitizeName(runID string) string {
@@ -244,7 +257,7 @@ func (s *Scope) Command(ctx context.Context, bin string, args []string, dir stri
 			"--",
 			bin,
 		}, args...)
-		cmd = exec.CommandContext(ctx, "systemd-run", full...)
+		cmd = exec.CommandContext(ctx, s.primitivePath, full...)
 		cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	case ScopeCgroupDirect:
 		cmd = exec.CommandContext(ctx, bin, args...)
@@ -259,7 +272,7 @@ func (s *Scope) Command(ctx context.Context, bin string, args []string, dir stri
 			bin,
 		}
 		full = append(full, args...)
-		cmd = exec.CommandContext(ctx, "unshare", full...)
+		cmd = exec.CommandContext(ctx, s.primitivePath, full...)
 		cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	default: // scopeDegraded
 		cmd = exec.CommandContext(ctx, bin, args...)

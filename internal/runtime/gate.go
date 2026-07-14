@@ -15,6 +15,7 @@ import (
 	"github.com/cousingary/governator/internal/policy"
 	"github.com/cousingary/governator/internal/protectedpaths"
 	"github.com/cousingary/governator/internal/snapshots"
+	"github.com/cousingary/governator/internal/toolregistry"
 )
 
 // GateDecision is the output of the Phase 5 parity gate. It mirrors the JSON
@@ -486,7 +487,17 @@ func PreflightSnapshotIfDelete(cmd string) {
 		script = expandPath(script)
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
-		if err := exec.CommandContext(ctx, "python3", script, "snapshot", "pre-delete").Run(); err != nil {
+		// Session 2 (post-v4 hardening plan item C): python3 through the
+		// trusted-tool registry rather than a bare ambient argv0. This path
+		// is already non-blocking (a failure here only skips the recall
+		// snapshot, never the run itself), so an unresolvable/untrusted
+		// python3 degrades the same way any other failure here does.
+		pythonIdentity, perr := toolregistry.ResolveTrusted("python3", "python3")
+		if perr != nil {
+			fmt.Fprintln(os.Stderr, "GOVERNATOR GATE — pre-delete snapshot skipped, python3 not trusted (non-blocking):", perr)
+			return
+		}
+		if err := exec.CommandContext(ctx, pythonIdentity.CanonicalPath, script, "snapshot", "pre-delete").Run(); err != nil {
 			fmt.Fprintln(os.Stderr, "GOVERNATOR GATE — pre-delete snapshot failed (non-blocking):", err)
 		}
 		return
