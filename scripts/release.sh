@@ -198,9 +198,28 @@ for platform in $PLATFORMS; do
   PLATFORM_ID="${GOOS_VALUE}_${GOARCH_VALUE}"
   STAGE="$OUT_DIR/stage-${PLATFORM_ID}"
   mkdir -p "$STAGE"
-  BIN="$STAGE/gov"
+  # Found 2026-07-14 (Session 1 of the post-v4 hardening plan): OUT_DIR can
+  # sit on a filesystem that does not honor Unix permission bits at all
+  # (e.g. WSL's DrvFs mount for a Windows drive -- chmod exits 0 but every
+  # file reports 777 regardless). tar bakes in whatever mode stat() reports
+  # at archive time, so a binary built/chmod'd directly under such an
+  # OUT_DIR ships with the wrong mode no matter what chmod says -- this is
+  # exactly the "shipped at mode 0777" shape the acceptance check below
+  # (report attack 24) exists to catch, except self-inflicted by the build
+  # itself rather than a hostile archive. Build and chmod in a native-fs
+  # temp dir instead (same mktemp -d pattern the acceptance smoke test
+  # below already uses for extraction) and tar from there -- only the
+  # binary INSIDE the archive needs a real Unix mode; the .tar.gz written
+  # into OUT_DIR is opaque data and unaffected by the host mount's
+  # permission quirks. A copy also lands at $STAGE/gov (whatever OUT_DIR's
+  # mount reports for it) purely for the other places in this script that
+  # read it by content -- hash comparisons, or a local convenience binary
+  # -- never as a tar source.
+  NATIVE_STAGE=$(mktemp -d)
+  BIN="$NATIVE_STAGE/gov"
   GOOS=$GOOS_VALUE GOARCH=$GOARCH_VALUE CGO_ENABLED=0 go build -trimpath -ldflags "$LDFLAGS" -o "$BIN" ./cmd/gov
   chmod 0755 "$BIN"
+  cp "$BIN" "$STAGE/gov"
   ARCHIVE_NAME="gov_${VERSION}_${PLATFORM_ID}.tar.gz"
   ARCHIVE="$OUT_DIR/${ARCHIVE_NAME}"
   # Explicit owner/perm normalization: tar preserves the source file's mode
@@ -209,9 +228,10 @@ for platform in $PLATFORMS; do
   # whichever uid/gid happened to run this script (audit: "several outer ZIP
   # ELF files stored without executable permission" — normalize instead of
   # trusting the ambient umask).
-  tar --numeric-owner --owner=0 --group=0 -czf "$ARCHIVE" -C "$STAGE" gov
+  tar --numeric-owner --owner=0 --group=0 -czf "$ARCHIVE" -C "$NATIVE_STAGE" gov
+  rm -rf "$NATIVE_STAGE"
   ARCHIVE_SHA=$(sha256sum "$ARCHIVE" | awk '{print $1}')
-  BIN_SHA=$(sha256sum "$BIN" | awk '{print $1}')
+  BIN_SHA=$(sha256sum "$STAGE/gov" | awk '{print $1}')
   SIZE=$(stat -c%s "$ARCHIVE" 2>/dev/null || stat -f%z "$ARCHIVE")
   python3 -c "
 import json, sys
