@@ -30,20 +30,45 @@ bin/gov validate examples/jobs/code_surgical_fix.yaml
 ```text
 job.yaml -> strict parser -> preflight policy -> disposable Git worktree
                                                   |
+                                  enforce.Plan (Landlock + netns,        ┐
+                                                applied via              │ S5
+                                                gov __sandbox_exec)      │
+                            containment.Scope (cgroup v2 descendants)    ┘ ┐ S2
+                                                  |                       ┘
+                                  BackendExecutionHandle (one fd,         ┐
+                                          re-verified pre-launch)        │ S3
+                                                  |                       ┘
                                            backend adapter
                                       (Claude/Codex/GLM/
                                          OpenCode/Pi)
                                                   |
-          protected paths <- F1-F7 gate <- tool calls/transcript
+                          toolregistry gates every controller tool      ┐ S4
+                          (git self-pins on first gov doctor run)        ┘
                                                   |
-             fingerprint diff -> budgets -> deterministic validators
+           protected paths <- F1-F7 gate <- tool calls/transcript
                                                   |
-                              approve + merge OR quarantine/rollback
+              fingerprint diff -> budgets -> deterministic validators
                                                   |
-                                         SQLite WAL ledger
+                              DESCENDANTS_TERMINATED lifecycle stage     ┐ S2/S9
+                              (cgroup freeze+kill+extinction proof)      ┘
+                                                  |
+                       final-state capture (worktree diff,              ┐
+                          transcript-effect cross-check)                 │ S1/S5
+                                                  |                       ┘
+             gitplumb: isolated index + commit-tree + update-ref CAS,   ┐
+                       no shell, no hooks, literal pathspecs only        │ S1
+                                                  |                       ┘
+                               approve + merge OR quarantine/rollback
+                                                  |
+                                  lifecycle.Record validates every      ┐ S9
+                                  stage transition (state machine)        ┘
+                                                  |
+                                          SQLite WAL ledger
+                            (runs, run_stages, effect_events,
+                             enforcement_events, capability_attestations)
 ```
 
-Every backend implements one abstract execution specification. Native controls are used when available; missing guarantees are compensated by the runtime and recorded in each run's enforcement envelope.
+Every backend implements one abstract execution specification. Native controls are used when available; missing guarantees are compensated by the runtime and recorded in each run's enforcement envelope. As of v1.0.0 (Sol redteam v4), the load-bearing containment/identity/sovereignty invariants are **enforced by the operating system rather than promised by the backend**: Landlock LSM confines filesystem writes; a network namespace with no route removes egress at the kernel level; a cgroup v2 scope owns the whole process tree through a `DESCENDANTS_TERMINATED` stage before final-state capture; an immutable `BackendExecutionHandle` resolves the executable exactly once from a single open file descriptor; a trusted-tool registry gates every controller-invoked external process; and `internal/gitplumb` performs merge/commit with no shell, no hooks, and literal pathspecs only. See [docs/containment.md](docs/containment.md) for the full containment model.
 
 ## Backend capabilities
 
@@ -146,7 +171,13 @@ gov version
 
 > Versioning note: v1.0.0 is Governator's first released version. The v1.1–v1.5 numbers that appear in the changelog, branch names, and internal planning documents were pre-release development milestones of the initial build — they were never released, and this release supersedes all of them.
 
-An independent redteam review reproduced eight Critical and twelve High-severity gaps in v1.4.1 (replay bypasses, symlink escapes, unattested backend trust, non-atomic live-root merges, and more). All were repaired across seven sessions, plus a documentation pass (S8) and one follow-up session that closed the single gap S8's own cross-check found (High 11's local-runner output capping — scoped into S3/S6 but not actually implemented there); see [docs/security.md](docs/security.md) for the full finding-by-finding register and [CHANGELOG.md](CHANGELOG.md) for the per-session summary. `gov version` reports the build's real semantic version, source commit, and claims hash, embedded at build time by `scripts/release.sh` — there is exactly one version story now, not the source/archive/repo-claim divergence Sol found. All eight Critical and twelve High findings are now fully closed.
+The Sol redteam repair program ran in three rounds against this codebase:
+
+- **Round 1 (v2)** reproduced eight Critical and twelve High-severity gaps in v1.4.1 (replay bypasses, symlink escapes, unattested backend trust, non-atomic live-root merges, and more). All were repaired across seven sessions, plus a documentation pass (S8) and one follow-up session that closed the single gap S8's own cross-check found (High 11's local-runner output capping).
+- **Round 2 (v3)** reproduced twenty further findings against the v1.0.0 binary round 1 shipped — mostly transaction/concurrency, identity, and containment gaps the first pass's fixes didn't reach. All twenty were repaired across fifteen sessions (S1–S15) plus one standalone flake fix.
+- **Round 3 (v4)** reproduced a 25-item black-box attack corpus against the binary round 2 shipped — git-tree sovereignty, descendant/process containment, executable identity, externally enforced (not self-reported) capability attestation, and release/supply-chain integrity. All twenty-five were repaired across ten sessions (S0–S9).
+
+The v1.0.0 binary at `HEAD` carries all three rounds. The defining v4 change is that the load-bearing invariants are now **enforced by the operating system rather than promised by the backend**: Landlock LSM confines filesystem writes; a network namespace with no route removes egress at the kernel level; a cgroup v2 scope owns the whole process tree through a `DESCENDANTS_TERMINATED` stage before final-state capture; an immutable `BackendExecutionHandle` resolves the executable exactly once from a single open file descriptor; a trusted-tool registry gates every controller-invoked external process; and `internal/gitplumb` performs merge/commit with no shell, no hooks, and literal pathspecs only. `scripts/redteam.sh` is the executable acceptance criterion for the v4 round — 25/25 attacks green, zero skips, both plain and `-race`. See [docs/security.md](docs/security.md) for the full finding-by-finding register, [docs/containment.md](docs/containment.md) for the containment model, [docs/claims.md](docs/claims.md) for how `docs/claims.yaml`'s `sol-s*`/`sol3-s*`/`sol4-s*` entries mechanically re-derive many of these fixes from the repository, and [CHANGELOG.md](CHANGELOG.md) for the per-session summary. `gov version` reports the build's real semantic version, source commit, and claims hash, embedded at build time by `scripts/release.sh` — there is exactly one version story now, not the source/archive/repo-claim divergence Sol found.
 
 ## Roadmap (not built)
 

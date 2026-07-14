@@ -94,7 +94,9 @@ Unlike v2/v3, this round's corpus lives in-repo as executable tests, not just a 
 (build tag `redteam`), run via `scripts/redteam.sh`. The skip count it prints is the literal project
 burn-down — S0 landed all 25 attacks with the not-yet-fixed ones `t.Skip`-marked with a session tag; each
 session's fix removes its own skips. **Closed 2026-07-14: `scripts/redteam.sh` reports 25/25 attacks green,
-zero skips, zero failures**, both plain and `-race`, at commit `d289bf3` (tag `v1.0.0`).
+zero skips, zero failures**, both plain and `-race`. The v1.0.0 tag points at `f0cba5c` (the S9 follow-ups
+that fixed two darwin cross-compile breaks and a missing executable bit on `scripts/*.sh` in the git index,
+landed after the `d289bf3` S0–S9 commit that the corpus first went green against).
 
 ## Session ↔ report-item map
 

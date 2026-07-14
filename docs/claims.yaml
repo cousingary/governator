@@ -835,3 +835,268 @@ claims:
         funcs:
           - TestVerifyReleaseArtifactChecksExactBinaryAndSelfReportedVersion
           - TestVerifyRealClaimsFileIsFullyConsistent
+
+  # ─────────────────────────────────────────────────────────────────────
+  # Sol redteam v4 (P0/P1 remediation, S0–S9). Each session's claim points
+  # at the package(s) it introduced and the redteam attack(s) it closes;
+  # see docs/security.md's "Sol redteam v4 findings register" for the
+  # session ↔ report-item ↔ corpus-attack map and agents/governator-sol-
+  # upgrade4-findings.md for the per-session design narrative. Claimed at
+  # `tested` (the corpus + unit tests verify behavior in the current tree);
+  # v1.0.0 is the first release whose archived binary actually contains
+  # these mechanisms.
+  # ─────────────────────────────────────────────────────────────────────
+
+  - id: sol4-s1-git-tree-sovereignty
+    title: "Merge/commit goes through a low-level plumbing layer (internal/gitplumb) that runs git as exec.Command argv (never a shell string) under a neutralized environment (no global/system config, empty hooks directory, filters/signing disabled), builds the merge tree in an isolated temporary index outside any worktree, hashes blobs with --no-filters --literally, treats every machine-generated path as a literal pathspec, and uses commit-tree + update-ref compare-and-swap with post-commit tree re-verification -- a hostile pre-commit/clean-filter/pathspec-magic filename cannot alter the committed tree or execute with Governator's authority"
+    first_shipped_version: v1.0.0-sol4-repair-s1
+    claimed_maturity: tested
+    implementation:
+      - file: internal/gitplumb/gitplumb.go
+        symbols: [NewSession, runCmd, runCapture]
+      - file: internal/gitplumb/trust.go
+        symbols: [TrustedGitPath]
+      - file: internal/gitplumb/status.go
+        symbols: [StatusPorcelainV2]
+    tests:
+      - file: internal/gitplumb/gitplumb_test.go
+        funcs:
+          - TestHashObjectFileIgnoresCleanFilter
+          - TestReadTreeUpdateIndexWriteTreeRoundTrip
+          - TestUpdateIndexAddFileTreatsPathspecMagicFilenameLiterally
+          - TestCommitTreeAndUpdateRefCAS
+          - TestStatusPorcelainV2HandlesHostileFilename
+          - TestStatusPorcelainV2HandlesRename
+      - file: internal/redteam/hooks_test.go
+        funcs:
+          - TestAttack1HostilePreCommitHookNeverStagesForbiddenFile
+          - TestAttack2HostileGlobalHooksPathNeverStagesForbiddenFile
+          - TestAttack4CleanFilterNeverAltersCommittedContent
+      - file: internal/redteam/pathspec_test.go
+        funcs:
+          - TestAttack3PathspecMagicFilenameNeverStagesInternalPath
+          - TestAttack19NewlinePathspecFilenameHandledLiterally
+
+  - id: sol4-s2-descendant-containment
+    title: "A governed local launch wraps its process tree in a descendant-owning primitive (systemd transient scope on cgroup v2, then a directly-managed cgroup via CLONE_INTO_CGROUP, then unshare --user --pid --fork --mount-proc as a last resort); a DESCENDANTS_TERMINATED lifecycle stage freezes the cgroup, kills the whole owned tree, and waits for confirmed extinction (cgroup.procs empty) before final-state capture. A high-risk run refuses outright when no primitive is available rather than degrading to process-group-only kill. A detached setsid + double-fork + delayed-write child cannot survive the execution boundary"
+    first_shipped_version: v1.0.0-sol4-repair-s2
+    claimed_maturity: tested
+    implementation:
+      - file: internal/containment/descendants.go
+        symbols: [NewScope, WithScope, ScopeFromContext]
+    tests:
+      - file: internal/containment/descendants_test.go
+        funcs:
+          - TestScopeKillsDetachedSetsidDescendant
+          - TestScopeExtinguishNoopWhenNothingStarted
+      - file: internal/redteam/descendants_test.go
+        funcs:
+          - TestAttack8DetachedSetsidChildCannotWriteAfterApproval
+
+  - id: sol4-s3-executable-identity-one-handle
+    title: "A backend's executable identity is resolved exactly once per run into an immutable BackendExecutionHandle built from a single open file descriptor (PATH lookup, symlink canonicalization, fstat+io.Copy-hash for owner/mode/dev+inode/SHA-256 in one read); attestation, containment, replay identity, launch, and audit all consume that one handle. Launch verifies the handle's identity has not changed (VerifyUnchanged, re-stat+re-hash immediately before Start) in both the fd-launch and wrapper-launch paths, closing the truncate+overwrite TOCTOU that holding the fd alone does not protect against. Model/provider/account identity is operator-declared (not inferred from the backend name) and an unknown identity hard-refuses a high-risk native-sandbox run; Docker identity is the content-addressed image ID resolved from docker image inspect, never the mutable tag"
+    first_shipped_version: v1.0.0-sol4-repair-s3
+    claimed_maturity: tested
+    implementation:
+      - file: internal/agents/handle.go
+        symbols: [ResolveHandle, BackendExecutionHandle, ContextWithHandle, HandleFromContext, LaunchCommand]
+      - file: internal/runner/docker.go
+        symbols: [ResolveImageIdentity, ImageIdentity]
+    tests:
+      - file: internal/agents/handle_test.go
+        funcs:
+          - TestResolveHandleHashesFromTheOpenDescriptor
+          - TestResolveHandleFailsClosedWhenUnresolvable
+          - TestBackendExecutionHandleLaunchRejectsFileSwap
+          - TestBackendExecutionHandleFDLaunchRunsVerifiedContent
+          - TestVerifyUnchangedDetectsSwap
+          - TestLaunchCommandWrapperPathRejectsSwap
+          - TestBackendIdentityKnownRequiresProviderAndModelRevision
+      - file: internal/redteam/backend_identity_test.go
+        funcs:
+          - TestAttack6BackendReplacementBetweenHashAndLaunchIsDetected
+          - TestAttack7PathResolvedBinaryReplacedBetweenRuns
+          - TestAttack11MutableDockerTagChangesBeforeReplay
+          - TestAttack12InContainerBackendDiffersFromHostAttestedBinary
+
+  - id: sol4-s4-trusted-tool-registry
+    title: "Every external controller tool (git today; any operator-declared helper) must have an explicit trust entry -- shipped default (git only) or ~/.governator/tools.yaml -- before Governator will execute it at all; absence is 'outside the trust model,' not 'trust whatever PATH finds.' A registered entry is independently re-verified on every resolution (canonical path, content hash, owner, mode, non-writable parent directories). git self-pins on the first gov doctor run (toolregistry.Pin, trust-on-first-use mirroring SSH known_hosts); the gitplumb layer and the runtime/runner shell() helpers route through that pinned path, never a bare ambient PATH lookup, so a later PATH change cannot redirect it. Backend launches go through BuildAllowedEnv, which filters the inherited environment to a small fixed baseline plus the backend's own declared AllowedEnv (cloud credentials, GITHUB_TOKEN, SSH_AUTH_SOCK stripped by default); only the variable-name set is hashed into ExecutionIdentity, never the values"
+    first_shipped_version: v1.0.0-sol4-repair-s4
+    claimed_maturity: tested
+    implementation:
+      - file: internal/toolregistry/registry.go
+        symbols: [Load, Resolve, Pin, FilePath]
+      - file: internal/agents/env.go
+        symbols: [BuildAllowedEnv, EnvPolicyHash]
+    tests:
+      - file: internal/toolregistry/registry_test.go
+        funcs:
+          - TestResolveUnregisteredToolRefuses
+          - TestResolveRegisteredToolByAmbientLookup
+          - TestResolvePinnedPathIgnoresRequestedBin
+          - TestResolveRejectsGroupWritableParentOwnedByAnotherUser
+          - TestResolveRejectsContentHashMismatch
+          - TestGitHasShippedDefaultEntry
+          - TestPinPersistsPathAndPreservesOtherEntries
+      - file: internal/agents/env_test.go
+        funcs:
+          - TestBuildAllowedEnvStripsUnlistedVariables
+          - TestBuildAllowedEnvHonorsDeclaredExtra
+          - TestEnvPolicyHashIgnoresValuesOnlyNames
+          - TestEnvPolicyHashOrderIndependent
+      - file: internal/redteam/helpers_test.go
+        funcs:
+          - TestAttack9GraphHelperCannotWriteOutsideRepository
+      - file: internal/redteam/backend_identity_test.go
+        funcs:
+          - TestAttack10FakeGitInjectedThroughPathIsRejected
+
+  - id: sol4-s5-externally-enforced-attestation
+    title: "Only Governator's OWN externally enforced sandbox (Landlock LSM filesystem confinement + a network namespace with no configured route, applied to the exact process that becomes the backend via a hidden gov __sandbox_exec re-exec the backend cannot negotiate with) may authorize a high-risk local run -- never a declared capability and never a probe verdict. attest.VerifyHighRiskNative is still generated when the backend declares a native sandbox, but its outcome no longer gates authorization (it is evidence/audit only); containment.EnforcePolicy's externallyEnforced argument (enforce.Supported()) is the sole load-bearing gate. Transcripts are demoted to explanatory evidence: filesystem effects come from a worktree before/after diff, network egress is structurally impossible inside the netns rather than policy-denied, and an undisclosed change surfaces as a transcript_effect_mismatch note. A total attestation deadline bounds the SUM of probe time, not each probe independently"
+    first_shipped_version: v1.0.0-sol4-repair-s5
+    claimed_maturity: tested
+    implementation:
+      - file: internal/enforce/enforce.go
+        symbols: [Supported, NewPlan, WithPlan, PlanFromContext]
+      - file: internal/enforce/landlock.go
+        symbols: [RunSandboxExec]
+      - file: internal/runtime/runtime.go
+        symbols: [enforceContainment]
+      - file: internal/observability/enforcement.go
+        symbols: [RecordEnforcement, EnforcementForRun]
+    tests:
+      - file: internal/runtime/sol5_enforcement_ledger_test.go
+        funcs:
+          - TestSol5EnforcementLedgerRecordsExternalObservation
+      - file: internal/redteam/backend_identity_test.go
+        funcs:
+          - TestAttack5FakeBackendBehavesSafelyOnlyDuringAttestation
+
+  - id: sol4-s6-assayer-outbox-languages-evidence
+    title: "Assayer's quarantine outbox is idempotent at the target store (every entry carries a stable event_id; downstream tables UNIQUE on it; _complete_success/_complete_failure are rowcount-aware, never reporting success on a zero-row update when the lease was stolen), renews each entry's lease individually before submitting, increments attempts on every claim/reclaim, dead-letters malformed payloads per-row without poisoning the batch, and uses per-thread SQLite connections. coding-output-v2 (v2.2.0) rejects an unknown language (language_allowlist, on_unknown=fail) and a known language with no installed validator (domain_validator, require_validator=true); coding-output-v1 is deprecated to advisory. Quarantine/trace payloads are field-redacted (sensitive keys + secret-shape values), size-capped, classified, and optionally Fernet-encrypted; terminal quarantine rows purge on a retention window with a durable deletion-audit record. Governator's redteam corpus asserts the named Python regression tests still exist (cross-repo existence check)"
+    first_shipped_version: v1.0.0-sol4-repair-s6
+    claimed_maturity: tested
+    implementation:
+      - file: internal/redteam/assayer_test.go
+        symbols: [TestAttack13TwoAssayerWorkersReclaimOneExpiredLease, TestAttack14DownstreamInsertSucceedsBeforeOutboxWorkerCrashes, TestAttack16InventedAssayerLanguagePasses]
+    tests:
+      - file: internal/redteam/assayer_test.go
+        funcs:
+          - TestAttack13TwoAssayerWorkersReclaimOneExpiredLease
+          - TestAttack14DownstreamInsertSucceedsBeforeOutboxWorkerCrashes
+          - TestAttack16InventedAssayerLanguagePasses
+
+  - id: sol4-s7-correctness-and-concurrency
+    title: "A PolicyBundle (org rules + project doctrine + contract rules) is loaded exactly once before the first gate call and threaded unchanged into both evaluatePolicyGate and computeExecutionIdentity, closing the doctrine-edit race between evaluation and identity hashing (P1-3). One-shot override consumption is all-or-nothing across the whole expected set inside one transaction (ConsumePolicyOverrideReservations, P1-5). Produced/consumed artifact paths resolve via openat2 (RESOLVE_BENEATH|RESOLVE_NO_SYMLINKS|RESOLVE_NO_MAGICLINKS) validating every component, not just the final one (P1-7). Non-Git merge failures roll back via the existing captureRecall/restoreRecall snapshot machinery rather than leaving the live root half-updated (P1-8). spend.SettleGlobal claims the pending->settled transition and reads the estimate in one UPDATE...RETURNING, racing expireStaleReservations cleanly (P1-10). gov gate check fails closed on malformed input (structured DENY + PROTOCOL_ERROR + nonzero exit + durable audit row), reusing gov hook pre-tool-use's machinery (P1-11). contracts.Validate enforces an explicit MaxSafeBudgetMinutes schema maximum and SafeMinutesDuration refuses overflow at the one conversion site, so time.Duration(maxMinutes)*time.Minute can no longer wrap (P1-16)"
+    first_shipped_version: v1.0.0-sol4-repair-s7
+    claimed_maturity: tested
+    implementation:
+      - file: internal/runtime/policy_gate.go
+        symbols: [loadPolicyBundle, evaluatePolicyGate]
+      - file: internal/observability/policy_checkpoints.go
+        symbols: [ConsumePolicyOverrideReservations]
+      - file: internal/runtime/openbeneath.go
+        symbols: [openBeneath]
+      - file: internal/runtime/artifacts.go
+        symbols: [readRegularBeneath, writeNewBeneath, writeOverwriteBeneath]
+      - file: internal/spend/reservation.go
+        symbols: [SettleGlobal]
+      - file: cmd/gov/main.go
+        symbols: [denyGateProtocolError]
+      - file: internal/contracts/schema.go
+        symbols: [SafeMinutesDuration, MaxSafeBudgetMinutes]
+    tests:
+      - file: internal/runtime/policy_gate_test.go
+        funcs:
+          - TestPolicyBundleSharedBetweenGateAndIdentityIgnoresLaterDoctrineEdit
+          - TestEvaluatePolicyGateOrgRuleAppearsExactlyOnce
+          - TestPreflightOrgDenialIndependentOfConfiguredPolicyRules
+      - file: internal/observability/policy_checkpoints_test.go
+        funcs:
+          - TestConsumePolicyOverrideReservationsIsAllOrNothing
+      - file: internal/runtime/openbeneath_test.go
+        funcs:
+          - TestOpenBeneathRefusesParentComponentSymlink
+          - TestOpenBeneathRefusesParentComponentSymlinkEvenAfterPriorSafeResolution
+          - TestOpenBeneathAllowsOrdinaryNestedPaths
+          - TestOpenBeneathRefusesFinalComponentSymlink
+      - file: internal/spend/sol3_reservation_test.go
+        funcs:
+          - TestSol3SettleGlobalRacingExpiryNeverSilentlyLosesSettlement
+      - file: internal/contracts/schema_test.go
+        funcs:
+          - TestSafeMinutesDuration
+      - file: cmd/gov/main_test.go
+        funcs:
+          - TestAttack15GateCheckMalformedInputFailsClosed
+      - file: internal/redteam/gate_protocol_test.go
+        funcs:
+          - TestAttack15MalformedGateCheckInputFailsClosed
+      - file: internal/redteam/policy_race_test.go
+        funcs:
+          - TestAttack17DoctrineChangesBetweenEvaluationAndIdentity
+          - TestAttack18SecondOneShotApprovalConsumptionFails
+      - file: internal/redteam/spend_test.go
+        funcs:
+          - TestAttack20SpendSettleRacesExpiry
+      - file: internal/redteam/symlinks_test.go
+        funcs:
+          - TestAttack22SymlinkParentReplacedBetweenScanAndOpen
+      - file: internal/redteam/nongit_merge_test.go
+        funcs:
+          - TestAttack23NonGitMergeFailureHalfwayThrough
+      - file: internal/redteam/numeric_test.go
+        funcs:
+          - TestAttack21HugeTimeoutCausesDurationOverflow
+
+  - id: sol4-s8-release-and-supply-chain
+    title: "gov claims verify --release refuses to run without both --artifact and --manifest (cmd/gov/main.go claimsCmd), so a release pipeline can no longer silently degrade into the bare symbol-existence check that hid the original source/binary drift; verifyArtifactManifest then checks binary VCS revision, source commit, claims hash, and self-reported version against build-manifest.json. scripts/release_verify.sh is the release-blocking gate (extracts the host-platform archive with tar -xzf -p, preserving archived mode bits through the extracting user's umask; asserts the extracted binary's mode is exactly 0755; invokes claims verify --release against the exact shipped artifact), and scripts/release.sh's acceptance smoke test enforces the same -p extraction + mode 0755. Assayer SKIPPED blocks the release exactly like FAIL does. REQUIRE_TAG (default off locally, on in the tag-triggered .github/workflows/release.yml) asserts git tag --points-at HEAD when set. Optional minisign (Ed25519) signing augments the shared-secret HMAC when GOV_RELEASE_MINISIGN_KEY is configured; absent config means no fabricated .minisig"
+    first_shipped_version: v1.0.0-sol4-repair-s8
+    claimed_maturity: tested
+    implementation:
+      - file: cmd/gov/main.go
+        symbols: [claimsCmd]
+      - file: internal/claims/claims.go
+        symbols: [verifyArtifactManifest, verifyReleaseArtifact]
+    tests:
+      - file: internal/redteam/release_test.go
+        funcs:
+          - TestAttack24ExtractedReleaseBinaryHasWrongMode
+          - TestAttack25ReleaseBinaryCommitDiffersFromSourceAndClaims
+
+  - id: sol4-s9-lifecycle-state-machine
+    title: "The run state machine is formalized as an explicit Stage type with a validated transition graph (internal/lifecycle); every RecordStage call site in internal/runtime goes through lifecycle.Record, which rejects out-of-order writes at record time rather than only catching them after the fact by reading run_stages. A kernel-observed effect ledger (internal/observability/effects.go, table effect_events) records process_creation, network, and executable_launch per run independent of the transcript, alongside the pre-existing files_touched (file writes) and EnforcementRecord (S5's per-run enforcement summary). The plan's five lifecycle invariants are property-tested or cross-referenced to existing tests: no approval before final state, no merge without an approved tree, no reservation without settlement/recovery, no workspace left unowned, no one-shot approval consumed without action. A chaos suite exercises real concurrent-SQLite contention, a hung validator killed at its context deadline, and forward/backward system-clock jumps against the spend reservation ledger"
+    first_shipped_version: v1.0.0-sol4-repair-s9
+    claimed_maturity: tested
+    implementation:
+      - file: internal/lifecycle/lifecycle.go
+        symbols: [Validate, Record, Macro, Stage]
+      - file: internal/observability/effects.go
+        symbols: [RecordEffects, EffectsForRun, EffectRecord]
+    tests:
+      - file: internal/lifecycle/lifecycle_test.go
+        funcs:
+          - TestValidate_EmptyHistoryOnlyAcceptsParsed
+          - TestValidate_IdempotentReplayAlwaysAllowed
+          - TestValidate_TerminalStagesRejectForwardProgress
+          - TestValidate_EveryDeclaredEdgeIsAccepted
+          - TestValidate_RecoveryJumpAllowedFromAnyNonTerminalStage
+          - TestValidate_UndeclaredEdgesAreRejected
+          - TestProperty_NoApprovalBeforeFinalState
+          - TestProperty_NoMergeWithoutPriorApprovalIntent
+          - TestProperty_CompleteOnlyAfterApprovedOrQuarantined
+      - file: internal/runtime/lifecycle_invariant_test.go
+        funcs:
+          - TestLifecycleInvariant_RecoveryNeverLeaksReservationOrWorkspace
+          - TestLifecycleInvariant_RollbackReachesTerminalFromCompleteNotJustApproved
+      - file: internal/runtime/effects_test.go
+        funcs:
+          - TestApprovedRun_RecordsKernelObservedEffectLedger
+      - file: internal/runtime/chaos_test.go
+        funcs:
+          - TestChaos_ConcurrentLifecycleRecordersUnderRealSQLiteContention
+          - TestChaos_HungValidatorKilledAtContextDeadline
+      - file: internal/spend/chaos_clock_test.go
+        funcs:
+          - TestChaos_ClockJumpForwardExpiresReservationExactlyOnce
+          - TestChaos_ClockJumpBackwardSettleStillClaimsExactlyOnce

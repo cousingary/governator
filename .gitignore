@@ -7,3 +7,9 @@
 .env*
 __pycache__/
 RESULT.json
+# Test-run artifacts (governed-run scratch state left behind by TestX helpers
+# that build a real in-process Run; never tracked, harmless, ignored so a
+# post-test working tree stays clean).
+output/
+.governator/
+.governator-canary
