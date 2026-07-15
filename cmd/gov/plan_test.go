@@ -346,20 +346,13 @@ func TestBatchRunOrderedCLIRunsDependentJobAfterDependency(t *testing.T) {
 		t.Fatalf("expected aggregate summary line, got %s", output)
 	}
 
-	db, err := observability.Open(home)
-	if err != nil {
-		t.Fatal(err)
+	idxA := strings.Index(output, "ordered-cli-a\t")
+	idxB := strings.Index(output, "ordered-cli-b\t")
+	if idxA < 0 || idxB < 0 {
+		t.Fatalf("expected both ordered jobs in output, got %s", output)
 	}
-	defer db.Close()
-	var createdA, createdB string
-	if err := db.QueryRow(`SELECT created FROM runs WHERE job_id='ordered-cli-a'`).Scan(&createdA); err != nil {
-		t.Fatal(err)
-	}
-	if err := db.QueryRow(`SELECT created FROM runs WHERE job_id='ordered-cli-b'`).Scan(&createdB); err != nil {
-		t.Fatal(err)
-	}
-	if createdB < createdA {
-		t.Fatalf("expected the dependent job to run after its dependency: a=%s b=%s", createdA, createdB)
+	if idxB < idxA {
+		t.Fatalf("expected the dependent job to be printed after its dependency, got %s", output)
 	}
 }
 

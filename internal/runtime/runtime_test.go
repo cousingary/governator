@@ -1781,12 +1781,14 @@ func TestWallClockBudgetExhaustionQuarantinesSlowValidators(t *testing.T) {
 	// Budget.MaxMinutes must stay >=1 for contract validation, but a
 	// context.WithTimeout wrapping a caller ctx that already has an
 	// earlier deadline keeps that earlier deadline (context.WithDeadline
-	// never extends a parent's deadline) — so the 800ms deadline below,
+	// never extends a parent's deadline) — so the 2s deadline below,
 	// not the 1-minute budget, is what actually governs remainingRunBudget.
+	// Keep this above git worktree setup latency under -race, but well below
+	// the two validators' combined 10s sleep time.
 	c.Budget.MaxMinutes = 1
 	c.Success.Validators = []string{"sleep 5", "sleep 5"}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 800*time.Millisecond)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 
 	started := time.Now()
@@ -1799,7 +1801,7 @@ func TestWallClockBudgetExhaustionQuarantinesSlowValidators(t *testing.T) {
 		t.Fatalf("status=%s message=%s", r.Status, r.Message)
 	}
 	if elapsed > 4*time.Second {
-		t.Fatalf("wall time should track the run budget (~800ms), not the sum of slow validators (10s): %s", elapsed)
+		t.Fatalf("wall time should track the run budget (~2s), not the sum of slow validators (10s): %s", elapsed)
 	}
 }
 

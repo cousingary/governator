@@ -62,10 +62,23 @@ func TestAutoRepairFiresExactlyOnceWithDefaultMaxAttempts(t *testing.T) {
 	if len(failures) != 2 {
 		t.Fatalf("expected exactly 2 quarantined runs (original + 1 repair), got %d: %#v", len(failures), failures)
 	}
-	// Failures is ordered created DESC: [0] is the repair, [1] is the original.
-	original, repair := failures[1], failures[0]
-	if original.RepairOf != "" {
-		t.Fatalf("original run must not itself carry repair_of, got %q", original.RepairOf)
+	// Do not rely on created DESC as a strict original/repair discriminator:
+	// under -race the two records can land close enough that timestamp order is
+	// not the property this test is meant to prove. Identify the original by its
+	// empty repair_of and the repair by its non-empty lineage link.
+	var original, repair observability.Failure
+	for _, f := range failures {
+		if f.RepairOf == "" {
+			original = f
+		} else {
+			repair = f
+		}
+	}
+	if original.RunID == "" {
+		t.Fatalf("did not find original failure with empty repair_of: %#v", failures)
+	}
+	if repair.RunID == "" {
+		t.Fatalf("did not find repair failure with non-empty repair_of: %#v", failures)
 	}
 	if repair.RepairOf != original.RunID {
 		t.Fatalf("repair run repair_of=%q, want original run id %q", repair.RepairOf, original.RunID)

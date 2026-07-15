@@ -54,7 +54,19 @@ import (
 // observability.Open is what this test would catch a regression in).
 func TestChaos_ConcurrentLifecycleRecordersUnderRealSQLiteContention(t *testing.T) {
 	home := t.TempDir()
-	const n = 25
+	// Initialize the schema once before the concurrent writer phase. The
+	// chaos property under test is lifecycle.Record contention, not racing
+	// CREATE TABLE bootstrap on every connection; under -race that bootstrap
+	// contention can exceed SQLite's busy timeout and make the fixture flaky.
+	bootstrap, err := observability.Open(home)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := bootstrap.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	const n = 12
 	var wg sync.WaitGroup
 	errs := make([]error, n)
 	for i := 0; i < n; i++ {

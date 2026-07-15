@@ -218,10 +218,18 @@ func TestNewDockerWithoutConfigFailsClosed(t *testing.T) {
 }
 
 // TestNewDockerUnavailableFailsClosed pins the plan rule using a deliberately
-// bogus PATH so CheckDockerAvailable fails regardless of whether the host
-// running this test actually has Docker installed.
+// missing trusted-tool registry entry so CheckDockerAvailable fails regardless
+// of whether the host running this test has Docker installed or an operator
+// registry has pinned Docker independently of PATH.
 func TestNewDockerUnavailableFailsClosed(t *testing.T) {
-	t.Setenv("PATH", t.TempDir())
+	registryFile := filepath.Join(t.TempDir(), "tools.yaml")
+	missingDocker := filepath.Join(t.TempDir(), "missing-docker")
+	yaml := "tools:\n  - name: docker\n    kind: trusted_controller\n    path: " + missingDocker + "\n"
+	if err := os.WriteFile(registryFile, []byte(yaml), 0644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("GOV_TOOLREGISTRY_FILE", registryFile)
+
 	_, err := New("docker", &contracts.DockerRunnerConfig{Image: "example/image:latest"}, nil, nil)
 	if err == nil {
 		t.Fatal("want error when docker is unavailable")
