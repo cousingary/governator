@@ -932,12 +932,12 @@ claims:
       - file: internal/toolregistry/registry_test.go
         funcs:
           - TestResolveUnregisteredToolRefuses
-          - TestResolveRegisteredToolByAmbientLookup
-          - TestResolvePinnedPathIgnoresRequestedBin
-          - TestResolveRejectsGroupWritableParentOwnedByAnotherUser
+          - TestResolveRegisteredToolWithoutEnrollmentRefusesAmbientLookup
+          - TestEnrollPersistsFullIdentityAndResolveIgnoresRequestedBin
+          - TestResolveRejectsPermissiveExecutableAncestor
           - TestResolveRejectsContentHashMismatch
-          - TestGitHasShippedDefaultEntry
-          - TestPinPersistsPathAndPreservesOtherEntries
+          - TestGitHasShippedDefaultEntryButNoExecutableIdentity
+          - TestPinPersistsIdentityAndPreservesOtherEntries
       - file: internal/agents/env_test.go
         funcs:
           - TestBuildAllowedEnvStripsUnlistedVariables
@@ -1100,3 +1100,22 @@ claims:
         funcs:
           - TestChaos_ClockJumpForwardExpiresReservationExactlyOnce
           - TestChaos_ClockJumpBackwardSettleStillClaimsExactlyOnce
+
+  # S9's production fixes live in the sibling Assayer Python repo. The
+  # claims verifier only resolves implementation symbols in this Go checkout,
+  # so this claim binds the cross-repo fix through the Governator redteam
+  # pointer/process tests; the Python implementation/test details are indexed
+  # in docs/security.md.
+  - id: sol6-s9-assayer-lifecycle
+    title: "Assayer outbox replay keeps leases heartbeating for the full downstream target call, unknown outbox operations are strict-dead-lettered as UNKNOWN_OUTBOX_OPERATION instead of reinterpreted as traces, crash-recovery multiprocessing uses spawn to avoid fork/thread pytest hangs, dedup store failures are profile-controlled (fail/advisory/skip), retention deletion constrains the delete by status and age, and encrypted evidence stores key identity/algorithm/format metadata with unavailable-key failure. Governator's redteam corpus asserts the named Python regression tests exist and that pytest exits with code 0."
+    first_shipped_version: v1.0.1-candidate
+    claimed_maturity: tested
+    implementation:
+      - file: internal/redteam/v6_s9_assayer_lifecycle_test.go
+        symbols: [TestV6Case31AssayerLeaseRenewedThroughSlowDownstreamCallPreventsDuplicate, TestV6Case32UnknownOutboxOperationIsDeadLettered, TestV6Case33AssayerPytestExitsCleanlyOnSupportedPythonVersions]
+    tests:
+      - file: internal/redteam/v6_s9_assayer_lifecycle_test.go
+        funcs:
+          - TestV6Case31AssayerLeaseRenewedThroughSlowDownstreamCallPreventsDuplicate
+          - TestV6Case32UnknownOutboxOperationIsDeadLettered
+          - TestV6Case33AssayerPytestExitsCleanlyOnSupportedPythonVersions

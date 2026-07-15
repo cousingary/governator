@@ -102,17 +102,10 @@ func checkGit() Check {
 		check.Status, check.Detail = StatusFail, err.Error()
 		return check
 	}
-	entry, _ := registry.Entry("git")
 	identity, err := registry.Resolve("git", "git")
 	if err != nil {
 		check.Status, check.Detail = StatusFail, "untrusted: "+err.Error()
 		return check
-	}
-	if entry.Path == "" {
-		if perr := toolregistry.Pin("git", identity.CanonicalPath); perr != nil {
-			check.Status, check.Detail = StatusFail, fmt.Sprintf("resolved %s but failed to pin it in the trust registry: %v", identity.CanonicalPath, perr)
-			return check
-		}
 	}
 	path := identity.CanonicalPath
 	output, err := exec.Command(path, "--version").Output()
@@ -149,7 +142,6 @@ func checkTrustedTool(name string, required bool, versionArgs ...string) Check {
 		check.Status, check.Detail = StatusFail, err.Error()
 		return check
 	}
-	entry, _ := registry.Entry(name)
 	identity, err := registry.Resolve(name, name)
 	if err != nil {
 		status := StatusFail
@@ -158,12 +150,6 @@ func checkTrustedTool(name string, required bool, versionArgs ...string) Check {
 		}
 		check.Status, check.Detail = status, "untrusted: "+err.Error()
 		return check
-	}
-	if entry.Path == "" {
-		if perr := toolregistry.Pin(name, identity.CanonicalPath); perr != nil {
-			check.Status, check.Detail = StatusFail, fmt.Sprintf("resolved %s but failed to pin it in the trust registry: %v", identity.CanonicalPath, perr)
-			return check
-		}
 	}
 	output, verr := exec.Command(identity.CanonicalPath, versionArgs...).CombinedOutput()
 	if verr != nil {

@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -105,5 +106,33 @@ func TestScopeCommandUsesResolvedPrimitivePath(t *testing.T) {
 				t.Fatalf("Command built argv0=%q for method %s, want the registry-resolved path %q (a bare tool name would let ambient PATH redirect it)", cmd.Path, method, pinned)
 			}
 		})
+	}
+}
+
+func TestSystemdScopeRejectsUnconfirmedObservedCgroup(t *testing.T) {
+	if _, err := os.Stat("/proc/self/cgroup"); err != nil {
+		t.Skipf("no proc cgroup view: %v", err)
+	}
+	s := &Scope{method: ScopeSystemdUserScope, runID: "unit-test", unitName: "governator-unit-that-must-not-match"}
+	s.resolveCgroupFromPID(os.Getpid())
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.cgroupPath != "" {
+		t.Fatalf("unconfirmed systemd unit retained fallback cgroup %q", s.cgroupPath)
+	}
+	if s.resolveErr == nil {
+		t.Fatal("expected resolveErr for unconfirmed generated systemd unit")
+	}
+}
+
+func TestWaitPIDGoneDoesNotTreatEPERMAsGone(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root can signal pid 1; EPERM fixture unavailable")
+	}
+	if err := syscall.Kill(1, 0); err != syscall.EPERM {
+		t.Skipf("pid 1 did not produce EPERM in this environment: %v", err)
+	}
+	if err := waitPIDGone(1, 0); err == nil {
+		t.Fatal("waitPIDGone treated EPERM as extinction proof")
 	}
 }

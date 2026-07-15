@@ -21,6 +21,7 @@ import (
 
 	"github.com/cousingary/governator/internal/agents"
 	"github.com/cousingary/governator/internal/config"
+	"github.com/cousingary/governator/internal/controllerenv"
 	"github.com/cousingary/governator/internal/gitplumb"
 )
 
@@ -358,7 +359,11 @@ func runBehavioralProbes(ctx context.Context, agent agents.Agent, res agents.Res
 	// same way any other init failure here does.
 	if gitPath, gerr := gitplumb.TrustedGitPath(); gerr != nil {
 		out.notes = append(out.notes, "resolve trusted git for probe workspace: "+gerr.Error())
-	} else if err := exec.CommandContext(ctx, gitPath, "init", "-q", workspace).Run(); err != nil {
+	} else if err := func() error {
+		cmd := exec.CommandContext(ctx, gitPath, "init", "-q", workspace)
+		cmd.Env = controllerenv.Base()
+		return cmd.Run()
+	}(); err != nil {
 		out.notes = append(out.notes, "git init probe workspace: "+err.Error())
 	}
 	if err := os.MkdirAll(protectedDir, 0700); err != nil {

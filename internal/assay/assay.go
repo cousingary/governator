@@ -26,6 +26,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/cousingary/governator/internal/controllerenv"
 	"github.com/cousingary/governator/internal/toolregistry"
 )
 
@@ -221,6 +222,7 @@ func Evaluate(ctx context.Context, cfg Config, req Request, artifactPath string)
 	cliPath := filepath.Join(cfg.Repo, "cli.py")
 
 	cmd := exec.CommandContext(runCtx, pythonIdentity.CanonicalPath, cliPath, "evaluate", "--profile", req.CheckProfile)
+	cmd.Env = controllerenv.Base()
 	cmd.Dir = cfg.Repo
 	cmd.Stdin = bytes.NewReader(payload)
 	var stdout, stderr bytes.Buffer

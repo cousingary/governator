@@ -382,6 +382,23 @@ func main() {
 		t.Fatal(err)
 	}
 	manifest := filepath.Join(root, "evidence", "release.json")
+	writeFile(t, root, "evidence/test-summary.json", `{
+  "source_commit": "`+commit+`",
+  "environment_capabilities": {"goos": "test", "machine": "test"},
+  "suites": {
+    "redteam": {
+      "command": "go test -v -tags redteam -count=1 ./...",
+      "result": "PASS",
+      "source_commit": "`+commit+`",
+      "log_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "tests_discovered": 36,
+      "tests_run": 36,
+      "tests_skipped": 0,
+      "tests_failed": 0,
+      "unexpected_skipped": 0
+    }
+  }
+}`)
 	writeFile(t, root, "evidence/release.json", `{
   "version": "v1.4.1",
   "source_commit": "`+commit+`",
@@ -393,6 +410,7 @@ func main() {
   "claims_hash": "`+claimsHash+`",
   "test_run_id": "unit-test",
   "test_result": "PASS",
+  "test_summary_path": "evidence/test-summary.json",
   "acceptance_run_id": "acceptance-test",
   "acceptance_result": "PASS",
   "binaries": {"targets": [{"platform": "linux_amd64", "sha256": "`+artifactHash+`"}]}

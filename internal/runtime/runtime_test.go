@@ -23,6 +23,7 @@ import (
 	"github.com/cousingary/governator/internal/enforce"
 	"github.com/cousingary/governator/internal/observability"
 	"github.com/cousingary/governator/internal/policy"
+	"github.com/cousingary/governator/internal/toolregistry"
 )
 
 func git(t *testing.T, dir string, args ...string) {
@@ -36,6 +37,7 @@ func git(t *testing.T, dir string, args ...string) {
 
 func fixture(t *testing.T) (string, string) {
 	t.Helper()
+	t.Setenv("GOV_TEST_ALLOW_FAKE_ENV", "1")
 	root := t.TempDir()
 	git(t, root, "init", "-b", "main")
 	git(t, root, "config", "user.email", "test@example.invalid")
@@ -967,20 +969,45 @@ func TestWriteOutsideIntendedScopeIsQuarantined(t *testing.T) {
 	}
 }
 
+func secureRuntimeTempDir(t *testing.T) string {
+	t.Helper()
+	home := "/home/lam"
+	if _, err := os.Stat(home); err != nil {
+		var homeErr error
+		home, homeErr = os.UserHomeDir()
+		if homeErr != nil {
+			t.Fatal(homeErr)
+		}
+	}
+	dir, err := os.MkdirTemp(home, ".gov-runtime-test-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	return dir
+}
+
 func TestRunBuildsDisposableGraphAndRecordsFingerprint(t *testing.T) {
 	root, agentBin := fixture(t)
 	home := t.TempDir()
-	graphBin := filepath.Join(t.TempDir(), "codegraph")
+	graphBin := filepath.Join(secureRuntimeTempDir(t), "codegraph")
 	graphScript := `#!/bin/sh
 for arg in "$@"; do project="$arg"; done
 case "$1" in
   version) echo 'codegraph 0.24.0' ;;
   init|sync)
     mkdir -p "$project/.codegraph"
+    exclude=$(git -C "$project" rev-parse --git-path info/exclude 2>/dev/null || true)
+    if [ -n "$exclude" ]; then mkdir -p "$(dirname "$exclude")"; grep -qxF .codegraph "$exclude" 2>/dev/null || printf '.codegraph\n' >> "$exclude"; fi
     printf 'runtime graph database' > "$project/.codegraph/codegraph.db"
     ;;
   status)
+    mkdir -p "$project/.codegraph"
+    exclude=$(git -C "$project" rev-parse --git-path info/exclude 2>/dev/null || true)
+    if [ -n "$exclude" ]; then mkdir -p "$(dirname "$exclude")"; grep -qxF .codegraph "$exclude" 2>/dev/null || printf '.codegraph\n' >> "$exclude"; fi
+    printf 'runtime graph database' > "$project/.codegraph/codegraph.db"
     printf '{"initialized":true,"projectPath":"%s","indexPath":"%s/.codegraph/codegraph.db","fileCount":7,"nodeCount":31,"edgeCount":44,"dbSizeBytes":22}\n' "$project" "$project"
+    (sleep 0.05; rm -rf "$project/.codegraph") >/dev/null 2>&1 &
     ;;
   query) printf '[]\n' ;;
   *) exit 1 ;;
@@ -995,12 +1022,23 @@ esac
 	t.Setenv("GOV_GRAPH_MODE", "required")
 	t.Setenv("GOV_GRAPH_PROVIDER", "codegraph")
 	t.Setenv("GOV_GRAPH_BIN", graphBin)
+	t.Setenv("GOV_CONTAINMENT_FORCE_DEGRADED", "1")
 	t.Setenv("FAKE_PROMPT_FILE", promptFile)
 	toolsReg := filepath.Join(t.TempDir(), "tools.yaml")
-	if err := os.WriteFile(toolsReg, []byte("tools:\n  - name: codegraph\n    kind: trusted_controller\n"), 0644); err != nil {
+	t.Setenv("GOV_TOOLREGISTRY_FILE", toolsReg)
+	if _, err := toolregistry.Enroll("git", "/usr/bin/git"); err != nil {
 		t.Fatal(err)
 	}
-	t.Setenv("GOV_TOOLREGISTRY_FILE", toolsReg)
+	bashPath, err := exec.LookPath("bash")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := toolregistry.Enroll("bash", bashPath); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := toolregistry.Enroll("codegraph", graphBin); err != nil {
+		t.Fatal(err)
+	}
 
 	record, err := New().Run(context.Background(), contract(root))
 	if err != nil {
@@ -1032,6 +1070,9 @@ esac
 	}
 	if len(tracked) != 0 {
 		t.Fatalf("controller graph was committed: %s", tracked)
+	}
+	if err := os.RemoveAll(filepath.Join(root, ".codegraph")); err != nil {
+		t.Fatal(err)
 	}
 	if _, err := os.Stat(filepath.Join(root, ".codegraph")); !os.IsNotExist(err) {
 		t.Fatalf("graph escaped disposable worktree: %v", err)
@@ -1577,7 +1618,7 @@ func TestWorkspaceCleanupGuardRemovesGraphPrepareFailureResources(t *testing.T) 
 	promptRoot := t.TempDir()
 	writePrompt(t, promptRoot, "claude-code", "surgeon")
 	t.Setenv("GOV_PROMPTS", promptRoot)
-	graphBin := filepath.Join(t.TempDir(), "codegraph")
+	graphBin := filepath.Join(secureRuntimeTempDir(t), "codegraph")
 	graphScript := "#!/bin/sh\nif [ \"$1\" = version ]; then echo codegraph-test; exit 0; fi\necho graph failed >&2\nexit 2\n"
 	if err := os.WriteFile(graphBin, []byte(graphScript), 0755); err != nil {
 		t.Fatal(err)

@@ -8,13 +8,15 @@ import (
 )
 
 type ParityEvent struct {
-	Payload           string
-	PayloadHash       string
-	GoDecision        string
-	PythonDecision    string
-	Match             bool
-	PythonUnavailable bool
-	Created           string
+	Payload            string
+	PayloadHash        string
+	GoDecision         string
+	PythonDecision     string
+	Match              bool
+	PythonUnavailable  bool
+	ShadowScriptPath   string
+	ShadowScriptSHA256 string
+	Created            string
 }
 
 type ParityReport struct {
@@ -39,8 +41,8 @@ func RecordParity(home string, event ParityEvent) error {
 	if event.Created == "" {
 		event.Created = time.Now().UTC().Format(time.RFC3339Nano)
 	}
-	_, err = db.Exec(`INSERT INTO parity_events(payload_hash,payload,go_decision,py_decision,matched,py_unavailable,created) VALUES(?,?,?,?,?,?,?)`,
-		event.PayloadHash, event.Payload, event.GoDecision, event.PythonDecision, boolInt(event.Match), boolInt(event.PythonUnavailable), event.Created)
+	_, err = db.Exec(`INSERT INTO parity_events(payload_hash,payload,go_decision,py_decision,matched,py_unavailable,shadow_script_path,shadow_script_sha256,created) VALUES(?,?,?,?,?,?,?,?,?)`,
+		event.PayloadHash, event.Payload, event.GoDecision, event.PythonDecision, boolInt(event.Match), boolInt(event.PythonUnavailable), event.ShadowScriptPath, event.ShadowScriptSHA256, event.Created)
 	return err
 }
 
@@ -64,14 +66,14 @@ func ParitySummary(home string) (ParityReport, error) {
 			report.CoverageDays = b.Sub(a).Hours() / 24
 		}
 	}
-	rows, err := db.Query(`SELECT payload_hash,payload,go_decision,py_decision,matched,py_unavailable,created FROM parity_events WHERE matched=0 OR py_unavailable=1 ORDER BY created DESC`)
+	rows, err := db.Query(`SELECT payload_hash,payload,go_decision,py_decision,matched,py_unavailable,shadow_script_path,shadow_script_sha256,created FROM parity_events WHERE matched=0 OR py_unavailable=1 ORDER BY created DESC`)
 	if err != nil {
 		return report, err
 	}
 	defer rows.Close()
 	for rows.Next() {
 		var event ParityEvent
-		if err := rows.Scan(&event.PayloadHash, &event.Payload, &event.GoDecision, &event.PythonDecision, &event.Match, &event.PythonUnavailable, &event.Created); err != nil {
+		if err := rows.Scan(&event.PayloadHash, &event.Payload, &event.GoDecision, &event.PythonDecision, &event.Match, &event.PythonUnavailable, &event.ShadowScriptPath, &event.ShadowScriptSHA256, &event.Created); err != nil {
 			return report, err
 		}
 		report.Events = append(report.Events, event)

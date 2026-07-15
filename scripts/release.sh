@@ -22,8 +22,16 @@ if ! git diff --quiet || ! git diff --cached --quiet; then
   exit 1
 fi
 
-VERSION=${VERSION:-1.0.0}
 COMMIT=$(git rev-parse HEAD)
+SHORT_COMMIT=$(git rev-parse --short=12 HEAD)
+if [ -z "${VERSION:-}" ]; then
+  EXACT_TAG=$(git describe --tags --exact-match HEAD 2>/dev/null || true)
+  if [ -n "$EXACT_TAG" ]; then
+    VERSION=${EXACT_TAG#v}
+  else
+    VERSION="local-candidate-${SHORT_COMMIT}"
+  fi
+fi
 
 # P0-7 (Sol redteam v4 S8): "build releases only from a clean, tagged
 # commit." REQUIRE_TAG defaults off so docs/publishing.md's documented local
@@ -39,6 +47,17 @@ if [ "$REQUIRE_TAG" = 1 ]; then
     echo "release: REQUIRE_TAG=1 but HEAD is not tagged v${VERSION}" >&2
     exit 1
   fi
+else
+  case "$VERSION" in
+    local-candidate-*|*-candidate*|*-rc*|*+*) ;;
+    *)
+      TAG_AT_HEAD=$(git tag --points-at HEAD | grep -x "v${VERSION}" || true)
+      if [ -z "$TAG_AT_HEAD" ]; then
+        echo "release: refusing ambiguous untagged version ${VERSION}; use a local-candidate/rc version or set REQUIRE_TAG=1 on a matching tag" >&2
+        exit 1
+      fi
+      ;;
+  esac
 fi
 BUILD_TS=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 CLAIMS_HASH=$(sha256sum docs/claims.yaml | awk '{print $1}')
@@ -124,6 +143,39 @@ run_tier black_box_corpus "$CORPUS_LOG" CORPUS_RESULT CORPUS_SECONDS CORPUS_STAR
 CORPUS_TESTS_RUN=$(grep -c '^--- PASS\|^--- FAIL' "$CORPUS_LOG" || true)
 CORPUS_TESTS_FAILED=$(grep -c '^--- FAIL' "$CORPUS_LOG" || true)
 
+# Sol redteam v6 S0 (P0-18, partial): the build-tagged internal/redteam/
+# corpus was never actually compiled by any release or CI command —
+# "black_box_corpus" above only runs Sol3-prefixed tests, which never
+# triggers the `redteam` build tag. A release could report
+# black_box_corpus: PASS while every permanent red-team attack was excluded
+# from compilation. These two tiers are the exact commands the v6 report
+# requires. Skips are not failures here — the corpus's skip count is the
+# project burn-down (agents/governator-sol-upgrade6-plan.md). Full record
+# fields (discovered/run/skipped/failed counts as first-class release
+# evidence, and rejection of any *unexpected* skip) land in S8, not here.
+REDTEAM_LOG="$OUT_DIR/test-redteam.log"
+run_tier redteam "$REDTEAM_LOG" REDTEAM_RESULT REDTEAM_SECONDS REDTEAM_STARTED REDTEAM_ENDED REDTEAM_LOG_SHA go test -v -tags redteam -count=1 ./...
+
+REDTEAM_RACE_LOG="$OUT_DIR/test-redteam-race.log"
+run_tier redteam_race "$REDTEAM_RACE_LOG" REDTEAM_RACE_RESULT REDTEAM_RACE_SECONDS REDTEAM_RACE_STARTED REDTEAM_RACE_ENDED REDTEAM_RACE_LOG_SHA go test -v -race -tags redteam -count=1 ./...
+
+MIN_REDTEAM_TESTS=${MIN_REDTEAM_TESTS:-36}
+EXPECTED_REDTEAM_SKIPS=${EXPECTED_REDTEAM_SKIPS:-0}
+read REDTEAM_TESTS_DISCOVERED REDTEAM_TESTS_RUN REDTEAM_TESTS_SKIPPED REDTEAM_TESTS_FAILED REDTEAM_UNEXPECTED_SKIPPED < <(python3 - "$REDTEAM_LOG" "$EXPECTED_REDTEAM_SKIPS" <<'PYREDTEAMCOUNTS'
+import pathlib, re, sys
+log = pathlib.Path(sys.argv[1]).read_text(errors="replace")
+expected_skips = int(sys.argv[2])
+counts = {"PASS": 0, "FAIL": 0, "SKIP": 0}
+for line in log.splitlines():
+    m = re.match(r"^--- (PASS|FAIL|SKIP): ", line)
+    if m:
+        counts[m.group(1)] += 1
+run = counts["PASS"] + counts["FAIL"] + counts["SKIP"]
+unexpected = max(0, counts["SKIP"] - expected_skips)
+print(run, run, counts["SKIP"], counts["FAIL"], unexpected)
+PYREDTEAMCOUNTS
+)
+
 FUZZ_TARGETS=(
   "internal/contracts FuzzContractParser"
   "internal/policy FuzzClassifyShellCommand"
@@ -174,8 +226,16 @@ else
   echo "$ASSAYER_SUMMARY" >"$ASSAYER_LOG"
 fi
 
-if [ "$UNIT_RESULT" != PASS ] || [ "$RACE_RESULT" != PASS ] || [ "$INTEGRATION_RESULT" != PASS ] || [ "$CORPUS_RESULT" != PASS ] || [ "$FUZZ_OK" != true ]; then
+if [ "$UNIT_RESULT" != PASS ] || [ "$RACE_RESULT" != PASS ] || [ "$INTEGRATION_RESULT" != PASS ] || [ "$CORPUS_RESULT" != PASS ] || [ "$REDTEAM_RESULT" != PASS ] || [ "$REDTEAM_RACE_RESULT" != PASS ] || [ "$FUZZ_OK" != true ]; then
   echo "release: refusing to package — a required test tier failed" >&2
+  exit 1
+fi
+if [ "$REDTEAM_TESTS_RUN" -lt "$MIN_REDTEAM_TESTS" ]; then
+  echo "release: refusing to package — redteam suite ran ${REDTEAM_TESTS_RUN}, below required minimum ${MIN_REDTEAM_TESTS}" >&2
+  exit 1
+fi
+if [ "$REDTEAM_UNEXPECTED_SKIPPED" -ne 0 ]; then
+  echo "release: refusing to package — redteam suite has ${REDTEAM_UNEXPECTED_SKIPPED} unexpected skip(s)" >&2
   exit 1
 fi
 if [ "$ASSAYER_RESULT" != PASS ]; then
@@ -331,6 +391,9 @@ python3 - "$TEST_SUMMARY" "$COMMIT" "$GO_VERSION" "$BUILD_TS" "$GO_SUM_HASH" \
   "$RACE_RESULT" "$RACE_SECONDS" "$RACE_STARTED" "$RACE_ENDED" "$RACE_LOG_SHA" \
   "$INTEGRATION_RESULT" "$INTEGRATION_SECONDS" "$INTEGRATION_STARTED" "$INTEGRATION_ENDED" "$INTEGRATION_LOG_SHA" \
   "$CORPUS_RESULT" "$CORPUS_SECONDS" "$CORPUS_STARTED" "$CORPUS_ENDED" "$CORPUS_LOG_SHA" "$CORPUS_TESTS_RUN" "$CORPUS_TESTS_FAILED" \
+  "$REDTEAM_RESULT" "$REDTEAM_SECONDS" "$REDTEAM_STARTED" "$REDTEAM_ENDED" "$REDTEAM_LOG_SHA" \
+  "$REDTEAM_TESTS_DISCOVERED" "$REDTEAM_TESTS_RUN" "$REDTEAM_TESTS_SKIPPED" "$REDTEAM_TESTS_FAILED" "$REDTEAM_UNEXPECTED_SKIPPED" "$MIN_REDTEAM_TESTS" "$EXPECTED_REDTEAM_SKIPS" \
+  "$REDTEAM_RACE_RESULT" "$REDTEAM_RACE_SECONDS" "$REDTEAM_RACE_STARTED" "$REDTEAM_RACE_ENDED" "$REDTEAM_RACE_LOG_SHA" \
   "$FUZZ_RESULTS_JSON" "$ASSAYER_RESULT" "$ASSAYER_SUMMARY" <<'PYTESTSUMMARY'
 import json, pathlib, sys
 
@@ -339,6 +402,9 @@ import json, pathlib, sys
  race_result, race_seconds, race_started, race_ended, race_log_sha,
  integration_result, integration_seconds, integration_started, integration_ended, integration_log_sha,
  corpus_result, corpus_seconds, corpus_started, corpus_ended, corpus_log_sha, corpus_tests_run, corpus_tests_failed,
+ redteam_result, redteam_seconds, redteam_started, redteam_ended, redteam_log_sha,
+ redteam_tests_discovered, redteam_tests_run, redteam_tests_skipped, redteam_tests_failed, redteam_unexpected_skipped, min_redteam_tests, expected_redteam_skips,
+ redteam_race_result, redteam_race_seconds, redteam_race_started, redteam_race_ended, redteam_race_log_sha,
  fuzz_results_path, assayer_result, assayer_summary) = sys.argv[1:]
 
 fuzz = []
@@ -351,6 +417,11 @@ data = {
     "source_commit": commit,
     "go_version": go_version,
     "go_sum_sha256": go_sum_sha256,
+    "environment_capabilities": {
+        "goos": __import__("platform").system().lower(),
+        "machine": __import__("platform").machine(),
+        "python": __import__("sys").version.split()[0],
+    },
     "suites": {
         "unit": {"command": "go test -count=1 ./...", "result": unit_result, "duration_seconds": int(unit_seconds), "started_at": unit_started, "ended_at": unit_ended, "log_sha256": unit_log_sha},
         "race": {"command": "go test -race -count=1 ./...", "result": race_result, "duration_seconds": int(race_seconds), "started_at": race_started, "ended_at": race_ended, "log_sha256": race_log_sha},
@@ -365,12 +436,36 @@ data = {
             "tests_run": int(corpus_tests_run),
             "tests_failed": int(corpus_tests_failed),
         },
+        "redteam": {
+            "command": "go test -v -tags redteam -count=1 ./...",
+            "result": redteam_result,
+            "source_commit": commit,
+            "duration_seconds": int(redteam_seconds),
+            "started_at": redteam_started,
+            "ended_at": redteam_ended,
+            "log_sha256": redteam_log_sha,
+            "tests_discovered": int(redteam_tests_discovered),
+            "tests_run": int(redteam_tests_run),
+            "tests_skipped": int(redteam_tests_skipped),
+            "tests_failed": int(redteam_tests_failed),
+            "unexpected_skipped": int(redteam_unexpected_skipped),
+            "minimum_required_tests": int(min_redteam_tests),
+            "expected_skipped": int(expected_redteam_skips),
+        },
+        "redteam_race": {
+            "command": "go test -v -race -tags redteam -count=1 ./...",
+            "result": redteam_race_result,
+            "duration_seconds": int(redteam_race_seconds),
+            "started_at": redteam_race_started,
+            "ended_at": redteam_race_ended,
+            "log_sha256": redteam_race_log_sha,
+        },
         "fuzz": fuzz,
         "assayer_matrix": {"result": assayer_result, "summary": assayer_summary.strip()},
     },
 }
 overall = "PASS"
-for suite in ("unit", "race", "integration", "black_box_corpus"):
+for suite in ("unit", "race", "integration", "black_box_corpus", "redteam", "redteam_race"):
     if data["suites"][suite]["result"] != "PASS":
         overall = "FAIL"
 for f in fuzz:
@@ -381,7 +476,7 @@ if assayer_result != "PASS":
 data["overall_result"] = overall
 pathlib.Path(summary_path).write_text(json.dumps(data, indent=2, sort_keys=True) + "\n")
 PYTESTSUMMARY
-rm -f "$FUZZ_RESULTS_JSON" "$UNIT_LOG" "$RACE_LOG" "$INTEGRATION_LOG" "$CORPUS_LOG" "$ASSAYER_LOG" "$OUT_DIR"/test-fuzz-*.log
+rm -f "$FUZZ_RESULTS_JSON" "$UNIT_LOG" "$RACE_LOG" "$INTEGRATION_LOG" "$CORPUS_LOG" "$REDTEAM_LOG" "$REDTEAM_RACE_LOG" "$ASSAYER_LOG" "$OUT_DIR"/test-fuzz-*.log
 
 # ---------------------------------------------------------------------------
 # Acceptance smoke test: extract the exact distributable archive for THIS
@@ -496,12 +591,12 @@ fi
 # ---------------------------------------------------------------------------
 MANIFEST="$OUT_DIR/build-manifest.json"
 python3 - "$MANIFEST" "$VERSION" "$COMMIT" "$BUILD_TS" "$GO_VERSION" "$LDFLAGS" "$CLAIMS_HASH" "$ADAPTER_PROTOCOL_VERSION" "$ARTIFACTS_JSON" \
-  "$HOST_ARCHIVE_NAME" "$HOST_BIN_SHA" "$TEST_RUN_ID" "$ACCEPTANCE_RUN_ID" "$ACCEPTANCE_RESULT" <<'PYMANIFEST'
+  "$HOST_ARCHIVE_NAME" "$HOST_BIN_SHA" "$TEST_RUN_ID" "$TEST_SUMMARY" "$ACCEPTANCE_RUN_ID" "$ACCEPTANCE_RESULT" <<'PYMANIFEST'
 import json, pathlib, sys
 
 (manifest, version, commit, build_ts, go_version, build_flags, claims_hash,
  adapter_protocol_version, artifacts_path,
- host_archive_name, host_bin_sha, test_run_id, acceptance_run_id, acceptance_result) = sys.argv[1:]
+ host_archive_name, host_bin_sha, test_run_id, test_summary_path, acceptance_run_id, acceptance_result) = sys.argv[1:]
 
 artifacts = []
 for line in pathlib.Path(artifacts_path).read_text().splitlines():
@@ -526,6 +621,7 @@ data = {
     "build_info": {"vcs_revision": commit},
     "test_run_id": test_run_id,
     "test_result": "PASS",
+    "test_summary_path": pathlib.Path(test_summary_path).name,
     "acceptance_run_id": acceptance_run_id,
     "acceptance_result": acceptance_result,
 }

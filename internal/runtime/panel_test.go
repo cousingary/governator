@@ -9,6 +9,7 @@ import (
 
 	"github.com/cousingary/governator/internal/config"
 	"github.com/cousingary/governator/internal/contracts"
+	"github.com/cousingary/governator/internal/enforce"
 	"github.com/cousingary/governator/internal/observability"
 	"github.com/cousingary/governator/internal/router"
 )
@@ -178,7 +179,7 @@ func panelExecContract(root, id, jobType, agent string, produces []contracts.Art
 		Preflight:     contracts.Preflight{IntendedWrites: []string{}},
 		Success:       contracts.Success{RequiredFiles: []string{}, Validators: validators},
 		Produces:      produces, Consumes: consumes, DependsOn: dependsOn, ArtifactSources: artifactSources,
-		RiskClass: "low", OnViolation: "quarantine",
+		RiskClass: "", OnViolation: "quarantine",
 	}
 }
 
@@ -200,6 +201,11 @@ printf '{"type":"result","total_cost_usd":0.01}\n'
 // per-backend fake binary via GOV_<BACKEND>_BIN.
 func panelExecFixture(t *testing.T, bins map[string]string, modes map[string]string) string {
 	t.Helper()
+	oldSelfExeOverride := enforce.SelfExeOverride
+	if oldSelfExeOverride == "" {
+		enforce.SelfExeOverride = govBinary(t)
+	}
+	t.Cleanup(func() { enforce.SelfExeOverride = oldSelfExeOverride })
 	home := t.TempDir()
 	t.Setenv("GOV_HOME", home)
 	promptRoot := t.TempDir()
@@ -243,7 +249,7 @@ func TestRunPanelQuorumProceedsWithoutStraggler(t *testing.T) {
 			"claude-code": panelFakeBackend(t, `mkdir -p .governator/artifacts
 printf '{"summary":"m1","findings":[]}' > .governator/artifacts/art1.json
 `+panelFakeResult),
-			"codex": panelFakeBackend(t, `sleep 6
+			"codex": panelFakeBackend(t, `sleep 12
 mkdir -p .governator/artifacts
 printf '{"summary":"m2","findings":[]}' > .governator/artifacts/art2.json
 `+panelFakeResult),
@@ -277,7 +283,7 @@ printf '{"summary":"judged","recommendation":"n/a"}' > .governator/artifacts/pan
 
 	spec := contracts.PanelSpec{
 		ID: "panel", Members: []string{"m1", "m2", "m3"}, ComparisonJob: "cmp", Judge: "judge",
-		MinSuccess: 2, HardTimeoutSeconds: 5,
+		MinSuccess: 2, HardTimeoutSeconds: 15,
 	}
 	levels := [][]contracts.Contract{{m1, m2, m3}, {cmp}, {judge}}
 

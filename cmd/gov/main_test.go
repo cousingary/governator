@@ -8,11 +8,15 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	goruntime "runtime"
 	"strings"
+	"sync"
 	"testing"
 
+	"github.com/cousingary/governator/internal/enforce"
 	"github.com/cousingary/governator/internal/observability"
 	govruntime "github.com/cousingary/governator/internal/runtime"
+	"github.com/cousingary/governator/internal/toolregistry"
 )
 
 func batchGit(t *testing.T, dir string, args ...string) {
@@ -111,8 +115,45 @@ func captureHookWith(t *testing.T, script, payload string) string {
 	return string(data)
 }
 
+var (
+	cmdGovBinaryOnce sync.Once
+	cmdGovBinaryPath string
+	cmdGovBinaryErr  error
+)
+
+func cmdGovBinary(t *testing.T) string {
+	t.Helper()
+	cmdGovBinaryOnce.Do(func() {
+		_, thisFile, _, _ := goruntime.Caller(0)
+		repoRoot := filepath.Join(filepath.Dir(thisFile), "..", "..")
+		dir, err := os.MkdirTemp("", "gov-cmd-test-bin")
+		if err != nil {
+			cmdGovBinaryErr = err
+			return
+		}
+		out := filepath.Join(dir, "gov")
+		cmd := exec.Command("go", "build", "-o", out, "./cmd/gov")
+		cmd.Dir = repoRoot
+		if combined, err := cmd.CombinedOutput(); err != nil {
+			cmdGovBinaryErr = err
+			cmdGovBinaryPath = string(combined)
+			return
+		}
+		cmdGovBinaryPath = out
+	})
+	if cmdGovBinaryErr != nil {
+		t.Fatalf("build gov binary: %v: %s", cmdGovBinaryErr, cmdGovBinaryPath)
+	}
+	return cmdGovBinaryPath
+}
+
 func captureRunInput(t *testing.T, args []string, input string) (int, string) {
 	t.Helper()
+	oldSelfExeOverride := enforce.SelfExeOverride
+	if oldSelfExeOverride == "" {
+		enforce.SelfExeOverride = cmdGovBinary(t)
+	}
+	defer func() { enforce.SelfExeOverride = oldSelfExeOverride }()
 	oldIn, oldOut := os.Stdin, os.Stdout
 	inR, inW, _ := os.Pipe()
 	outR, outW, _ := os.Pipe()
@@ -271,6 +312,14 @@ func TestGateCheckDialectRoundTrip(t *testing.T) {
 func TestShadowParityMatchMismatchUnavailable(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("GOV_HOME", home)
+	t.Setenv("GOV_TOOLREGISTRY_FILE", filepath.Join(t.TempDir(), "tools.yaml"))
+	python, err := exec.LookPath("python3")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := toolregistry.Enroll("python3", python); err != nil {
+		t.Fatal(err)
+	}
 	dir := t.TempDir()
 	write := func(name, body string) string {
 		path := filepath.Join(dir, name)
@@ -280,7 +329,9 @@ func TestShadowParityMatchMismatchUnavailable(t *testing.T) {
 		return path
 	}
 	allow := write("allow.py", "import sys\nsys.stdin.read()\n")
-	deny := write("deny.py", "import sys\nsys.stdin.read()\nsys.stdout.write('DENY')\n")
+	deny := write("deny.py", "import sys\nsys.stdin.read()\n"+
+		`sys.stdout.write('{"hookSpecificOutput": {"hookEventName": "PreToolUse", `+
+		`"permissionDecision": "deny", "permissionDecisionReason": "HARNESS AUTHORITY - nope"}}')`+"\n")
 	crash := write("crash.py", "raise SystemExit(1)\n")
 	// A legacy gate that denies with DIFFERENT reason wording than the Go gate.
 	// Parity compares the decision, not the prose — both deny ⇒ match (the raw
@@ -293,22 +344,22 @@ func TestShadowParityMatchMismatchUnavailable(t *testing.T) {
 	if got := captureHook(t, allow); got != "" {
 		t.Fatalf("allow output=%q", got)
 	}
-	if got := captureHook(t, deny); got != "DENY" {
-		t.Fatalf("deny output=%q", got)
+	if got := captureHook(t, deny); !strings.Contains(got, "shadow parity denied") {
+		t.Fatalf("shadow deny must not be ignored, got %q", got)
 	}
 	if got := captureHook(t, crash); got != "" {
 		t.Fatalf("fallback output=%q", got)
 	}
 	denyPayload := `{"tool_name":"Bash","tool_input":{"command":"rm -rf /tmp/example"},"cwd":"/tmp"}`
-	if got := captureHookWith(t, wordedDeny, denyPayload); !strings.Contains(got, "HARNESS AUTHORITY") {
-		t.Fatalf("legacy deny must stay authoritative, got %q", got)
+	if got := captureHookWith(t, wordedDeny, denyPayload); !strings.Contains(got, "GOVERNATOR GATE") || strings.Contains(got, "HARNESS AUTHORITY") {
+		t.Fatalf("Go deny must stay authoritative over shadow wording, got %q", got)
 	}
 
 	report, err := observability.ParitySummary(home)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if report.Total != 4 || report.Matches != 2 || report.Mismatches != 1 || report.Unavailable != 1 {
+	if report.Total != 4 || report.Matches != 1 || report.Mismatches != 1 || report.Unavailable != 2 {
 		t.Fatalf("report=%+v", report)
 	}
 }

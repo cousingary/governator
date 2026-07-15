@@ -162,7 +162,7 @@ CREATE TABLE IF NOT EXISTS violations(run_id TEXT, kind TEXT, detail TEXT);
 CREATE TABLE IF NOT EXISTS repair_packets(id INTEGER PRIMARY KEY AUTOINCREMENT, run_id TEXT, taxonomy TEXT, packet_json TEXT, created TEXT);
 CREATE TABLE IF NOT EXISTS eval_runs(id INTEGER PRIMARY KEY AUTOINCREMENT, suite TEXT, case_name TEXT, agent TEXT, mode TEXT, job_type TEXT, passed INTEGER, taxonomy TEXT, cost_usd REAL, created TEXT);
 CREATE TABLE IF NOT EXISTS hook_events(run_id TEXT, tool TEXT, decision TEXT, finding TEXT, detail TEXT, created TEXT);
-CREATE TABLE IF NOT EXISTS parity_events(id INTEGER PRIMARY KEY AUTOINCREMENT, payload_hash TEXT, payload TEXT, go_decision TEXT, py_decision TEXT, matched INTEGER, py_unavailable INTEGER, created TEXT);
+CREATE TABLE IF NOT EXISTS parity_events(id INTEGER PRIMARY KEY AUTOINCREMENT, payload_hash TEXT, payload TEXT, go_decision TEXT, py_decision TEXT, matched INTEGER, py_unavailable INTEGER, shadow_script_path TEXT NOT NULL DEFAULT '', shadow_script_sha256 TEXT NOT NULL DEFAULT '', created TEXT);
 CREATE TABLE IF NOT EXISTS batches(batch_id TEXT PRIMARY KEY, started TEXT, finished TEXT, jobs INTEGER NOT NULL DEFAULT 0, quarantined INTEGER NOT NULL DEFAULT 0, total_cost_usd REAL NOT NULL DEFAULT 0);
 CREATE TABLE IF NOT EXISTS route_decisions(id INTEGER PRIMARY KEY AUTOINCREMENT, run_id TEXT NOT NULL DEFAULT '', job_id TEXT NOT NULL, job_type TEXT NOT NULL, objective TEXT NOT NULL DEFAULT 'balanced', candidate TEXT NOT NULL, valid_rate_score REAL NOT NULL DEFAULT 0, failure_severity_score REAL NOT NULL DEFAULT 0, cost_score REAL NOT NULL DEFAULT 0, breaker_score REAL NOT NULL DEFAULT 0, quota_score REAL NOT NULL DEFAULT 0, repair_affinity_score REAL NOT NULL DEFAULT 0, total REAL NOT NULL DEFAULT 0, excluded INTEGER NOT NULL DEFAULT 0, exclusion_reason TEXT NOT NULL DEFAULT '', selected INTEGER NOT NULL DEFAULT 0, preview INTEGER NOT NULL DEFAULT 0, created TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS breaker_state(backend TEXT PRIMARY KEY, state TEXT NOT NULL DEFAULT 'CLOSED', failure_kind TEXT NOT NULL DEFAULT '', opened_at TEXT NOT NULL DEFAULT '', cooldown_until TEXT NOT NULL DEFAULT '', consecutive_failures INTEGER NOT NULL DEFAULT 0, last_probe_at TEXT NOT NULL DEFAULT '', updated_at TEXT NOT NULL DEFAULT '');
@@ -230,6 +230,12 @@ CREATE TABLE IF NOT EXISTS policy_overrides(id INTEGER PRIMARY KEY AUTOINCREMENT
 	if _, alterErr := db.Exec("ALTER TABLE route_decisions ADD COLUMN assay_quality_score REAL NOT NULL DEFAULT 0"); alterErr != nil && !strings.Contains(strings.ToLower(alterErr.Error()), "duplicate column") {
 		db.Close()
 		return nil, alterErr
+	}
+	for _, column := range []string{"shadow_script_path TEXT NOT NULL DEFAULT ''", "shadow_script_sha256 TEXT NOT NULL DEFAULT ''"} {
+		if _, alterErr := db.Exec("ALTER TABLE parity_events ADD COLUMN " + column); alterErr != nil && !strings.Contains(strings.ToLower(alterErr.Error()), "duplicate column") {
+			db.Close()
+			return nil, alterErr
+		}
 	}
 	// sources/policy_hash (Phase 6) attach provenance to every interactive-hook
 	// gate decision: which policy layer (job contract / project doctrine / org

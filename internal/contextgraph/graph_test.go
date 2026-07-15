@@ -6,7 +6,23 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/cousingary/governator/internal/toolregistry"
 )
+
+func secureGraphTempDir(t *testing.T) string {
+	t.Helper()
+	home, err := os.UserHomeDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir, err := os.MkdirTemp(home, ".gov-contextgraph-test-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	return dir
+}
 
 func graphEnv(t *testing.T, mode, bin string) {
 	t.Helper()
@@ -15,6 +31,7 @@ func graphEnv(t *testing.T, mode, bin string) {
 	t.Setenv("GOV_GRAPH_MODE", mode)
 	t.Setenv("GOV_GRAPH_PROVIDER", "codegraph")
 	t.Setenv("GOV_GRAPH_BIN", bin)
+	t.Setenv("GOV_CONTAINMENT_FORCE_DEGRADED", "1")
 }
 
 // trustCodegraph registers "codegraph" as a trusted controller tool for
@@ -22,15 +39,14 @@ func graphEnv(t *testing.T, mode, bin string) {
 // an explicit trust declaration — see toolregistry). Tests exercising a
 // deliberately untrusted/unregistered provider (report attack 9) must NOT
 // call this.
-func trustCodegraph(t *testing.T) {
+func trustCodegraph(t *testing.T, bin string) {
 	t.Helper()
 	reg := filepath.Join(t.TempDir(), "tools.yaml")
-	if err := os.WriteFile(reg, []byte("tools:\n  - name: codegraph\n    kind: trusted_controller\n"), 0644); err != nil {
+	t.Setenv("GOV_TOOLREGISTRY_FILE", reg)
+	if _, err := toolregistry.Enroll("codegraph", bin); err != nil {
 		t.Fatal(err)
 	}
-	t.Setenv("GOV_TOOLREGISTRY_FILE", reg)
 }
-
 func TestResolveAutoMissing(t *testing.T) {
 	graphEnv(t, "auto", "codegraph-not-present")
 	t.Setenv("PATH", t.TempDir())
@@ -52,7 +68,7 @@ func TestResolveRequiredMissingFails(t *testing.T) {
 }
 
 func TestInspectCodeGraphStatus(t *testing.T) {
-	bin := filepath.Join(t.TempDir(), "codegraph")
+	bin := filepath.Join(secureGraphTempDir(t), "codegraph")
 	script := `#!/bin/sh
 if [ "$1" = version ]; then echo 'codegraph 0.24.0'; exit 0; fi
 if [ "$1" = status ]; then echo '{"version":"0.24.0","initialized":true,"fileCount":51,"nodeCount":689,"edgeCount":1579,"dbSizeBytes":1765376,"languages":["go"]}'; exit 0; fi
@@ -62,7 +78,7 @@ exit 1
 		t.Fatal(err)
 	}
 	graphEnv(t, "required", bin)
-	trustCodegraph(t)
+	trustCodegraph(t, bin)
 	status, err := Resolve()
 	if err != nil {
 		t.Fatal(err)
@@ -81,7 +97,7 @@ exit 1
 }
 
 func TestPrepareBuildsFingerprintAndQueries(t *testing.T) {
-	bin := filepath.Join(t.TempDir(), "codegraph")
+	bin := filepath.Join(secureGraphTempDir(t), "codegraph")
 	script := `#!/bin/sh
 for arg in "$@"; do project="$arg"; done
 case "$1" in
@@ -109,7 +125,7 @@ esac
 		t.Fatal(err)
 	}
 	graphEnv(t, "required", bin)
-	trustCodegraph(t)
+	trustCodegraph(t, bin)
 	project := t.TempDir()
 
 	snapshot, err := Prepare(context.Background(), project)
@@ -140,12 +156,12 @@ esac
 }
 
 func TestPrepareAutoDegradesOnProviderFailure(t *testing.T) {
-	bin := filepath.Join(t.TempDir(), "codegraph")
+	bin := filepath.Join(secureGraphTempDir(t), "codegraph")
 	if err := os.WriteFile(bin, []byte("#!/bin/sh\nif [ \"$1\" = version ]; then echo 'codegraph broken'; exit 0; fi\necho build-failed >&2\nexit 2\n"), 0755); err != nil {
 		t.Fatal(err)
 	}
 	graphEnv(t, "auto", bin)
-	trustCodegraph(t)
+	trustCodegraph(t, bin)
 	snapshot, err := Prepare(context.Background(), t.TempDir())
 	if err != nil {
 		t.Fatal(err)

@@ -13,12 +13,31 @@ import (
 
 	"github.com/cousingary/governator/internal/agents"
 	"github.com/cousingary/governator/internal/contracts"
+	"github.com/cousingary/governator/internal/toolregistry"
 )
 
 // dockerTestImage is a tiny, near-universally-cached image used only to
 // prove the container boundary and resource limits actually apply — it does
 // not need to contain any real agent CLI.
 const dockerTestImage = "busybox:1.36"
+
+func secureRunnerTempDir(t *testing.T) string {
+	t.Helper()
+	home := "/home/lam"
+	if _, err := os.Stat(home); err != nil {
+		var homeErr error
+		home, homeErr = os.UserHomeDir()
+		if homeErr != nil {
+			t.Fatal(homeErr)
+		}
+	}
+	dir, err := os.MkdirTemp(home, ".gov-runner-test-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	return dir
+}
 
 // requireDocker skips the test cleanly whenever Docker (or the test image)
 // isn't available, so CI without Docker installed — or without registry
@@ -815,12 +834,11 @@ func TestResolveDockerHonorsRegistryPin(t *testing.T) {
 	registryFile := filepath.Join(t.TempDir(), "tools.yaml")
 	t.Setenv("GOV_TOOLREGISTRY_FILE", registryFile)
 
-	pinnedDocker := filepath.Join(t.TempDir(), "real-docker")
+	pinnedDocker := filepath.Join(secureRunnerTempDir(t), "real-docker")
 	if err := os.WriteFile(pinnedDocker, []byte("#!/bin/sh\nexit 0\n"), 0755); err != nil {
 		t.Fatal(err)
 	}
-	yaml := "tools:\n  - name: docker\n    kind: trusted_controller\n    path: " + pinnedDocker + "\n"
-	if err := os.WriteFile(registryFile, []byte(yaml), 0644); err != nil {
+	if _, err := toolregistry.Enroll("docker", pinnedDocker); err != nil {
 		t.Fatal(err)
 	}
 

@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/cousingary/governator/internal/controllerenv"
 	"github.com/cousingary/governator/internal/gitplumb"
 	"github.com/cousingary/governator/internal/toolregistry"
 )
@@ -86,6 +87,7 @@ func assayerCommit(repo string) string {
 			ctx, cancel := context.WithTimeout(context.Background(), environmentProbeTimeout)
 			defer cancel()
 			cmd := exec.CommandContext(ctx, gitPath, "-C", repo, "rev-parse", "HEAD")
+			cmd.Env = controllerenv.Base()
 			var out bytes.Buffer
 			cmd.Stdout = &out
 			if err := cmd.Run(); err == nil {
@@ -129,6 +131,7 @@ func pythonVersion(python string) string {
 	ctx, cancel := context.WithTimeout(context.Background(), environmentProbeTimeout)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, python, "--version")
+	cmd.Env = controllerenv.Base()
 	var out bytes.Buffer
 	cmd.Stdout = &out
 	cmd.Stderr = &out

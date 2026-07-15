@@ -119,6 +119,7 @@ type BuildManifest struct {
 	ClaimsHash       string            `json:"claims_hash"`
 	TestRunID        string            `json:"test_run_id"`
 	TestResult       string            `json:"test_result"`
+	TestSummaryPath  string            `json:"test_summary_path"`
 	AcceptanceRunID  string            `json:"acceptance_run_id"`
 	AcceptanceResult string            `json:"acceptance_result"`
 }
@@ -438,9 +439,22 @@ func verifyShipped(repoRoot string, c Claim, opts VerifyOptions) (bool, []string
 		if err := json.Unmarshal(data, &parsed); err != nil {
 			ok = false
 			problems = append(problems, fmt.Sprintf("absent from shipped binary: evidence file %s is not valid JSON: %v", be.EvidenceFile, err))
-		} else if !evidenceRecordsCommit(parsed, be.Commit, be.Platform) {
+		} else {
+			if !evidenceRecordsCommit(parsed, be.Commit, be.Platform) {
+				ok = false
+				problems = append(problems, fmt.Sprintf("absent from shipped binary: evidence file %s does not record commit %s with a binary hash", be.EvidenceFile, be.Commit))
+			}
+			if gateOK, gateProblems := verifyReleaseGateEvidence(repoRoot, parsed, be.Commit); !gateOK {
+				ok = false
+				problems = append(problems, gateProblems...)
+			}
+		}
+	}
+
+	if be.Version != "" {
+		if versionOK, versionProblems := verifyVersionTagProvenance(repoRoot, be.Commit, be.Version); !versionOK {
 			ok = false
-			problems = append(problems, fmt.Sprintf("absent from shipped binary: evidence file %s does not record commit %s with a binary hash", be.EvidenceFile, be.Commit))
+			problems = append(problems, versionProblems...)
 		}
 	}
 
@@ -460,6 +474,231 @@ func verifyShipped(repoRoot string, c Claim, opts VerifyOptions) (bool, []string
 		}
 	}
 	return ok, problems
+}
+
+const minRedteamTestCount = 36
+
+func verifyReleaseGateEvidence(repoRoot string, evidence map[string]any, commit string) (bool, []string) {
+	var problems []string
+	ok := true
+	if strings.TrimSpace(commit) == "" {
+		ok = false
+		problems = append(problems, "absent from shipped binary: release evidence has empty source commit")
+	}
+	if suite, found := findNamedMap(evidence, "redteam"); found {
+		if suiteOK, suiteProblems := verifyRedteamSuite(suite, commit); !suiteOK {
+			ok = false
+			problems = append(problems, suiteProblems...)
+		}
+	}
+	if version, _ := stringAt(evidence, "version"); version != "" {
+		if versionOK, versionProblems := verifyVersionTagProvenance(repoRoot, commit, version); !versionOK {
+			ok = false
+			problems = append(problems, versionProblems...)
+		}
+	}
+	return ok, problems
+}
+
+func verifyTestSummary(repoRoot, summaryPath, commit string) (bool, []string) {
+	full := absOrRepo(repoRoot, summaryPath)
+	data, err := os.ReadFile(full)
+	if err != nil {
+		return false, []string{fmt.Sprintf("absent from shipped binary: test summary %s: %v", summaryPath, err)}
+	}
+	var parsed map[string]any
+	if err := json.Unmarshal(data, &parsed); err != nil {
+		return false, []string{fmt.Sprintf("absent from shipped binary: test summary %s is not valid JSON: %v", summaryPath, err)}
+	}
+	var problems []string
+	ok := true
+	if got, _ := stringAt(parsed, "source_commit"); commit != "" && got != "" && got != commit {
+		ok = false
+		problems = append(problems, fmt.Sprintf("absent from shipped binary: test summary source_commit %s does not match manifest %s", got, commit))
+	}
+	if suite, found := findNamedMap(parsed, "redteam"); found {
+		if suiteOK, suiteProblems := verifyRedteamSuite(suite, commit); !suiteOK {
+			ok = false
+			problems = append(problems, suiteProblems...)
+		}
+	} else {
+		ok = false
+		problems = append(problems, "absent from shipped binary: test summary lacks mandatory redteam suite")
+	}
+	if _, found := findNamedMap(parsed, "environment_capabilities"); !found {
+		ok = false
+		problems = append(problems, "absent from shipped binary: test summary lacks environment_capabilities")
+	}
+	return ok, problems
+}
+
+func verifyRedteamSuite(suite map[string]any, commit string) (bool, []string) {
+	var problems []string
+	ok := true
+	command, _ := stringAt(suite, "command")
+	if !commandIncludesRedteam(command) {
+		ok = false
+		problems = append(problems, fmt.Sprintf("absent from shipped binary: redteam suite command %q excludes -tags redteam", command))
+	}
+	if !strings.Contains(command, "-count=1") && !strings.Contains(command, "-count 1") {
+		ok = false
+		problems = append(problems, fmt.Sprintf("absent from shipped binary: redteam suite command %q is not uncached (-count=1)", command))
+	}
+	result, _ := stringAt(suite, "result")
+	if !passingResult(result) {
+		ok = false
+		problems = append(problems, fmt.Sprintf("absent from shipped binary: redteam suite result %q is not passing", result))
+	}
+	if gotCommit, _ := stringAt(suite, "source_commit"); gotCommit != "" && commit != "" && gotCommit != commit {
+		ok = false
+		problems = append(problems, fmt.Sprintf("absent from shipped binary: redteam suite source_commit %s does not match %s", gotCommit, commit))
+	}
+	if logHash, _ := stringAt(suite, "log_sha256"); logHash != "" && !isSHA256Hex(logHash) {
+		ok = false
+		problems = append(problems, "absent from shipped binary: redteam suite has invalid log_sha256")
+	}
+	discovered, hasDiscovered := intAt(suite, "tests_discovered", "number_discovered", "discovered", "test_count")
+	run, hasRun := intAt(suite, "tests_run", "test_count", "number_run", "run")
+	skipped, hasSkipped := intAt(suite, "tests_skipped", "skipped", "number_skipped")
+	failed, hasFailed := intAt(suite, "tests_failed", "failed", "number_failed")
+	if !hasDiscovered {
+		ok = false
+		problems = append(problems, "absent from shipped binary: redteam suite lacks tests_discovered")
+	} else if discovered < minRedteamTestCount {
+		ok = false
+		problems = append(problems, fmt.Sprintf("absent from shipped binary: redteam suite discovered %d below minimum %d", discovered, minRedteamTestCount))
+	}
+	if !hasRun {
+		ok = false
+		problems = append(problems, "absent from shipped binary: redteam suite lacks tests_run")
+	} else if run < minRedteamTestCount {
+		ok = false
+		problems = append(problems, fmt.Sprintf("absent from shipped binary: redteam suite ran %d below minimum %d", run, minRedteamTestCount))
+	}
+	if !hasSkipped {
+		ok = false
+		problems = append(problems, "absent from shipped binary: redteam suite lacks tests_skipped")
+	}
+	if !hasFailed {
+		ok = false
+		problems = append(problems, "absent from shipped binary: redteam suite lacks tests_failed")
+	} else if failed != 0 {
+		ok = false
+		problems = append(problems, fmt.Sprintf("absent from shipped binary: redteam suite failed count is %d", failed))
+	}
+	unexpected, hasUnexpected := intAt(suite, "unexpected_skipped", "unexpected_skips", "unexpected_skip_count")
+	if !hasUnexpected {
+		ok = false
+		problems = append(problems, "absent from shipped binary: redteam suite lacks unexpected_skipped count")
+	} else if unexpected != 0 {
+		ok = false
+		problems = append(problems, fmt.Sprintf("absent from shipped binary: redteam suite has %d unexpected skip(s)", unexpected))
+	}
+	if hasSkipped && hasRun && skipped > run {
+		ok = false
+		problems = append(problems, "absent from shipped binary: redteam skipped count exceeds run count")
+	}
+	return ok, problems
+}
+
+func verifyVersionTagProvenance(repoRoot, commit, version string) (bool, []string) {
+	v := strings.TrimSpace(version)
+	if v == "" || strings.Contains(v, "candidate") || strings.Contains(v, "rc") || strings.Contains(v, "+") {
+		return true, nil
+	}
+	tag := v
+	if !strings.HasPrefix(tag, "v") {
+		tag = "v" + tag
+	}
+	out, err := gitOutput(repoRoot, "rev-parse", tag+"^{commit}")
+	if err != nil {
+		return true, nil
+	}
+	tagCommit := strings.TrimSpace(string(out))
+	if tagCommit != "" && commit != "" && tagCommit != commit {
+		return false, []string{fmt.Sprintf("absent from shipped binary: binary_build_evidence.version %s names tag %s at %s, but evidence commit is %s", version, tag, tagCommit, commit)}
+	}
+	return true, nil
+}
+
+func commandIncludesRedteam(command string) bool {
+	fields := strings.Fields(command)
+	for i, f := range fields {
+		if strings.HasPrefix(f, "-tags=") || strings.HasPrefix(f, "--tags=") {
+			for _, tag := range strings.Split(strings.TrimPrefix(strings.TrimPrefix(f, "--tags="), "-tags="), ",") {
+				if tag == "redteam" {
+					return true
+				}
+			}
+		}
+		if (f == "-tags" || f == "--tags") && i+1 < len(fields) {
+			for _, tag := range strings.Split(fields[i+1], ",") {
+				if tag == "redteam" {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
+func findNamedMap(v any, name string) (map[string]any, bool) {
+	switch t := v.(type) {
+	case map[string]any:
+		if child, ok := t[name].(map[string]any); ok {
+			return child, true
+		}
+		for _, child := range t {
+			if found, ok := findNamedMap(child, name); ok {
+				return found, true
+			}
+		}
+	case []any:
+		for _, child := range t {
+			if found, ok := findNamedMap(child, name); ok {
+				return found, true
+			}
+		}
+	}
+	return nil, false
+}
+
+func stringAt(m map[string]any, key string) (string, bool) {
+	v, ok := m[key]
+	if !ok {
+		return "", false
+	}
+	s, ok := v.(string)
+	return strings.TrimSpace(s), ok
+}
+
+func intAt(m map[string]any, keys ...string) (int, bool) {
+	for _, key := range keys {
+		v, ok := m[key]
+		if !ok {
+			continue
+		}
+		switch t := v.(type) {
+		case float64:
+			return int(t), true
+		case int:
+			return t, true
+		case json.Number:
+			i, err := t.Int64()
+			return int(i), err == nil
+		case []any:
+			return len(t), true
+		}
+	}
+	return 0, false
+}
+
+func isSHA256Hex(value string) bool {
+	if len(value) != 64 {
+		return false
+	}
+	_, err := hex.DecodeString(value)
+	return err == nil
 }
 
 func verifyReleaseArtifact(repoRoot string, c Claim, opts VerifyOptions) (bool, []string) {
@@ -514,6 +753,13 @@ func verifyArtifactManifest(repoRoot, artifactPath, manifestPath string) (bool, 
 	if !passingResult(manifest.TestResult) || strings.TrimSpace(manifest.TestRunID) == "" {
 		ok = false
 		problems = append(problems, "absent from shipped binary: manifest lacks a passing test_run_id/test_result")
+	}
+	if strings.TrimSpace(manifest.TestSummaryPath) == "" {
+		ok = false
+		problems = append(problems, "absent from shipped binary: manifest lacks required test_summary_path")
+	} else if summaryOK, summaryProblems := verifyTestSummary(repoRoot, manifest.TestSummaryPath, manifest.SourceCommit); !summaryOK {
+		ok = false
+		problems = append(problems, summaryProblems...)
 	}
 	if !passingResult(manifest.AcceptanceResult) || strings.TrimSpace(manifest.AcceptanceRunID) == "" {
 		ok = false
@@ -714,6 +960,27 @@ func containsPlatformHash(v any, platform string) bool {
 		}
 	}
 	return false
+}
+
+func gitOutput(repoRoot string, args ...string) ([]byte, error) {
+	gitPath, gerr := gitplumb.TrustedGitPath()
+	if gerr != nil {
+		return nil, fmt.Errorf("resolve trusted git: %w", gerr)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), probeTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, gitPath, append([]string{"-C", repoRoot}, args...)...)
+	var out, stderr bytes.Buffer
+	cmd.Stdout = &out
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		msg := strings.TrimSpace(stderr.String())
+		if msg != "" {
+			return nil, fmt.Errorf("%s", msg)
+		}
+		return nil, err
+	}
+	return out.Bytes(), nil
 }
 
 func gitCheck(repoRoot string, args ...string) error {

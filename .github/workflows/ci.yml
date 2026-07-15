@@ -51,6 +51,20 @@ jobs:
       - name: Black-box security regression corpus (all 15 Sol3 findings)
         run: go test -run 'Sol3' -v -count=1 ./...
 
+      # Sol redteam v6 S0 (P0-18): internal/redteam/'s 17 build-tagged files
+      # (`//go:build redteam`) were never compiled by any CI or release
+      # command — the "Sol3" step above never triggers the redteam tag, so
+      # every permanent red-team attack was silently excluded from every CI
+      # run. These two steps are the exact commands the v6 report requires.
+      # Skips are not failures; the skip count is the project burn-down
+      # (agents/governator-sol-upgrade6-plan.md). Full record fields land
+      # in S8.
+      - name: Red-team corpus (-tags redteam, -count=1)
+        run: go test -tags redteam -count=1 ./...
+
+      - name: Red-team corpus (-race, -tags redteam, -count=1)
+        run: go test -race -tags redteam -count=1 ./...
+
       - name: gofmt check
         shell: bash
         run: |

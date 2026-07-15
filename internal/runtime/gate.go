@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/cousingary/governator/internal/config"
+	"github.com/cousingary/governator/internal/controllerenv"
 	"github.com/cousingary/governator/internal/policy"
 	"github.com/cousingary/governator/internal/protectedpaths"
 	"github.com/cousingary/governator/internal/snapshots"
@@ -497,7 +498,11 @@ func PreflightSnapshotIfDelete(cmd string) {
 			fmt.Fprintln(os.Stderr, "GOVERNATOR GATE — pre-delete snapshot skipped, python3 not trusted (non-blocking):", perr)
 			return
 		}
-		if err := exec.CommandContext(ctx, pythonIdentity.CanonicalPath, script, "snapshot", "pre-delete").Run(); err != nil {
+		if err := func() error {
+			cmd := exec.CommandContext(ctx, pythonIdentity.CanonicalPath, script, "snapshot", "pre-delete")
+			cmd.Env = controllerenv.Base()
+			return cmd.Run()
+		}(); err != nil {
 			fmt.Fprintln(os.Stderr, "GOVERNATOR GATE — pre-delete snapshot failed (non-blocking):", err)
 		}
 		return

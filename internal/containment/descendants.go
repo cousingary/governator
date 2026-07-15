@@ -31,6 +31,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/cousingary/governator/internal/controllerenv"
 	"github.com/cousingary/governator/internal/toolregistry"
 )
 
@@ -135,9 +136,12 @@ type Scope struct {
 // NewScope selects the strongest descendant-owning primitive available on
 // this host, in the order the plan specifies: systemd --user transient
 // scope, then a directly managed cgroup v2 subtree, then a PID namespace.
-// highRisk contracts refuse outright when none qualifies rather than
+// requireStrong callers refuse outright when none qualifies rather than
 // silently falling back to a bare process group.
-func NewScope(runID string, highRisk bool) (*Scope, error) {
+func NewScope(runID string, requireStrong bool) (*Scope, error) {
+	if os.Getenv("GOV_CONTAINMENT_FORCE_DEGRADED") == "1" {
+		return &Scope{method: scopeDegraded, runID: runID}, nil
+	}
 	if s, err := newSystemdUserScope(runID); err == nil {
 		return s, nil
 	}
@@ -147,8 +151,8 @@ func NewScope(runID string, highRisk bool) (*Scope, error) {
 	if s, err := newPIDNamespaceScope(runID); err == nil {
 		return s, nil
 	}
-	if highRisk {
-		return nil, fmt.Errorf("containment: no descendant-owning primitive available (tried systemd --user scope, direct cgroup v2, PID namespace); refusing high-risk run rather than degrading to a bare process group")
+	if requireStrong {
+		return nil, fmt.Errorf("containment: no descendant-owning primitive available (tried systemd --user scope, direct cgroup v2, PID namespace); refusing authority-bearing run rather than degrading to a bare process group")
 	}
 	return &Scope{method: scopeDegraded, runID: runID}, nil
 }
@@ -163,6 +167,18 @@ func newSystemdUserScope(runID string) (*Scope, error) {
 	}
 	if _, err := os.Stat("/run/systemd/system"); err != nil {
 		return nil, fmt.Errorf("containment: systemd is not PID 1 (no /run/systemd/system): %w", err)
+	}
+	userBus := fmt.Sprintf("/run/user/%d/bus", os.Getuid())
+	if _, err := os.Stat(userBus); err != nil {
+		return nil, fmt.Errorf("containment: systemd user manager is not available (no %s): %w", userBus, err)
+	}
+	probeCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	probeUnit := "governator-probe-" + sanitizeName(runID) + "-" + nonce()
+	probe := exec.CommandContext(probeCtx, identity.CanonicalPath, "--user", "--scope", "--quiet", "--collect", "--wait", "--unit="+probeUnit, "--", "/bin/true")
+	probe.Env = controllerenv.Base()
+	if out, err := probe.CombinedOutput(); err != nil {
+		return nil, fmt.Errorf("containment: systemd user scope probe failed: %w: %s", err, strings.TrimSpace(string(out)))
 	}
 	return &Scope{
 		method:        ScopeSystemdUserScope,
@@ -194,6 +210,10 @@ func newDirectCgroupScope(runID string) (*Scope, error) {
 	dir := filepath.Join(self, "governator-"+sanitizeName(runID)+"-"+nonce()+".scope")
 	if err := os.Mkdir(dir, 0755); err != nil {
 		return nil, fmt.Errorf("containment: direct cgroup unavailable: %w", err)
+	}
+	if err := writeCgroupFile(dir, "cgroup.freeze", "0"); err != nil {
+		_ = os.Remove(dir)
+		return nil, fmt.Errorf("containment: direct cgroup unavailable: cannot control cgroup.freeze: %w", err)
 	}
 	f, err := os.Open(dir)
 	if err != nil {
@@ -258,6 +278,7 @@ func (s *Scope) Command(ctx context.Context, bin string, args []string, dir stri
 			bin,
 		}, args...)
 		cmd = exec.CommandContext(ctx, s.primitivePath, full...)
+		cmd.Env = controllerenv.Base()
 		cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	case ScopeCgroupDirect:
 		cmd = exec.CommandContext(ctx, bin, args...)
@@ -273,6 +294,7 @@ func (s *Scope) Command(ctx context.Context, bin string, args []string, dir stri
 		}
 		full = append(full, args...)
 		cmd = exec.CommandContext(ctx, s.primitivePath, full...)
+		cmd.Env = controllerenv.Base()
 		cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	default: // scopeDegraded
 		cmd = exec.CommandContext(ctx, bin, args...)
@@ -312,11 +334,7 @@ func (s *Scope) resolveCgroupFromPID(pid int) {
 		if time.Now().After(deadline) {
 			s.mu.Lock()
 			if err == nil {
-				// Process is alive but never joined the expected unit --
-				// record whatever cgroup it actually landed in so
-				// Extinguish still has a real target instead of trusting an
-				// empty path.
-				s.cgroupPath = path
+				s.resolveErr = fmt.Errorf("containment: generated systemd unit %q was never confirmed for pid %d; observed cgroup %q is not accepted as a fallback kill target", s.unitName, pid, path)
 			} else {
 				s.resolveErr = err
 			}
@@ -338,7 +356,10 @@ func (s *Scope) resolveNSInitPID(outerPid int) {
 			return
 		}
 		if time.Now().After(deadline) {
-			return // best effort; Extinguish falls back to the outer pid
+			s.mu.Lock()
+			s.resolveErr = fmt.Errorf("containment: pid namespace init for outer pid %d was never identified", outerPid)
+			s.mu.Unlock()
+			return
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
@@ -407,10 +428,20 @@ func (s *Scope) Extinguish(ctx context.Context, deadline time.Duration, workspac
 	case ScopePIDNamespace:
 		s.mu.Lock()
 		target := s.nsInitPid
-		if target == 0 {
-			target = s.pid
-		}
+		pid := s.pid
+		rerr := s.resolveErr
 		s.mu.Unlock()
+		if pid != 0 && target == 0 {
+			if err := waitPIDGone(pid, 0); err == nil {
+				proof.Killed = true
+				proof.Frozen = true
+				break
+			}
+			if rerr != nil {
+				return proof, rerr
+			}
+			return proof, fmt.Errorf("containment: pid namespace init was never identified and outer pid %d is still present or indeterminate", pid)
+		}
 		if target != 0 {
 			_ = syscall.Kill(target, syscall.SIGKILL)
 			proof.Killed = true
@@ -496,7 +527,13 @@ func waitPIDGone(pid int, deadline time.Duration) error {
 	end := time.Now().Add(deadline)
 	for {
 		if err := syscall.Kill(pid, 0); err != nil {
-			return nil // ESRCH: gone
+			if errors.Is(err, syscall.ESRCH) {
+				return nil
+			}
+			if errors.Is(err, syscall.EPERM) {
+				return fmt.Errorf("pid %d still exists but is not signalable (EPERM)", pid)
+			}
+			return fmt.Errorf("pid %d existence check indeterminate: %w", pid, err)
 		}
 		if time.Now().After(end) {
 			return fmt.Errorf("pid %d still alive", pid)

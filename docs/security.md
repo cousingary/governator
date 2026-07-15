@@ -220,3 +220,25 @@ The audit's 15-item black-box reproduction corpus, closed end to end (see `agent
 ## Sol v3's non-goals — confirmed not violated
 
 Per the same non-goals discipline the v2 register above checks: none of the v3 fixes disabled replay, containment tiering, or the ASK lifecycle; none weakened a probe/schema/check to make a backend or fixture pass (S4's real attestation and S12's transcript conformance both explicitly leave real non-Claude/GLM backends with narrower, honestly-labeled — not fabricated — coverage where a real transcript sample wasn't available to verify against); the containment-tiering default (S6) and the transcript-conformance blocking default (S12) were both implemented enforcing-by-default with the non-default alternative behind an explicit, disclosed operator opt-out — never silently relaxed to make an existing workflow keep passing.
+
+
+---
+
+# Sol redteam v6 S9 Assayer lifecycle register (2026-07-15)
+
+S9 closes the Assayer-owned lifecycle findings from `agents/governator-sol-upgrade6-plan.md` at the code/test level, but the release is not re-cut from this workspace until the whole v6 redteam corpus is green. Verification collected in this session:
+
+- Assayer: `python3 -m pytest -q` -> `191 passed in 6.38s`.
+- Governator S9 corpus pointer/process tests: `go test -tags redteam -run "V6Case3[123]" -count=1 ./internal/redteam` -> pass.
+- Full `go build ./...` and `go vet ./...` passed.
+- Full `go test -count=1 ./...` and `./scripts/redteam.sh` did not complete cleanly under the 120s harness; a bounded full-redteam attempt surfaced non-S9 failures in older corpus cases before timing out. No v6 S9 release install was performed.
+
+| Finding | Fix state | Regression test(s) |
+|---|---|---|
+| P1-3: pytest could print a passing summary but hang under Python 3.13 due fork/thread crash-recovery tests | Crash-recovery multiprocessing now uses `multiprocessing.get_context("spawn")`; release evidence must still record process exit code. | Assayer `tests/test_outbox.py`: `Sol3OutboxCrashRecoveryTests.test_sol3_kill_mid_replay_recovers_via_lease_expiry`; Governator `internal/redteam/v6_s9_assayer_lifecycle_test.go`: `TestV6Case33AssayerPytestExitsCleanlyOnSupportedPythonVersions` |
+| P1-4: outbox leases renewed once before slow target calls, allowing duplicate execution after lease expiry | `Outbox.replay` starts a per-entry heartbeat that renews the lease while the downstream call is in flight; completion still requires current lease ownership. | Assayer `tests/test_outbox.py`: `Sol6OutboxLeaseHeartbeatTests.test_attack31_lease_renewed_through_slow_downstream_call_prevents_duplicate_execution`; Governator: `TestV6Case31AssayerLeaseRenewedThroughSlowDownstreamCallPreventsDuplicate` |
+| P1-5: unknown outbox table hints routed as traces | Strict allowlist (`assayer_quarantine`, `assayer_traces`); unknown hints become dead letters with `UNKNOWN_OUTBOX_OPERATION`. | Assayer `tests/test_outbox.py`: `Sol6OutboxUnknownOperationTests.test_attack32_unknown_table_hint_is_dead_lettered_not_reinterpreted_as_trace`; Governator: `TestV6Case32UnknownOutboxOperationIsDeadLettered` |
+| P1-6: dedup store failures fail open | `checks.dedup(..., failure_policy=...)` supports `fail`, `advisory`, and `skip`; blocking profiles can fail closed. | Assayer `tests/test_checks.py`: `test_blocking_profile_can_fail_closed_when_store_raises`, `test_skip_policy_is_explicit` |
+| P1-7: retention deletion selection/deletion race | `Store.delete_expired_quarantine(statuses, cutoff_iso)` constrains the delete by status and age; purge uses it when available and audits returned ids. | Assayer `tests/test_evidence.py`: purge tests with `FakeStore.delete_expired_quarantine` |
+| P1-8: evidence encryption lacks key identity/rotation | Encrypted payloads now store `key_id`, `algorithm`, `format_version`, `nonce`, ciphertext, and auth metadata; decryption rejects unavailable key ids; classified/sensitive evidence requires encryption via `store_representation_for_classification`. | Assayer `tests/test_evidence.py`: `test_round_trips_with_key_id_and_previous_key_map`, `test_decrypt_rejects_unavailable_key_id`, `test_classified_evidence_requires_encryption` |
+

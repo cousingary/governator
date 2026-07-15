@@ -23,6 +23,7 @@ import (
 	"github.com/cousingary/governator/internal/agents"
 	"github.com/cousingary/governator/internal/containment"
 	"github.com/cousingary/governator/internal/contracts"
+	"github.com/cousingary/governator/internal/controllerenv"
 	"github.com/cousingary/governator/internal/enforce"
 	"github.com/cousingary/governator/internal/gitplumb"
 	"github.com/cousingary/governator/internal/toolregistry"
@@ -141,9 +142,9 @@ func shell(ctx context.Context, dir, command string) (int, string, error) {
 	if berr != nil {
 		return -1, "", fmt.Errorf("resolve trusted bash: %w", berr)
 	}
-	cmd := exec.CommandContext(ctx, bashIdentity.CanonicalPath, "-lc", command)
+	cmd := exec.CommandContext(ctx, bashIdentity.CanonicalPath, "--noprofile", "--norc", "-c", command)
 	cmd.Dir = dir
-	cmd.Env = append(os.Environ(), "PATH="+filepath.Dir(gitPath)+string(os.PathListSeparator)+os.Getenv("PATH"))
+	cmd.Env = controllerenv.With(map[string]string{"PATH": filepath.Dir(gitPath) + string(os.PathListSeparator) + os.Getenv("PATH")})
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	out, err := cmd.CombinedOutput()
 	if ctx.Err() != nil && cmd.Process != nil {
@@ -272,6 +273,14 @@ func (r *LocalWorktreeRunner) executor() agents.Executor {
 		}
 		if launchErr != nil {
 			return 0, false, launchErr
+		}
+		var allowedEnv []string
+		if handle != nil {
+			allowedEnv = handle.AllowedEnv
+		}
+		cmd.Env = agents.BuildAllowedEnv(allowedEnv)
+		if len(cmd.Env) == 0 {
+			cmd.Env = controllerenv.Base()
 		}
 		capped := &cappedWriter{w: out, remaining: r.Config.EffectiveOutputCapBytes()}
 		cmd.Stdout, cmd.Stderr = capped, capped

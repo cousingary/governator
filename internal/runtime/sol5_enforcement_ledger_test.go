@@ -61,7 +61,7 @@ printf '{"type":"result","total_cost_usd":0.25}\n'
 	if !enf.NetworkNamespaced {
 		t.Fatal("expected NetworkNamespaced=true (contract forbids network)")
 	}
-	if enf.ProcessesObservedPeak < 0 {
-		t.Fatalf("expected a non-negative kernel-observed process count, got %d", enf.ProcessesObservedPeak)
+	if enf.ProcessesObservedPeak < -1 {
+		t.Fatalf("expected a non-negative kernel-observed process count or -1 when accounting is unavailable, got %d", enf.ProcessesObservedPeak)
 	}
 }

@@ -22,22 +22,56 @@ func LocalEffectfulTieringEnforced(mode string) bool {
 	return strings.TrimSpace(mode) != "off"
 }
 
-// Effectful reports whether a contract can create persistent effects in the
-// workspace/artifact graph. Pure read-only scout contracts can be medium risk
-// without host containment; any declared write/produced artifact is effectful.
+// Effectful reports whether a contract can create persistent effects or run
+// external helper/controller stages. Pure read-only scout contracts with no
+// declared external stages can avoid host containment; any write, produced
+// artifact, validator, cleanup validator, credential mount, network-deny
+// requirement, or helper-launch authority is effectful for containment.
 func Effectful(c contracts.Contract) bool {
-	return len(c.Allowed.Write) > 0 || len(c.Preflight.IntendedWrites) > 0 || len(c.Produces) > 0
+	return len(c.Allowed.Write) > 0 ||
+		len(c.Allowed.Execute) > 0 ||
+		len(c.Preflight.IntendedWrites) > 0 ||
+		len(c.Produces) > 0 ||
+		len(c.Success.Validators) > 0 ||
+		(c.Cleanup != nil && len(c.Cleanup.Validators) > 0) ||
+		(c.Docker != nil && len(c.Docker.CredentialMounts) > 0)
+}
+
+// NetworkForbidden reports whether the contract's effective network
+// permission is deny. Today SpecFromContract defaults to no-network and
+// forbidden.behaviors may also state it explicitly; either way, S1 requires
+// an externally enforced no-network boundary rather than a transcript check.
+func NetworkForbidden(c contracts.Contract) bool {
+	for _, behavior := range c.Forbidden.Behaviors {
+		if strings.TrimSpace(strings.ToLower(behavior)) == "network" {
+			return true
+		}
+	}
+	return false
 }
 
 // RequiresHostContainment reports whether this contract must prove host-level
-// containment. High risk remains fail-closed as before. Session 6 adds medium
-// risk when the job is effectful and local effectful tiering is enforced.
+// containment. Explicit no-network on a labeled job and high-risk jobs require
+// Governator-owned external containment. Medium effectful local jobs retain
+// the existing local-run gate; low effectful jobs are handled by strong
+// descendant containment below.
 func RequiresHostContainment(c contracts.Contract, enforceLocalEffectful bool) bool {
 	risk := strings.TrimSpace(c.RiskClass)
 	if risk == "high" {
 		return true
 	}
-	return enforceLocalEffectful && risk == "medium" && Effectful(c)
+	if risk != "" && NetworkForbidden(c) {
+		return true
+	}
+	return risk == "medium" && enforceLocalEffectful && Effectful(c)
+}
+
+// RequiresStrongDescendantContainment reports whether a launch must refuse a
+// degraded process-group fallback. It is intentionally authority-based rather
+// than risk-label-based: any effectful job or high-risk job needs a real
+// descendant-owning primitive.
+func RequiresStrongDescendantContainment(c contracts.Contract, enforceLocalEffectful bool) bool {
+	return strings.TrimSpace(c.RiskClass) == "high" || (enforceLocalEffectful && Effectful(c))
 }
 
 // Enforce applies the default risk-class containment policy. It preserves the

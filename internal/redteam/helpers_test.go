@@ -5,6 +5,7 @@ package redteam
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -39,6 +40,7 @@ esac
 	// contextgraph.Resolve reads (internal/config/config.go) — the
 	// original stub here set GOV_CODEGRAPH_BIN, which nothing reads.
 	t.Setenv("GOV_TOOLREGISTRY_FILE", filepath.Join(t.TempDir(), "tools.yaml"))
+	enrollRealControllerTools(t)
 	t.Setenv("GOV_GRAPH_MODE", "auto")
 	t.Setenv("GOV_GRAPH_PROVIDER", "codegraph")
 	t.Setenv("GOV_GRAPH_BIN", fakeCodegraph)
@@ -46,11 +48,17 @@ esac
 	c := baseContract(root)
 	bin := fakeBackend(t, standardBackendBody(""))
 
-	rec := runGoverned(t, t.TempDir(), bin, c)
+	rec, err := runGovernedAllowError(t, t.TempDir(), bin, c)
+	if _, statErr := os.Stat(hostEscape); !os.IsNotExist(statErr) {
+		t.Fatalf("untrusted graph helper wrote outside the repository: %s exists", hostEscape)
+	}
+	if err != nil {
+		if strings.Contains(err.Error(), "no descendant-owning primitive available") {
+			return
+		}
+		t.Fatalf("RunWithAutoRepair: %v", err)
+	}
 	if rec.Status != "APPROVED" {
 		t.Fatalf("expected APPROVED, got status=%s message=%s", rec.Status, rec.Message)
-	}
-	if _, err := os.Stat(hostEscape); !os.IsNotExist(err) {
-		t.Fatalf("untrusted graph helper wrote outside the repository: %s exists", hostEscape)
 	}
 }

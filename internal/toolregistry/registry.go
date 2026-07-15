@@ -1,44 +1,25 @@
 // Package toolregistry is Governator's trusted-tool registry (Sol redteam
-// v4 S4, P0-5). Report finding: internal/contextgraph/graph.go ran a
-// PATH-resolved codegraph helper directly on the host, before the backend
-// and before baseline measurement -- bypassing every containment/policy
-// mechanism the contract selected. The same concern applies to any
-// controller-invoked external process (git, docker, bash, formatters,
-// linters, validators): a bare PATH lookup trusts whatever ambient PATH
-// currently resolves to, with no verification and no memory across calls.
-//
-// The registry inverts that default: an external tool must have an
-// explicit trust declaration -- shipped (git) or operator-added
-// (~/.governator/tools.yaml) -- before Governator will execute it at all.
-// Absence from the registry is "outside the trust model," not "trust
-// whatever PATH finds." A declared entry is then verified every time it
-// resolves: canonical (symlink-evaluated) path, content hash, owner,
-// mode, non-writable parent directories, and (when the entry pins one) an
-// exact path or content-hash match -- reject on any mismatch.
+// v4 S4, extended by Sol redteam v6 S2). Controller tools are not trusted
+// by name, PATH position, or first use. They must be administratively
+// enrolled with a complete file identity before any ordinary governed
+// execution may invoke them.
 package toolregistry
 
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"os"
-	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 
 	"gopkg.in/yaml.v3"
 )
 
-// Kind classifies exactly what authority a trusted-tool entry may carry.
-// Report S4: "classify every external process as exactly one of: trusted
-// controller component / sandboxed untrusted helper / governed backend."
-// This registry only governs the first class today (git, and any operator-
-// registered controller helper such as a context-graph provider); a
-// "governed backend" is the coding-agent CLI itself, resolved and verified
-// separately by agents.BackendExecutionHandle (Session 3) since it carries
-// model/provider identity this registry has no concept of.
 type Kind string
 
 const (
@@ -47,26 +28,24 @@ const (
 	KindGovernedBackend   Kind = "governed_backend"
 )
 
-// Entry is one operator- or Governator-declared trust registration.
-// Path/SHA256 are optional stronger pins: when Path is set, Resolve never
-// performs an ambient PATH lookup for this tool again -- every resolution
-// verifies that exact file. When SHA256 is set, a content mismatch fails
-// closed regardless of how the path was found.
 type Entry struct {
 	Name       string   `yaml:"name"`
 	Kind       Kind     `yaml:"kind"`
 	Path       string   `yaml:"path,omitempty"`
 	SHA256     string   `yaml:"sha256,omitempty"`
+	OwnerUID   uint32   `yaml:"owner_uid,omitempty"`
+	OwnerGID   uint32   `yaml:"owner_gid,omitempty"`
+	Mode       string   `yaml:"mode,omitempty"`
+	Device     uint64   `yaml:"device,omitempty"`
+	Inode      uint64   `yaml:"inode,omitempty"`
 	AllowedEnv []string `yaml:"allowed_env,omitempty"`
 }
 
 type fileFormat struct {
-	Tools []Entry `yaml:"tools"`
+	Generation int     `yaml:"generation,omitempty"`
+	Tools      []Entry `yaml:"tools"`
 }
 
-// Identity is everything verified about a resolved, trusted external tool
-// -- the shape callers bind into a run record so an audit can see exactly
-// what ran, not just that "git" or "codegraph" was invoked.
 type Identity struct {
 	Name           string
 	Kind           Kind
@@ -75,24 +54,12 @@ type Identity struct {
 	OwnerUID       uint32
 	OwnerGID       uint32
 	Mode           os.FileMode
+	Device         uint64
+	Inode          uint64
 	ParentWritable bool
 	AllowedEnv     []string
 }
 
-// defaultEntries ships baseline trust for the controller tools Governator
-// cannot function without: git (S4), and -- Session 2 of the post-v4
-// hardening plan (item C) -- unshare/systemd-run (the descendant- and
-// network-containment primitives enforce/containment wrap launches in),
-// bash (the shell every deterministic validator/formatter/linter command a
-// job contract declares actually runs through), docker (the DockerRunner
-// containment boundary), and python3 (the Assayer interpreter). Each of
-// these was previously resolved via a bare ambient PATH lookup at its call
-// site -- the same "PATH-resolved codegraph helper ran before any
-// verification" shape S4 closed for git, just not yet applied beyond it.
-// Everything else -- including any configured context-graph provider -- has
-// no shipped default and requires an explicit operator registration; an
-// unregistered tool must never execute with controller authority (report
-// attack 9).
 var defaultEntries = []Entry{
 	{Name: "git", Kind: KindTrustedController},
 	{Name: "unshare", Kind: KindTrustedController},
@@ -102,19 +69,12 @@ var defaultEntries = []Entry{
 	{Name: "python3", Kind: KindTrustedController},
 }
 
-// Registry is an immutable, loaded view of tools.yaml merged over the
-// shipped defaults. Load a fresh Registry per resolution rather than
-// caching one process-wide: callers (tests, and any future `gov tools`
-// mutation) must see the current file, not a stale snapshot from an
-// earlier point in the process's life.
 type Registry struct {
-	entries map[string]Entry
-	path    string
+	entries    map[string]Entry
+	path       string
+	generation int
 }
 
-// FilePath returns the registry file this process will read/write:
-// $GOV_TOOLREGISTRY_FILE if set (test/override hook, mirrors GOV_CONFIG),
-// else ~/.governator/tools.yaml.
 func FilePath() string {
 	if v := strings.TrimSpace(os.Getenv("GOV_TOOLREGISTRY_FILE")); v != "" {
 		return v
@@ -128,84 +88,155 @@ func FilePath() string {
 	return filepath.Join(home, ".governator", "tools.yaml")
 }
 
-// Load reads the registry file (if present) merged over the shipped
-// defaults. A missing file is not an error -- the defaults alone are a
-// valid registry, exactly the state a fresh install starts from.
 func Load() (*Registry, error) {
 	path := FilePath()
 	entries := make(map[string]Entry, len(defaultEntries))
 	for _, e := range defaultEntries {
 		entries[e.Name] = e
 	}
-	data, err := os.ReadFile(path)
+	parsed, exists, err := readRegistryFile(path)
 	if err != nil {
-		if os.IsNotExist(err) {
-			return &Registry{entries: entries, path: path}, nil
-		}
-		return nil, fmt.Errorf("read tool registry %s: %w", path, err)
+		return nil, err
 	}
-	var parsed fileFormat
-	if err := yaml.Unmarshal(data, &parsed); err != nil {
-		return nil, fmt.Errorf("parse tool registry %s: %w", path, err)
+	if !exists {
+		return &Registry{entries: entries, path: path}, nil
 	}
+	seen := map[string]bool{}
 	for _, e := range parsed.Tools {
-		if strings.TrimSpace(e.Name) == "" {
-			return nil, fmt.Errorf("tool registry %s: entry with empty name", path)
+		if err := validateEntry(path, e); err != nil {
+			return nil, err
 		}
-		if e.Kind == "" {
-			e.Kind = KindTrustedController
+		if seen[e.Name] {
+			return nil, fmt.Errorf("tool registry %s: duplicate tool name %q", path, e.Name)
 		}
+		seen[e.Name] = true
 		entries[e.Name] = e
 	}
-	return &Registry{entries: entries, path: path}, nil
+	return &Registry{entries: entries, path: path, generation: parsed.Generation}, nil
 }
 
-// Entry reports whether name has an explicit trust registration (shipped
-// default or operator-declared).
 func (r *Registry) Entry(name string) (Entry, bool) {
 	e, ok := r.entries[name]
 	return e, ok
 }
 
-// Resolve verifies that name is a registered trusted tool, resolves its
-// executable (the entry's pinned Path, or requestedBin via ambient PATH
-// lookup when Path is empty), and checks baseline hygiene: canonical
-// (symlink-resolved) identity, content hash, owner, mode, and non-writable
-// parent directories. Fails closed on any of: unregistered name, missing
-// binary, untrusted owner, a group/world-writable file or parent
-// directory, or (when the entry pins one) a content-hash mismatch.
-//
-// An entry with no Path set performs a fresh ambient lookup on every call
-// -- by itself this does not defend against a PATH substitution present
-// from the very first resolution (there is no prior trust to compare
-// against). Pinning Path (see Pin) is what closes that gap: once pinned,
-// Resolve never looks at PATH again for this tool.
+func (r *Registry) Generation() int { return r.generation }
+
+func (r *Registry) Entries() []Entry {
+	out := make([]Entry, 0, len(r.entries))
+	for _, e := range r.entries {
+		out = append(out, e)
+	}
+	return out
+}
+
 func (r *Registry) Resolve(name, requestedBin string) (Identity, error) {
 	entry, ok := r.Entry(name)
 	if !ok {
 		return Identity{}, fmt.Errorf("tool %q has no entry in the trusted-tool registry (%s); refusing to execute an unregistered external tool", name, r.path)
 	}
-	bin := entry.Path
-	if bin == "" {
-		bin = requestedBin
+	_ = requestedBin
+	if strings.TrimSpace(entry.Path) == "" {
+		return Identity{}, fmt.Errorf("tool %q has no enrolled path in %s; run `gov tools enroll %s <absolute-path>` before execution", name, r.path, name)
 	}
-	if strings.TrimSpace(bin) == "" {
-		return Identity{}, fmt.Errorf("tool %q: no executable path configured", name)
+	if strings.TrimSpace(entry.SHA256) == "" {
+		return Identity{}, fmt.Errorf("tool %q has no enrolled sha256 in %s", name, r.path)
 	}
-	resolved := bin
-	if !filepath.IsAbs(resolved) {
-		looked, err := exec.LookPath(resolved)
-		if err != nil {
-			return Identity{}, fmt.Errorf("resolve tool %q: %w", name, err)
-		}
-		resolved = looked
+	if !filepath.IsAbs(entry.Path) {
+		return Identity{}, fmt.Errorf("tool %q: enrolled path %q is not absolute", name, entry.Path)
 	}
-	abs, err := filepath.Abs(resolved)
+	identity, err := inspectPath(name, entry.Path)
 	if err != nil {
-		return Identity{}, fmt.Errorf("resolve tool %q: %w", name, err)
+		return Identity{}, err
 	}
-	canonical := abs
-	if eval, everr := filepath.EvalSymlinks(abs); everr == nil {
+	if identity.SHA256 != strings.ToLower(entry.SHA256) {
+		return Identity{}, fmt.Errorf("resolve tool %q: %s content hash %s does not match registry pin %s", name, identity.CanonicalPath, identity.SHA256, entry.SHA256)
+	}
+	if entry.OwnerUID != 0 && identity.OwnerUID != entry.OwnerUID {
+		return Identity{}, fmt.Errorf("resolve tool %q: owner uid changed from %d to %d", name, entry.OwnerUID, identity.OwnerUID)
+	}
+	if entry.OwnerGID != 0 && identity.OwnerGID != entry.OwnerGID {
+		return Identity{}, fmt.Errorf("resolve tool %q: owner gid changed from %d to %d", name, entry.OwnerGID, identity.OwnerGID)
+	}
+	if entry.Mode != "" {
+		wantMode, err := strconv.ParseUint(strings.TrimPrefix(entry.Mode, "0"), 8, 32)
+		if err != nil {
+			return Identity{}, fmt.Errorf("tool %q: invalid enrolled mode %q", name, entry.Mode)
+		}
+		if identity.Mode.Perm() != os.FileMode(wantMode) {
+			return Identity{}, fmt.Errorf("resolve tool %q: mode changed from %s to %04o", name, entry.Mode, identity.Mode.Perm())
+		}
+	}
+	if entry.Device != 0 && identity.Device != entry.Device {
+		return Identity{}, fmt.Errorf("resolve tool %q: device changed from %d to %d", name, entry.Device, identity.Device)
+	}
+	if entry.Inode != 0 && identity.Inode != entry.Inode {
+		return Identity{}, fmt.Errorf("resolve tool %q: inode changed from %d to %d", name, entry.Inode, identity.Inode)
+	}
+	identity.AllowedEnv = entry.AllowedEnv
+	return identity, nil
+}
+
+func ResolveTrusted(name, requestedBin string) (Identity, error) {
+	registry, err := Load()
+	if err != nil {
+		return Identity{}, fmt.Errorf("load trusted-tool registry: %w", err)
+	}
+	return registry.Resolve(name, requestedBin)
+}
+
+func Enroll(name, path string) (Identity, error) {
+	if strings.TrimSpace(name) == "" {
+		return Identity{}, errors.New("tool name is required")
+	}
+	kind := KindTrustedController
+	if r, err := Load(); err == nil {
+		if e, ok := r.Entry(name); ok && e.Kind != "" {
+			kind = e.Kind
+		}
+	}
+	identity, err := inspectPath(name, path)
+	if err != nil {
+		return Identity{}, err
+	}
+	entry := Entry{
+		Name: name, Kind: kind, Path: identity.CanonicalPath, SHA256: identity.SHA256,
+		OwnerUID: identity.OwnerUID, OwnerGID: identity.OwnerGID, Mode: fmt.Sprintf("%04o", identity.Mode.Perm()),
+		Device: identity.Device, Inode: identity.Inode,
+	}
+	if err := updateRegistry(func(ff *fileFormat) error {
+		replaceEntry(ff, entry)
+		return nil
+	}); err != nil {
+		return Identity{}, err
+	}
+	return identity, nil
+}
+
+func Pin(name, path string) error {
+	_, err := Enroll(name, path)
+	return err
+}
+
+func Verify(name string) (Identity, error) {
+	registry, err := Load()
+	if err != nil {
+		return Identity{}, err
+	}
+	return registry.Resolve(name, "")
+}
+
+func Rotate(name, path string) (Identity, error) { return Enroll(name, path) }
+
+func inspectPath(name, path string) (Identity, error) {
+	if strings.TrimSpace(path) == "" {
+		return Identity{}, fmt.Errorf("tool %q: path is required", name)
+	}
+	if !filepath.IsAbs(path) {
+		return Identity{}, fmt.Errorf("tool %q: path %q is not absolute", name, path)
+	}
+	canonical := path
+	if eval, everr := filepath.EvalSymlinks(path); everr == nil {
 		canonical = eval
 	}
 	f, err := os.Open(canonical)
@@ -217,9 +248,14 @@ func (r *Registry) Resolve(name, requestedBin string) (Identity, error) {
 	if err != nil {
 		return Identity{}, fmt.Errorf("resolve tool %q: stat %s: %w", name, canonical, err)
 	}
+	if info.IsDir() || info.Mode()&0o111 == 0 {
+		return Identity{}, fmt.Errorf("resolve tool %q: %s is not executable", name, canonical)
+	}
 	var ownerUID, ownerGID uint32
+	var dev, ino uint64
 	if st, ok := info.Sys().(*syscall.Stat_t); ok {
 		ownerUID, ownerGID = st.Uid, st.Gid
+		dev, ino = uint64(st.Dev), uint64(st.Ino)
 	}
 	euid := os.Geteuid()
 	if int(ownerUID) != euid && ownerUID != 0 {
@@ -229,107 +265,175 @@ func (r *Registry) Resolve(name, requestedBin string) (Identity, error) {
 		return Identity{}, fmt.Errorf("resolve tool %q: %s is group- or world-writable", name, canonical)
 	}
 	if parentWritable(canonical) {
-		return Identity{}, fmt.Errorf("resolve tool %q: %s has a group- or world-writable parent directory owned by an untrusted party", name, canonical)
+		return Identity{}, fmt.Errorf("resolve tool %q: %s has a group- or world-writable executable ancestor", name, canonical)
 	}
 	sum := sha256.New()
 	if _, err := io.Copy(sum, f); err != nil {
 		return Identity{}, fmt.Errorf("resolve tool %q: hash %s: %w", name, canonical, err)
 	}
-	sha := hex.EncodeToString(sum.Sum(nil))
-	if entry.SHA256 != "" && entry.SHA256 != sha {
-		return Identity{}, fmt.Errorf("resolve tool %q: %s content hash %s does not match registry pin %s", name, canonical, sha, entry.SHA256)
-	}
-	return Identity{
-		Name: name, Kind: entry.Kind, CanonicalPath: canonical, SHA256: sha,
-		OwnerUID: ownerUID, OwnerGID: ownerGID, Mode: info.Mode(),
-		ParentWritable: false, AllowedEnv: entry.AllowedEnv,
-	}, nil
+	return Identity{Name: name, Kind: KindTrustedController, CanonicalPath: canonical, SHA256: hex.EncodeToString(sum.Sum(nil)), OwnerUID: ownerUID, OwnerGID: ownerGID, Mode: info.Mode(), Device: dev, Inode: ino}, nil
 }
 
-// ResolveTrusted loads the registry and resolves name/requestedBin in one
-// step -- the common case for a call site that only needs the resolved
-// Identity, not the Registry object itself afterward. Load()+Resolve() are
-// kept as two steps on Registry itself (see gitplumb.TrustedGitPath) for
-// callers that already hold a Registry across several resolutions; this is
-// purely a convenience wrapper for everyone else, with identical fail-closed
-// behavior.
-func ResolveTrusted(name, requestedBin string) (Identity, error) {
-	registry, err := Load()
-	if err != nil {
-		return Identity{}, fmt.Errorf("load trusted-tool registry: %w", err)
+func validateEntry(path string, e Entry) error {
+	if strings.TrimSpace(e.Name) == "" {
+		return fmt.Errorf("tool registry %s: entry with empty name", path)
 	}
-	return registry.Resolve(name, requestedBin)
-}
-
-// Pin persists path as name's registered Path, creating a default
-// trusted-controller entry if none exists yet and preserving every other
-// entry already in the file. This is Governator's own trust-on-first-use
-// step (report attack 10): `gov doctor` calls it right after successfully
-// resolving git, so every later resolution -- in this process and any
-// future one -- verifies that exact file instead of repeating an ambient
-// PATH lookup a subsequently poisoned PATH could redirect.
-func Pin(name, path string) error {
-	target := FilePath()
-	var parsed fileFormat
-	if data, err := os.ReadFile(target); err == nil {
-		if uerr := yaml.Unmarshal(data, &parsed); uerr != nil {
-			return fmt.Errorf("parse tool registry %s: %w", target, uerr)
+	if e.Kind == "" {
+		return fmt.Errorf("tool registry %s: tool %q missing kind", path, e.Name)
+	}
+	if e.Kind != KindTrustedController && e.Kind != KindSandboxedHelper && e.Kind != KindGovernedBackend {
+		return fmt.Errorf("tool registry %s: tool %q has invalid kind %q", path, e.Name, e.Kind)
+	}
+	if e.Path != "" {
+		if !filepath.IsAbs(e.Path) {
+			return fmt.Errorf("tool registry %s: tool %q path must be absolute", path, e.Name)
 		}
-	} else if !os.IsNotExist(err) {
-		return fmt.Errorf("read tool registry %s: %w", target, err)
-	}
-	found := false
-	for i := range parsed.Tools {
-		if parsed.Tools[i].Name == name {
-			parsed.Tools[i].Path = path
-			if parsed.Tools[i].Kind == "" {
-				parsed.Tools[i].Kind = KindTrustedController
-			}
-			found = true
-			break
+		if strings.TrimSpace(e.SHA256) == "" {
+			return fmt.Errorf("tool registry %s: tool %q path is enrolled without mandatory sha256", path, e.Name)
 		}
-	}
-	if !found {
-		kind := KindTrustedController
-		for _, d := range defaultEntries {
-			if d.Name == name {
-				kind = d.Kind
-			}
+		if _, err := hex.DecodeString(e.SHA256); err != nil || len(e.SHA256) != 64 {
+			return fmt.Errorf("tool registry %s: tool %q has invalid sha256", path, e.Name)
 		}
-		parsed.Tools = append(parsed.Tools, Entry{Name: name, Kind: kind, Path: path})
-	}
-	if err := os.MkdirAll(filepath.Dir(target), 0o700); err != nil {
-		return fmt.Errorf("create %s: %w", filepath.Dir(target), err)
-	}
-	out, err := yaml.Marshal(parsed)
-	if err != nil {
-		return fmt.Errorf("marshal tool registry: %w", err)
-	}
-	if err := os.WriteFile(target, out, 0o600); err != nil {
-		return fmt.Errorf("write tool registry %s: %w", target, err)
 	}
 	return nil
 }
 
-// parentWritable reports whether any directory in path's ancestry is
-// writable by a party other than its owner -- group- or world-writable,
-// where the owner is not this process's effective user and not root.
-// Mirrors agents.parentTrustState's semantics (Session 3); duplicated
-// rather than imported to keep this package decoupled from internal/agents.
+func readRegistryFile(path string) (fileFormat, bool, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return fileFormat{}, false, nil
+		}
+		return fileFormat{}, false, fmt.Errorf("read tool registry %s: %w", path, err)
+	}
+	if info, err := os.Stat(path); err == nil {
+		if info.Mode().Perm()&0o022 != 0 {
+			return fileFormat{}, false, fmt.Errorf("tool registry %s is group- or world-writable", path)
+		}
+	}
+	var node yaml.Node
+	if err := yaml.Unmarshal(data, &node); err != nil {
+		return fileFormat{}, false, fmt.Errorf("parse tool registry %s: %w", path, err)
+	}
+	if err := rejectDuplicateYAMLKeys(&node, path); err != nil {
+		return fileFormat{}, false, err
+	}
+	var parsed fileFormat
+	dec := yaml.NewDecoder(strings.NewReader(string(data)))
+	dec.KnownFields(true)
+	if err := dec.Decode(&parsed); err != nil {
+		return fileFormat{}, false, fmt.Errorf("parse tool registry %s: %w", path, err)
+	}
+	return parsed, true, nil
+}
+
+func rejectDuplicateYAMLKeys(n *yaml.Node, path string) error {
+	if n == nil {
+		return nil
+	}
+	if n.Kind == yaml.MappingNode {
+		seen := map[string]bool{}
+		for i := 0; i+1 < len(n.Content); i += 2 {
+			key := n.Content[i].Value
+			if seen[key] {
+				return fmt.Errorf("tool registry %s: duplicate YAML key %q", path, key)
+			}
+			seen[key] = true
+			if err := rejectDuplicateYAMLKeys(n.Content[i+1], path); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	for _, c := range n.Content {
+		if err := rejectDuplicateYAMLKeys(c, path); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func updateRegistry(mut func(*fileFormat) error) error {
+	target := FilePath()
+	if err := os.MkdirAll(filepath.Dir(target), 0o700); err != nil {
+		return fmt.Errorf("create %s: %w", filepath.Dir(target), err)
+	}
+	lockPath := target + ".lock"
+	lock, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return fmt.Errorf("open registry lock %s: %w", lockPath, err)
+	}
+	defer lock.Close()
+	if err := syscall.Flock(int(lock.Fd()), syscall.LOCK_EX); err != nil {
+		return fmt.Errorf("lock tool registry %s: %w", lockPath, err)
+	}
+	defer syscall.Flock(int(lock.Fd()), syscall.LOCK_UN)
+
+	ff, exists, err := readRegistryFile(target)
+	if err != nil {
+		return err
+	}
+	if !exists {
+		ff = fileFormat{Tools: []Entry{}}
+	}
+	if err := mut(&ff); err != nil {
+		return err
+	}
+	ff.Generation++
+	out, err := yaml.Marshal(ff)
+	if err != nil {
+		return fmt.Errorf("marshal tool registry: %w", err)
+	}
+	tmp, err := os.CreateTemp(filepath.Dir(target), ".tools-*.tmp")
+	if err != nil {
+		return fmt.Errorf("create temp registry: %w", err)
+	}
+	tmpName := tmp.Name()
+	defer os.Remove(tmpName)
+	if err := tmp.Chmod(0o600); err != nil {
+		tmp.Close()
+		return fmt.Errorf("chmod temp registry: %w", err)
+	}
+	if _, err := tmp.Write(out); err != nil {
+		tmp.Close()
+		return fmt.Errorf("write temp registry: %w", err)
+	}
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		return fmt.Errorf("fsync temp registry: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		return fmt.Errorf("close temp registry: %w", err)
+	}
+	if err := os.Rename(tmpName, target); err != nil {
+		return fmt.Errorf("rename tool registry %s: %w", target, err)
+	}
+	if dir, err := os.Open(filepath.Dir(target)); err == nil {
+		_ = dir.Sync()
+		_ = dir.Close()
+	}
+	return nil
+}
+
+func replaceEntry(ff *fileFormat, entry Entry) {
+	for i := range ff.Tools {
+		if ff.Tools[i].Name == entry.Name {
+			ff.Tools[i] = entry
+			return
+		}
+	}
+	ff.Tools = append(ff.Tools, entry)
+}
+
 func parentWritable(path string) bool {
-	euid := os.Geteuid()
 	dir := filepath.Dir(path)
 	for {
 		info, err := os.Lstat(dir)
 		if err != nil {
 			return true
 		}
-		if st, ok := info.Sys().(*syscall.Stat_t); ok {
-			untrustedOwner := int(st.Uid) != euid && st.Uid != 0
-			groupOrWorldWritable := info.Mode()&0o022 != 0
-			if groupOrWorldWritable && untrustedOwner {
-				return true
-			}
+		if info.Mode()&0o022 != 0 {
+			return true
 		}
 		parent := filepath.Dir(dir)
 		if parent == dir {

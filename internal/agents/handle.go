@@ -15,6 +15,7 @@ import (
 	"syscall"
 
 	"github.com/cousingary/governator/internal/config"
+	"github.com/cousingary/governator/internal/controllerenv"
 )
 
 // BackendIdentity is the operator-declared model/provider identity behind a
@@ -113,7 +114,8 @@ type BackendExecutionHandle struct {
 	Mode           os.FileMode
 	ParentWritable bool
 
-	file *os.File
+	file      *os.File
+	sealedDir string
 }
 
 // ResolveHandle resolves agent's configured backend binary exactly once into
@@ -217,10 +219,21 @@ func (h *BackendExecutionHandle) ProbeVersion(ctx context.Context) {
 // Close releases the handle's open file descriptor. Safe to call once,
 // after the handle is done being used for launch.
 func (h *BackendExecutionHandle) Close() error {
-	if h == nil || h.file == nil {
+	if h == nil {
 		return nil
 	}
-	return h.file.Close()
+	var err error
+	if h.file != nil {
+		err = h.file.Close()
+		h.file = nil
+	}
+	if h.sealedDir != "" {
+		if rerr := os.RemoveAll(h.sealedDir); err == nil && rerr != nil {
+			err = rerr
+		}
+		h.sealedDir = ""
+	}
+	return err
 }
 
 // Resolution projects the handle down to the legacy Resolution shape, for
@@ -253,6 +266,57 @@ func (h *BackendExecutionHandle) fdLaunchArgs() (path string, extraFiles []*os.F
 		return "", nil, false
 	}
 	return "/proc/self/fd/3", []*os.File{h.file}, true
+}
+
+// sealedExecutablePath copies the already-open, already-hashed backend
+// executable into a private, mode-0500 directory and returns that immutable
+// launch path for wrapper-based execution. Scope wrappers such as unshare or
+// systemd-run cannot reliably receive our backend fd all the way to the final
+// exec, so the S7-safe fallback is an object copied from the verified fd into
+// a directory the backend does not know or control, never the mutable original
+// pathname.
+func (h *BackendExecutionHandle) sealedExecutablePath() (string, error) {
+	if h == nil || h.file == nil {
+		return "", fmt.Errorf("backend identity: no open executable handle available for sealed launch")
+	}
+	if h.sealedDir != "" {
+		return filepath.Join(h.sealedDir, "backend"), nil
+	}
+	dir, err := os.MkdirTemp("", "governator-backend-exec-*")
+	if err != nil {
+		return "", fmt.Errorf("backend identity: create sealed exec dir: %w", err)
+	}
+	outPath := filepath.Join(dir, "backend")
+	out, err := os.OpenFile(outPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0500)
+	if err != nil {
+		_ = os.RemoveAll(dir)
+		return "", fmt.Errorf("backend identity: create sealed exec copy: %w", err)
+	}
+	if _, err := h.file.Seek(0, io.SeekStart); err != nil {
+		_ = out.Close()
+		_ = os.RemoveAll(dir)
+		return "", fmt.Errorf("backend identity: rewind verified executable fd: %w", err)
+	}
+	_, copyErr := io.Copy(out, h.file)
+	closeErr := out.Close()
+	if copyErr != nil {
+		_ = os.RemoveAll(dir)
+		return "", fmt.Errorf("backend identity: copy verified executable: %w", copyErr)
+	}
+	if closeErr != nil {
+		_ = os.RemoveAll(dir)
+		return "", fmt.Errorf("backend identity: close sealed exec copy: %w", closeErr)
+	}
+	if err := os.Chmod(outPath, 0500); err != nil {
+		_ = os.RemoveAll(dir)
+		return "", fmt.Errorf("backend identity: chmod sealed exec copy: %w", err)
+	}
+	if err := os.Chmod(dir, 0500); err != nil {
+		_ = os.RemoveAll(dir)
+		return "", fmt.Errorf("backend identity: chmod sealed exec dir: %w", err)
+	}
+	h.sealedDir = dir
+	return outPath, nil
 }
 
 // VerifyUnchanged re-stats and re-hashes h's canonical path RIGHT NOW and
@@ -305,9 +369,11 @@ func (h *BackendExecutionHandle) probeVersion(ctx context.Context) (string, bool
 	var cmd *exec.Cmd
 	if path, extra, ok := h.fdLaunchArgs(); ok {
 		cmd = exec.CommandContext(probeCtx, path, "--version")
+		cmd.Env = controllerenv.Base()
 		cmd.ExtraFiles = extra
 	} else {
 		cmd = exec.CommandContext(probeCtx, h.CanonicalPath, "--version")
+		cmd.Env = controllerenv.Base()
 	}
 	cmd.Dir = scratch
 	out, err := cmd.CombinedOutput()
@@ -410,11 +476,11 @@ func LaunchCommand(ctx context.Context, handle *BackendExecutionHandle, bin stri
 		return nil, err
 	}
 	if scopeCmd != nil {
-		// A containment.Scope wrapper (systemd-run/unshare): its immediate
-		// child is the wrapper, not the governed backend, so fd-passing
-		// can't reach the real target -- the VerifyUnchanged gate above is
-		// the whole defense on this path.
-		return scopeCmd(ctx, bin, args), nil
+		sealed, err := handle.sealedExecutablePath()
+		if err != nil {
+			return nil, err
+		}
+		return scopeCmd(ctx, sealed, args), nil
 	}
 	if path, extra, ok := handle.fdLaunchArgs(); ok {
 		cmd := exec.CommandContext(ctx, path, args...)

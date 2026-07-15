@@ -29,6 +29,8 @@ import (
 	"path/filepath"
 	"strings"
 	"syscall"
+
+	"github.com/cousingary/governator/internal/controllerenv"
 )
 
 // Session is one isolated Git plumbing workspace: a temporary index file
@@ -99,28 +101,16 @@ func (s *Session) Close() error {
 // GIT_INDEX_FILE. extra is applied on top (e.g. this session's own
 // GIT_INDEX_FILE for index-mutating commands).
 func neutralEnv(extra map[string]string) []string {
-	drop := map[string]bool{
-		"GIT_CONFIG_GLOBAL": true, "GIT_CONFIG_SYSTEM": true, "GIT_CONFIG_NOSYSTEM": true,
-		"GIT_INDEX_FILE": true, "GIT_TERMINAL_PROMPT": true,
+	controlled := map[string]string{
+		"GIT_CONFIG_GLOBAL":   "/dev/null",
+		"GIT_CONFIG_SYSTEM":   "/dev/null",
+		"GIT_CONFIG_NOSYSTEM": "1",
+		"GIT_TERMINAL_PROMPT": "0",
 	}
-	base := os.Environ()
-	env := make([]string, 0, len(base)+len(extra)+4)
-	for _, kv := range base {
-		if i := strings.IndexByte(kv, '='); i >= 0 && drop[kv[:i]] {
-			continue
-		}
-		env = append(env, kv)
-	}
-	env = append(env,
-		"GIT_CONFIG_GLOBAL=/dev/null",
-		"GIT_CONFIG_SYSTEM=/dev/null",
-		"GIT_CONFIG_NOSYSTEM=1",
-		"GIT_TERMINAL_PROMPT=0",
-	)
 	for k, v := range extra {
-		env = append(env, k+"="+v)
+		controlled[k] = v
 	}
-	return env
+	return controllerenv.With(controlled)
 }
 
 // neutralArgs are the global options applied to every plumbing invocation:
@@ -343,6 +333,42 @@ func (s *Session) CommitTree(ctx context.Context, tree, parent, message string) 
 func (s *Session) UpdateRefCAS(ctx context.Context, dir, ref, newVal, oldVal string) error {
 	_, err := s.run(ctx, dir, false, "update-ref", ref, newVal, oldVal)
 	return err
+}
+
+// LooseObjectInGitDir reports whether oid exists as a loose object in this
+// session's intended repository object database, without consulting any
+// inherited GIT_OBJECT_DIRECTORY or alternates environment. This is the
+// post-write check required by Sol v6 S5/P0-7: a successful git command is
+// not enough if the object was redirected outside .git/objects.
+func (s *Session) LooseObjectInGitDir(oid string) (bool, error) {
+	oid = strings.TrimSpace(oid)
+	if len(oid) < 4 || strings.ContainsAny(oid, "/\\") {
+		return false, fmt.Errorf("gitplumb: invalid object id %q", oid)
+	}
+	path := filepath.Join(s.GitDir, "objects", oid[:2], oid[2:])
+	info, err := os.Stat(path)
+	if err == nil {
+		return info.Mode().IsRegular(), nil
+	}
+	if os.IsNotExist(err) {
+		return false, nil
+	}
+	return false, err
+}
+
+// RequireLooseObjectInGitDir fails closed unless oid is present in the
+// repository's own object database. It intentionally does not use git
+// cat-file, because cat-file can succeed via alternates; this check is about
+// proving that newly approved/quarantined objects were not written elsewhere.
+func (s *Session) RequireLooseObjectInGitDir(oid string) error {
+	ok, err := s.LooseObjectInGitDir(oid)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return fmt.Errorf("gitplumb: object %s missing from intended object database %s", oid, filepath.Join(s.GitDir, "objects"))
+	}
+	return nil
 }
 
 // RevParseTree resolves commit's tree object ID (commit^{tree}) — used to

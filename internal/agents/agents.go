@@ -113,16 +113,16 @@ func defaultExecutor(ctx context.Context, bin string, args []string, workdir str
 	if err != nil {
 		return 0, false, err
 	}
+	// Sol P1-14 / v6 S3: filter every launched backend environment down
+	// to the fixed baseline plus the backend's declared extras. Do this even
+	// when handle is nil (tests, doctor-style probes, or legacy callers),
+	// because nil cmd.Env inherits LD_PRELOAD/BASH_ENV and reopens the
+	// controller-injection class.
+	var allowedEnv []string
 	if handle != nil {
-		// Sol P1-14: filter the launched process's environment down to a
-		// fixed baseline plus this backend's own declared extras, applied
-		// unconditionally regardless of whether this is a scoped
-		// (systemd-run/unshare wrapper) or direct launch -- see
-		// baselineAllowedEnvKeys' doc comment for why the wrapper's own
-		// session-bus variables are part of that baseline rather than an
-		// adapter concern.
-		cmd.Env = BuildAllowedEnv(handle.AllowedEnv)
+		allowedEnv = handle.AllowedEnv
 	}
+	cmd.Env = BuildAllowedEnv(allowedEnv)
 	cmd.Stdout, cmd.Stderr = out, out
 	if err := cmd.Start(); err != nil {
 		return 0, false, err

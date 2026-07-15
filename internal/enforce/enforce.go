@@ -18,8 +18,10 @@ package enforce
 import (
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 
 	"github.com/cousingary/governator/internal/toolregistry"
 )
@@ -78,9 +80,61 @@ var SelfExeOverride string
 
 func selfExePath() (string, error) {
 	if SelfExeOverride != "" {
-		return SelfExeOverride, nil
+		return sealedExecutableCopy(SelfExeOverride, "governator-self-exec-*")
+	}
+	if runtime.GOOS == "linux" {
+		return "/proc/self/exe", nil
 	}
 	return os.Executable()
+}
+
+func sealedExecutableCopy(src, pattern string) (string, error) {
+	in, err := os.Open(src)
+	if err != nil {
+		return "", fmt.Errorf("open executable for sealed copy: %w", err)
+	}
+	defer in.Close()
+	if runtime.GOOS == "linux" {
+		var magic [4]byte
+		if _, err := io.ReadFull(in, magic[:]); err != nil {
+			return "", fmt.Errorf("read executable magic for sealed copy: %w", err)
+		}
+		if magic != [4]byte{0x7f, 'E', 'L', 'F'} {
+			return "", fmt.Errorf("sealed gov executable is not an ELF binary")
+		}
+		if _, err := in.Seek(0, io.SeekStart); err != nil {
+			return "", fmt.Errorf("rewind executable for sealed copy: %w", err)
+		}
+	}
+	dir, err := os.MkdirTemp("", pattern)
+	if err != nil {
+		return "", fmt.Errorf("create sealed exec dir: %w", err)
+	}
+	outPath := filepath.Join(dir, "gov")
+	out, err := os.OpenFile(outPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0500)
+	if err != nil {
+		_ = os.RemoveAll(dir)
+		return "", fmt.Errorf("create sealed exec copy: %w", err)
+	}
+	_, copyErr := io.Copy(out, in)
+	closeErr := out.Close()
+	if copyErr != nil {
+		_ = os.RemoveAll(dir)
+		return "", fmt.Errorf("copy sealed exec: %w", copyErr)
+	}
+	if closeErr != nil {
+		_ = os.RemoveAll(dir)
+		return "", fmt.Errorf("close sealed exec: %w", closeErr)
+	}
+	if err := os.Chmod(outPath, 0500); err != nil {
+		_ = os.RemoveAll(dir)
+		return "", fmt.Errorf("chmod sealed exec copy: %w", err)
+	}
+	if err := os.Chmod(dir, 0500); err != nil {
+		_ = os.RemoveAll(dir)
+		return "", fmt.Errorf("chmod sealed exec dir: %w", err)
+	}
+	return outPath, nil
 }
 
 // ForceUnsupported is a test-only seam: Supported() has no meaningful way to

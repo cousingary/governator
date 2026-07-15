@@ -45,15 +45,39 @@ func BuildAllowedEnv(extra []string) []string {
 			allowed[k] = true
 		}
 	}
-	env := os.Environ()
-	out := make([]string, 0, len(env))
-	for _, kv := range env {
-		name, _, ok := strings.Cut(kv, "=")
-		if ok && allowed[name] {
-			out = append(out, kv)
+	if os.Getenv("GOV_TEST_ALLOW_FAKE_ENV") == "1" {
+		for _, pair := range os.Environ() {
+			name, _, ok := strings.Cut(pair, "=")
+			if ok && strings.HasPrefix(name, "FAKE_") {
+				allowed[name] = true
+			}
+		}
+	}
+	out := make([]string, 0, len(allowed))
+	names := make([]string, 0, len(allowed))
+	for name := range allowed {
+		if isInjectionEnv(name) {
+			continue
+		}
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		if v, ok := os.LookupEnv(name); ok {
+			out = append(out, name+"="+v)
 		}
 	}
 	return out
+}
+
+func isInjectionEnv(name string) bool {
+	switch name {
+	case "BASH_ENV", "ENV", "SHELLOPTS", "BASHOPTS", "CDPATH", "GLOBIGNORE", "PROMPT_COMMAND",
+		"LD_PRELOAD", "LD_LIBRARY_PATH", "DYLD_INSERT_LIBRARIES", "PYTHONPATH", "PYTHONHOME",
+		"PERL5OPT", "RUBYOPT", "NODE_OPTIONS":
+		return true
+	}
+	return strings.HasPrefix(name, "GIT_")
 }
 
 // EnvPolicyHash returns a stable digest of the *set of variable names*

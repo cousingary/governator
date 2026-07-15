@@ -2,6 +2,7 @@ package runtime
 
 import (
 	"context"
+	"os"
 	"path/filepath"
 	"testing"
 
@@ -11,6 +12,25 @@ import (
 
 // repairContract returns the shared fixture contract with repair.auto wired
 // in, so each test only has to state what differs.
+
+func repairFakeBackend(t *testing.T, bin string, body string) {
+	t.Helper()
+	script := "#!/bin/sh\nset -eu\nmkdir -p output\n" + body + "\nprintf '{\"status\":\"complete\",\"files_changed\":[\"output/result.txt\"],\"commands_run\":0,\"validation\":{\"self_checked\":true},\"violations\":[],\"blockers\":[],\"next_recommended_action\":\"none\"}\\n' > RESULT.json\nprintf '{\"type\":\"result\",\"total_cost_usd\":0.25}\\n'\n"
+	if err := os.WriteFile(bin, []byte(script), 0755); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func repairAlwaysFailBackend(t *testing.T, bin string) {
+	t.Helper()
+	repairFakeBackend(t, bin, "rm -f output/result.txt\n")
+}
+
+func repairFailOnceBackend(t *testing.T, bin string, marker string) {
+	t.Helper()
+	repairFakeBackend(t, bin, "if [ ! -f \""+marker+"\" ]; then touch \""+marker+"\"; rm -f output/result.txt; else printf 'ok\\n' > output/result.txt; fi\n")
+}
+
 func repairContract(root string, r *contracts.Repair) contracts.Contract {
 	c := contract(root)
 	c.Repair = r
@@ -19,10 +39,10 @@ func repairContract(root string, r *contracts.Repair) contracts.Contract {
 
 func TestAutoRepairOffFiresNoRepair(t *testing.T) {
 	root, bin := fixture(t)
+	repairAlwaysFailBackend(t, bin)
 	home := t.TempDir()
 	t.Setenv("GOV_HOME", home)
 	t.Setenv("GOV_CLAUDE_BIN", bin)
-	t.Setenv("FAKE_ALWAYS_FAIL", "1")
 
 	rec, err := New().RunWithAutoRepair(context.Background(), repairContract(root, nil))
 	if err != nil {
@@ -42,10 +62,10 @@ func TestAutoRepairOffFiresNoRepair(t *testing.T) {
 
 func TestAutoRepairFiresExactlyOnceWithDefaultMaxAttempts(t *testing.T) {
 	root, bin := fixture(t)
+	repairAlwaysFailBackend(t, bin)
 	home := t.TempDir()
 	t.Setenv("GOV_HOME", home)
 	t.Setenv("GOV_CLAUDE_BIN", bin)
-	t.Setenv("FAKE_ALWAYS_FAIL", "1")
 
 	rec, err := New().RunWithAutoRepair(context.Background(), repairContract(root, &contracts.Repair{Auto: true}))
 	if err != nil {
@@ -103,10 +123,10 @@ func TestAutoRepairFiresExactlyOnceWithDefaultMaxAttempts(t *testing.T) {
 
 func TestAutoRepairClampsAtTwoAttemptsRegardlessOfYAML(t *testing.T) {
 	root, bin := fixture(t)
+	repairAlwaysFailBackend(t, bin)
 	home := t.TempDir()
 	t.Setenv("GOV_HOME", home)
 	t.Setenv("GOV_CLAUDE_BIN", bin)
-	t.Setenv("FAKE_ALWAYS_FAIL", "1")
 
 	// max_attempts requests 5; EffectiveMaxAttempts must clamp this to 2.
 	rec, err := New().RunWithAutoRepair(context.Background(), repairContract(root, &contracts.Repair{Auto: true, MaxAttempts: 5}))
@@ -147,9 +167,9 @@ func TestAutoRepairStopsOnceApproved(t *testing.T) {
 	root, bin := fixture(t)
 	home := t.TempDir()
 	marker := filepath.Join(t.TempDir(), "marker")
+	repairFailOnceBackend(t, bin, marker) // fails once, then succeeds
 	t.Setenv("GOV_HOME", home)
 	t.Setenv("GOV_CLAUDE_BIN", bin)
-	t.Setenv("FAKE_MARKER_FILE", marker) // fails once, then succeeds
 
 	rec, err := New().RunWithAutoRepair(context.Background(), repairContract(root, &contracts.Repair{Auto: true, MaxAttempts: 2}))
 	if err != nil {
@@ -183,6 +203,7 @@ func TestAutoRepairStopsOnceApproved(t *testing.T) {
 
 func TestAutoRepairRefusedBySpendCapStopsLoopInsteadOfLooping(t *testing.T) {
 	root, bin := fixture(t)
+	repairAlwaysFailBackend(t, bin)
 	home := t.TempDir()
 	t.Setenv("GOV_HOME", home)
 	t.Setenv("GOV_CLAUDE_BIN", bin)
@@ -199,7 +220,6 @@ func TestAutoRepairRefusedBySpendCapStopsLoopInsteadOfLooping(t *testing.T) {
 	// machine, not just this test's disposable ledger.
 	t.Setenv("GOV_SPEND_DAILY_CAP_USD", "0.25")
 	t.Setenv("GOV_SPEND_HALT_FILE", filepath.Join(t.TempDir(), "HALT"))
-	t.Setenv("FAKE_ALWAYS_FAIL", "1")
 
 	rec, err := New().RunWithAutoRepair(context.Background(), repairContract(root, &contracts.Repair{Auto: true, MaxAttempts: 2}))
 	if err != nil {
@@ -223,10 +243,10 @@ func TestAutoRepairRefusedBySpendCapStopsLoopInsteadOfLooping(t *testing.T) {
 
 func TestHandoffReportsRepairAttempted(t *testing.T) {
 	root, bin := fixture(t)
+	repairAlwaysFailBackend(t, bin)
 	home := t.TempDir()
 	t.Setenv("GOV_HOME", home)
 	t.Setenv("GOV_CLAUDE_BIN", bin)
-	t.Setenv("FAKE_ALWAYS_FAIL", "1")
 
 	if _, err := New().RunWithAutoRepair(context.Background(), repairContract(root, &contracts.Repair{Auto: true})); err != nil {
 		t.Fatal(err)

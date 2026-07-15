@@ -30,6 +30,7 @@ import (
 	"github.com/cousingary/governator/internal/containment"
 	"github.com/cousingary/governator/internal/contextgraph"
 	"github.com/cousingary/governator/internal/contracts"
+	"github.com/cousingary/governator/internal/controllerenv"
 	"github.com/cousingary/governator/internal/enforce"
 	"github.com/cousingary/governator/internal/gitplumb"
 	"github.com/cousingary/governator/internal/lifecycle"
@@ -614,11 +615,32 @@ func shell(ctx context.Context, dir, command string) (int, string, error) {
 	if berr != nil {
 		return -1, "", fmt.Errorf("resolve trusted bash: %w", berr)
 	}
-	cmd := exec.CommandContext(ctx, bashIdentity.CanonicalPath, "-lc", command)
-	cmd.Dir = dir
-	cmd.Env = append(os.Environ(), "PATH="+filepath.Dir(gitPath)+string(os.PathListSeparator)+os.Getenv("PATH"))
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	out, err := cmd.CombinedOutput()
+	cmd := exec.CommandContext(ctx, bashIdentity.CanonicalPath, "--noprofile", "--norc", "-c", command)
+	if scope, ok := containment.ScopeFromContext(ctx); ok {
+		cmd = scope.Command(ctx, bashIdentity.CanonicalPath, []string{"--noprofile", "--norc", "-c", command}, dir)
+	} else {
+		cmd.Dir = dir
+		cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	}
+	cmd.Env = controllerenv.With(map[string]string{"PATH": filepath.Dir(gitPath) + string(os.PathListSeparator) + os.Getenv("PATH")})
+	var out []byte
+	var err error
+	if scope, ok := containment.ScopeFromContext(ctx); ok {
+		var buf strings.Builder
+		cmd.Stdout = &buf
+		cmd.Stderr = &buf
+		startErr := cmd.Start()
+		if startErr == nil && cmd.Process != nil {
+			scope.Started(cmd.Process.Pid)
+		}
+		if startErr != nil {
+			return -1, buf.String(), startErr
+		}
+		err = cmd.Wait()
+		out = []byte(buf.String())
+	} else {
+		out, err = cmd.CombinedOutput()
+	}
 	if ctx.Err() != nil && cmd.Process != nil {
 		_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
 	}
@@ -633,16 +655,71 @@ func shell(ctx context.Context, dir, command string) (int, string, error) {
 	return code, string(out), nil
 }
 
+func shellStage(ctx context.Context, runID, stage, dir, command string, requireStrong bool) (int, string, error, error) {
+	scope, err := containment.NewScope(runID+"-"+stage, requireStrong)
+	if err != nil {
+		return -1, "", err, nil
+	}
+	code, out, runErr := shell(containment.WithScope(ctx, scope), dir, command)
+	_, extinctionErr := scope.Extinguish(context.Background(), containment.DefaultExtinctionDeadline, dir)
+	if extinctionErr != nil {
+		if out != "" && !strings.HasSuffix(out, "\n") {
+			out += "\n"
+		}
+		out += "descendant containment: " + extinctionErr.Error()
+	}
+	return code, out, runErr, extinctionErr
+}
+
 func gitHead(root string) (string, error) {
 	c, o, e := shell(context.Background(), root, "git rev-parse HEAD")
-	if e != nil || c != 0 {
-		return "", fmt.Errorf("git rev-parse: %s", strings.TrimSpace(o))
+	if e == nil && c == 0 {
+		return strings.TrimSpace(o), nil
 	}
-	return strings.TrimSpace(o), nil
+	if head, ferr := gitHeadFromFiles(root); ferr == nil {
+		return head, nil
+	}
+	return "", fmt.Errorf("git rev-parse: %s", strings.TrimSpace(o))
+}
+
+func gitHeadFromFiles(root string) (string, error) {
+	gitDir := filepath.Join(root, ".git")
+	if data, err := os.ReadFile(gitDir); err == nil {
+		line := strings.TrimSpace(string(data))
+		if strings.HasPrefix(line, "gitdir:") {
+			gitDir = strings.TrimSpace(strings.TrimPrefix(line, "gitdir:"))
+			if !filepath.IsAbs(gitDir) {
+				gitDir = filepath.Join(root, gitDir)
+			}
+		}
+	}
+	data, err := os.ReadFile(filepath.Join(gitDir, "HEAD"))
+	if err != nil {
+		return "", err
+	}
+	value := strings.TrimSpace(string(data))
+	if strings.HasPrefix(value, "ref:") {
+		ref := strings.TrimSpace(strings.TrimPrefix(value, "ref:"))
+		data, err = os.ReadFile(filepath.Join(gitDir, filepath.FromSlash(ref)))
+		if err != nil {
+			return "", err
+		}
+		value = strings.TrimSpace(string(data))
+	}
+	if value == "" {
+		return "", fmt.Errorf("empty HEAD")
+	}
+	return value, nil
 }
 func isGit(root string) bool {
 	c, _, _ := shell(context.Background(), root, "git rev-parse --is-inside-work-tree")
-	return c == 0
+	if c == 0 {
+		return true
+	}
+	if _, err := os.Stat(filepath.Join(root, ".git")); err == nil {
+		return true
+	}
+	return false
 }
 
 func validateNoLocalSymlinkEscape(root string) error {
@@ -1230,6 +1307,12 @@ func commitAndSyncRoot(ctx context.Context, result *approvedMergeResult, root, w
 	if err := result.session.UpdateRefCAS(ctx, root, "HEAD", commit, head); err != nil {
 		return "", fmt.Errorf("git merge: update-ref: %w", err)
 	}
+	if err := result.session.RequireLooseObjectInGitDir(result.mergeTree); err != nil {
+		return "", fmt.Errorf("git merge: verify tree object database: %w", err)
+	}
+	if err := result.session.RequireLooseObjectInGitDir(commit); err != nil {
+		return "", fmt.Errorf("git merge: verify commit object database: %w", err)
+	}
 	verifyTree, err := result.session.RevParseTree(ctx, commit)
 	if err != nil {
 		return "", fmt.Errorf("git merge: re-verify commit tree: %w", err)
@@ -1260,6 +1343,104 @@ func commitAndSyncRoot(ctx context.Context, result *approvedMergeResult, root, w
 	}
 	if err := result.session.SyncRealIndex(ctx, root, result.mergeTree); err != nil {
 		return "", fmt.Errorf("git merge: sync real index: %w", err)
+	}
+	return commit, nil
+}
+
+func preserveQuarantineWorktree(ctx context.Context, work, head, runID string) (string, error) {
+	sess, err := gitplumb.NewSession(ctx, work)
+	if err != nil {
+		return "", fmt.Errorf("git quarantine: open plumbing session: %w", err)
+	}
+	defer sess.Close()
+	baseline, err := sess.RevParseTree(ctx, head)
+	if err != nil {
+		return "", fmt.Errorf("git quarantine: resolve baseline tree: %w", err)
+	}
+	if err := sess.ReadTreeIntoIndex(ctx, baseline); err != nil {
+		return "", fmt.Errorf("git quarantine: seed isolated index: %w", err)
+	}
+	entries, err := gitplumb.StatusPorcelainV2(ctx, work)
+	if err != nil {
+		return "", fmt.Errorf("git quarantine: status: %w", err)
+	}
+	seen := map[string]bool{}
+	var paths []string
+	addPath := func(p string) {
+		if p == "" || seen[p] || isGovernatorInternalPath(p) || p == ".codegraph" || strings.HasPrefix(p, ".codegraph/") {
+			return
+		}
+		seen[p] = true
+		paths = append(paths, p)
+	}
+	for _, e := range entries {
+		if e.Kind == '2' && e.OrigPath != "" && e.OrigPath != e.Path {
+			addPath(e.OrigPath)
+		}
+		addPath(e.Path)
+	}
+	sort.Strings(paths)
+	for _, p := range paths {
+		disk := filepath.Join(work, filepath.FromSlash(p))
+		info, statErr := os.Stat(disk)
+		switch {
+		case statErr == nil && info.Mode().IsRegular():
+			if err := sess.UpdateIndexAddFile(ctx, disk, p); err != nil {
+				return "", fmt.Errorf("git quarantine: stage %s: %w", p, err)
+			}
+		case statErr == nil && info.IsDir():
+			if err := filepath.WalkDir(disk, func(child string, d os.DirEntry, walkErr error) error {
+				if walkErr != nil {
+					return walkErr
+				}
+				if d.IsDir() {
+					return nil
+				}
+				info, err := d.Info()
+				if err != nil {
+					return err
+				}
+				if !info.Mode().IsRegular() {
+					return fmt.Errorf("unsupported non-regular path %s", child)
+				}
+				rel, err := filepath.Rel(work, child)
+				if err != nil {
+					return err
+				}
+				literal := filepath.ToSlash(rel)
+				if isGovernatorInternalPath(literal) || literal == ".codegraph" || strings.HasPrefix(literal, ".codegraph/") {
+					return nil
+				}
+				return sess.UpdateIndexAddFile(ctx, child, literal)
+			}); err != nil {
+				return "", fmt.Errorf("git quarantine: stage directory %s: %w", p, err)
+			}
+		case statErr == nil:
+			return "", fmt.Errorf("git quarantine: unsupported non-regular path %s", p)
+		case os.IsNotExist(statErr):
+			if err := sess.UpdateIndexRemove(ctx, p); err != nil {
+				return "", fmt.Errorf("git quarantine: remove %s: %w", p, err)
+			}
+		default:
+			return "", fmt.Errorf("git quarantine: stat %s: %w", p, statErr)
+		}
+	}
+	tree, err := sess.WriteTree(ctx)
+	if err != nil {
+		return "", fmt.Errorf("git quarantine: write-tree: %w", err)
+	}
+	commit, err := sess.CommitTree(ctx, tree, head, "Quarantined Governator run "+runID+"\n\nGov-Run: "+runID+"\n")
+	if err != nil {
+		return "", fmt.Errorf("git quarantine: commit-tree: %w", err)
+	}
+	if err := sess.RequireLooseObjectInGitDir(tree); err != nil {
+		return "", fmt.Errorf("git quarantine: verify tree object database: %w", err)
+	}
+	if err := sess.RequireLooseObjectInGitDir(commit); err != nil {
+		return "", fmt.Errorf("git quarantine: verify commit object database: %w", err)
+	}
+	if err := sess.UpdateRefCAS(ctx, work, "HEAD", commit, head); err != nil {
+		return "", fmt.Errorf("git quarantine: update-ref: %w", err)
 	}
 	return commit, nil
 }
@@ -2361,6 +2542,7 @@ func (r *Runner) runOnce(ctx context.Context, c contracts.Contract) (RunRecord, 
 	// native-sandbox attestation branch resolved it; runOnce reuses it below
 	// instead of resolving again (Sol P0-6 / Session 3: exactly one
 	// agents.ResolveHandle call per run).
+	enforceLocalEffectful := containment.LocalEffectfulTieringEnforced(cfg.Containment.LocalEffectfulTiering)
 	capabilityAttestID, handle, requiresEnforcementWrap, err := enforceContainment(ctx, db, c, agent, cfg)
 	if err != nil {
 		return RunRecord{}, err
@@ -2573,7 +2755,28 @@ func (r *Runner) runOnce(ctx context.Context, c contracts.Contract) (RunRecord, 
 		}
 		dockerImage = &img
 	}
-	identity := computeExecutionIdentity(cfg, c, agent, handle.PathResolution, handle.Identity, dockerImage, agents.EnvPolicyHash(handle.AllowedEnv), head, hash, promptVersion, capabilityAttestID, policyBundle)
+	consumedIdentities, err := consumedArtifactIdentities(db, r.Home, c)
+	if err != nil {
+		return RunRecord{}, err
+	}
+	graphStatus, err := contextgraph.ResolveConfig(cfg)
+	if err != nil {
+		return RunRecord{}, err
+	}
+	preReplayGraph, err := contextgraph.CurrentWithStatus(ctx, root, graphStatus)
+	if err != nil {
+		return RunRecord{}, err
+	}
+	compiledPromptForIdentity, err := contracts.CompilePrompt(c, root)
+	if err != nil {
+		return RunRecord{}, err
+	}
+	compiledPromptForIdentity += artifactPromptAnnotation(consumedIdentities, c.Produces)
+	compiledPromptForIdentity += prompts.Annotation(promptVersion)
+	compiledPromptForIdentity += contextgraph.PromptAnnotation(preReplayGraph)
+	compiledPromptHash := hashJSON(map[string]string{"prompt": compiledPromptForIdentity})
+	graphSnapshotHash := hashJSON(preReplayGraph)
+	identity := computeExecutionIdentity(cfg, c, agent, handle.PathResolution, handle.Identity, dockerImage, agents.EnvPolicyHash(handle.AllowedEnv), head, hash, promptVersion, capabilityAttestID, policyBundle, compiledPromptHash, consumedArtifactsHash(consumedIdentities), contextgraph.ProviderIdentityHash(graphStatus), graphSnapshotHash)
 	if priorID, perr := replayMatch(db, identity.Hash()); perr != nil {
 		return RunRecord{}, perr
 	} else if priorID != "" {
@@ -2620,7 +2823,7 @@ func (r *Runner) runOnce(ctx context.Context, c contracts.Contract) (RunRecord, 
 	if err := lifecycle.Record(db, id, lifecycle.WorkspaceReady, string(wsDescriptorJSON), lifecycle.Now()); err != nil {
 		return rec, err
 	}
-	graphSnapshot, err := contextgraph.Prepare(ctx, work)
+	graphSnapshot, err := contextgraph.PrepareWithStatus(ctx, work, graphStatus)
 	if err != nil {
 		return rec, err
 	}
@@ -2689,7 +2892,8 @@ func (r *Runner) runOnce(ctx context.Context, c contracts.Contract) (RunRecord, 
 	// is the DESCENDANTS_TERMINATED lifecycle stage -- it runs
 	// unconditionally on every path (success, backend error, timeout), and
 	// approval is impossible without a recorded successful extinction proof.
-	descendants, descScopeErr := containment.NewScope(id, strings.TrimSpace(c.RiskClass) == "high")
+	requireStrongDescendants := containment.RequiresStrongDescendantContainment(c, enforceLocalEffectful)
+	descendants, descScopeErr := containment.NewScope(id, requireStrongDescendants)
 	if descScopeErr != nil {
 		return RunRecord{}, fmt.Errorf("descendant containment: %w", descScopeErr)
 	}
@@ -2700,7 +2904,7 @@ func (r *Runner) runOnce(ctx context.Context, c contracts.Contract) (RunRecord, 
 	// -- not recomputed here. NewPlan refuses outright for a high-risk run on
 	// a host that cannot actually provide it, the same fail-closed posture as
 	// containment.NewScope just above for the descendant-owning primitive.
-	enforcePlan, enforcePlanErr := enforce.NewPlan(requiresEnforcementWrap, work, spec.Sandbox == agents.SandboxReadOnly, spec.Network, strings.TrimSpace(c.RiskClass) == "high")
+	enforcePlan, enforcePlanErr := enforce.NewPlan(requiresEnforcementWrap, work, spec.Sandbox == agents.SandboxReadOnly, spec.Network, requiresEnforcementWrap)
 	if enforcePlanErr != nil {
 		return RunRecord{}, fmt.Errorf("external enforcement: %w", enforcePlanErr)
 	}
@@ -3042,8 +3246,11 @@ func (r *Runner) runOnce(ctx context.Context, c contracts.Contract) (RunRecord, 
 			violations = append(violations, deadlineErr.Error())
 			break
 		}
-		code, out, e := shell(vctx, work, v)
+		code, out, e, extinctionErr := shellStage(vctx, id, "success-validator", work, v, requireStrongDescendants)
 		cancel()
+		if extinctionErr != nil {
+			violations = append(violations, "success validator descendant containment: "+extinctionErr.Error())
+		}
 		if e != nil {
 			out += "\n" + e.Error()
 		}
@@ -3076,8 +3283,11 @@ func (r *Runner) runOnce(ctx context.Context, c contracts.Contract) (RunRecord, 
 				}
 				break
 			}
-			code, out, e := shell(vctx, work, v)
+			code, out, e, extinctionErr := shellStage(vctx, id, "cleanup-validator", work, v, requireStrongDescendants)
 			cancel()
+			if extinctionErr != nil && c.Cleanup.Required {
+				violations = append(violations, "cleanup validator descendant containment: "+extinctionErr.Error())
+			}
 			if e != nil {
 				out += "\n" + e.Error()
 			}
@@ -3299,8 +3509,12 @@ func (r *Runner) runOnce(ctx context.Context, c contracts.Contract) (RunRecord, 
 			rec.FailureTaxonomy = observability.ClassifyFailure(violations)
 		}
 		if git {
-			_, _, _ = shell(ctx, work, "git add -A -- . ':(exclude).codegraph' ':(exclude).governator'")
-			_, _, _ = shell(ctx, work, "git commit --allow-empty -m "+shQuote("Quarantined Governator run "+id))
+			commit, err := preserveQuarantineWorktree(ctx, work, head, id)
+			if err != nil {
+				rec.Message = strings.TrimSpace(rec.Message + "; " + err.Error())
+			} else {
+				rec.Commit = commit
+			}
 		}
 	}
 	ledgerPending := func(opKind string, opErr error, payload string) (RunRecord, error) {

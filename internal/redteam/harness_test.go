@@ -24,6 +24,7 @@ import (
 
 	"github.com/cousingary/governator/internal/contracts"
 	govruntime "github.com/cousingary/governator/internal/runtime"
+	"github.com/cousingary/governator/internal/toolregistry"
 )
 
 var (
@@ -138,13 +139,52 @@ func baseContract(root string) contracts.Contract {
 // disposable per-test fixtures.
 func runGoverned(t *testing.T, home, bin string, c contracts.Contract) govruntime.RunRecord {
 	t.Helper()
-	t.Setenv("GOV_HOME", home)
-	t.Setenv("GOV_CLAUDE_BIN", bin)
-	rec, err := govruntime.New().RunWithAutoRepair(context.Background(), c)
+	rec, err := runGovernedAllowError(t, home, bin, c)
 	if err != nil {
 		t.Fatalf("RunWithAutoRepair: %v", err)
 	}
 	return rec
+}
+
+func runGovernedAllowError(t *testing.T, home, bin string, c contracts.Contract) (govruntime.RunRecord, error) {
+	t.Helper()
+	t.Setenv("GOV_HOME", home)
+	t.Setenv("GOV_CLAUDE_BIN", bin)
+	return govruntime.New().RunWithAutoRepair(context.Background(), c)
+}
+
+// enrollRealControllerTools pins the controller tools every ordinary
+// governed run needs before any hostile PATH poisoning happens. v6 S2 made
+// ordinary execution fail closed when git/bash are not enrolled; older
+// redteam fixtures that only care about a different attack surface should
+// not fail at workspace creation just because their disposable registry is
+// intentionally fresh.
+func enrollRealControllerTools(t *testing.T) {
+	t.Helper()
+	realGit := "/usr/bin/git"
+	if _, err := os.Stat(realGit); err != nil {
+		var lookErr error
+		realGit, lookErr = exec.LookPath("git")
+		if lookErr != nil {
+			t.Fatal(lookErr)
+		}
+		if canonical, everr := filepath.EvalSymlinks(realGit); everr == nil {
+			realGit = canonical
+		}
+	}
+	realBash, err := exec.LookPath("bash")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if canonical, everr := filepath.EvalSymlinks(realBash); everr == nil {
+		realBash = canonical
+	}
+	if _, err := toolregistry.Enroll("git", realGit); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := toolregistry.Enroll("bash", realBash); err != nil {
+		t.Fatal(err)
+	}
 }
 
 // committedPaths lists every path git actually knows about in root's HEAD

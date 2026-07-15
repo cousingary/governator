@@ -3,7 +3,9 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -22,6 +24,7 @@ import (
 	"github.com/cousingary/governator/internal/containment"
 	"github.com/cousingary/governator/internal/contextgraph"
 	"github.com/cousingary/governator/internal/contracts"
+	"github.com/cousingary/governator/internal/controllerenv"
 	"github.com/cousingary/governator/internal/doctor"
 	"github.com/cousingary/governator/internal/enforce"
 	"github.com/cousingary/governator/internal/observability"
@@ -34,6 +37,7 @@ import (
 	govruntime "github.com/cousingary/governator/internal/runtime"
 	"github.com/cousingary/governator/internal/snapshots"
 	"github.com/cousingary/governator/internal/spend"
+	"github.com/cousingary/governator/internal/toolregistry"
 	"gopkg.in/yaml.v3"
 )
 
@@ -68,13 +72,15 @@ func run(args []string) int {
 	// (need no config) and hook (a high-frequency path that must stay
 	// resilient — the launching job already validated config) skip the guard.
 	switch args[0] {
-	case "init", "validate", "version", "--version", "-version", "help", "--help", "-h", "hook":
+	case "init", "validate", "version", "--version", "-version", "help", "--help", "-h", "hook", "tools":
 	default:
 		if code := guardConfig(); code != 0 {
 			return code
 		}
 	}
 	switch args[0] {
+	case "tools":
+		return toolsCmd(args[1:])
 	case "init":
 		return initCmd(args[1:])
 	case "validate":
@@ -2288,6 +2294,20 @@ func hookCmd(args []string) int {
 	}
 
 	goOutput := govruntime.HookPayload(decision)
+	shadowHash, shadowHashErr := fileSHA256(shadow)
+	pythonIdentity, pythonErr := toolregistry.ResolveTrusted("python3", "python3")
+	event := observability.ParityEvent{Payload: string(data), GoDecision: string(goOutput), ShadowScriptPath: shadow, ShadowScriptSHA256: shadowHash}
+	if shadowHashErr != nil || pythonErr != nil {
+		event.PythonUnavailable = true
+		event.Match = false
+		if shadowHashErr != nil {
+			event.PythonDecision = "shadow_unavailable: " + shadowHashErr.Error()
+		} else {
+			event.PythonDecision = "python_unavailable: " + pythonErr.Error()
+		}
+		_ = observability.RecordParity(govruntime.Home(), event)
+		return govruntime.EmitHookJSON(decision)
+	}
 	// 35s comfortably exceeds harness_gate.py's own 30s pre-delete snapshot
 	// ceiling (_preflight_snapshot) plus interpreter startup: a real local
 	// delete on a slow drvfs mount measured at ~13s in practice, and 2s was
@@ -2295,22 +2315,44 @@ func hookCmd(args []string) int {
 	// authoritative legacy decision land (governator ledger, 2026-07-06).
 	ctx, cancel := context.WithTimeout(context.Background(), 35*time.Second)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, "python3", shadow)
+	cmd := exec.CommandContext(ctx, pythonIdentity.CanonicalPath, shadow)
+	cmd.Env = controllerenv.Base()
 	cmd.Stdin = bytes.NewReader(data)
 	var pythonOutput bytes.Buffer
 	cmd.Stdout = &pythonOutput
 	err := cmd.Run()
-	event := observability.ParityEvent{Payload: string(data), GoDecision: string(goOutput), PythonDecision: pythonOutput.String()}
-	if err != nil {
+	event.PythonDecision = pythonOutput.String()
+	goVerdict, goOK := shadowVerdict(goOutput, true)
+	pyVerdict, pyOK := shadowVerdict(pythonOutput.Bytes(), false)
+	if err != nil || !goOK || !pyOK {
 		event.PythonUnavailable = true
 		event.Match = false
+		if err != nil {
+			event.PythonDecision = strings.TrimSpace(event.PythonDecision + "\nshadow_error: " + err.Error())
+		} else if !pyOK {
+			event.PythonDecision = strings.TrimSpace(event.PythonDecision + "\nshadow_error: malformed_or_empty_shadow_output")
+		}
 		_ = observability.RecordParity(govruntime.Home(), event)
 		return govruntime.EmitHookJSON(decision)
 	}
-	event.Match = shadowVerdict(goOutput) == shadowVerdict(pythonOutput.Bytes())
+	event.Match = goVerdict == pyVerdict
 	_ = observability.RecordParity(govruntime.Home(), event)
-	_, _ = os.Stdout.Write(pythonOutput.Bytes())
-	return 0
+	if !decision.Allow {
+		return govruntime.EmitHookJSON(decision)
+	}
+	if pyVerdict == "deny" {
+		return govruntime.EmitHookJSON(govruntime.GateDecision{Allow: false, Reason: "shadow parity denied an allow from the Go gate", Finding: "SHADOW_PARITY"})
+	}
+	return govruntime.EmitHookJSON(decision)
+}
+
+func fileSHA256(path string) (string, error) {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return "", err
+	}
+	sum := sha256.Sum256(b)
+	return hex.EncodeToString(sum[:]), nil
 }
 
 // shadowVerdict reduces a gate's raw hook output to the decision it carries so
@@ -2318,22 +2360,26 @@ func hookCmd(args []string) int {
 // planes phrase deny reasons differently by design ("GOVERNATOR GATE" vs
 // "HARNESS AUTHORITY"), and byte-level comparison counted every deny as a
 // mismatch, making the zero-mismatch cutover criterion unreachable. Empty
-// output is the allow convention on both planes; unparseable non-empty output
-// is returned verbatim so genuinely alien output still registers as a mismatch.
-func shadowVerdict(out []byte) string {
+// output is allowed only for the Go hook payload. Empty or malformed shadow
+// output is not allow; it is a parity error and the caller must preserve the
+// Go decision.
+func shadowVerdict(out []byte, allowEmpty bool) (string, bool) {
 	trimmed := bytes.TrimSpace(out)
 	if len(trimmed) == 0 {
-		return "allow"
+		return "allow", allowEmpty
 	}
 	var parsed struct {
 		HookSpecificOutput struct {
 			PermissionDecision string `json:"permissionDecision"`
 		} `json:"hookSpecificOutput"`
 	}
-	if err := json.Unmarshal(trimmed, &parsed); err == nil && parsed.HookSpecificOutput.PermissionDecision != "" {
-		return parsed.HookSpecificOutput.PermissionDecision
+	if err := json.Unmarshal(trimmed, &parsed); err != nil {
+		return string(trimmed), false
 	}
-	return string(trimmed)
+	if parsed.HookSpecificOutput.PermissionDecision != "" {
+		return parsed.HookSpecificOutput.PermissionDecision, true
+	}
+	return "allow", true
 }
 
 // hookProtocolMaxBytes bounds the PreToolUse hook stdin payload (audit #7 /
@@ -2524,6 +2570,68 @@ func contractError(path string, err error) int {
 	}
 	return 1
 }
+func toolsCmd(args []string) int {
+	if len(args) == 0 {
+		return bad("usage: gov tools enroll <name> <absolute-path> | verify <name> | status | rotate <name> <absolute-path>")
+	}
+	switch args[0] {
+	case "enroll", "rotate":
+		if len(args) != 3 {
+			return bad("usage: gov tools " + args[0] + " <name> <absolute-path>")
+		}
+		var (
+			id  toolregistry.Identity
+			err error
+		)
+		if args[0] == "rotate" {
+			id, err = toolregistry.Rotate(args[1], args[2])
+		} else {
+			id, err = toolregistry.Enroll(args[1], args[2])
+		}
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "tools:", err)
+			return 1
+		}
+		fmt.Printf("%s %s %s %s\n", strings.ToUpper(args[0]), id.Name, id.CanonicalPath, id.SHA256)
+		return 0
+	case "verify":
+		if len(args) != 2 {
+			return bad("usage: gov tools verify <name>")
+		}
+		id, err := toolregistry.Verify(args[1])
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "tools:", err)
+			return 1
+		}
+		fmt.Printf("VERIFIED %s %s %s\n", id.Name, id.CanonicalPath, id.SHA256)
+		return 0
+	case "status":
+		if len(args) != 1 {
+			return bad("usage: gov tools status")
+		}
+		registry, err := toolregistry.Load()
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "tools:", err)
+			return 1
+		}
+		fmt.Printf("registry: %s generation=%d\n", toolregistry.FilePath(), registry.Generation())
+		for _, e := range registry.Entries() {
+			state := "missing-identity"
+			if e.Path != "" && e.SHA256 != "" {
+				if _, err := registry.Resolve(e.Name, ""); err != nil {
+					state = "invalid: " + err.Error()
+				} else {
+					state = "verified"
+				}
+			}
+			fmt.Printf("%s\t%s\t%s\t%s\n", e.Name, e.Kind, state, e.Path)
+		}
+		return 0
+	default:
+		return bad("usage: gov tools enroll <name> <absolute-path> | verify <name> | status | rotate <name> <absolute-path>")
+	}
+}
+
 func usage() {
 	fmt.Println(`Governator - contract-first runtime for replaceable coding agents
 

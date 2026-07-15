@@ -123,12 +123,11 @@ func TestSol3ProducedArtifactSymlinkRefusedNoCopy(t *testing.T) {
 	}
 	bin := writeFakeBackend(t, `mkdir -p output .governator/artifacts
 printf 'ok\n' > output/result.txt
-ln -s "$SOL3_EXTERNAL" .governator/artifacts/scout.json
+ln -s "`+external+`" .governator/artifacts/scout.json
 printf '{"status":"complete","files_changed":["output/result.txt"],"commands_run":0,"validation":{"self_checked":true},"violations":[],"blockers":[],"next_recommended_action":"none"}\n' > RESULT.json
 printf '{"type":"result","total_cost_usd":0.01}\n'
 `)
 	t.Setenv("GOV_CLAUDE_BIN", bin)
-	t.Setenv("SOL3_EXTERNAL", external)
 	promptRoot := t.TempDir()
 	writePrompt(t, promptRoot, "claude-code", "surgeon")
 	t.Setenv("GOV_PROMPTS", promptRoot)

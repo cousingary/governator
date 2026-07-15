@@ -4,6 +4,7 @@ import (
 	"fmt"
 
 	"github.com/cousingary/governator/internal/config"
+	"github.com/cousingary/governator/internal/controllerenv"
 	"github.com/cousingary/governator/internal/protectedpaths"
 )
 
@@ -25,6 +26,11 @@ import (
 // before any run decision (lock, quota, routing, containment, policy gate,
 // launch). Every subsequent execution-critical read of configuration takes
 // its value from this struct, never from config.Current() again.
+type ControllerEnvironment struct {
+	Environment     []string
+	EnvironmentHash string
+}
+
 type RunEnvironment struct {
 	// Config is the full effective configuration, loaded once via
 	// config.LoadStrict() (never config.Current(), which silently swallows a
@@ -47,6 +53,7 @@ type RunEnvironment struct {
 	// credential-mount resolution can't be redirected mid-run by an edited
 	// config file.
 	CredentialRoots []string
+	Controller      ControllerEnvironment
 }
 
 // buildRunEnvironment loads and freezes every configuration-derived input a
@@ -61,11 +68,16 @@ func buildRunEnvironment() (RunEnvironment, error) {
 	if err != nil {
 		return RunEnvironment{}, fmt.Errorf("load protected-path manifest %q: %w", cfg.ProtectedManifest, err)
 	}
+	controllerEnv := controllerenv.Base()
 	return RunEnvironment{
 		Config:                cfg,
 		ConfigHash:            cfg.Hash(),
 		ProtectedManifestPath: cfg.ProtectedManifest,
 		ProtectedPatterns:     patterns,
 		CredentialRoots:       append([]string(nil), cfg.Credentials.Roots...),
+		Controller: ControllerEnvironment{
+			Environment:     append([]string(nil), controllerEnv...),
+			EnvironmentHash: controllerenv.Hash(controllerEnv),
+		},
 	}, nil
 }

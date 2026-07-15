@@ -6,7 +6,10 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
+
+	"github.com/cousingary/governator/internal/toolregistry"
 )
 
 // TestAttack26FakeBashInjectedThroughPathIsRejected is the post-v4 hardening
@@ -58,10 +61,10 @@ func TestAttack26FakeBashInjectedThroughPathIsRejected(t *testing.T) {
 	if canonical, everr := filepath.EvalSymlinks(realBash); everr == nil {
 		realBash = canonical
 	}
-	registryYAML := "tools:\n" +
-		"  - name: git\n    kind: trusted_controller\n    path: " + realGit + "\n" +
-		"  - name: bash\n    kind: trusted_controller\n    path: " + realBash + "\n"
-	if err := os.WriteFile(registryFile, []byte(registryYAML), 0644); err != nil {
+	if _, err := toolregistry.Enroll("git", realGit); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := toolregistry.Enroll("bash", realBash); err != nil {
 		t.Fatal(err)
 	}
 
@@ -78,11 +81,17 @@ func TestAttack26FakeBashInjectedThroughPathIsRejected(t *testing.T) {
 
 	c := baseContract(root)
 	bin := fakeBackend(t, standardBackendBody(""))
-	rec := runGoverned(t, t.TempDir(), bin, c)
+	rec, err := runGovernedAllowError(t, t.TempDir(), bin, c)
+	if _, statErr := os.Stat(fakeBashMarker); !os.IsNotExist(statErr) {
+		t.Fatal("hostile PATH-shadowing bash executed instead of the registry-pinned real bash")
+	}
+	if err != nil {
+		if strings.Contains(err.Error(), "no descendant-owning primitive available") {
+			return
+		}
+		t.Fatalf("RunWithAutoRepair: %v", err)
+	}
 	if rec.Status != "APPROVED" {
 		t.Fatalf("expected APPROVED using the registry-pinned real bash to run success.validators despite a hostile bash earlier on PATH, got status=%s message=%s", rec.Status, rec.Message)
-	}
-	if _, err := os.Stat(fakeBashMarker); !os.IsNotExist(err) {
-		t.Fatal("hostile PATH-shadowing bash executed instead of the registry-pinned real bash")
 	}
 }

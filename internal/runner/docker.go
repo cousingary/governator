@@ -15,6 +15,7 @@ import (
 
 	"github.com/cousingary/governator/internal/agents"
 	"github.com/cousingary/governator/internal/contracts"
+	"github.com/cousingary/governator/internal/controllerenv"
 	"github.com/cousingary/governator/internal/toolregistry"
 )
 
@@ -62,7 +63,11 @@ func ResolveImageIdentity(ctx context.Context, image string) (ImageIdentity, err
 	if berr != nil {
 		return ImageIdentity{}, fmt.Errorf("resolve image identity %q: %w", image, berr)
 	}
-	out, err := exec.CommandContext(ctx, bin, "image", "inspect", image, "--format", "{{json .}}").Output()
+	out, err := func() ([]byte, error) {
+		cmd := exec.CommandContext(ctx, bin, "image", "inspect", image, "--format", "{{json .}}")
+		cmd.Env = controllerenv.Base()
+		return cmd.Output()
+	}()
 	if err != nil {
 		return ImageIdentity{}, fmt.Errorf("resolve image identity %q: %w", image, err)
 	}
@@ -203,6 +208,7 @@ func (d *DockerRunner) executor(ws Workspace) agents.Executor {
 			return 0, false, dberr
 		}
 		cmd := exec.CommandContext(runCtx, dockerBin, dockerArgs...)
+		cmd.Env = controllerenv.Base()
 		capped := &cappedWriter{w: out, remaining: d.Config.EffectiveOutputCapBytes()}
 		cmd.Stdout, cmd.Stderr = capped, capped
 		if err := cmd.Start(); err != nil {

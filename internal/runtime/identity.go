@@ -31,24 +31,32 @@ import (
 // — whose current HEAD equals that post-merge HEAD — matches. Every other
 // field is a snapshot of the environment at replay-check time.
 type ExecutionIdentity struct {
-	ContractHash          string
-	ApprovedHead          string
-	ConfigHash            string
-	ProtectedManifestHash string
-	OrgPolicyHash         string
-	ProjectDoctrineHash   string
-	PromptVersion         string
-	PromptChecksum        string
-	ValidatorSetHash      string
-	AssayerProfileHash    string
-	BackendAdapter        string
-	BackendAdapterVersion string
-	BackendBinaryPath     string
-	BackendBinarySHA256   string
-	ModelID               string
-	CapabilityAttestID    string
-	RunnerConfigHash      string
-	GovernatorVersion     string
+	ContractHash           string
+	ApprovedHead           string
+	ConfigHash             string
+	ProtectedManifestHash  string
+	OrgPolicyHash          string
+	ProjectDoctrineHash    string
+	PromptVersion          string
+	PromptChecksum         string
+	CompiledPromptHash     string
+	ValidatorSetHash       string
+	ValidatorToolsetHash   string
+	ControllerToolsetHash  string
+	AssayerEnvironmentHash string
+	ConsumedArtifactsHash  string
+	GraphProviderHash      string
+	GraphSnapshotHash      string
+	GovernatorSelfSHA256   string
+	AssayerProfileHash     string
+	BackendAdapter         string
+	BackendAdapterVersion  string
+	BackendBinaryPath      string
+	BackendBinarySHA256    string
+	ModelID                string
+	CapabilityAttestID     string
+	RunnerConfigHash       string
+	GovernatorVersion      string
 
 	// Sol P1-2: model/provider identity declared on the backend's
 	// config.Backend entry (agents.BackendIdentity). "model = backend name,
@@ -60,16 +68,16 @@ type ExecutionIdentity struct {
 	// identity still hashes (so it stays part of the replay key) but callers
 	// authorizing high-risk native-sandbox reuse must treat it as blocking,
 	// never as "unchanged since last time" (see attest.VerifyHighRiskNative).
-	BackendProvider       string
-	BackendAccountID      string
-	BackendOrgID          string
-	BackendModelRevision  string
-	BackendEndpoint       string
-	BackendReasoningMode  string
-	BackendApprovalMode   string
-	BackendSandboxMode    string
-	BackendIdentityHash   string
-	BackendIdentityKnown  bool
+	BackendProvider      string
+	BackendAccountID     string
+	BackendOrgID         string
+	BackendModelRevision string
+	BackendEndpoint      string
+	BackendReasoningMode string
+	BackendApprovalMode  string
+	BackendSandboxMode   string
+	BackendIdentityHash  string
+	BackendIdentityKnown bool
 }
 
 // Hash returns the canonical SHA-256 digest of the full identity. This is the
@@ -87,7 +95,15 @@ func (id ExecutionIdentity) Hash() string {
 	fmt.Fprintf(&b, "project_doctrine_hash=%s\n", id.ProjectDoctrineHash)
 	fmt.Fprintf(&b, "prompt_version=%s\n", id.PromptVersion)
 	fmt.Fprintf(&b, "prompt_checksum=%s\n", id.PromptChecksum)
+	fmt.Fprintf(&b, "compiled_prompt_hash=%s\n", id.CompiledPromptHash)
 	fmt.Fprintf(&b, "validator_set_hash=%s\n", id.ValidatorSetHash)
+	fmt.Fprintf(&b, "validator_toolset_hash=%s\n", id.ValidatorToolsetHash)
+	fmt.Fprintf(&b, "controller_toolset_hash=%s\n", id.ControllerToolsetHash)
+	fmt.Fprintf(&b, "assayer_environment_hash=%s\n", id.AssayerEnvironmentHash)
+	fmt.Fprintf(&b, "consumed_artifacts_hash=%s\n", id.ConsumedArtifactsHash)
+	fmt.Fprintf(&b, "graph_provider_hash=%s\n", id.GraphProviderHash)
+	fmt.Fprintf(&b, "graph_snapshot_hash=%s\n", id.GraphSnapshotHash)
+	fmt.Fprintf(&b, "governator_self_sha256=%s\n", id.GovernatorSelfSHA256)
 	fmt.Fprintf(&b, "assayer_profile_hash=%s\n", id.AssayerProfileHash)
 	fmt.Fprintf(&b, "backend_adapter=%s\n", id.BackendAdapter)
 	fmt.Fprintf(&b, "backend_adapter_version=%s\n", id.BackendAdapterVersion)
@@ -130,37 +146,59 @@ func (id ExecutionIdentity) Hash() string {
 // "pi" literally (via os.ReadFile, never through PATH) and always produced
 // the same "unreadable:pi" sentinel regardless of which binary that name
 // actually resolved to — a swapped executable never changed the identity.
-func computeExecutionIdentity(cfg config.Config, c contracts.Contract, agent agents.Agent, resolution agents.PathResolution, identity agents.BackendIdentity, dockerImage *runner.ImageIdentity, envPolicyHash, head, hash string, promptVer prompts.Version, capabilityAttestID string, bundle PolicyBundle) ExecutionIdentity {
+func computeExecutionIdentity(cfg config.Config, c contracts.Contract, agent agents.Agent, resolution agents.PathResolution, identity agents.BackendIdentity, dockerImage *runner.ImageIdentity, envPolicyHash, head, hash string, promptVer prompts.Version, capabilityAttestID string, bundle PolicyBundle, dynamicHashes ...string) ExecutionIdentity {
+	compiledPromptHash, consumedArtifactsHash, graphProviderHash, graphSnapshotHash := dynamicIdentityHashes(dynamicHashes...)
 	return ExecutionIdentity{
-		ContractHash:          hash,
-		ApprovedHead:          head,
-		ConfigHash:            cfg.Hash(),
-		ProtectedManifestHash: hashFileContent(cfg.ProtectedManifest),
-		OrgPolicyHash:         hashJSON(bundle.OrgRules),
-		ProjectDoctrineHash:   hashJSON(bundle.ProjectRules),
-		PromptVersion:         promptVer.ID,
-		PromptChecksum:        promptVer.Checksum,
-		ValidatorSetHash:      hashJSON(contractValidatorSet(c)),
-		AssayerProfileHash:    hashJSON(assayerInputs(cfg, c)),
-		BackendAdapter:        agent.Name(),
-		BackendAdapterVersion: adapterVersion(agent),
-		BackendBinaryPath:     resolution.CanonicalPath,
-		BackendBinarySHA256:   resolution.SHA256,
-		ModelID:               agent.Name(),
-		BackendProvider:       identity.Provider,
-		BackendAccountID:      identity.AccountID,
-		BackendOrgID:          identity.OrgID,
-		BackendModelRevision:  identity.ModelRevision,
-		BackendEndpoint:       identity.Endpoint,
-		BackendReasoningMode:  identity.ReasoningMode,
-		BackendApprovalMode:   identity.ApprovalMode,
-		BackendSandboxMode:    identity.SandboxMode,
-		BackendIdentityHash:   identity.ConfigHash,
-		BackendIdentityKnown:  identity.Known(),
-		CapabilityAttestID:    capabilityAttestID,
-		RunnerConfigHash:      hashJSON(runnerConfig(c, dockerImage, envPolicyHash)),
-		GovernatorVersion:     governatorBuildID(),
+		ContractHash:           hash,
+		ApprovedHead:           head,
+		ConfigHash:             cfg.Hash(),
+		ProtectedManifestHash:  hashFileContent(cfg.ProtectedManifest),
+		OrgPolicyHash:          hashJSON(bundle.OrgRules),
+		ProjectDoctrineHash:    hashJSON(bundle.ProjectRules),
+		PromptVersion:          promptVer.ID,
+		PromptChecksum:         promptVer.Checksum,
+		CompiledPromptHash:     compiledPromptHash,
+		ValidatorSetHash:       hashJSON(contractValidatorSet(c)),
+		ValidatorToolsetHash:   hashJSON(contractValidatorToolset(c)),
+		ControllerToolsetHash:  hashJSON(map[string]string{"backend_path": resolution.CanonicalPath, "backend_sha256": resolution.SHA256}),
+		AssayerEnvironmentHash: hashJSON(assayerInputs(cfg, c)),
+		ConsumedArtifactsHash:  consumedArtifactsHash,
+		GraphProviderHash:      graphProviderHash,
+		GraphSnapshotHash:      graphSnapshotHash,
+		GovernatorSelfSHA256:   governatorSelfSHA256(),
+		AssayerProfileHash:     hashJSON(assayerInputs(cfg, c)),
+		BackendAdapter:         agent.Name(),
+		BackendAdapterVersion:  adapterVersion(agent),
+		BackendBinaryPath:      resolution.CanonicalPath,
+		BackendBinarySHA256:    resolution.SHA256,
+		ModelID:                agent.Name(),
+		BackendProvider:        identity.Provider,
+		BackendAccountID:       identity.AccountID,
+		BackendOrgID:           identity.OrgID,
+		BackendModelRevision:   identity.ModelRevision,
+		BackendEndpoint:        identity.Endpoint,
+		BackendReasoningMode:   identity.ReasoningMode,
+		BackendApprovalMode:    identity.ApprovalMode,
+		BackendSandboxMode:     identity.SandboxMode,
+		BackendIdentityHash:    identity.ConfigHash,
+		BackendIdentityKnown:   identity.Known(),
+		CapabilityAttestID:     capabilityAttestID,
+		RunnerConfigHash:       hashJSON(runnerConfig(c, dockerImage, envPolicyHash)),
+		GovernatorVersion:      governatorBuildID(),
 	}
+}
+
+func dynamicIdentityHashes(values ...string) (compiledPromptHash, consumedArtifactsHash, graphProviderHash, graphSnapshotHash string) {
+	defaults := []string{"unknown", "none", "unknown", "unknown"}
+	for i, v := range values {
+		if i >= len(defaults) {
+			break
+		}
+		if v != "" {
+			defaults[i] = v
+		}
+	}
+	return defaults[0], defaults[1], defaults[2], defaults[3]
 }
 
 // replayMatch looks up the most recent APPROVED run whose stored identity hash
@@ -218,6 +256,18 @@ func contractValidatorSet(c contracts.Contract) map[string][]string {
 		out["cleanup"] = c.Cleanup.Validators
 	}
 	return out
+}
+
+func contractValidatorToolset(c contracts.Contract) map[string][]string {
+	return contractValidatorSet(c)
+}
+
+func governatorSelfSHA256() string {
+	exe, err := os.Executable()
+	if err != nil {
+		return "unknown:" + err.Error()
+	}
+	return hashFileContent(exe)
 }
 
 // assayerInputs gathers the bridge config and the contract's assay declaration

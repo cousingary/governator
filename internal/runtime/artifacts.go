@@ -26,6 +26,68 @@ type stagedArtifact struct {
 	Bytes  int64
 }
 
+func consumedArtifactIdentities(db *sql.DB, home string, c contracts.Contract) ([]stagedArtifact, error) {
+	if len(c.Consumes) == 0 {
+		return nil, nil
+	}
+	if len(c.ArtifactSources) == 0 {
+		return nil, fmt.Errorf("consumes declared but no artifact sources were resolved by plan validation")
+	}
+	artifactsRoot, err := filepath.Abs(filepath.Join(home, "artifacts"))
+	if err != nil {
+		return nil, err
+	}
+	out := make([]stagedArtifact, 0, len(c.Consumes))
+	for _, name := range c.Consumes {
+		producer := c.ArtifactSources[name]
+		if producer == "" {
+			return nil, fmt.Errorf("consumed artifact %q has no producing job_id", name)
+		}
+		var src, sha string
+		var size int64
+		err := db.QueryRow(`SELECT a.path,a.sha256,a.bytes FROM artifacts a JOIN runs r ON r.id=a.run_id WHERE a.name=? AND r.job_id=? AND r.status='APPROVED' ORDER BY r.created DESC LIMIT 1`, name, producer).Scan(&src, &sha, &size)
+		if err != nil {
+			if err == sql.ErrNoRows {
+				return nil, fmt.Errorf("consumed artifact %q from job %q is not available in the ledger", name, producer)
+			}
+			return nil, err
+		}
+		if cleanSlash(name) != name || name == "." || strings.Contains(name, "/") || strings.Contains(name, `\`) {
+			return nil, fmt.Errorf("consumed artifact %q is not a safe basename", name)
+		}
+		srcAbs, err := filepath.Abs(src)
+		if err != nil {
+			return nil, err
+		}
+		srcRel, err := filepath.Rel(artifactsRoot, srcAbs)
+		if err != nil || srcRel == ".." || strings.HasPrefix(srcRel, ".."+string(os.PathSeparator)) {
+			return nil, fmt.Errorf("consumed artifact %q ledger path escapes artifacts root: %s", name, src)
+		}
+		data, info, err := readRegularBeneath(artifactsRoot, filepath.ToSlash(srcRel))
+		if err != nil {
+			return nil, fmt.Errorf("identify consumed artifact %q beneath-root read: %w", name, err)
+		}
+		if size >= 0 && info.Size() != size {
+			return nil, fmt.Errorf("identify consumed artifact %q size mismatch: ledger=%d actual=%d", name, size, info.Size())
+		}
+		actualSum := sha256.Sum256(data)
+		actualSHA := hex.EncodeToString(actualSum[:])
+		if sha != "" && actualSHA != sha {
+			return nil, fmt.Errorf("identify consumed artifact %q sha256 mismatch", name)
+		}
+		out = append(out, stagedArtifact{Name: name, Path: filepath.ToSlash(filepath.Join(".governator", "consumed", name)), SHA256: actualSHA, Bytes: info.Size()})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+	return out, nil
+}
+
+func consumedArtifactsHash(artifacts []stagedArtifact) string {
+	if len(artifacts) == 0 {
+		return "none"
+	}
+	return hashJSON(artifacts)
+}
+
 func stageConsumedArtifacts(db *sql.DB, home, work string, c contracts.Contract) ([]stagedArtifact, error) {
 	if len(c.Consumes) == 0 {
 		return nil, nil

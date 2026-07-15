@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/cousingary/governator/internal/config"
+	"github.com/cousingary/governator/internal/controllerenv"
 )
 
 // PathResolution is the identity-bearing subset of canonical backend
@@ -139,6 +140,7 @@ func probeVersion(ctx context.Context, path string) (string, bool) {
 	}
 	defer os.RemoveAll(scratch)
 	cmd := exec.CommandContext(probeCtx, path, "--version")
+	cmd.Env = controllerenv.Base()
 	cmd.Dir = scratch
 	out, err := cmd.CombinedOutput()
 	text := strings.TrimSpace(string(out))

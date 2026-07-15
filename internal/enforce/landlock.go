@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"syscall"
 
 	"github.com/landlock-lsm/go-landlock/landlock"
@@ -22,20 +23,34 @@ func landlockUsable() bool {
 
 // applyLandlockRuleset restricts the CALLING process (and, because Landlock
 // rules are inherited across execve and cannot be dropped by a descendant,
-// every process it execs into or forks) to read-only access everywhere
-// except workspace, which gets read-write. readOnly additionally strips
-// write access from workspace itself, matching agents.SandboxReadOnly.
-//
-// BestEffort degrades to whatever ABI version this kernel actually supports
-// rather than failing outright on an older kernel -- Supported() already
-// confirmed ABI>0, so BestEffort here never silently no-ops to "no
-// restriction at all," only to "not every V9 refinement is enforced."
-func applyLandlockRuleset(workspace string, readOnly bool) error {
+// every process it execs into or forks) to a deny-by-default read envelope:
+// the workspace, the verified backend executable location, runtime loader and
+// shared-library directories, and minimal /dev + /proc. It intentionally does
+// not grant read-only access to /, because that permits undeclared host-secret
+// reads (Sol v6 S7 / P0-13).
+func applyLandlockRuleset(workspace string, readOnly bool, execPath string) error {
 	cfg := landlock.V9.BestEffort()
-	if readOnly {
-		return cfg.RestrictPaths(landlock.RODirs("/"))
+	ro := []landlock.Rule{
+		landlock.RODirs("/bin").IgnoreIfMissing(),
+		landlock.RODirs("/usr").IgnoreIfMissing(),
+		landlock.RODirs("/lib").IgnoreIfMissing(),
+		landlock.RODirs("/lib64").IgnoreIfMissing(),
+		landlock.RODirs("/etc").IgnoreIfMissing(),
+		landlock.RODirs("/dev").IgnoreIfMissing(),
+		landlock.RODirs("/proc").IgnoreIfMissing(),
 	}
-	return cfg.RestrictPaths(landlock.RODirs("/"), landlock.RWDirs(workspace))
+	if execPath != "" {
+		if abs, err := filepath.Abs(execPath); err == nil {
+			ro = append(ro, landlock.RODirs(filepath.Dir(abs)).IgnoreIfMissing())
+		}
+	}
+	if readOnly {
+		ro = append(ro, landlock.RODirs(workspace).IgnoreIfMissing())
+		return cfg.RestrictPaths(ro...)
+	}
+	rules := append([]landlock.Rule{}, ro...)
+	rules = append(rules, landlock.RWDirs(workspace))
+	return cfg.RestrictPaths(rules...)
 }
 
 // RunSandboxExec is the entry point for the hidden `gov __sandbox_exec`
@@ -61,7 +76,7 @@ func RunSandboxExec(argv []string) int {
 		fmt.Fprintln(os.Stderr, "enforce: sandbox-exec requires --workspace and -- <bin> [args...]")
 		return 2
 	}
-	if err := applyLandlockRuleset(*workspace, *readOnly); err != nil {
+	if err := applyLandlockRuleset(*workspace, *readOnly, rest[0]); err != nil {
 		fmt.Fprintln(os.Stderr, "enforce: apply landlock ruleset:", err)
 		return 1
 	}

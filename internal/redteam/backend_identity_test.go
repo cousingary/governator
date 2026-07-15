@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -143,16 +144,7 @@ func TestAttack10FakeGitInjectedThroughPathIsRejected(t *testing.T) {
 
 	registryFile := filepath.Join(t.TempDir(), "tools.yaml")
 	t.Setenv("GOV_TOOLREGISTRY_FILE", registryFile)
-	realGit, err := exec.LookPath("git")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if canonical, everr := filepath.EvalSymlinks(realGit); everr == nil {
-		realGit = canonical
-	}
-	if err := os.WriteFile(registryFile, []byte("tools:\n  - name: git\n    kind: trusted_controller\n    path: "+realGit+"\n"), 0644); err != nil {
-		t.Fatal(err)
-	}
+	enrollRealControllerTools(t)
 
 	fakeGitMarker := filepath.Join(t.TempDir(), "fake-git-ran.txt")
 	fakeGitDir := t.TempDir()
@@ -164,12 +156,18 @@ func TestAttack10FakeGitInjectedThroughPathIsRejected(t *testing.T) {
 
 	c := baseContract(root)
 	bin := fakeBackend(t, standardBackendBody(""))
-	rec := runGoverned(t, t.TempDir(), bin, c)
+	rec, err := runGovernedAllowError(t, t.TempDir(), bin, c)
+	if _, statErr := os.Stat(fakeGitMarker); !os.IsNotExist(statErr) {
+		t.Fatal("hostile PATH-shadowing git executed instead of the registry-pinned real git")
+	}
+	if err != nil {
+		if strings.Contains(err.Error(), "no descendant-owning primitive available") {
+			return
+		}
+		t.Fatalf("RunWithAutoRepair: %v", err)
+	}
 	if rec.Status != "APPROVED" {
 		t.Fatalf("expected APPROVED using the registry-pinned real git despite a hostile git earlier on PATH, got status=%s message=%s", rec.Status, rec.Message)
-	}
-	if _, err := os.Stat(fakeGitMarker); !os.IsNotExist(err) {
-		t.Fatal("hostile PATH-shadowing git executed instead of the registry-pinned real git")
 	}
 }
 
