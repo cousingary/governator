@@ -70,3 +70,47 @@ func TestNewPlanFailsClosedWhenUnshareUnresolvable(t *testing.T) {
 		t.Fatal("expected NewPlan to fail closed when unshare cannot be resolved through the trusted-tool registry")
 	}
 }
+
+func TestNewPlanInactiveIsNoopWithoutHostSupport(t *testing.T) {
+	ForceUnsupported = true
+	t.Cleanup(func() { ForceUnsupported = false })
+
+	p, err := NewPlan(false, "relative-workspace", false, false, true)
+	if err != nil {
+		t.Fatalf("inactive NewPlan returned error: %v", err)
+	}
+	if p.Active {
+		t.Fatalf("inactive NewPlan returned active plan: %+v", p)
+	}
+
+	bin, args := p.Wrap("backend", []string{"--arg"})
+	if bin != "backend" || len(args) != 1 || args[0] != "--arg" {
+		t.Fatalf("inactive Wrap changed launch: bin=%q args=%v", bin, args)
+	}
+}
+
+func TestWrapBuildsSandboxExecAndReadOnlyArgs(t *testing.T) {
+	workspace := t.TempDir()
+	p := Plan{
+		Active:       true,
+		Workspace:    workspace,
+		ReadOnly:     true,
+		AllowNetwork: true,
+		selfExe:      "/trusted/gov",
+		unsharePath:  "/trusted/unshare",
+	}
+
+	bin, args := p.Wrap("backend", []string{"--arg", "value"})
+	if bin != "/trusted/gov" {
+		t.Fatalf("network-allowed Wrap should exec trusted gov wrapper directly, got %q", bin)
+	}
+	want := []string{SandboxExecArg, "--workspace", workspace, "--readonly", "--", "backend", "--arg", "value"}
+	if len(args) != len(want) {
+		t.Fatalf("Wrap args length=%d want=%d: %v", len(args), len(want), args)
+	}
+	for i := range want {
+		if args[i] != want[i] {
+			t.Fatalf("Wrap arg[%d]=%q want %q; full args=%v", i, args[i], want[i], args)
+		}
+	}
+}

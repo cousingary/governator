@@ -82,7 +82,6 @@ func TestAttack6BackendReplacementBetweenHashAndLaunchIsDetected(t *testing.T) {
 // -- replay/identity must notice, not silently accept whatever PATH
 // currently resolves to.
 func TestAttack7PathResolvedBinaryReplacedBetweenRuns(t *testing.T) {
-
 	root := fixtureRepo(t)
 	binDir := t.TempDir()
 	binPath := filepath.Join(binDir, "claude")
@@ -90,19 +89,33 @@ func TestAttack7PathResolvedBinaryReplacedBetweenRuns(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	// This fixture must exercise replay identity, not transcript conformance:
+	// both binaries emit valid, approving transcripts; the only trust-bearing
+	// input that changes is the PATH-resolved executable's content hash. Use a
+	// bare backend name plus one GOV_HOME so the second run would replay the
+	// first approval if executable identity were not part of the replay key.
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	home := t.TempDir()
 	c := baseContract(root)
-	first := runGoverned(t, t.TempDir(), binPath, c)
-	if first.Status != "APPROVED" {
-		t.Fatalf("expected first run APPROVED, got status=%s message=%s", first.Status, first.Message)
+	first := runGoverned(t, home, "claude", c)
+	if first.Status != "APPROVED" || first.Replayed {
+		t.Fatalf("expected first run fresh APPROVED, got status=%s replayed=%v message=%s", first.Status, first.Replayed, first.Message)
 	}
 
-	// Replace the PATH-resolved binary's content before the "replay" run.
-	if err := os.WriteFile(binPath, []byte("#!/bin/sh\nset -eu\nprintf 'different implementation\\n'\n"+standardBackendBody("")), 0755); err != nil {
+	// Replace the PATH-resolved binary's content before the replay-eligible
+	// second run, while keeping the backend transcript valid.
+	if err := os.WriteFile(binPath, []byte("#!/bin/sh\nset -eu\n# different implementation hash, same valid transcript\n"+standardBackendBody("")), 0755); err != nil {
 		t.Fatal(err)
 	}
-	second := runGoverned(t, t.TempDir(), binPath, c)
-	if second.Status == "APPROVED" {
-		t.Fatal("second run reused replay/identity evidence from the first, differently-hashed executable")
+	second := runGoverned(t, home, "claude", c)
+	if second.Replayed {
+		t.Fatal("second run replayed the first approval after the PATH-resolved executable hash changed")
+	}
+	if second.Status != "APPROVED" {
+		t.Fatalf("changed executable should force a fresh valid run, not rely on an adjacent failure; got status=%s message=%s", second.Status, second.Message)
+	}
+	if second.ID == first.ID {
+		t.Fatalf("fresh run reused first run ID %s", first.ID)
 	}
 }
 
