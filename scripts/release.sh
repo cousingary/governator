@@ -160,7 +160,12 @@ REDTEAM_RACE_LOG="$OUT_DIR/test-redteam-race.log"
 run_tier redteam_race "$REDTEAM_RACE_LOG" REDTEAM_RACE_RESULT REDTEAM_RACE_SECONDS REDTEAM_RACE_STARTED REDTEAM_RACE_ENDED REDTEAM_RACE_LOG_SHA go test -v -race -timeout=30m -tags redteam -count=1 ./...
 
 MIN_REDTEAM_TESTS=${MIN_REDTEAM_TESTS:-36}
-EXPECTED_REDTEAM_SKIPS=${EXPECTED_REDTEAM_SKIPS:-0}
+# Two redteam cases are conditionally non-executable in the tagged release
+# environment rather than unresolved vulnerabilities: case 28 needs adversarial
+# control of a live systemd --user manager, and case 36 deliberately requires
+# a checkout that is several commits past a tag (the opposite of REQUIRE_TAG=1).
+# Additional skips still block packaging via REDTEAM_UNEXPECTED_SKIPPED.
+EXPECTED_REDTEAM_SKIPS=${EXPECTED_REDTEAM_SKIPS:-2}
 read REDTEAM_TESTS_DISCOVERED REDTEAM_TESTS_RUN REDTEAM_TESTS_SKIPPED REDTEAM_TESTS_FAILED REDTEAM_UNEXPECTED_SKIPPED < <(python3 - "$REDTEAM_LOG" "$EXPECTED_REDTEAM_SKIPS" <<'PYREDTEAMCOUNTS'
 import pathlib, re, sys
 log = pathlib.Path(sys.argv[1]).read_text(errors="replace")
