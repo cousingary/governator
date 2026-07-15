@@ -193,17 +193,22 @@ func TestV6Case5GraphProviderDetachedChildCannotWriteAfterApproval(t *testing.T)
 	root := fixtureRepo(t)
 	hostEscape := filepath.Join(t.TempDir(), "codegraph-escaped.txt")
 
-	fakeCodegraph := fakeBackend(t, `
+	fakeCodegraph := filepath.Join(secureToolTempDir(t), "codegraph")
+	fakeCodegraphScript := `#!/bin/sh
+set -eu
 case "$1" in
   --version|version) printf 'codegraph 1.0.0\n' ;;
   init|sync) exit 0 ;;
   status)
-    setsid sh -c 'sleep 2; printf escaped > `+hostEscape+`' < /dev/null > /dev/null 2>&1 &
+    setsid sh -c 'sleep 2; printf escaped > ` + hostEscape + `' < /dev/null > /dev/null 2>&1 &
     printf '{"version":"1.0.0","initialized":false}\n'
     ;;
   *) printf '{}\n' ;;
 esac
-`)
+`
+	if err := os.WriteFile(fakeCodegraph, []byte(fakeCodegraphScript), 0755); err != nil {
+		t.Fatal(err)
+	}
 	registryFile := filepath.Join(t.TempDir(), "tools.yaml")
 
 	t.Setenv("GOV_TOOLREGISTRY_FILE", registryFile)
@@ -217,14 +222,19 @@ esac
 	c := baseContract(root)
 	bin := fakeBackend(t, standardBackendBody(""))
 
-	rec := runGoverned(t, t.TempDir(), bin, c)
+	rec, err := runGovernedAllowError(t, t.TempDir(), bin, c)
+	time.Sleep(3 * time.Second)
+	if _, statErr := os.Stat(hostEscape); !os.IsNotExist(statErr) {
+		t.Fatalf("detached graph-provider descendant wrote outside the repository after the run completed: err=%v", statErr)
+	}
+	if err != nil {
+		if strings.Contains(err.Error(), "no descendant-owning primitive available") {
+			return
+		}
+		t.Fatalf("RunWithAutoRepair: %v", err)
+	}
 	if rec.Status != "APPROVED" {
 		t.Fatalf("expected APPROVED, got status=%s message=%s", rec.Status, rec.Message)
-	}
-
-	time.Sleep(3 * time.Second)
-	if _, err := os.Stat(hostEscape); !os.IsNotExist(err) {
-		t.Fatalf("detached graph-provider descendant wrote outside the repository after the run completed: err=%v", err)
 	}
 }
 
