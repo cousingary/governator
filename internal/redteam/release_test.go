@@ -109,6 +109,22 @@ type releaseFixtureOpts struct {
 	manifestCommit string
 	artifactCommit string // defaults to manifestCommit when empty
 	mode           os.FileMode
+
+	// artifactVersion, when non-empty, is compiled into the fake artifact
+	// binary in place of version -- so build-manifest.json's declared
+	// "version" and the artifact's own `version --json` report can be made
+	// to drift independently (Session 7 / TestV7Case32).
+	artifactVersion string
+	// manifestArtifactSHAOverride, when non-empty, replaces the manifest's
+	// recorded artifact_sha256 with an arbitrary value instead of the
+	// archive's real hash (Session 7 / TestV7Case36: an installed/local
+	// binary whose hash no longer matches what the release manifest
+	// recorded).
+	manifestArtifactSHAOverride string
+	// omitArchive, when true, writes build-manifest.json referencing the
+	// expected archive name but never actually writes that file to distDir
+	// (Session 7 / TestV7Case31: a release with a missing current binary).
+	omitArchive bool
 }
 
 // buildReleaseFixtureDist assembles a synthetic release dist/ directory --
@@ -140,11 +156,20 @@ func buildReleaseFixtureDist(t *testing.T, opts releaseFixtureOpts) (distDir, re
 		t.Fatal(err)
 	}
 
-	artifactBin := buildFakeArtifactBinary(t, opts.version, artifactCommit, claimsHash)
+	artifactVersion := opts.artifactVersion
+	if artifactVersion == "" {
+		artifactVersion = opts.version
+	}
+	artifactBin := buildFakeArtifactBinary(t, artifactVersion, artifactCommit, claimsHash)
 	artifactSHA := fileSHA256Hex(t, artifactBin)
+	if opts.manifestArtifactSHAOverride != "" {
+		artifactSHA = opts.manifestArtifactSHAOverride
+	}
 
 	archiveName := fmt.Sprintf("gov_%s_%s.tar.gz", opts.version, platform)
-	writeSingleFileTarGz(t, filepath.Join(distDir, archiveName), "gov", artifactBin, opts.mode)
+	if !opts.omitArchive {
+		writeSingleFileTarGz(t, filepath.Join(distDir, archiveName), "gov", artifactBin, opts.mode)
+	}
 
 	manifest := map[string]any{
 		"version":                  opts.version,
@@ -207,7 +232,7 @@ func main() {
 		t.Fatal(err)
 	}
 	out := filepath.Join(t.TempDir(), "fakegov")
-	cmd := exec.Command("go", "build", "-o", out,
+	cmd := exec.Command("go", "build", "-buildvcs=false", "-o", out,
 		"-ldflags", "-X main.version="+version+" -X main.sourceCommit="+sourceCommit+" -X main.claimsHash="+claimsHash,
 		".")
 	cmd.Dir = modDir

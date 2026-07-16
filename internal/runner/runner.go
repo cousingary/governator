@@ -96,22 +96,29 @@ type Runner interface {
 // Credentials.Roots itself at credential-mount time, independently of
 // whatever the rest of the run had already frozen. Ignored for mode "local"
 // (LocalWorktreeRunner never mounts credentials).
-func New(mode string, dockerCfg *contracts.DockerRunnerConfig, localCfg *contracts.LocalRunnerConfig, credentialRoots []string) (Runner, error) {
+func New(mode string, dockerCfg *contracts.DockerRunnerConfig, localCfg *contracts.LocalRunnerConfig, credentialRoots []string, controllerEnvironments ...controllerenv.Frozen) (Runner, error) {
+	frozen := controllerenv.Freeze()
+	if len(controllerEnvironments) > 0 {
+		frozen = controllerEnvironments[0]
+	}
+	if err := frozen.Validate(); err != nil {
+		return nil, fmt.Errorf("runner: %w", err)
+	}
 	switch mode {
 	case "", "local":
 		cfg := contracts.LocalRunnerConfig{}
 		if localCfg != nil {
 			cfg = *localCfg
 		}
-		return &LocalWorktreeRunner{Config: cfg}, nil
+		return &LocalWorktreeRunner{Config: cfg, ControllerEnvironment: frozen}, nil
 	case "docker":
 		if dockerCfg == nil {
 			return nil, fmt.Errorf("runner: docker requested but no docker config was supplied")
 		}
-		if err := CheckDockerAvailable(); err != nil {
+		if err := CheckDockerAvailable(frozen); err != nil {
 			return nil, fmt.Errorf("runner: docker requested but unavailable: %w", err)
 		}
-		return &DockerRunner{Config: *dockerCfg, CredentialRoots: credentialRoots}, nil
+		return &DockerRunner{Config: *dockerCfg, CredentialRoots: credentialRoots, ControllerEnvironment: frozen}, nil
 	default:
 		return nil, fmt.Errorf("runner: unknown mode %q", mode)
 	}
@@ -121,7 +128,11 @@ func New(mode string, dockerCfg *contracts.DockerRunnerConfig, localCfg *contrac
 // is done before it exits. Copied verbatim from internal/runtime's identical
 // helper — both packages need the same "run a git plumbing command, honor
 // ctx cancellation" primitive, and runner must not import runtime.
-func shell(ctx context.Context, dir, command string) (int, string, error) {
+func shell(ctx context.Context, dir, command string, environments ...controllerenv.Frozen) (int, string, error) {
+	frozen := controllerenv.Freeze()
+	if len(environments) > 0 {
+		frozen = environments[0]
+	}
 	// Sol report attack 10 / P0-5: see internal/runtime's identical helper
 	// for why this prepends the trusted-tool registry's verified git
 	// directory to the subprocess's PATH rather than trusting whatever the
@@ -144,7 +155,14 @@ func shell(ctx context.Context, dir, command string) (int, string, error) {
 	}
 	cmd := exec.CommandContext(ctx, bashIdentity.CanonicalPath, "--noprofile", "--norc", "-c", command)
 	cmd.Dir = dir
-	cmd.Env = controllerenv.With(map[string]string{"PATH": filepath.Dir(gitPath) + string(os.PathListSeparator) + os.Getenv("PATH")})
+	if err := frozen.Validate(); err != nil {
+		return -1, "", err
+	}
+	pathValue := filepath.Dir(gitPath)
+	if basePath, ok := frozen.Lookup("PATH"); ok && basePath != "" {
+		pathValue += string(os.PathListSeparator) + basePath
+	}
+	cmd.Env = frozen.With(map[string]string{"PATH": pathValue}).Values
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	out, err := cmd.CombinedOutput()
 	if ctx.Err() != nil && cmd.Process != nil {
@@ -166,25 +184,25 @@ func shQuote(s string) string { return "'" + strings.ReplaceAll(s, "'", "'\"'\"'
 // prepareWorktree creates the disposable workspace shared by every Runner: a
 // git worktree off root (git == true) or a plain reflink copy (git == false).
 // Copied verbatim from internal/runtime's prior createWorkspace.
-func prepareWorktree(ctx context.Context, root, home, id string, git bool) (Workspace, error) {
+func prepareWorktree(ctx context.Context, root, home, id string, git bool, frozen controllerenv.Frozen) (Workspace, error) {
 	p := filepath.Join(home, "worktrees", id)
 	if err := os.MkdirAll(filepath.Dir(p), 0700); err != nil {
 		return Workspace{}, err
 	}
 	branch := "gov/job/" + id
 	if git {
-		c, o, e := shell(ctx, root, fmt.Sprintf("git worktree add -b %s %s HEAD", shQuote(branch), shQuote(p)))
+		c, o, e := shell(ctx, root, fmt.Sprintf("git worktree add -b %s %s HEAD", shQuote(branch), shQuote(p)), frozen)
 		if e != nil || c != 0 {
-			return Workspace{}, fmt.Errorf("git worktree: %s", o)
+			return Workspace{}, fmt.Errorf("git worktree: %v: %s", e, o)
 		}
 		return Workspace{Path: p, Root: root, Branch: branch, Git: true}, nil
 	}
 	if err := os.MkdirAll(p, 0700); err != nil {
 		return Workspace{}, err
 	}
-	c, o, e := shell(ctx, root, fmt.Sprintf("cp -a --reflink=auto ./. %s", shQuote(p)))
+	c, o, e := shell(ctx, root, fmt.Sprintf("cp -a --reflink=auto ./. %s", shQuote(p)), frozen)
 	if e != nil || c != 0 {
-		return Workspace{}, fmt.Errorf("copy workspace: %s", o)
+		return Workspace{}, fmt.Errorf("copy workspace: %v: %s", e, o)
 	}
 	return Workspace{Path: p, Root: root}, nil
 }
@@ -193,13 +211,13 @@ func prepareWorktree(ctx context.Context, root, home, id string, git bool) (Work
 // controls whether the git branch is deleted: a quarantined run keeps its
 // branch around for inspection, exactly as before Phase 5 extracted this
 // logic out of internal/runtime's runOnce tail.
-func destroyWorktree(ctx context.Context, ws Workspace, approved bool) error {
+func destroyWorktree(ctx context.Context, ws Workspace, approved bool, frozen controllerenv.Frozen) error {
 	if ws.Git {
-		if _, o, e := shell(ctx, ws.Root, "git worktree remove --force "+shQuote(ws.Path)); e != nil {
+		if _, o, e := shell(ctx, ws.Root, "git worktree remove --force "+shQuote(ws.Path), frozen); e != nil {
 			return fmt.Errorf("git worktree remove: %s", o)
 		}
 		if approved {
-			_, _, _ = shell(ctx, ws.Root, "git branch -D "+shQuote(ws.Branch))
+			_, _, _ = shell(ctx, ws.Root, "git branch -D "+shQuote(ws.Branch), frozen)
 		}
 		return nil
 	}
@@ -216,14 +234,24 @@ func destroyWorktree(ctx context.Context, ws Workspace, approved bool) error {
 // LocalWorktreeRunner serves a single run (runner.New builds a fresh
 // instance per run), so this mutable state does not leak across runs.
 type LocalWorktreeRunner struct {
-	Config contracts.LocalRunnerConfig
+	Config                contracts.LocalRunnerConfig
+	ControllerEnvironment controllerenv.Frozen
 
 	mu    sync.Mutex
 	trunc truncationStats
 }
 
+func (r *LocalWorktreeRunner) controllerEnvironment() controllerenv.Frozen {
+	if r.ControllerEnvironment.Validate() == nil {
+		return r.ControllerEnvironment
+	}
+	// Preserve direct struct construction for package clients and tests. Runs
+	// constructed through New always carry the single run-frozen snapshot.
+	return controllerenv.Freeze()
+}
+
 func (r *LocalWorktreeRunner) Prepare(ctx context.Context, req PrepareRequest) (Workspace, error) {
-	return prepareWorktree(ctx, req.Root, req.Home, req.ID, req.Git)
+	return prepareWorktree(ctx, req.Root, req.Home, req.ID, req.Git, r.controllerEnvironment())
 }
 
 // Launch itself adds no host containment beyond what the worktree provides
@@ -345,5 +373,5 @@ func (r *LocalWorktreeRunner) Observe(context.Context, Workspace) (ObserveResult
 func (r *LocalWorktreeRunner) Stop(context.Context, Workspace) error { return nil }
 
 func (r *LocalWorktreeRunner) Destroy(ctx context.Context, ws Workspace, approved bool) error {
-	return destroyWorktree(ctx, ws, approved)
+	return destroyWorktree(ctx, ws, approved, r.controllerEnvironment())
 }

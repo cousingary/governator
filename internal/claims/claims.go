@@ -29,6 +29,7 @@ import (
 	"time"
 
 	"github.com/cousingary/governator/internal/gitplumb"
+	"github.com/cousingary/governator/internal/redteamgate"
 	"gopkg.in/yaml.v3"
 )
 
@@ -136,6 +137,15 @@ type Claim struct {
 	IntegrationTests    []FileFuncs     `yaml:"integration_tests,omitempty"`
 	AcceptanceArtifacts []ArtifactRef   `yaml:"acceptance_artifacts,omitempty"`
 	BinaryBuildEvidence *BinaryEvidence `yaml:"binary_build_evidence,omitempty"`
+	// RedteamCases lists internal/redteam/manifest.yaml case numbers this
+	// claim's "shipped" maturity depends on (Sol v7 S7, secondary finding 5:
+	// "claims verification rejects evidence ... and fails when a claim
+	// exceeds executable enforcement"). A claim naming case 4 ("narrow
+	// Landlock is enforced") must have case 4 actually passing in the
+	// shipped binary's redteam evidence, not merely skipped or absent —
+	// verifyShipped checks this against the manifest and the evidence
+	// file's identity_gate results.
+	RedteamCases []int `yaml:"redteam_cases,omitempty"`
 }
 
 // Document is the top-level docs/claims.yaml shape.
@@ -448,6 +458,12 @@ func verifyShipped(repoRoot string, c Claim, opts VerifyOptions) (bool, []string
 				ok = false
 				problems = append(problems, gateProblems...)
 			}
+			if len(c.RedteamCases) > 0 {
+				if casesOK, caseProblems := verifyClaimedRedteamCases(repoRoot, c.RedteamCases, parsed); !casesOK {
+					ok = false
+					problems = append(problems, caseProblems...)
+				}
+			}
 		}
 	}
 
@@ -476,7 +492,61 @@ func verifyShipped(repoRoot string, c Claim, opts VerifyOptions) (bool, []string
 	return ok, problems
 }
 
-const minRedteamTestCount = 36
+// minRedteamTestCount is a defense-in-depth floor, not the primary release
+// gate: even if the identity gate's manifest were somehow tampered down to
+// fewer entries, a redteam suite discovering fewer than the full 38-case
+// mandatory final attack corpus (agents/governator-sol-upgrade7-plan.md)
+// cannot be a real release. The identity check below (an exact,
+// name-by-name comparison against internal/redteam/manifest.yaml via `gov
+// redteam-gate verify`) is what actually replaces the old count-only gate
+// (Sol v7 S7, HS4) — see identity_gate below.
+const minRedteamTestCount = 38
+
+// verifyClaimedRedteamCases checks that every redteam manifest case number a
+// claim declares (Claim.RedteamCases) is neither missing, name-drifted,
+// failed, nor an unauthorized skip in the shipped binary's redteam evidence
+// — Sol v7 S7 secondary finding 5 ("claims verification ... fails when a
+// claim exceeds executable enforcement"). Resolves case numbers to exact
+// test names via internal/redteam/manifest.yaml, so a claim can assert
+// "cases 13-16 are enforced" without hardcoding function names that could
+// drift out from under it.
+func verifyClaimedRedteamCases(repoRoot string, cases []int, evidence map[string]any) (bool, []string) {
+	manifestPath := filepath.Join(repoRoot, "internal", "redteam", "manifest.yaml")
+	manifest, err := redteamgate.LoadManifest(manifestPath)
+	if err != nil {
+		return false, []string{fmt.Sprintf("absent from shipped binary: redteam_cases declared but manifest unreadable: %v", err)}
+	}
+	byCase := make(map[int]string, len(manifest.Cases))
+	for _, c := range manifest.Cases {
+		byCase[c.Case] = c.Name
+	}
+	suite, found := findNamedMap(evidence, "redteam")
+	if !found {
+		return false, []string{"absent from shipped binary: redteam_cases declared but evidence has no redteam suite"}
+	}
+	gate, found := findNamedMap(suite, "identity_gate")
+	if !found {
+		return false, []string{"absent from shipped binary: redteam_cases declared but redteam suite has no identity_gate evidence"}
+	}
+	blocked := make(map[string]bool)
+	for _, field := range []string{"missing_tests", "unexpected_tests", "unexpected_skips", "failed_tests"} {
+		for _, name := range stringsAt(gate, field) {
+			blocked[name] = true
+		}
+	}
+	var problems []string
+	for _, num := range cases {
+		name, known := byCase[num]
+		if !known {
+			problems = append(problems, fmt.Sprintf("absent from shipped binary: redteam_cases declares case %d, not present in manifest.yaml", num))
+			continue
+		}
+		if blocked[name] {
+			problems = append(problems, fmt.Sprintf("absent from shipped binary: redteam case %d (%s) is missing, failed, drifted, or an unauthorized skip in the shipped evidence", num, name))
+		}
+	}
+	return len(problems) == 0, problems
+}
 
 func verifyReleaseGateEvidence(repoRoot string, evidence map[string]any, commit string) (bool, []string) {
 	var problems []string
@@ -558,27 +628,14 @@ func verifyRedteamSuite(suite map[string]any, commit string) (bool, []string) {
 		problems = append(problems, "absent from shipped binary: redteam suite has invalid log_sha256")
 	}
 	discovered, hasDiscovered := intAt(suite, "tests_discovered", "number_discovered", "discovered", "test_count")
-	run, hasRun := intAt(suite, "tests_run", "test_count", "number_run", "run")
-	skipped, hasSkipped := intAt(suite, "tests_skipped", "skipped", "number_skipped")
-	failed, hasFailed := intAt(suite, "tests_failed", "failed", "number_failed")
 	if !hasDiscovered {
 		ok = false
 		problems = append(problems, "absent from shipped binary: redteam suite lacks tests_discovered")
 	} else if discovered < minRedteamTestCount {
 		ok = false
-		problems = append(problems, fmt.Sprintf("absent from shipped binary: redteam suite discovered %d below minimum %d", discovered, minRedteamTestCount))
+		problems = append(problems, fmt.Sprintf("absent from shipped binary: redteam suite discovered %d below the full %d-case mandatory final attack corpus", discovered, minRedteamTestCount))
 	}
-	if !hasRun {
-		ok = false
-		problems = append(problems, "absent from shipped binary: redteam suite lacks tests_run")
-	} else if run < minRedteamTestCount {
-		ok = false
-		problems = append(problems, fmt.Sprintf("absent from shipped binary: redteam suite ran %d below minimum %d", run, minRedteamTestCount))
-	}
-	if !hasSkipped {
-		ok = false
-		problems = append(problems, "absent from shipped binary: redteam suite lacks tests_skipped")
-	}
+	failed, hasFailed := intAt(suite, "tests_failed", "failed", "number_failed")
 	if !hasFailed {
 		ok = false
 		problems = append(problems, "absent from shipped binary: redteam suite lacks tests_failed")
@@ -586,17 +643,31 @@ func verifyRedteamSuite(suite map[string]any, commit string) (bool, []string) {
 		ok = false
 		problems = append(problems, fmt.Sprintf("absent from shipped binary: redteam suite failed count is %d", failed))
 	}
-	unexpected, hasUnexpected := intAt(suite, "unexpected_skipped", "unexpected_skips", "unexpected_skip_count")
-	if !hasUnexpected {
+
+	// Sol v7 S7 (HS4): the old count-based unexpected-skip check
+	// (unexpected_skipped == 0) is retired — it validated a total, not which
+	// test skipped or why, so a wrong test skipping at the same total count
+	// passed unnoticed. identity_gate is `gov redteam-gate verify`'s full
+	// structured verdict against internal/redteam/manifest.yaml: exact
+	// missing/unexpected/failed/unexpected-skip test *names*. A release
+	// whose test-summary.json lacks this object entirely cannot be verified
+	// as identity-checked and fails closed, the same posture every other
+	// missing-evidence branch in this function already takes.
+	gate, hasGate := findNamedMap(suite, "identity_gate")
+	if !hasGate {
 		ok = false
-		problems = append(problems, "absent from shipped binary: redteam suite lacks unexpected_skipped count")
-	} else if unexpected != 0 {
-		ok = false
-		problems = append(problems, fmt.Sprintf("absent from shipped binary: redteam suite has %d unexpected skip(s)", unexpected))
+		problems = append(problems, "absent from shipped binary: redteam suite lacks identity_gate evidence (gov redteam-gate verify)")
+		return ok, problems
 	}
-	if hasSkipped && hasRun && skipped > run {
+	if gateOK, _ := boolAt(gate, "ok"); !gateOK {
 		ok = false
-		problems = append(problems, "absent from shipped binary: redteam skipped count exceeds run count")
+		problems = append(problems, "absent from shipped binary: redteam suite identity_gate reports ok=false (missing/unexpected/failed test or unauthorized skip)")
+	}
+	for _, field := range []string{"missing_tests", "unexpected_tests", "unexpected_skips"} {
+		if names := stringsAt(gate, field); len(names) > 0 {
+			ok = false
+			problems = append(problems, fmt.Sprintf("absent from shipped binary: redteam suite identity_gate.%s: %s", field, strings.Join(names, ", ")))
+		}
 	}
 	return ok, problems
 }
@@ -670,6 +741,32 @@ func stringAt(m map[string]any, key string) (string, bool) {
 	}
 	s, ok := v.(string)
 	return strings.TrimSpace(s), ok
+}
+
+func boolAt(m map[string]any, key string) (bool, bool) {
+	v, ok := m[key]
+	if !ok {
+		return false, false
+	}
+	b, ok := v.(bool)
+	return b, ok
+}
+
+// stringsAt reads a JSON array of strings at key, tolerating absence (nil,
+// not an error) — used for identity_gate's missing_tests/unexpected_tests/
+// unexpected_skips fields, which are omitted entirely when empty.
+func stringsAt(m map[string]any, key string) []string {
+	raw, ok := m[key].([]any)
+	if !ok {
+		return nil
+	}
+	out := make([]string, 0, len(raw))
+	for _, v := range raw {
+		if s, ok := v.(string); ok {
+			out = append(out, s)
+		}
+	}
+	return out
 }
 
 func intAt(m map[string]any, keys ...string) (int, bool) {

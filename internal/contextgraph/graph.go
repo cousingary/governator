@@ -13,7 +13,8 @@ import (
 	"strings"
 
 	"github.com/cousingary/governator/internal/config"
-	"github.com/cousingary/governator/internal/containment"
+	"github.com/cousingary/governator/internal/controllerenv"
+	stageexec "github.com/cousingary/governator/internal/stage"
 	"github.com/cousingary/governator/internal/toolregistry"
 )
 
@@ -81,14 +82,23 @@ func Resolve() (Status, error) {
 }
 
 // ResolveConfig resolves the graph provider from the already-loaded run config.
+// Standalone callers load the registry here; governed runs use
+// ResolveConfigWithRegistry with the registry frozen at run construction.
 func ResolveConfig(cfg config.Config) (Status, error) {
+	registry, err := toolregistry.Load()
+	if err != nil {
+		return Status{}, err
+	}
+	return ResolveConfigWithRegistry(cfg, registry)
+}
+
+func ResolveConfigWithRegistry(cfg config.Config, registry *toolregistry.Registry) (Status, error) {
 	status := Status{Mode: cfg.Graph.Mode, Provider: cfg.Graph.Provider, Bin: cfg.Graph.Bin}
 	if status.Mode == "off" {
 		return status, nil
 	}
-	registry, err := toolregistry.Load()
-	if err != nil {
-		return status, err
+	if registry == nil {
+		return status, fmt.Errorf("graph provider registry is not frozen")
 	}
 	identity, terr := registry.Resolve(status.Provider, status.Bin)
 	if terr != nil {
@@ -104,38 +114,37 @@ func ResolveConfig(cfg config.Config) (Status, error) {
 	return status, nil
 }
 
-func scopedCommandOutput(ctx context.Context, bin string, args []string, dir string) ([]byte, error) {
-	scope, scopeErr := containment.NewScope("contextgraph", true)
-	if scopeErr != nil {
-		return nil, scopeErr
+func scopedCommandOutput(ctx context.Context, status Status, args []string, dir string, env controllerenv.Frozen) ([]byte, error) {
+	if err := env.Validate(); err != nil {
+		return nil, err
 	}
-	cmd := scope.Command(ctx, bin, args, dir)
-	var buf strings.Builder
-	cmd.Stdout = &buf
-	cmd.Stderr = &buf
-	err := cmd.Start()
-	if err == nil && cmd.Process != nil {
-		scope.Started(cmd.Process.Pid)
-	}
-	if err == nil {
-		err = cmd.Wait()
-	}
-	output := []byte(buf.String())
-	_, extinctionErr := scope.Extinguish(context.Background(), containment.DefaultExtinctionDeadline, dir)
+	executable, err := stageexec.HashExecutable(status.Path)
 	if err != nil {
-		return output, err
+		return nil, err
 	}
-	if extinctionErr != nil {
-		return output, extinctionErr
-	}
-	return output, nil
+	result, err := stageexec.NewExecutor().Run(ctx, stageexec.StageSpec{
+		RunID:            "contextgraph",
+		StageID:          status.Provider,
+		Executable:       executable,
+		Arguments:        append([]string(nil), args...),
+		WorkingDirectory: dir,
+		Environment:      stageexec.FrozenEnvironment{Values: append([]string(nil), env.Values...), Hash: env.Hash},
+		NetworkPolicy:    stageexec.NetworkPolicyDenied,
+		CredentialPolicy: stageexec.CredentialPolicyNone,
+		DescendantPolicy: stageexec.DescendantPolicy{RequireStrong: true},
+	})
+	return []byte(result.Output), err
 }
 
 func Version(ctx context.Context, status Status) (string, error) {
+	return versionWithEnvironment(ctx, status, controllerenv.Freeze())
+}
+
+func versionWithEnvironment(ctx context.Context, status Status, env controllerenv.Frozen) (string, error) {
 	if !status.Enabled {
 		return "", fmt.Errorf("graph provider is not enabled")
 	}
-	output, err := scopedCommandOutput(ctx, status.Path, []string{"version"}, "")
+	output, err := scopedCommandOutput(ctx, status, []string{"version"}, "", env)
 	if err != nil {
 		return "", fmt.Errorf("%s version: %w: %s", status.Provider, err, strings.TrimSpace(string(output)))
 	}
@@ -143,10 +152,14 @@ func Version(ctx context.Context, status Status) (string, error) {
 }
 
 func Inspect(ctx context.Context, status Status, project string) (Stats, error) {
+	return inspectWithEnvironment(ctx, status, project, controllerenv.Freeze())
+}
+
+func inspectWithEnvironment(ctx context.Context, status Status, project string, env controllerenv.Frozen) (Stats, error) {
 	if !status.Enabled {
 		return Stats{}, fmt.Errorf("graph provider is not enabled")
 	}
-	output, err := scopedCommandOutput(ctx, status.Path, []string{"status", "--json", project}, project)
+	output, err := scopedCommandOutput(ctx, status, []string{"status", "--json", project}, project, env)
 	if err != nil {
 		return Stats{}, fmt.Errorf("%s status: %w: %s", status.Provider, err, strings.TrimSpace(string(output)))
 	}
@@ -162,11 +175,11 @@ func Current(project string) (Snapshot, error) {
 	if err != nil {
 		return Snapshot{}, err
 	}
-	return CurrentWithStatus(context.Background(), project, status)
+	return CurrentWithStatus(context.Background(), project, status, controllerenv.Freeze())
 }
 
 // CurrentWithStatus snapshots an already-resolved provider without mutating the graph.
-func CurrentWithStatus(ctx context.Context, project string, status Status) (Snapshot, error) {
+func CurrentWithStatus(ctx context.Context, project string, status Status, env controllerenv.Frozen) (Snapshot, error) {
 	var err error
 	snapshot := Snapshot{Mode: status.Mode, Provider: status.Provider, BinaryPath: status.Path}
 	if !status.Enabled {
@@ -177,11 +190,11 @@ func CurrentWithStatus(ctx context.Context, project string, status Status) (Snap
 		return snapshot, err
 	}
 	snapshot.ProjectPath = project
-	snapshot.Version, err = Version(ctx, status)
+	snapshot.Version, err = versionWithEnvironment(ctx, status, env)
 	if err != nil {
 		return snapshot, err
 	}
-	stats, err := Inspect(ctx, status, project)
+	stats, err := inspectWithEnvironment(ctx, status, project, env)
 	if err != nil || !stats.Initialized {
 		return snapshot, nil
 	}
@@ -197,11 +210,11 @@ func Prepare(ctx context.Context, project string) (Snapshot, error) {
 	if err != nil {
 		return Snapshot{}, err
 	}
-	return PrepareWithStatus(ctx, project, status)
+	return PrepareWithStatus(ctx, project, status, controllerenv.Freeze())
 }
 
 // PrepareWithStatus runs an already-resolved provider handle.
-func PrepareWithStatus(ctx context.Context, project string, status Status) (Snapshot, error) {
+func PrepareWithStatus(ctx context.Context, project string, status Status, env controllerenv.Frozen) (Snapshot, error) {
 	var err error
 	snapshot := Snapshot{Mode: status.Mode, Provider: status.Provider, BinaryPath: status.Path}
 	if !status.Enabled {
@@ -212,7 +225,7 @@ func PrepareWithStatus(ctx context.Context, project string, status Status) (Snap
 		return prepareFailure(snapshot, status.Mode, err)
 	}
 	snapshot.ProjectPath = project
-	snapshot.Version, err = Version(ctx, status)
+	snapshot.Version, err = versionWithEnvironment(ctx, status, env)
 	if err != nil {
 		return prepareFailure(snapshot, status.Mode, err)
 	}
@@ -224,12 +237,12 @@ func PrepareWithStatus(ctx context.Context, project string, status Status) (Snap
 	} else if statErr != nil {
 		return prepareFailure(snapshot, status.Mode, statErr)
 	}
-	output, runErr := scopedCommandOutput(ctx, status.Path, args, project)
+	output, runErr := scopedCommandOutput(ctx, status, args, project, env)
 	if runErr != nil {
 		err = fmt.Errorf("%s %s: %w: %s", status.Provider, args[0], runErr, strings.TrimSpace(string(output)))
 		return prepareFailure(snapshot, status.Mode, err)
 	}
-	stats, err := Inspect(ctx, status, project)
+	stats, err := inspectWithEnvironment(ctx, status, project, env)
 	if err != nil {
 		return prepareFailure(snapshot, status.Mode, err)
 	}
@@ -307,7 +320,8 @@ func Query(ctx context.Context, snapshot Snapshot, search string, limit int) ([]
 	if limit <= 0 || limit > 20 {
 		return nil, fmt.Errorf("graph query limit must be between 1 and 20")
 	}
-	output, err := scopedCommandOutput(ctx, snapshot.BinaryPath, []string{"query", "--json", "--path", snapshot.ProjectPath, "--limit", strconv.Itoa(limit), search}, snapshot.ProjectPath)
+	status := Status{Provider: snapshot.Provider, Path: snapshot.BinaryPath, Enabled: snapshot.Available}
+	output, err := scopedCommandOutput(ctx, status, []string{"query", "--json", "--path", snapshot.ProjectPath, "--limit", strconv.Itoa(limit), search}, snapshot.ProjectPath, controllerenv.Freeze())
 	if err != nil {
 		return nil, fmt.Errorf("%s query: %w: %s", snapshot.Provider, err, strings.TrimSpace(string(output)))
 	}

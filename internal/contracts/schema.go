@@ -9,6 +9,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"gopkg.in/yaml.v3"
 )
 
 type Mode string
@@ -309,6 +311,10 @@ type LocalRunnerConfig struct {
 	// name: a local run whose transcript was capped is quarantined rather
 	// than approved on an incomplete evidence trail. Defaults false.
 	RequireCompleteTranscript bool `yaml:"require_complete_transcript,omitempty" json:"require_complete_transcript,omitempty"`
+	// ReadRoots declares exact external files or narrow application directories
+	// the local stage may read. Broad host roots (/etc, /proc, /dev, /usr, /)
+	// are rejected by the Landlock policy. The workspace is implicit.
+	ReadRoots []string `yaml:"read_roots,omitempty" json:"read_roots,omitempty"`
 }
 
 // EffectiveOutputCapBytes defaults an unset/invalid cap to 20MiB, identical
@@ -421,6 +427,11 @@ func (d *DockerRunnerConfig) IsHardened() bool {
 // EffectiveRunner's "local" default.
 var validRunners = map[string]bool{"": true, "local": true, "docker": true}
 
+// ReplayPolicy declares how canary material participates in strict replay.
+type ReplayPolicy struct {
+	CanaryPolicy string `yaml:"canary_policy,omitempty" json:"canary_policy,omitempty"`
+}
+
 type Contract struct {
 	Task          string         `yaml:"task,omitempty" json:"task,omitempty"`
 	JobID         string         `yaml:"job_id" json:"job_id"`
@@ -440,6 +451,7 @@ type Contract struct {
 	Produces      []ArtifactSpec `yaml:"produces,omitempty" json:"produces,omitempty"`
 	Consumes      []string       `yaml:"consumes,omitempty" json:"consumes,omitempty"`
 	OnViolation   string         `yaml:"on_violation" json:"on_violation"`
+	Replay        *ReplayPolicy  `yaml:"replay,omitempty" json:"replay,omitempty"`
 
 	// Routing shapes route-broker selection and is only meaningful with
 	// agent: auto. Validate rejects a routing block paired with an explicit
@@ -534,6 +546,13 @@ type Contract struct {
 }
 
 // EffectiveRunner defaults an unset Runner to "local".
+func (c Contract) EffectiveCanaryPolicy() string {
+	if c.Replay == nil || c.Replay.CanaryPolicy == "" {
+		return "exclude_random_bytes_from_model"
+	}
+	return c.Replay.CanaryPolicy
+}
+
 func (c Contract) EffectiveRunner() string {
 	if c.Runner == "" {
 		return "local"
@@ -691,9 +710,79 @@ type Preflight struct {
 	ApproveHighRisk bool     `yaml:"approve_high_risk,omitempty" json:"approve_high_risk,omitempty"`
 }
 
+type ValidatorSpec struct {
+	Command string   `yaml:"command" json:"command"`
+	Tools   []string `yaml:"tools,omitempty" json:"tools,omitempty"`
+	Files   []string `yaml:"files,omitempty" json:"files,omitempty"`
+}
+
 type Success struct {
-	RequiredFiles []string `yaml:"required_files" json:"required_files"`
-	Validators    []string `yaml:"validators" json:"validators"`
+	RequiredFiles  []string        `yaml:"required_files" json:"required_files"`
+	Validators     []string        `yaml:"-" json:"validators"`
+	ValidatorSpecs []ValidatorSpec `yaml:"-" json:"validator_specs,omitempty"`
+}
+
+func (s *Success) UnmarshalYAML(node *yaml.Node) error {
+	if node.Kind != yaml.MappingNode {
+		return fmt.Errorf("success must be a mapping")
+	}
+	s.RequiredFiles = nil
+	s.Validators = nil
+	s.ValidatorSpecs = nil
+	for i := 0; i < len(node.Content); i += 2 {
+		key, value := node.Content[i].Value, node.Content[i+1]
+		switch key {
+		case "required_files":
+			if err := value.Decode(&s.RequiredFiles); err != nil {
+				return err
+			}
+		case "validators":
+			if value.Kind != yaml.SequenceNode {
+				return fmt.Errorf("success.validators must be a sequence")
+			}
+			for _, item := range value.Content {
+				switch item.Kind {
+				case yaml.ScalarNode:
+					s.Validators = append(s.Validators, item.Value)
+				case yaml.MappingNode:
+					for j := 0; j < len(item.Content); j += 2 {
+						field := item.Content[j].Value
+						if field != "command" && field != "tools" && field != "files" {
+							return fmt.Errorf("validator field %s is not supported", field)
+						}
+					}
+					var spec ValidatorSpec
+					if err := item.Decode(&spec); err != nil {
+						return err
+					}
+					s.Validators = append(s.Validators, spec.Command)
+					s.ValidatorSpecs = append(s.ValidatorSpecs, spec)
+				default:
+					return fmt.Errorf("validator must be a command string or mapping")
+				}
+			}
+		default:
+			return fmt.Errorf("field %s not found in type contracts.Success", key)
+		}
+	}
+	return nil
+}
+
+func (s Success) MarshalYAML() (any, error) {
+	validators := make([]any, 0, len(s.Validators))
+	if len(s.ValidatorSpecs) > 0 {
+		for _, spec := range s.ValidatorSpecs {
+			validators = append(validators, spec)
+		}
+	} else {
+		for _, command := range s.Validators {
+			validators = append(validators, command)
+		}
+	}
+	return struct {
+		RequiredFiles []string `yaml:"required_files"`
+		Validators    []any    `yaml:"validators"`
+	}{s.RequiredFiles, validators}, nil
 }
 
 type OutputPolicy struct {
@@ -775,6 +864,9 @@ func (e ValidationErrors) Sorted() ValidationErrors {
 func (c Contract) Validate() error {
 	var errs ValidationErrors
 	add := func(field, message string) { errs = append(errs, ValidationError{Field: field, Message: message}) }
+	if policy := c.EffectiveCanaryPolicy(); policy != "exclude_random_bytes_from_model" {
+		add("replay.canary_policy", "must be exclude_random_bytes_from_model")
+	}
 
 	if strings.TrimSpace(c.JobID) == "" {
 		add("job_id", "is required")
@@ -878,6 +970,20 @@ func (c Contract) Validate() error {
 		add("success.validators", "must contain at least one deterministic validator command")
 	}
 	validateNonBlank("success.validators", c.Success.Validators, add)
+	if len(c.Success.ValidatorSpecs) > 0 && len(c.Success.ValidatorSpecs) != len(c.Success.Validators) {
+		add("success.validators", "structured and command-string validators cannot be mixed")
+	}
+	for i, spec := range c.Success.ValidatorSpecs {
+		prefix := fmt.Sprintf("success.validators[%d]", i)
+		if strings.TrimSpace(spec.Command) == "" {
+			add(prefix+".command", "is required")
+		}
+		if len(spec.Tools) == 0 {
+			add(prefix+".tools", "must declare at least one executable tool")
+		}
+		validateNonBlank(prefix+".tools", spec.Tools, add)
+		validatePathPatterns(prefix+".files", spec.Files, add)
+	}
 
 	if c.Output != nil {
 		switch c.Output.Style {

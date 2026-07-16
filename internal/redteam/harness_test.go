@@ -23,6 +23,7 @@ import (
 	"testing"
 
 	"github.com/cousingary/governator/internal/contracts"
+	"github.com/cousingary/governator/internal/enforce"
 	govruntime "github.com/cousingary/governator/internal/runtime"
 	"github.com/cousingary/governator/internal/toolregistry"
 )
@@ -49,7 +50,7 @@ func govBinary(t *testing.T) string {
 			return
 		}
 		out := filepath.Join(dir, "gov")
-		cmd := exec.Command("go", "build", "-o", out, "./cmd/gov")
+		cmd := exec.Command("go", "build", "-buildvcs=false", "-o", out, "./cmd/gov")
 		cmd.Dir = repoRoot
 		if combined, err := cmd.CombinedOutput(); err != nil {
 			govBinaryErr = err
@@ -148,6 +149,14 @@ func runGoverned(t *testing.T, home, bin string, c contracts.Contract) govruntim
 
 func runGovernedAllowError(t *testing.T, home, bin string, c contracts.Contract) (govruntime.RunRecord, error) {
 	t.Helper()
+	// Authority-derived containment makes effectful local fixtures use the
+	// same Landlock/netns prerequisites as production.
+	enrollRealControllerTools(t)
+	ownSelfExe := enforce.SelfExeOverride == ""
+	if ownSelfExe {
+		enforce.SelfExeOverride = govBinary(t)
+		defer func() { enforce.SelfExeOverride = "" }()
+	}
 	t.Setenv("GOV_HOME", home)
 	t.Setenv("GOV_CLAUDE_BIN", bin)
 	return govruntime.New().RunWithAutoRepair(context.Background(), c)
@@ -161,29 +170,28 @@ func runGovernedAllowError(t *testing.T, home, bin string, c contracts.Contract)
 // intentionally fresh.
 func enrollRealControllerTools(t *testing.T) {
 	t.Helper()
-	realGit := "/usr/bin/git"
-	if _, err := os.Stat(realGit); err != nil {
-		var lookErr error
-		realGit, lookErr = exec.LookPath("git")
-		if lookErr != nil {
-			t.Fatal(lookErr)
+	for _, tool := range []struct{ name, abs string }{
+		{"git", "/usr/bin/git"},
+		{"bash", "/usr/bin/bash"},
+		{"unshare", "/usr/bin/unshare"},
+	} {
+		path := tool.abs
+		if _, err := os.Stat(path); err != nil {
+			looked, lookErr := exec.LookPath(tool.name)
+			if lookErr != nil {
+				if tool.name == "unshare" {
+					continue
+				}
+				t.Fatal(lookErr)
+			}
+			path = looked
 		}
-		if canonical, everr := filepath.EvalSymlinks(realGit); everr == nil {
-			realGit = canonical
+		if canonical, err := filepath.EvalSymlinks(path); err == nil {
+			path = canonical
 		}
-	}
-	realBash, err := exec.LookPath("bash")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if canonical, everr := filepath.EvalSymlinks(realBash); everr == nil {
-		realBash = canonical
-	}
-	if _, err := toolregistry.Enroll("git", realGit); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := toolregistry.Enroll("bash", realBash); err != nil {
-		t.Fatal(err)
+		if _, err := toolregistry.Enroll(tool.name, path); err != nil {
+			t.Fatal(err)
+		}
 	}
 }
 

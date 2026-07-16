@@ -43,6 +43,7 @@ import (
 	"github.com/cousingary/governator/internal/router"
 	"github.com/cousingary/governator/internal/runner"
 	"github.com/cousingary/governator/internal/spend"
+	stageexec "github.com/cousingary/governator/internal/stage"
 	"github.com/cousingary/governator/internal/tokenoptimizer"
 	"github.com/cousingary/governator/internal/toolregistry"
 )
@@ -622,7 +623,12 @@ func shell(ctx context.Context, dir, command string) (int, string, error) {
 		cmd.Dir = dir
 		cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	}
-	cmd.Env = controllerenv.With(map[string]string{"PATH": filepath.Dir(gitPath) + string(os.PathListSeparator) + os.Getenv("PATH")})
+	frozen := controllerenv.Freeze()
+	pathValue := filepath.Dir(gitPath)
+	if basePath, ok := frozen.Lookup("PATH"); ok && basePath != "" {
+		pathValue += string(os.PathListSeparator) + basePath
+	}
+	cmd.Env = frozen.With(map[string]string{"PATH": pathValue}).Values
 	var out []byte
 	var err error
 	if scope, ok := containment.ScopeFromContext(ctx); ok {
@@ -655,20 +661,71 @@ func shell(ctx context.Context, dir, command string) (int, string, error) {
 	return code, string(out), nil
 }
 
-func shellStage(ctx context.Context, runID, stage, dir, command string, requireStrong bool) (int, string, error, error) {
-	scope, err := containment.NewScope(runID+"-"+stage, requireStrong)
-	if err != nil {
+// shellStage runs command via bash -lc in dir like shell(), but through
+// internal/stage's StageExecutor -- the one launch path every external
+// executable stage (backend, validators, cleanup validators, graph
+// provider, Assayer) shares (Sol redteam v7 S1 / RB3). Before this, a
+// validator/cleanup-validator got only a descendant-owning containment
+// scope (via containment.NewScope directly, with a scope name that was
+// just runID+"-"+stage -- reused across every validator in one run, which
+// StageExecutor's runID+stageID+nonce naming fixes) and none of the
+// filesystem/network/credential envelope a governed backend gets.
+func shellStage(ctx context.Context, runID, stageName, dir, command string, requireStrong bool, frozen ControllerEnvironment, trustedToolDirs []string, registry *toolregistry.Registry) (int, string, error, error) {
+	if registry == nil {
+		return -1, "", fmt.Errorf("controller tool registry is not frozen"), nil
+	}
+	gitIdentity, gerr := registry.Resolve("git", "git")
+	if gerr != nil {
+		return -1, "", fmt.Errorf("resolve trusted git: %w", gerr), nil
+	}
+	bashHandle, berr := registry.ResolveHandle("bash", "bash", toolregistry.KindTrustedController)
+	if berr != nil {
+		return -1, "", fmt.Errorf("resolve trusted bash handle: %w", berr), nil
+	}
+	defer bashHandle.Close()
+	bashIdentity := bashHandle.Identity
+	execID := stageexec.ExecutableIdentity{CanonicalPath: bashIdentity.CanonicalPath, SHA256: bashIdentity.SHA256}
+	if err := frozen.Validate(); err != nil {
 		return -1, "", err, nil
 	}
-	code, out, runErr := shell(containment.WithScope(ctx, scope), dir, command)
-	_, extinctionErr := scope.Extinguish(context.Background(), containment.DefaultExtinctionDeadline, dir)
-	if extinctionErr != nil {
+	pathParts := []string{filepath.Dir(gitIdentity.CanonicalPath)}
+	pathParts = append(pathParts, trustedToolDirs...)
+	if basePath, ok := frozen.Lookup("PATH"); ok && basePath != "" {
+		pathParts = append(pathParts, basePath)
+	}
+	pathValue := strings.Join(pathParts, string(os.PathListSeparator))
+	stageEnv := frozen.With(map[string]string{"PATH": pathValue})
+	enforcementPlan, _ := enforce.PlanFromContext(ctx)
+	res, err := stageexec.NewExecutor().Run(ctx, stageexec.StageSpec{
+		RunID:            runID,
+		StageID:          stageName,
+		Executable:       execID,
+		Arguments:        []string{"--noprofile", "--norc", "-c", command},
+		WorkingDirectory: dir,
+		Environment:      stageexec.FrozenEnvironment{Values: stageEnv.Values, Hash: stageEnv.Hash},
+		NetworkPolicy:    stageexec.NetworkPolicyDenied,
+		CredentialPolicy: stageexec.CredentialPolicyNone,
+		DescendantPolicy: stageexec.DescendantPolicy{RequireStrong: requireStrong},
+		EnforcementPlan:  enforcementPlan,
+		ExecutableHandle: bashHandle,
+	})
+	out := res.Output
+	var extinctionErr error
+	if err != nil && !res.DescendantsGone {
+		extinctionErr = err
 		if out != "" && !strings.HasSuffix(out, "\n") {
 			out += "\n"
 		}
-		out += "descendant containment: " + extinctionErr.Error()
+		out += "descendant containment: " + err.Error()
 	}
-	return code, out, runErr, extinctionErr
+	return res.ExitStatus, out, err, extinctionErr
+}
+
+func localReadRoots(cfg *contracts.LocalRunnerConfig) []string {
+	if cfg == nil {
+		return nil
+	}
+	return append([]string(nil), cfg.ReadRoots...)
 }
 
 func gitHead(root string) (string, error) {
@@ -2419,7 +2476,7 @@ func (r *Runner) runOnce(ctx context.Context, c contracts.Contract) (RunRecord, 
 	// effect: a docker request Governator can't satisfy must fail closed with
 	// a clear error here, never silently fall back to LocalWorktreeRunner and
 	// never leave a partially-acquired lock or reservation behind.
-	rn, err := runner.New(c.EffectiveRunner(), c.Docker, c.Local, env.CredentialRoots)
+	rn, err := runner.New(c.EffectiveRunner(), c.Docker, c.Local, env.CredentialRoots, env.Controller)
 	if err != nil {
 		return RunRecord{}, err
 	}
@@ -2751,7 +2808,7 @@ func (r *Runner) runOnce(ctx context.Context, c contracts.Contract) (RunRecord, 
 	// exactly like every other pre-launch identity input.
 	var dockerImage *runner.ImageIdentity
 	if c.EffectiveRunner() == "docker" && c.Docker != nil {
-		img, ierr := runner.ResolveImageIdentity(ctx, c.Docker.Image)
+		img, ierr := runner.ResolveImageIdentity(ctx, c.Docker.Image, env.Controller)
 		if ierr != nil {
 			return RunRecord{}, ierr
 		}
@@ -2761,11 +2818,16 @@ func (r *Runner) runOnce(ctx context.Context, c contracts.Contract) (RunRecord, 
 	if err != nil {
 		return RunRecord{}, err
 	}
-	graphStatus, err := contextgraph.ResolveConfig(cfg)
+	validatorToolsetHash, err := resolveValidatorToolset(c, root, env.ToolRegistry)
 	if err != nil {
 		return RunRecord{}, err
 	}
-	preReplayGraph, err := contextgraph.CurrentWithStatus(ctx, root, graphStatus)
+	validatorToolDirs, err := validatorToolDirectories(c, env.ToolRegistry)
+	if err != nil {
+		return RunRecord{}, err
+	}
+	graphStatus := env.GraphStatus
+	preReplayGraph, err := contextgraph.CurrentWithStatus(ctx, root, graphStatus, env.Controller)
 	if err != nil {
 		return RunRecord{}, err
 	}
@@ -2773,13 +2835,49 @@ func (r *Runner) runOnce(ctx context.Context, c contracts.Contract) (RunRecord, 
 	if err != nil {
 		return RunRecord{}, err
 	}
+	compiledPromptForIdentity += "\nController canary: .governator-canary must remain byte-for-byte unchanged. Touching it quarantines the run.\n"
 	compiledPromptForIdentity += artifactPromptAnnotation(consumedIdentities, c.Produces)
 	compiledPromptForIdentity += prompts.Annotation(promptVersion)
+	compiledPromptForIdentity += rtkAnnotation
 	compiledPromptForIdentity += contextgraph.PromptAnnotation(preReplayGraph)
+	compiledPromptForIdentity += minimalismAnnotation
 	compiledPromptHash := hashJSON(map[string]string{"prompt": compiledPromptForIdentity})
 	graphSnapshotHash := hashJSON(preReplayGraph)
-	identity := computeExecutionIdentity(cfg, c, agent, handle.PathResolution, handle.Identity, dockerImage, agents.EnvPolicyHash(handle.AllowedEnv), head, hash, promptVersion, capabilityAttestID, policyBundle, compiledPromptHash, consumedArtifactsHash(consumedIdentities), contextgraph.ProviderIdentityHash(graphStatus), graphSnapshotHash)
-	if priorID, perr := replayMatch(db, identity.Hash()); perr != nil {
+	identity := computeExecutionIdentity(cfg, c, agent, handle.PathResolution, handle.Identity, dockerImage, agents.EnvPolicyHash(handle.AllowedEnv), head, hash, promptVersion, capabilityAttestID, policyBundle, compiledPromptHash, consumedArtifactsHash(consumedIdentities), contextgraph.ProviderIdentityHash(graphStatus), graphSnapshotHash, env.Controller.Hash, validatorToolsetHash)
+	identity.ProtectedManifestHash = hashJSON(env.ProtectedPatterns)
+	identity.AssayerEnvironmentHash = resolvedAssayerEnvironmentHash(cfg, c)
+	identity.AssayerProfileHash = identity.AssayerEnvironmentHash
+	backendToolIdentity := toolregistry.Identity{Name: resolved.Agent, Kind: toolregistry.KindGovernedBackend, CanonicalPath: handle.CanonicalPath, SHA256: handle.SHA256, OwnerUID: handle.OwnerUID, OwnerGID: handle.OwnerGID, Mode: handle.Mode}
+	assayerParticipantHash := ""
+	if cfg.Assay.Repo != "" {
+		assayerParticipantHash = identity.AssayerEnvironmentHash
+	}
+	identity.Participants = resolvedParticipants(env.ToolRegistry, backendToolIdentity, graphStatus, env.Controller.Hash, validatorToolsetHash, assayerParticipantHash)
+	if dockerImage != nil {
+		identity.Participants["docker_daemon"] = ExecutableIdentity{Role: "docker_daemon", SHA256: hashJSON(dockerImage), Known: true}
+	}
+	if len(c.Success.Validators) > 0 && len(c.Success.ValidatorSpecs) == 0 {
+		identity.Participants["validator_tools"] = ExecutableIdentity{Role: "validator_tools", Known: false}
+		identity.Participants["validator_scripts"] = ExecutableIdentity{Role: "validator_scripts", Known: false}
+	}
+	identity.ControllerToolsetHash = hashJSON(identity.Participants)
+	identity.ExactPromptHash = compiledPromptHash
+	identity.CredentialIdentityHash = hashJSON(map[string]any{"roots": env.CredentialRoots, "account": handle.Identity})
+	identity.StrictReplayEligible = handle.Identity.Known()
+	if !identity.StrictReplayEligible {
+		identity.StrictReplayDisabledReason = "backend provider/model/account identity is unknown"
+	}
+	if perr := validateParticipants(identity.Participants); perr != nil {
+		identity.StrictReplayEligible = false
+		identity.StrictReplayDisabledReason = perr.Error()
+	}
+	transaction := newTransactionSnapshot(hash, env.ConfigHash, env.ProtectedPatterns, graphSnapshotHash, compiledPromptForIdentity, env.Controller.Hash, identity.CredentialIdentityHash, identity.Participants, consumedIdentities)
+	if priorID, perr := replayMatch(db, func() string {
+		if identity.StrictReplayEligible {
+			return identity.Hash()
+		}
+		return ""
+	}()); perr != nil {
 		return RunRecord{}, perr
 	} else if priorID != "" {
 		replayed, replayErr := Last(priorID)
@@ -2825,10 +2923,9 @@ func (r *Runner) runOnce(ctx context.Context, c contracts.Contract) (RunRecord, 
 	if err := lifecycle.Record(db, id, lifecycle.WorkspaceReady, string(wsDescriptorJSON), lifecycle.Now()); err != nil {
 		return rec, err
 	}
-	graphSnapshot, err := contextgraph.PrepareWithStatus(ctx, work, graphStatus)
-	if err != nil {
-		return rec, err
-	}
+	// Consume the exact frozen graph snapshot represented by replay identity.
+	graphSnapshot := preReplayGraph
+	_ = transaction.GraphSnapshotHash
 	c.Allowed.Execute = append(c.Allowed.Execute, contextgraph.CommandPatterns(graphSnapshot)...)
 	rec.Graph = graphSnapshot
 	if graphSnapshot.Warning != "" {
@@ -2845,7 +2942,7 @@ func (r *Runner) runOnce(ctx context.Context, c contracts.Contract) (RunRecord, 
 	if err := os.WriteFile(canaryPath, []byte(id+"\n"), 0400); err != nil {
 		return RunRecord{}, fmt.Errorf("create canary: %w", err)
 	}
-	stagedArtifacts, err := stageConsumedArtifacts(db, r.Home, work, c)
+	_, err = stageConsumedArtifacts(work, transaction.Artifacts)
 	if err != nil {
 		return RunRecord{}, err
 	}
@@ -2856,7 +2953,7 @@ func (r *Runner) runOnce(ctx context.Context, c contracts.Contract) (RunRecord, 
 	if err != nil {
 		return rec, err
 	}
-	protectedBefore, err := protectedFingerprint(env.ProtectedPatterns)
+	protectedBefore, err := protectedFingerprint(transaction.ProtectedPatterns)
 	if err != nil {
 		return rec, err
 	}
@@ -2868,16 +2965,8 @@ func (r *Runner) runOnce(ctx context.Context, c contracts.Contract) (RunRecord, 
 	if err != nil {
 		return rec, err
 	}
-	prompt, err := contracts.CompilePrompt(c, work)
-	if err != nil {
-		return rec, err
-	}
-	prompt += "\nController canary: " + canaryName + " must remain byte-for-byte unchanged. Touching it quarantines the run.\n"
-	prompt += artifactPromptAnnotation(stagedArtifacts, c.Produces)
-	prompt += prompts.Annotation(promptVersion)
-	prompt += rtkAnnotation
-	prompt += contextgraph.PromptAnnotation(graphSnapshot)
-	prompt += minimalismAnnotation
+	// The model receives exactly the prompt bytes represented by replay identity.
+	prompt := transaction.ExactPrompt
 	// The AGENT_RUNNING checkpoint carries a digest of workBefore (the
 	// worktree's pre-launch fingerprint) as its detail so a recovery pass
 	// (gov run resume/recover --stale) run against a later crashed process can
@@ -2906,7 +2995,7 @@ func (r *Runner) runOnce(ctx context.Context, c contracts.Contract) (RunRecord, 
 	// -- not recomputed here. NewPlan refuses outright for a high-risk run on
 	// a host that cannot actually provide it, the same fail-closed posture as
 	// containment.NewScope just above for the descendant-owning primitive.
-	enforcePlan, enforcePlanErr := enforce.NewPlan(requiresEnforcementWrap, work, spec.Sandbox == agents.SandboxReadOnly, spec.Network, requiresEnforcementWrap)
+	enforcePlan, enforcePlanErr := enforce.NewPlanForExecutable(requiresEnforcementWrap, work, spec.Sandbox == agents.SandboxReadOnly, spec.Network, requiresEnforcementWrap, handle.CanonicalPath, append(localReadRoots(c.Local), env.CredentialRoots...))
 	if enforcePlanErr != nil {
 		return RunRecord{}, fmt.Errorf("external enforcement: %w", enforcePlanErr)
 	}
@@ -3005,7 +3094,9 @@ func (r *Runner) runOnce(ctx context.Context, c contracts.Contract) (RunRecord, 
 		}
 		enfRec := observability.EnforcementRecord{
 			RunID: id, Method: method, NetworkNamespaced: !enforcePlan.AllowNetwork,
-			ProcessesObservedPeak: descProof.ProcessesObservedPeak, Created: time.Now().UTC().Format(time.RFC3339Nano),
+			ProcessesObservedPeak: descProof.ProcessesObservedPeak,
+			LandlockABI:           enforcePlan.LandlockABI, KernelReadEnvelope: append([]string(nil), enforcePlan.ReadRoots...),
+			Created: time.Now().UTC().Format(time.RFC3339Nano),
 		}
 		if err := observability.RecordEnforcement(db, enfRec); err != nil {
 			payload, _ := json.Marshal(enfRec)
@@ -3093,7 +3184,7 @@ func (r *Runner) runOnce(ctx context.Context, c contracts.Contract) (RunRecord, 
 	}
 	workAfter, werr := fingerprint(work)
 	liveAfter, lerr := fingerprint(root)
-	protectedAfter, perr := protectedFingerprint(env.ProtectedPatterns)
+	protectedAfter, perr := protectedFingerprint(transaction.ProtectedPatterns)
 	gitControlAfter, gcerr := gitControlFingerprint(work)
 	violations := append([]string{}, audit.Violations...)
 	violations = appendRuntimePathScanViolation(violations, "after agent execution", work)
@@ -3242,13 +3333,17 @@ func (r *Runner) runOnce(ctx context.Context, c contracts.Contract) (RunRecord, 
 	if err := lifecycle.Record(db, id, lifecycle.Validating, "", lifecycle.Now()); err != nil {
 		return rec, err
 	}
-	for _, v := range c.Success.Validators {
+	for validatorIndex, v := range c.Success.Validators {
 		vctx, cancel, deadlineErr := stageTimeout(ctx, "success validator")
 		if deadlineErr != nil {
 			violations = append(violations, deadlineErr.Error())
 			break
 		}
-		code, out, e, extinctionErr := shellStage(vctx, id, "success-validator", work, v, requireStrongDescendants)
+		var toolDirs []string
+		if validatorIndex < len(validatorToolDirs) {
+			toolDirs = validatorToolDirs[validatorIndex]
+		}
+		code, out, e, extinctionErr := shellStage(vctx, id, "success-validator", work, v, requireStrongDescendants, env.Controller, toolDirs, env.ToolRegistry)
 		cancel()
 		if extinctionErr != nil {
 			violations = append(violations, "success validator descendant containment: "+extinctionErr.Error())
@@ -3285,9 +3380,17 @@ func (r *Runner) runOnce(ctx context.Context, c contracts.Contract) (RunRecord, 
 				}
 				break
 			}
-			code, out, e, extinctionErr := shellStage(vctx, id, "cleanup-validator", work, v, requireStrongDescendants)
+			code, out, e, extinctionErr := shellStage(vctx, id, "cleanup-validator", work, v, requireStrongDescendants, env.Controller, nil, env.ToolRegistry)
 			cancel()
-			if extinctionErr != nil && c.Cleanup.Required {
+			// Sol redteam v7 S1 cleanup-specific fail-open defect: Required
+			// governs whether a nonzero cleanup EXIT CODE blocks the merge
+			// (line below) -- it must never also govern whether a failure to
+			// PROVE DESCENDANT EXTINCTION is acceptable. "Cleanup is
+			// optional" means "we don't care if the lint/format pass itself
+			// failed," never "we don't care whether something it spawned is
+			// still alive and unaccounted for." Unconditional regardless of
+			// c.Cleanup.Required.
+			if extinctionErr != nil {
 				violations = append(violations, "cleanup validator descendant containment: "+extinctionErr.Error())
 			}
 			if e != nil {

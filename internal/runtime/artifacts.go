@@ -24,6 +24,9 @@ type stagedArtifact struct {
 	Path   string
 	SHA256 string
 	Bytes  int64
+	// data is the sealed content captured before replay lookup. It is never
+	// serialized into identity; SHA256 and Bytes bind it there.
+	data []byte
 }
 
 func consumedArtifactIdentities(db *sql.DB, home string, c contracts.Contract) ([]stagedArtifact, error) {
@@ -75,7 +78,7 @@ func consumedArtifactIdentities(db *sql.DB, home string, c contracts.Contract) (
 		if sha != "" && actualSHA != sha {
 			return nil, fmt.Errorf("identify consumed artifact %q sha256 mismatch", name)
 		}
-		out = append(out, stagedArtifact{Name: name, Path: filepath.ToSlash(filepath.Join(".governator", "consumed", name)), SHA256: actualSHA, Bytes: info.Size()})
+		out = append(out, stagedArtifact{Name: name, Path: filepath.ToSlash(filepath.Join(".governator", "consumed", name)), SHA256: actualSHA, Bytes: info.Size(), data: append([]byte(nil), data...)})
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
 	return out, nil
@@ -88,71 +91,24 @@ func consumedArtifactsHash(artifacts []stagedArtifact) string {
 	return hashJSON(artifacts)
 }
 
-func stageConsumedArtifacts(db *sql.DB, home, work string, c contracts.Contract) ([]stagedArtifact, error) {
-	if len(c.Consumes) == 0 {
+func stageConsumedArtifacts(work string, artifacts []stagedArtifact) ([]stagedArtifact, error) {
+	if len(artifacts) == 0 {
 		return nil, nil
-	}
-	if len(c.ArtifactSources) == 0 {
-		return nil, fmt.Errorf("consumes declared but no artifact sources were resolved by plan validation")
 	}
 	dir := filepath.Join(work, ".governator", "consumed")
 	if err := os.MkdirAll(dir, 0700); err != nil {
 		return nil, fmt.Errorf("stage consumed artifacts: %w", err)
 	}
-	// Sol P1-7 / report §9 attack 22: every read/write below resolves beneath
-	// a fixed base directory via openBeneath (openat2 RESOLVE_BENEATH|
-	// RESOLVE_NO_SYMLINKS|RESOLVE_NO_MAGICLINKS) rather than opening an
-	// already-joined absolute path with a bare O_NOFOLLOW, which only ever
-	// guarded the final path component. artifactsRoot is the fixed base every
-	// ledger-recorded artifact path lives beneath (see collectProducedArtifacts).
-	artifactsRoot, err := filepath.Abs(filepath.Join(home, "artifacts"))
-	if err != nil {
-		return nil, err
+	for _, artifact := range artifacts {
+		sum := sha256.Sum256(artifact.data)
+		if hex.EncodeToString(sum[:]) != artifact.SHA256 || int64(len(artifact.data)) != artifact.Bytes {
+			return nil, fmt.Errorf("sealed consumed artifact %q identity mismatch", artifact.Name)
+		}
+		if err := writeNewBeneath(dir, artifact.Name, artifact.data, 0400); err != nil {
+			return nil, fmt.Errorf("stage sealed consumed artifact %q: %w", artifact.Name, err)
+		}
 	}
-	out := make([]stagedArtifact, 0, len(c.Consumes))
-	for _, name := range c.Consumes {
-		producer := c.ArtifactSources[name]
-		if producer == "" {
-			return nil, fmt.Errorf("consumed artifact %q has no producing job_id", name)
-		}
-		var src, sha string
-		var size int64
-		err := db.QueryRow(`SELECT a.path,a.sha256,a.bytes FROM artifacts a JOIN runs r ON r.id=a.run_id WHERE a.name=? AND r.job_id=? AND r.status='APPROVED' ORDER BY r.created DESC LIMIT 1`, name, producer).Scan(&src, &sha, &size)
-		if err != nil {
-			if err == sql.ErrNoRows {
-				return nil, fmt.Errorf("consumed artifact %q from job %q is not available in the ledger", name, producer)
-			}
-			return nil, err
-		}
-		if cleanSlash(name) != name || name == "." || strings.Contains(name, "/") || strings.Contains(name, `\`) {
-			return nil, fmt.Errorf("consumed artifact %q is not a safe basename", name)
-		}
-		srcAbs, err := filepath.Abs(src)
-		if err != nil {
-			return nil, err
-		}
-		srcRel, err := filepath.Rel(artifactsRoot, srcAbs)
-		if err != nil || srcRel == ".." || strings.HasPrefix(srcRel, ".."+string(os.PathSeparator)) {
-			return nil, fmt.Errorf("consumed artifact %q ledger path escapes artifacts root: %s", name, src)
-		}
-		data, info, err := readRegularBeneath(artifactsRoot, filepath.ToSlash(srcRel))
-		if err != nil {
-			return nil, fmt.Errorf("stage consumed artifact %q beneath-root read: %w", name, err)
-		}
-		if size >= 0 && info.Size() != size {
-			return nil, fmt.Errorf("stage consumed artifact %q size mismatch: ledger=%d actual=%d", name, size, info.Size())
-		}
-		actualSum := sha256.Sum256(data)
-		actualSHA := hex.EncodeToString(actualSum[:])
-		if sha != "" && actualSHA != sha {
-			return nil, fmt.Errorf("stage consumed artifact %q sha256 mismatch", name)
-		}
-		if err := writeNewBeneath(dir, name, data, 0400); err != nil {
-			return nil, fmt.Errorf("stage consumed artifact %q beneath-root write: %w", name, err)
-		}
-		out = append(out, stagedArtifact{Name: name, Path: filepath.ToSlash(filepath.Join(".governator", "consumed", name)), SHA256: actualSHA, Bytes: info.Size()})
-	}
-	return out, nil
+	return append([]stagedArtifact(nil), artifacts...), nil
 }
 
 func artifactPromptAnnotation(staged []stagedArtifact, produced []contracts.ArtifactSpec) string {

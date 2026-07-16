@@ -173,7 +173,8 @@ func (r *Registry) Resolve(name, requestedBin string) (Identity, error) {
 	if entry.Inode != 0 && identity.Inode != entry.Inode {
 		return Identity{}, fmt.Errorf("resolve tool %q: inode changed from %d to %d", name, entry.Inode, identity.Inode)
 	}
-	identity.AllowedEnv = entry.AllowedEnv
+	identity.Kind = entry.Kind
+	identity.AllowedEnv = append([]string(nil), entry.AllowedEnv...)
 	return identity, nil
 }
 
@@ -182,7 +183,14 @@ func ResolveTrusted(name, requestedBin string) (Identity, error) {
 	if err != nil {
 		return Identity{}, fmt.Errorf("load trusted-tool registry: %w", err)
 	}
-	return registry.Resolve(name, requestedBin)
+	id, err := registry.Resolve(name, requestedBin)
+	if err != nil {
+		return Identity{}, err
+	}
+	if id.Kind != KindTrustedController {
+		return Identity{}, fmt.Errorf("tool %q has kind %q, trusted controller required", name, id.Kind)
+	}
+	return id, nil
 }
 
 func Enroll(name, path string) (Identity, error) {
@@ -190,9 +198,13 @@ func Enroll(name, path string) (Identity, error) {
 		return Identity{}, errors.New("tool name is required")
 	}
 	kind := KindTrustedController
+	var prior Entry
 	if r, err := Load(); err == nil {
-		if e, ok := r.Entry(name); ok && e.Kind != "" {
-			kind = e.Kind
+		if e, ok := r.Entry(name); ok {
+			prior = e
+			if e.Kind != "" {
+				kind = e.Kind
+			}
 		}
 	}
 	identity, err := inspectPath(name, path)
@@ -203,6 +215,7 @@ func Enroll(name, path string) (Identity, error) {
 		Name: name, Kind: kind, Path: identity.CanonicalPath, SHA256: identity.SHA256,
 		OwnerUID: identity.OwnerUID, OwnerGID: identity.OwnerGID, Mode: fmt.Sprintf("%04o", identity.Mode.Perm()),
 		Device: identity.Device, Inode: identity.Inode,
+		AllowedEnv: append([]string(nil), prior.AllowedEnv...),
 	}
 	if err := updateRegistry(func(ff *fileFormat) error {
 		replaceEntry(ff, entry)
@@ -299,17 +312,42 @@ func validateEntry(path string, e Entry) error {
 }
 
 func readRegistryFile(path string) (fileFormat, bool, error) {
-	data, err := os.ReadFile(path)
+	info, err := os.Lstat(path)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return fileFormat{}, false, nil
 		}
-		return fileFormat{}, false, fmt.Errorf("read tool registry %s: %w", path, err)
+		return fileFormat{}, false, fmt.Errorf("lstat tool registry %s: %w", path, err)
 	}
-	if info, err := os.Stat(path); err == nil {
-		if info.Mode().Perm()&0o022 != 0 {
-			return fileFormat{}, false, fmt.Errorf("tool registry %s is group- or world-writable", path)
-		}
+	if info.Mode()&os.ModeSymlink != 0 {
+		return fileFormat{}, false, fmt.Errorf("tool registry %s must not be a symlink", path)
+	}
+	if info.Mode().Perm() != 0o600 {
+		return fileFormat{}, false, fmt.Errorf("tool registry %s mode is %04o, want exactly 0600", path, info.Mode().Perm())
+	}
+	if parentWritable(path) {
+		return fileFormat{}, false, fmt.Errorf("tool registry %s has an untrusted parent directory", path)
+	}
+	if st, ok := info.Sys().(*syscall.Stat_t); ok && st.Uid != uint32(os.Geteuid()) && st.Uid != 0 {
+		return fileFormat{}, false, fmt.Errorf("tool registry %s owner uid %d is not this process or root", path, st.Uid)
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return fileFormat{}, false, fmt.Errorf("open tool registry %s: %w", path, err)
+	}
+	defer f.Close()
+	opened, err := f.Stat()
+	if err != nil {
+		return fileFormat{}, false, fmt.Errorf("fstat tool registry %s: %w", path, err)
+	}
+	want, wok := info.Sys().(*syscall.Stat_t)
+	got, gok := opened.Sys().(*syscall.Stat_t)
+	if wok && gok && (want.Dev != got.Dev || want.Ino != got.Ino) {
+		return fileFormat{}, false, fmt.Errorf("tool registry %s changed during open", path)
+	}
+	data, err := io.ReadAll(f)
+	if err != nil {
+		return fileFormat{}, false, fmt.Errorf("read tool registry %s: %w", path, err)
 	}
 	var node yaml.Node
 	if err := yaml.Unmarshal(data, &node); err != nil {

@@ -391,11 +391,11 @@ func main() {
       "result": "PASS",
       "source_commit": "`+commit+`",
       "log_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-      "tests_discovered": 36,
-      "tests_run": 36,
+      "tests_discovered": 38,
+      "tests_run": 38,
       "tests_skipped": 0,
       "tests_failed": 0,
-      "unexpected_skipped": 0
+      "identity_gate": {"ok": true, "discovered": 38, "run": 38, "skipped": 0, "failed": 0}
     }
   }
 }`)
@@ -496,6 +496,78 @@ func containsSubstring(items []string, sub string) bool {
 		}
 	}
 	return false
+}
+
+// TestVerifyRedteamSuiteRequiresIdentityGate is Sol v7 S7 (HS4): a redteam
+// suite record with the old count-only fields but no identity_gate object
+// must fail closed, not be silently accepted as before.
+func TestVerifyRedteamSuiteRequiresIdentityGate(t *testing.T) {
+	suite := map[string]any{
+		"command":          "go test -v -tags redteam -count=1 ./...",
+		"result":           "PASS",
+		"tests_discovered": float64(38),
+		"tests_failed":     float64(0),
+	}
+	ok, problems := verifyRedteamSuite(suite, "")
+	if ok {
+		t.Fatalf("expected verifyRedteamSuite to fail closed without identity_gate, got ok=true")
+	}
+	if !containsSubstring(problems, "identity_gate") {
+		t.Fatalf("expected a problem naming identity_gate, got %v", problems)
+	}
+}
+
+// TestVerifyRedteamSuiteRejectsFailingIdentityGate confirms the gate's own
+// ok=false verdict (any missing/unexpected/failed/unauthorized-skip test)
+// propagates as a claims failure, not just its aggregate counts.
+func TestVerifyRedteamSuiteRejectsFailingIdentityGate(t *testing.T) {
+	suite := map[string]any{
+		"command":          "go test -v -tags redteam -count=1 ./...",
+		"result":           "PASS",
+		"tests_discovered": float64(38),
+		"tests_failed":     float64(0),
+		"identity_gate": map[string]any{
+			"ok":               false,
+			"unexpected_skips": []any{"TestV7Case5ValidatorExternalWriteBlockedOrContained"},
+		},
+	}
+	ok, problems := verifyRedteamSuite(suite, "")
+	if ok {
+		t.Fatalf("expected verifyRedteamSuite to reject identity_gate.ok=false")
+	}
+	if !containsSubstring(problems, "TestV7Case5ValidatorExternalWriteBlockedOrContained") {
+		t.Fatalf("expected the unauthorized skip's name in problems, got %v", problems)
+	}
+}
+
+// TestVerifyClaimedRedteamCasesBlocksOnUnauthorizedSkip is the claims-vs-
+// enforcement check (Sol v7 S7 secondary finding 5): a claim naming a
+// specific manifest case must have that exact case passing, not merely an
+// overall-passing suite.
+func TestVerifyClaimedRedteamCasesBlocksOnUnauthorizedSkip(t *testing.T) {
+	repoRoot := findRepoRoot(t)
+	evidence := map[string]any{
+		"suites": map[string]any{
+			"redteam": map[string]any{
+				"identity_gate": map[string]any{
+					"ok":               false,
+					"unexpected_skips": []any{"TestV7Case4LowRiskHostSecretUnreadableUnderNarrowLandlock"},
+				},
+			},
+		},
+	}
+	ok, problems := verifyClaimedRedteamCases(repoRoot, []int{4}, evidence)
+	if ok {
+		t.Fatalf("expected case 4 (currently skipped in the fixture) to block the claim")
+	}
+	if !containsSubstring(problems, "case 4") {
+		t.Fatalf("expected a problem naming case 4, got %v", problems)
+	}
+
+	okPass, problemsPass := verifyClaimedRedteamCases(repoRoot, []int{1}, evidence)
+	if !okPass {
+		t.Fatalf("expected case 1 (not in any blocked list) to pass, got %v", problemsPass)
+	}
 }
 
 // findRepoRoot walks up from the current package directory to the

@@ -55,7 +55,14 @@ type dockerImageInspect struct {
 // sentinel -- when the image cannot be inspected: not present locally,
 // daemon unreachable, or a malformed reference. Callers needing a
 // replay-safe identity must use ID/RepoDigests here, never Reference alone.
-func ResolveImageIdentity(ctx context.Context, image string) (ImageIdentity, error) {
+func ResolveImageIdentity(ctx context.Context, image string, environments ...controllerenv.Frozen) (ImageIdentity, error) {
+	env := controllerenv.Freeze()
+	if len(environments) > 0 {
+		env = environments[0]
+	}
+	if err := env.Validate(); err != nil {
+		return ImageIdentity{}, err
+	}
 	if strings.TrimSpace(image) == "" {
 		return ImageIdentity{}, fmt.Errorf("resolve image identity: empty image reference")
 	}
@@ -65,7 +72,7 @@ func ResolveImageIdentity(ctx context.Context, image string) (ImageIdentity, err
 	}
 	out, err := func() ([]byte, error) {
 		cmd := exec.CommandContext(ctx, bin, "image", "inspect", image, "--format", "{{json .}}")
-		cmd.Env = controllerenv.Base()
+		cmd.Env = append([]string(nil), env.Values...)
 		return cmd.Output()
 	}()
 	if err != nil {
@@ -109,14 +116,23 @@ func resolveDocker() (string, error) {
 // reachable daemon exist, so New can fail closed: a contract that asks for
 // runner: docker without a usable Docker install must error, never silently
 // fall back to LocalWorktreeRunner.
-func CheckDockerAvailable() error {
+func CheckDockerAvailable(environments ...controllerenv.Frozen) error {
+	env := controllerenv.Freeze()
+	if len(environments) > 0 {
+		env = environments[0]
+	}
+	if err := env.Validate(); err != nil {
+		return err
+	}
 	bin, err := resolveDocker()
 	if err != nil {
 		return err
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	if out, err := exec.CommandContext(ctx, bin, "info").CombinedOutput(); err != nil {
+	cmd := exec.CommandContext(ctx, bin, "info")
+	cmd.Env = append([]string(nil), env.Values...)
+	if out, err := cmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("docker daemon unreachable: %v: %s", err, trimmed(out))
 	}
 	return nil
@@ -149,7 +165,8 @@ type DockerRunner struct {
 	// (Config.Credentials.Roots), set once by runner.New. credentialMountArgs
 	// no longer calls config.Current() itself — see runner.New's doc
 	// comment.
-	CredentialRoots []string
+	CredentialRoots       []string
+	ControllerEnvironment controllerenv.Frozen
 
 	mu    sync.Mutex
 	trunc truncationStats
@@ -176,7 +193,7 @@ var metadataSinkholeHosts = []string{
 }
 
 func (d *DockerRunner) Prepare(ctx context.Context, req PrepareRequest) (Workspace, error) {
-	ws, err := prepareWorktree(ctx, req.Root, req.Home, req.ID, req.Git)
+	ws, err := prepareWorktree(ctx, req.Root, req.Home, req.ID, req.Git, d.ControllerEnvironment)
 	if err != nil {
 		return Workspace{}, err
 	}
@@ -208,7 +225,7 @@ func (d *DockerRunner) executor(ws Workspace) agents.Executor {
 			return 0, false, dberr
 		}
 		cmd := exec.CommandContext(runCtx, dockerBin, dockerArgs...)
-		cmd.Env = controllerenv.Base()
+		cmd.Env = append([]string(nil), d.ControllerEnvironment.Values...)
 		capped := &cappedWriter{w: out, remaining: d.Config.EffectiveOutputCapBytes()}
 		cmd.Stdout, cmd.Stderr = capped, capped
 		if err := cmd.Start(); err != nil {
@@ -632,7 +649,9 @@ func (d *DockerRunner) Observe(ctx context.Context, ws Workspace) (ObserveResult
 		}
 		return base, nil
 	}
-	out, err := exec.CommandContext(ctx, dockerBin, "inspect", ws.Container, "--format", "{{json .}}").Output()
+	inspectCmd := exec.CommandContext(ctx, dockerBin, "inspect", ws.Container, "--format", "{{json .}}")
+	inspectCmd.Env = append([]string(nil), d.ControllerEnvironment.Values...)
+	out, err := inspectCmd.Output()
 	if err != nil {
 		base.Notes = appendDockerNote(base.Notes, "docker_inspect_failed: "+err.Error())
 		if hardened {
@@ -683,7 +702,9 @@ func (d *DockerRunner) Stop(ctx context.Context, ws Workspace) error {
 	if err != nil {
 		return err
 	}
-	return exec.CommandContext(ctx, bin, "stop", "-t", "5", ws.Container).Run()
+	cmd := exec.CommandContext(ctx, bin, "stop", "-t", "5", ws.Container)
+	cmd.Env = append([]string(nil), d.ControllerEnvironment.Values...)
+	return cmd.Run()
 }
 
 // Destroy removes the container and then the worktree, identically to
@@ -694,11 +715,11 @@ func (d *DockerRunner) Stop(ctx context.Context, ws Workspace) error {
 // session exists to prevent.
 func (d *DockerRunner) Destroy(ctx context.Context, ws Workspace, approved bool) error {
 	if ws.Container != "" {
-		if err := RemoveContainer(ctx, ws.Container); err != nil {
+		if err := RemoveContainer(ctx, ws.Container, d.ControllerEnvironment); err != nil {
 			return err
 		}
 	}
-	return destroyWorktree(ctx, ws, approved)
+	return destroyWorktree(ctx, ws, approved, d.ControllerEnvironment)
 }
 
 // RemoveContainer force-removes a container, tolerating only the
@@ -708,12 +729,21 @@ func (d *DockerRunner) Destroy(ctx context.Context, ws Workspace, approved bool)
 // workspace-destroy retry) never mark a teardown done while the container
 // may still be alive. Exposed so internal/runtime's reconciler and this
 // runner cannot drift on what counts as tolerable.
-func RemoveContainer(ctx context.Context, name string) error {
+func RemoveContainer(ctx context.Context, name string, environments ...controllerenv.Frozen) error {
+	env := controllerenv.Freeze()
+	if len(environments) > 0 {
+		env = environments[0]
+	}
+	if err := env.Validate(); err != nil {
+		return err
+	}
 	bin, berr := resolveDocker()
 	if berr != nil {
 		return berr
 	}
-	out, err := exec.CommandContext(ctx, bin, "rm", "-f", name).CombinedOutput()
+	cmd := exec.CommandContext(ctx, bin, "rm", "-f", name)
+	cmd.Env = append([]string(nil), env.Values...)
+	out, err := cmd.CombinedOutput()
 	if err != nil && !containerAlreadyGone(string(out)) {
 		return fmt.Errorf("docker rm -f %s: %v: %s", name, err, trimmed(out))
 	}

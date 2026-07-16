@@ -419,3 +419,38 @@ func TestAssayBlockWithNeitherProfileNorArtifactsRejected(t *testing.T) {
 		t.Fatalf("expected assay.profile error for an empty assay block, got %v", err)
 	}
 }
+
+func TestParseStructuredValidatorToolset(t *testing.T) {
+	structured := strings.Replace(validContract,
+		`    - "python3 validators/image/check_transparency.py output/clipart"
+    - "python3 validators/image/check_min_resolution.py --min 2000 output/clipart"`,
+		`    - command: python3 validator.py
+      tools: [python3]
+      files: [validator.py]`, 1)
+	contract, err := Parse([]byte(structured))
+	if err != nil {
+		t.Fatalf("Parse(structured validator) error = %v", err)
+	}
+	if len(contract.Success.Validators) != 1 || contract.Success.Validators[0] != "python3 validator.py" {
+		t.Fatalf("validators=%#v", contract.Success.Validators)
+	}
+	if len(contract.Success.ValidatorSpecs) != 1 {
+		t.Fatalf("validator_specs=%#v", contract.Success.ValidatorSpecs)
+	}
+	spec := contract.Success.ValidatorSpecs[0]
+	if len(spec.Tools) != 1 || spec.Tools[0] != "python3" || len(spec.Files) != 1 || spec.Files[0] != "validator.py" {
+		t.Fatalf("validator spec=%#v", spec)
+	}
+}
+
+func TestStructuredValidatorRequiresDeclaredTool(t *testing.T) {
+	structured := strings.Replace(validContract,
+		`    - "python3 validators/image/check_transparency.py output/clipart"
+    - "python3 validators/image/check_min_resolution.py --min 2000 output/clipart"`,
+		`    - command: python3 validator.py
+      files: [validator.py]`, 1)
+	_, err := Parse([]byte(structured))
+	if err == nil || !strings.Contains(err.Error(), "success.validators[0].tools") {
+		t.Fatalf("expected declared-tools validation error, got %v", err)
+	}
+}

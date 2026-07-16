@@ -30,9 +30,9 @@ func highRiskContract(runner string, docker *contracts.DockerRunnerConfig, cont 
 }
 
 func TestEnforceNonHostRiskIsNoOp(t *testing.T) {
-	// Unset/low risk and read-only medium-risk contracts must pass unchanged.
-	// Session 6 promotes only medium-risk effectful local work to host
-	// containment; pure scout reads remain no-ops.
+	// Non-effectful read-only contracts at empty/low/medium risk remain
+	// no-ops. S2 selects containment from authority; high risk may strengthen
+	// this baseline, but low/unset labels cannot weaken effectful work.
 	for _, risk := range []string{"", "low"} {
 		c := highRiskContract("local", nil, nil)
 		c.RiskClass = risk

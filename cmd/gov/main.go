@@ -13,6 +13,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"time"
@@ -33,6 +35,7 @@ import (
 	"github.com/cousingary/governator/internal/protect"
 	"github.com/cousingary/governator/internal/protectedpaths"
 	"github.com/cousingary/governator/internal/quota"
+	"github.com/cousingary/governator/internal/redteamgate"
 	"github.com/cousingary/governator/internal/router"
 	govruntime "github.com/cousingary/governator/internal/runtime"
 	"github.com/cousingary/governator/internal/snapshots"
@@ -416,6 +419,8 @@ func run(args []string) int {
 		return healthCmd(args[1:])
 	case "claims":
 		return claimsCmd(args[1:])
+	case "redteam-gate":
+		return redteamGateCmd(args[1:])
 	case "version":
 		return versionCmd(args[1:])
 	case "--version", "-version":
@@ -1857,23 +1862,55 @@ func healthCmd(args []string) int {
 	return 0
 }
 
+// buildIdentityExtras reports the two fields RB1 (report §"Required
+// correction") asks a release binary to carry that `version`/`sourceCommit`/
+// `buildTimestamp` (all ldflags-injected by scripts/release.sh) don't cover:
+// dirty state and the exact Go toolchain. dirty comes from Go's own VCS
+// stamping (debug.ReadBuildInfo's "vcs.modified" setting, present whenever
+// the binary was built with buildvcs enabled from a git checkout — the
+// default, and what scripts/release.sh uses); its absence (a bare `go run`,
+// or a binary built with -buildvcs=false) is reported as false, "not
+// provable dirty," never asserted as proven-clean. go_toolchain comes from
+// runtime.Version() — the actual compiler that produced this binary,
+// unforgeable by ldflags.
+func buildIdentityExtras() (dirty bool, goToolchain string) {
+	goToolchain = runtime.Version()
+	info, ok := debug.ReadBuildInfo()
+	if !ok {
+		return false, goToolchain
+	}
+	for _, s := range info.Settings {
+		if s.Key == "vcs.modified" && s.Value == "true" {
+			return true, goToolchain
+		}
+	}
+	return false, goToolchain
+}
+
 func versionCmd(args []string) int {
 	if len(args) > 1 || (len(args) == 1 && args[0] != "--json") {
 		return bad("usage: gov version [--json]")
 	}
 	if len(args) == 1 && args[0] == "--json" {
+		dirty, goToolchain := buildIdentityExtras()
 		payload := struct {
 			Version                string `json:"version"`
 			SourceCommit           string `json:"source_commit"`
 			BuildTimestamp         string `json:"build_timestamp"`
 			ClaimsHash             string `json:"claims_hash"`
 			AdapterProtocolVersion string `json:"adapter_protocol_version"`
+			Dirty                  bool   `json:"dirty"`
+			GoToolchain            string `json:"go_toolchain"`
+			Platform               string `json:"platform"`
 		}{
 			Version:                version,
 			SourceCommit:           sourceCommit,
 			BuildTimestamp:         buildTimestamp,
 			ClaimsHash:             claimsHash,
 			AdapterProtocolVersion: adapterProtocolVersion,
+			Dirty:                  dirty,
+			GoToolchain:            goToolchain,
+			Platform:               runtime.GOOS + "/" + runtime.GOARCH,
 		}
 		if err := json.NewEncoder(os.Stdout).Encode(payload); err != nil {
 			fmt.Fprintln(os.Stderr, "version:", err)
@@ -1961,6 +1998,78 @@ func claimsCmd(args []string) int {
 	report, exit := claims.Report(results)
 	fmt.Print(report)
 	return exit
+}
+
+// redteamGateCmd handles `gov redteam-gate verify`: the Session 7
+// identity-based release gate (report HS4) that replaces
+// scripts/release.sh's old MIN_REDTEAM_TESTS/EXPECTED_REDTEAM_SKIPS
+// count-based check. It loads internal/redteam/manifest.yaml (the single
+// source of truth for the 38-case mandatory final attack corpus) and a
+// captured `go test -v -tags redteam` log, and verifies exact test
+// identity — not just totals — via internal/redteamgate.
+func redteamGateCmd(args []string) int {
+	usage := "usage: gov redteam-gate verify --manifest <path> --log <path> [--capabilities <json>]"
+	if len(args) < 1 || args[0] != "verify" {
+		return bad(usage)
+	}
+	manifestPath := ""
+	logPath := ""
+	capabilitiesJSON := ""
+	rest := args[1:]
+	for len(rest) > 0 {
+		switch rest[0] {
+		case "--manifest":
+			if len(rest) < 2 {
+				return bad(usage)
+			}
+			manifestPath = rest[1]
+			rest = rest[2:]
+		case "--log":
+			if len(rest) < 2 {
+				return bad(usage)
+			}
+			logPath = rest[1]
+			rest = rest[2:]
+		case "--capabilities":
+			if len(rest) < 2 {
+				return bad(usage)
+			}
+			capabilitiesJSON = rest[1]
+			rest = rest[2:]
+		default:
+			return bad(usage)
+		}
+	}
+	if manifestPath == "" || logPath == "" {
+		fmt.Fprintln(os.Stderr, "redteam-gate: --manifest and --log are both required")
+		return bad(usage)
+	}
+	manifest, err := redteamgate.LoadManifest(manifestPath)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "redteam-gate:", err)
+		return 1
+	}
+	logData, err := os.ReadFile(logPath)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "redteam-gate:", err)
+		return 1
+	}
+	capabilities := map[string]bool{}
+	if capabilitiesJSON != "" {
+		if err := json.Unmarshal([]byte(capabilitiesJSON), &capabilities); err != nil {
+			fmt.Fprintln(os.Stderr, "redteam-gate: --capabilities:", err)
+			return 1
+		}
+	}
+	result := redteamgate.Evaluate(manifest, string(logData), capabilities)
+	if err := json.NewEncoder(os.Stdout).Encode(result); err != nil {
+		fmt.Fprintln(os.Stderr, "redteam-gate:", err)
+		return 1
+	}
+	if !result.OK {
+		return 1
+	}
+	return 0
 }
 
 // recoverDoctorGatedBreakers runs the backend doctor probes and closes any
@@ -2684,5 +2793,6 @@ Usage:
   gov doctor
   gov health [reset <backend>]
   gov claims verify [--file <path>] [--repo <path>] [--artifact <path>] [--manifest <path>] [--release]
+  gov redteam-gate verify --manifest <path> --log <path> [--capabilities <json>]
   gov version`)
 }

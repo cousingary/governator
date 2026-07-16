@@ -178,12 +178,28 @@ func TestVersionJSONReportsBuildIdentityFields(t *testing.T) {
 		BuildTimestamp         string `json:"build_timestamp"`
 		ClaimsHash             string `json:"claims_hash"`
 		AdapterProtocolVersion string `json:"adapter_protocol_version"`
+		Dirty                  *bool  `json:"dirty"`
+		GoToolchain            string `json:"go_toolchain"`
+		Platform               string `json:"platform"`
 	}
 	if err := json.Unmarshal([]byte(output), &got); err != nil {
 		t.Fatalf("version JSON %q: %v", output, err)
 	}
 	if got.Version == "" || got.SourceCommit == "" || got.BuildTimestamp == "" || got.ClaimsHash == "" || got.AdapterProtocolVersion == "" {
 		t.Fatalf("missing build identity field: %+v", got)
+	}
+	// Sol v7 S7 (report RB1): "the binary must report version, Git commit,
+	// dirty state, build timestamp ..., Go toolchain, target platform."
+	// dirty is a real bool key (must decode, not just be absent-and-zero);
+	// go_toolchain/platform must be non-empty and self-consistent.
+	if got.Dirty == nil {
+		t.Fatalf("version JSON missing dirty field: %+v", got)
+	}
+	if got.GoToolchain == "" || !strings.HasPrefix(got.GoToolchain, "go") {
+		t.Fatalf("version JSON go_toolchain %q does not look like a Go toolchain version", got.GoToolchain)
+	}
+	if got.Platform != goruntime.GOOS+"/"+goruntime.GOARCH {
+		t.Fatalf("version JSON platform %q does not match the running process's %s/%s", got.Platform, goruntime.GOOS, goruntime.GOARCH)
 	}
 }
 

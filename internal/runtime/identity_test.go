@@ -446,3 +446,48 @@ func TestComputeIdentityCapturesDockerImageIdentity(t *testing.T) {
 		t.Fatal("a resolved image identity vs. none (same tag) did not change the full identity hash")
 	}
 }
+
+func TestExecutionIdentityBindsControllerEnvironmentHash(t *testing.T) {
+	original := ExecutionIdentity{ContractHash: "contract", ControllerEnvironmentHash: "environment-a"}
+	changed := original
+	changed.ControllerEnvironmentHash = "environment-b"
+	if original.Hash() == changed.Hash() {
+		t.Fatal("controller environment change did not invalidate replay identity")
+	}
+}
+
+func TestResolveValidatorToolsetBindsDeclaredFileBytes(t *testing.T) {
+	root := t.TempDir()
+	path := filepath.Join(root, "validator.py")
+	if err := os.WriteFile(path, []byte("print('a')\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	c := contracts.Contract{Success: contracts.Success{
+		Validators:     []string{"python3 validator.py"},
+		ValidatorSpecs: []contracts.ValidatorSpec{{Command: "python3 validator.py", Files: []string{"validator.py"}}},
+	}}
+	first, err := resolveValidatorToolset(c, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte("print('b')\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	second, err := resolveValidatorToolset(c, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first == second {
+		t.Fatal("validator file byte change did not change resolved toolset hash")
+	}
+}
+
+func TestResolveValidatorToolsetRejectsEscapingFile(t *testing.T) {
+	c := contracts.Contract{Success: contracts.Success{
+		Validators:     []string{"python3 validator.py"},
+		ValidatorSpecs: []contracts.ValidatorSpec{{Command: "python3 validator.py", Files: []string{"../validator.py"}}},
+	}}
+	if _, err := resolveValidatorToolset(c, t.TempDir()); err == nil || !strings.Contains(err.Error(), "escapes workspace root") {
+		t.Fatalf("expected workspace escape error, got %v", err)
+	}
+}

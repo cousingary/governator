@@ -5,6 +5,7 @@ package controllerenv
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"fmt"
 	"os"
 	"sort"
 	"strings"
@@ -29,6 +30,65 @@ func IsForbidden(name string) bool {
 }
 
 func Base() []string { return With(map[string]string{}) }
+
+// Frozen is the one controller environment snapshot owned by a run.  Values
+// are captured once by Freeze; With derives stage-specific overrides from
+// those captured values and never consults the ambient process environment.
+type Frozen struct {
+	Values []string
+	Hash   string
+}
+
+func Freeze() Frozen {
+	values := Base()
+	return Frozen{Values: append([]string(nil), values...), Hash: Hash(values)}
+}
+
+func (f Frozen) Validate() error {
+	if f.Values == nil {
+		return fmt.Errorf("controller environment is not frozen")
+	}
+	if f.Hash == "" || f.Hash != Hash(f.Values) {
+		return fmt.Errorf("controller environment hash does not match frozen values")
+	}
+	return nil
+}
+
+func (f Frozen) Lookup(name string) (string, bool) {
+	for _, pair := range f.Values {
+		key, value, ok := strings.Cut(pair, "=")
+		if ok && key == name {
+			return value, true
+		}
+	}
+	return "", false
+}
+
+func (f Frozen) With(extra map[string]string) Frozen {
+	vals := make(map[string]string, len(f.Values)+len(extra))
+	for _, pair := range f.Values {
+		key, value, ok := strings.Cut(pair, "=")
+		if ok && key != "" && !IsForbidden(key) {
+			vals[key] = value
+		}
+	}
+	for key, value := range extra {
+		if key == "" || strings.Contains(key, "=") || injectionVars[key] {
+			continue
+		}
+		vals[key] = value
+	}
+	keys := make([]string, 0, len(vals))
+	for key := range vals {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	values := make([]string, 0, len(keys))
+	for _, key := range keys {
+		values = append(values, key+"="+vals[key])
+	}
+	return Frozen{Values: values, Hash: Hash(values)}
+}
 
 func With(extra map[string]string) []string {
 	vals := map[string]string{}

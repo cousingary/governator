@@ -159,27 +159,41 @@ run_tier redteam "$REDTEAM_LOG" REDTEAM_RESULT REDTEAM_SECONDS REDTEAM_STARTED R
 REDTEAM_RACE_LOG="$OUT_DIR/test-redteam-race.log"
 run_tier redteam_race "$REDTEAM_RACE_LOG" REDTEAM_RACE_RESULT REDTEAM_RACE_SECONDS REDTEAM_RACE_STARTED REDTEAM_RACE_ENDED REDTEAM_RACE_LOG_SHA go test -v -race -timeout=30m -tags redteam -count=1 ./...
 
-MIN_REDTEAM_TESTS=${MIN_REDTEAM_TESTS:-36}
-# Two redteam cases are conditionally non-executable in the tagged release
-# environment rather than unresolved vulnerabilities: case 28 needs adversarial
-# control of a live systemd --user manager, and case 36 deliberately requires
-# a checkout that is several commits past a tag (the opposite of REQUIRE_TAG=1).
-# Additional skips still block packaging via REDTEAM_UNEXPECTED_SKIPPED.
-EXPECTED_REDTEAM_SKIPS=${EXPECTED_REDTEAM_SKIPS:-2}
-read REDTEAM_TESTS_DISCOVERED REDTEAM_TESTS_RUN REDTEAM_TESTS_SKIPPED REDTEAM_TESTS_FAILED REDTEAM_UNEXPECTED_SKIPPED < <(python3 - "$REDTEAM_LOG" "$EXPECTED_REDTEAM_SKIPS" <<'PYREDTEAMCOUNTS'
-import pathlib, re, sys
-log = pathlib.Path(sys.argv[1]).read_text(errors="replace")
-expected_skips = int(sys.argv[2])
-counts = {"PASS": 0, "FAIL": 0, "SKIP": 0}
-for line in log.splitlines():
-    m = re.match(r"^--- (PASS|FAIL|SKIP): ", line)
-    if m:
-        counts[m.group(1)] += 1
-run = counts["PASS"] + counts["FAIL"] + counts["SKIP"]
-unexpected = max(0, counts["SKIP"] - expected_skips)
-print(run, run, counts["SKIP"], counts["FAIL"], unexpected)
-PYREDTEAMCOUNTS
-)
+# Sol redteam v7 S7 (HS4): the old count-based gate (MIN_REDTEAM_TESTS /
+# EXPECTED_REDTEAM_SKIPS) validated skip *count*, not the exact identity or
+# reason of each skip — a wrong test skipping while the total stayed the
+# same still passed. internal/redteam/manifest.yaml is now the single
+# source of truth for the 38-case mandatory final attack corpus, and `gov
+# redteam-gate verify` checks exact test identity against it: every
+# required case present and passing, every skip individually authorized by
+# name via the manifest's allowed_skip predicate+reason. See
+# agents/governator-sol-upgrade7-plan.md Session 7.
+REDTEAM_MANIFEST="internal/redteam/manifest.yaml"
+REDTEAM_CAPABILITIES_JSON=$(python3 -c "
+import json, os, platform
+print(json.dumps({
+    'linux': platform.system().lower() == 'linux',
+    'has_systemd_user': os.environ.get('GOV_REDTEAM_HAS_SYSTEMD_USER', '') == '1',
+    'has_second_uid': os.environ.get('GOV_REDTEAM_HAS_SECOND_UID', '') == '1',
+    'has_kernel_landlock_full_abi': os.environ.get('GOV_REDTEAM_HAS_LANDLOCK_FULL_ABI', '') == '1',
+}))
+")
+REDTEAM_GATE_JSON="$OUT_DIR/.redteam-gate.json"
+if go run ./cmd/gov redteam-gate verify --manifest "$REDTEAM_MANIFEST" --log "$REDTEAM_LOG" --capabilities "$REDTEAM_CAPABILITIES_JSON" >"$REDTEAM_GATE_JSON" 2>"$OUT_DIR/.redteam-gate.stderr"; then
+  REDTEAM_GATE_OK=true
+else
+  REDTEAM_GATE_OK=false
+  cat "$OUT_DIR/.redteam-gate.stderr" >&2
+fi
+read REDTEAM_TESTS_DISCOVERED REDTEAM_TESTS_RUN REDTEAM_TESTS_SKIPPED REDTEAM_TESTS_FAILED < <(python3 -c "
+import json
+d = json.load(open('$REDTEAM_GATE_JSON'))
+print(d['discovered'], d['run'], d['skipped'], d['failed'])
+")
+if [ "$REDTEAM_GATE_OK" != true ]; then
+  echo "release: redteam-gate verify FAILED — verdict:" >&2
+  cat "$REDTEAM_GATE_JSON" >&2
+fi
 
 FUZZ_TARGETS=(
   "internal/contracts FuzzContractParser"
@@ -235,12 +249,8 @@ if [ "$UNIT_RESULT" != PASS ] || [ "$RACE_RESULT" != PASS ] || [ "$INTEGRATION_R
   echo "release: refusing to package — a required test tier failed" >&2
   exit 1
 fi
-if [ "$REDTEAM_TESTS_RUN" -lt "$MIN_REDTEAM_TESTS" ]; then
-  echo "release: refusing to package — redteam suite ran ${REDTEAM_TESTS_RUN}, below required minimum ${MIN_REDTEAM_TESTS}" >&2
-  exit 1
-fi
-if [ "$REDTEAM_UNEXPECTED_SKIPPED" -ne 0 ]; then
-  echo "release: refusing to package — redteam suite has ${REDTEAM_UNEXPECTED_SKIPPED} unexpected skip(s)" >&2
+if [ "$REDTEAM_GATE_OK" != true ]; then
+  echo "release: refusing to package — redteam-gate verify rejected the corpus (missing/unexpected/failed test or unauthorized skip); see ${REDTEAM_GATE_JSON}" >&2
   exit 1
 fi
 if [ "$ASSAYER_RESULT" != PASS ]; then
@@ -397,7 +407,7 @@ python3 - "$TEST_SUMMARY" "$COMMIT" "$GO_VERSION" "$BUILD_TS" "$GO_SUM_HASH" \
   "$INTEGRATION_RESULT" "$INTEGRATION_SECONDS" "$INTEGRATION_STARTED" "$INTEGRATION_ENDED" "$INTEGRATION_LOG_SHA" \
   "$CORPUS_RESULT" "$CORPUS_SECONDS" "$CORPUS_STARTED" "$CORPUS_ENDED" "$CORPUS_LOG_SHA" "$CORPUS_TESTS_RUN" "$CORPUS_TESTS_FAILED" \
   "$REDTEAM_RESULT" "$REDTEAM_SECONDS" "$REDTEAM_STARTED" "$REDTEAM_ENDED" "$REDTEAM_LOG_SHA" \
-  "$REDTEAM_TESTS_DISCOVERED" "$REDTEAM_TESTS_RUN" "$REDTEAM_TESTS_SKIPPED" "$REDTEAM_TESTS_FAILED" "$REDTEAM_UNEXPECTED_SKIPPED" "$MIN_REDTEAM_TESTS" "$EXPECTED_REDTEAM_SKIPS" \
+  "$REDTEAM_TESTS_DISCOVERED" "$REDTEAM_TESTS_RUN" "$REDTEAM_TESTS_SKIPPED" "$REDTEAM_TESTS_FAILED" "$REDTEAM_GATE_OK" "$REDTEAM_GATE_JSON" "$REDTEAM_MANIFEST" \
   "$REDTEAM_RACE_RESULT" "$REDTEAM_RACE_SECONDS" "$REDTEAM_RACE_STARTED" "$REDTEAM_RACE_ENDED" "$REDTEAM_RACE_LOG_SHA" \
   "$FUZZ_RESULTS_JSON" "$ASSAYER_RESULT" "$ASSAYER_SUMMARY" <<'PYTESTSUMMARY'
 import json, pathlib, sys
@@ -408,9 +418,11 @@ import json, pathlib, sys
  integration_result, integration_seconds, integration_started, integration_ended, integration_log_sha,
  corpus_result, corpus_seconds, corpus_started, corpus_ended, corpus_log_sha, corpus_tests_run, corpus_tests_failed,
  redteam_result, redteam_seconds, redteam_started, redteam_ended, redteam_log_sha,
- redteam_tests_discovered, redteam_tests_run, redteam_tests_skipped, redteam_tests_failed, redteam_unexpected_skipped, min_redteam_tests, expected_redteam_skips,
+ redteam_tests_discovered, redteam_tests_run, redteam_tests_skipped, redteam_tests_failed, redteam_gate_ok, redteam_gate_json_path, redteam_manifest_path,
  redteam_race_result, redteam_race_seconds, redteam_race_started, redteam_race_ended, redteam_race_log_sha,
  fuzz_results_path, assayer_result, assayer_summary) = sys.argv[1:]
+
+redteam_gate = json.loads(pathlib.Path(redteam_gate_json_path).read_text())
 
 fuzz = []
 for line in pathlib.Path(fuzz_results_path).read_text().splitlines():
@@ -453,9 +465,13 @@ data = {
             "tests_run": int(redteam_tests_run),
             "tests_skipped": int(redteam_tests_skipped),
             "tests_failed": int(redteam_tests_failed),
-            "unexpected_skipped": int(redteam_unexpected_skipped),
-            "minimum_required_tests": int(min_redteam_tests),
-            "expected_skipped": int(expected_redteam_skips),
+            # Sol v7 S7 (HS4): identity-based, not count-based. manifest is
+            # internal/redteam/manifest.yaml (the 38-case single source of
+            # truth); gate is `gov redteam-gate verify`'s full structured
+            # verdict -- exact missing/unexpected/failed/unexpected-skip test
+            # names, not just totals.
+            "manifest": redteam_manifest_path,
+            "identity_gate": {**redteam_gate, "ok": redteam_gate_ok == "true"},
         },
         "redteam_race": {
             "command": "go test -v -race -tags redteam -count=1 ./...",
@@ -473,6 +489,8 @@ overall = "PASS"
 for suite in ("unit", "race", "integration", "black_box_corpus", "redteam", "redteam_race"):
     if data["suites"][suite]["result"] != "PASS":
         overall = "FAIL"
+if not data["suites"]["redteam"]["identity_gate"]["ok"]:
+    overall = "FAIL"
 for f in fuzz:
     if f["result"] != "PASS":
         overall = "FAIL"

@@ -1,6 +1,9 @@
-// Package containment implements the Session 3 (Phase 2) risk-class
-// containment policy: a risk_class: high contract must not silently resolve
-// to local execution. Qualifying containment is hardened Docker
+// Package containment implements Governator's authority-derived host
+// containment policy (Sol v7 RB2): the isolation requirement for a local run
+// is derived from what the run can actually do — write, execute, produce,
+// validate, use credentials, or forbid network — never from the operator's
+// risk_class label. A risk_class: high contract must not silently resolve to
+// local execution. Qualifying containment is hardened Docker
 // (contracts.DockerRunnerConfig.IsHardened), a backend with a verified native
 // sandbox capability, or an explicitly signed operator override. Every other
 // case fails closed before launch.
@@ -51,15 +54,32 @@ func NetworkForbidden(c contracts.Contract) bool {
 }
 
 // RequiresHostContainment reports whether this contract must prove host-level
-// containment. Explicit no-network on a labeled job and high-risk jobs require
-// Governator-owned external containment. Medium effectful local jobs retain
-// the existing local-run gate; low effectful jobs are handled by strong
-// descendant containment below.
+// containment. Selection is authority-derived, never risk-label-derived (Sol
+// v7 RB2): risk_class is a policy description, not a security boundary, so a
+// malicious or mistaken contract author cannot escape containment by labelling
+// a highly-capable operation low/unlabeled.
+//
+// The authority-derived baseline is scoped to local execution. A Docker
+// runner's container is its host boundary; risk_class may still strengthen
+// Docker requirements, but a low label can never weaken a local run's baseline.
 func RequiresHostContainment(c contracts.Contract, enforceLocalEffectful bool) bool {
-	risk := strings.TrimSpace(c.RiskClass)
-	if risk == "high" {
+	if strings.TrimSpace(c.RiskClass) == "high" {
 		return true
 	}
+	if c.EffectiveRunner() == "local" {
+		// Explicit no-network is always externally enforced. There is
+		// deliberately no risk_class condition here.
+		if NetworkForbidden(c) {
+			return true
+		}
+		// Write/execute/produce/validate/credential authority selects the
+		// baseline envelope at every risk tier.
+		return enforceLocalEffectful && Effectful(c)
+	}
+	// Docker provides the process/filesystem/network boundary. Preserve the
+	// existing stricter gates for labelled network-denied and medium effectful
+	// Docker jobs; high risk was handled above.
+	risk := strings.TrimSpace(c.RiskClass)
 	if risk != "" && NetworkForbidden(c) {
 		return true
 	}
@@ -81,7 +101,7 @@ func Enforce(c contracts.Contract, externallyEnforced bool, pubKeyHex string) er
 	return EnforcePolicy(c, externallyEnforced, pubKeyHex, true)
 }
 
-// EnforcePolicy applies the risk-class containment policy and returns a
+// EnforcePolicy applies the authority-derived containment policy and returns a
 // non-nil error when a contract lacks qualifying containment. It is
 // fail-closed by construction: pubKeyHex is the operator override public key
 // from config — empty means overrides are refused.

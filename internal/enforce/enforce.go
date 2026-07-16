@@ -55,6 +55,11 @@ type Plan struct {
 	// route, so egress is structurally impossible rather than merely denied
 	// by policy the backend could lie about honoring.
 	AllowNetwork bool
+	// ReadRoots is the pre-resolved exact kernel read envelope. It contains
+	// individual executable/loader/library files plus only contract-declared
+	// narrow directories; it is never reconstructed inside the sandbox.
+	ReadRoots   []string
+	LandlockABI int
 
 	selfExe string
 	// unsharePath is the trusted-tool registry's verified canonical path to
@@ -169,6 +174,12 @@ func Supported() bool {
 // enforcement at all" decision (containment.RequiresHostContainment) --
 // NewPlan performs no policy evaluation of its own.
 func NewPlan(active bool, workspace string, readOnly, allowNetwork, highRisk bool) (Plan, error) {
+	return NewPlanForExecutable(active, workspace, readOnly, allowNetwork, highRisk, "", nil)
+}
+
+// NewPlanForExecutable freezes the exact read closure before launch. The
+// sandbox consumes these resolved paths rather than discovering host state.
+func NewPlanForExecutable(active bool, workspace string, readOnly, allowNetwork, highRisk bool, executable string, declaredReadRoots []string) (Plan, error) {
 	if !active {
 		return Plan{}, nil
 	}
@@ -191,6 +202,14 @@ func NewPlan(active bool, workspace string, readOnly, allowNetwork, highRisk boo
 	if err != nil {
 		return Plan{}, fmt.Errorf("enforce: resolve trusted unshare: %w", err)
 	}
+	readRoots, err := exactReadClosure(executable, declaredReadRoots)
+	if err != nil {
+		return Plan{}, fmt.Errorf("enforce: construct exact read closure: %w", err)
+	}
+	abi, err := activeLandlockABI()
+	if err != nil || abi < RequiredLandlockABI {
+		return Plan{}, fmt.Errorf("enforce: required Landlock ABI %d unavailable (active=%d): %v", RequiredLandlockABI, abi, err)
+	}
 	abs := workspace
 	if !readOnly && workspace != "" {
 		if a, aerr := filepath.Abs(workspace); aerr == nil {
@@ -202,6 +221,8 @@ func NewPlan(active bool, workspace string, readOnly, allowNetwork, highRisk boo
 		Workspace:    abs,
 		ReadOnly:     readOnly,
 		AllowNetwork: allowNetwork,
+		ReadRoots:    readRoots,
+		LandlockABI:  abi,
 		selfExe:      self,
 		unsharePath:  unshareIdentity.CanonicalPath,
 	}, nil
@@ -212,6 +233,25 @@ func NewPlan(active bool, workspace string, readOnly, allowNetwork, highRisk boo
 // RunSandboxExec), and -- unless the run is permitted network access -- the
 // whole thing runs inside a network namespace with no configured route. A
 // no-op Plan (Active false) returns bin/args unchanged.
+func (p Plan) WithReadRoots(roots ...string) (Plan, error) {
+	return p.WithExecutableAndReadRoots("", roots...)
+}
+
+// WithExecutableAndReadRoots extends an active plan for a distinct stage
+// executable, deriving that executable's complete ELF runtime closure rather
+// than treating only the executable object as a declared file.
+func (p Plan) WithExecutableAndReadRoots(executable string, roots ...string) (Plan, error) {
+	if !p.Active {
+		return p, nil
+	}
+	closure, err := exactReadClosure(executable, append(append([]string(nil), p.ReadRoots...), roots...))
+	if err != nil {
+		return Plan{}, err
+	}
+	p.ReadRoots = closure
+	return p, nil
+}
+
 func (p Plan) Wrap(bin string, args []string) (string, []string) {
 	if !p.Active {
 		return bin, args
@@ -219,6 +259,9 @@ func (p Plan) Wrap(bin string, args []string) (string, []string) {
 	inner := []string{p.selfExe, SandboxExecArg, "--workspace", p.Workspace}
 	if p.ReadOnly {
 		inner = append(inner, "--readonly")
+	}
+	for _, root := range p.ReadRoots {
+		inner = append(inner, "--read-root", root)
 	}
 	inner = append(inner, "--")
 	inner = append(inner, bin)

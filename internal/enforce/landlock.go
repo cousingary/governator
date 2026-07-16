@@ -1,72 +1,237 @@
 package enforce
 
 import (
+	"debug/elf"
 	"flag"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
+	"sort"
+	"strings"
 	"syscall"
 
 	"github.com/landlock-lsm/go-landlock/landlock"
 	llsyscall "github.com/landlock-lsm/go-landlock/landlock/syscall"
 )
 
-// landlockUsable probes the kernel directly (LANDLOCK_CREATE_RULESET's
-// version query, not merely "the go-landlock import compiled") so Supported
-// reflects what THIS host's kernel will actually enforce rather than what a
-// linked library merely claims to support.
-func landlockUsable() bool {
+// RequiredLandlockABI is the minimum ABI that enforces the complete filesystem
+// policy Governator relies on: ABI 2 adds cross-directory refer and ABI 3 adds
+// truncate. Running V9 in BestEffort mode on an older kernel would silently
+// omit rights, so high-authority local execution instead requires this floor.
+const RequiredLandlockABI = 3
+
+func activeLandlockABI() (int, error) {
 	v, err := llsyscall.LandlockGetABIVersion()
-	return err == nil && v > 0
+	if err != nil {
+		return 0, err
+	}
+	return v, nil
 }
 
-// applyLandlockRuleset restricts the CALLING process (and, because Landlock
-// rules are inherited across execve and cannot be dropped by a descendant,
-// every process it execs into or forks) to a deny-by-default read envelope:
-// the workspace, the verified backend executable location, runtime loader and
-// shared-library directories, and minimal /dev + /proc. It intentionally does
-// not grant read-only access to /, because that permits undeclared host-secret
-// reads (Sol v6 S7 / P0-13).
-func applyLandlockRuleset(workspace string, readOnly bool, execPath string) error {
-	cfg := landlock.V9.BestEffort()
-	ro := []landlock.Rule{
-		landlock.RODirs("/bin").IgnoreIfMissing(),
-		landlock.RODirs("/usr").IgnoreIfMissing(),
-		landlock.RODirs("/lib").IgnoreIfMissing(),
-		landlock.RODirs("/lib64").IgnoreIfMissing(),
-		landlock.RODirs("/etc").IgnoreIfMissing(),
-		landlock.RODirs("/dev").IgnoreIfMissing(),
-		landlock.RODirs("/proc").IgnoreIfMissing(),
+func landlockUsable() bool {
+	v, err := activeLandlockABI()
+	return err == nil && v >= RequiredLandlockABI
+}
+
+var forbiddenBroadReadRoots = map[string]bool{
+	"/": true, "/bin": true, "/usr": true, "/usr/local": true,
+	"/lib": true, "/lib64": true, "/etc": true, "/dev": true, "/proc": true,
+}
+
+// exactReadClosure resolves the executable object and its ELF loader/shared
+// libraries into file rules. Directories are admitted only when explicitly
+// declared by the contract; implicit host-wide runtime directories are never
+// granted. Non-ELF executables (scripts) must declare their interpreter and
+// script through ReadRoots.
+func exactReadClosure(execPath string, declared []string) ([]string, error) {
+	seen := map[string]bool{}
+	var out []string
+	add := func(path string, explicit bool) error {
+		if strings.TrimSpace(path) == "" {
+			return nil
+		}
+		abs, err := filepath.Abs(path)
+		if err != nil {
+			return fmt.Errorf("resolve read root %q: %w", path, err)
+		}
+		abs = filepath.Clean(abs)
+		if forbiddenBroadReadRoots[abs] {
+			return fmt.Errorf("broad read root %q is forbidden; declare exact files or a narrower application directory", abs)
+		}
+		resolved, err := filepath.EvalSymlinks(abs)
+		if err != nil {
+			return fmt.Errorf("resolve read root %q: %w", abs, err)
+		}
+		if !explicit {
+			info, err := os.Stat(resolved)
+			if err != nil {
+				return err
+			}
+			if info.IsDir() {
+				return fmt.Errorf("implicit runtime read root %q is not an exact file", resolved)
+			}
+		}
+		if !seen[resolved] {
+			seen[resolved] = true
+			out = append(out, resolved)
+		}
+		return nil
 	}
-	if execPath != "" {
-		if abs, err := filepath.Abs(execPath); err == nil {
-			ro = append(ro, landlock.RODirs(filepath.Dir(abs)).IgnoreIfMissing())
+	for _, root := range declared {
+		if err := add(root, true); err != nil {
+			return nil, err
+		}
+	}
+	if execPath != "" && execPath != "/proc/self/fd/3" {
+		if err := add(execPath, false); err != nil {
+			return nil, err
+		}
+		resolved, _ := filepath.EvalSymlinks(execPath)
+		deps, err := elfRuntimeClosure(resolved)
+		if err != nil {
+			return nil, err
+		}
+		for _, dep := range deps {
+			if err := add(dep, false); err != nil {
+				return nil, err
+			}
+		}
+	}
+	// Minimal device surface. Missing devices are omitted rather than widening
+	// to /dev; callers that need another device must declare that exact node.
+	for _, dev := range []string{"/dev/null", "/dev/urandom"} {
+		if _, err := os.Stat(dev); err == nil {
+			if err := add(dev, false); err != nil {
+				return nil, err
+			}
+		}
+	}
+	sort.Strings(out)
+	return out, nil
+}
+
+func elfRuntimeClosure(path string) ([]string, error) {
+	seen := map[string]bool{}
+	queue := []string{path}
+	var out []string
+	for len(queue) > 0 {
+		current := queue[0]
+		queue = queue[1:]
+		deps, err := elfRuntimeFiles(current)
+		if err != nil {
+			return nil, err
+		}
+		for _, dep := range deps {
+			resolved, err := filepath.EvalSymlinks(dep)
+			if err != nil {
+				return nil, err
+			}
+			if seen[resolved] {
+				continue
+			}
+			seen[resolved] = true
+			out = append(out, resolved)
+			queue = append(queue, resolved)
+		}
+	}
+	return out, nil
+}
+
+func elfRuntimeFiles(path string) ([]string, error) {
+	f, err := elf.Open(path)
+	if err != nil {
+		// Scripts and statically opaque formats have no ELF closure. Their
+		// interpreters/runtime files must be contract-declared.
+		return nil, nil
+	}
+	defer f.Close()
+	var out []string
+	for _, prog := range f.Progs {
+		if prog.Type != elf.PT_INTERP {
+			continue
+		}
+		b := make([]byte, prog.Filesz)
+		if _, err := prog.ReadAt(b, 0); err != nil {
+			return nil, fmt.Errorf("read ELF interpreter for %q: %w", path, err)
+		}
+		interp := strings.TrimRight(string(b), "\x00")
+		if interp != "" {
+			out = append(out, interp)
+		}
+	}
+	libs, err := f.ImportedLibraries()
+	if err != nil {
+		return nil, fmt.Errorf("read ELF dependencies for %q: %w", path, err)
+	}
+	machineDirs := []string{"/lib", "/usr/lib", "/lib64", "/usr/lib64"}
+	switch f.Machine {
+	case elf.EM_X86_64:
+		machineDirs = append([]string{"/lib/x86_64-linux-gnu", "/usr/lib/x86_64-linux-gnu"}, machineDirs...)
+	case elf.EM_AARCH64:
+		machineDirs = append([]string{"/lib/aarch64-linux-gnu", "/usr/lib/aarch64-linux-gnu"}, machineDirs...)
+	}
+	for _, lib := range libs {
+		found := ""
+		for _, dir := range machineDirs {
+			candidate := filepath.Join(dir, lib)
+			if info, err := os.Stat(candidate); err == nil && !info.IsDir() {
+				found = candidate
+				break
+			}
+		}
+		if found == "" {
+			return nil, fmt.Errorf("resolve exact ELF dependency %q for %q", lib, path)
+		}
+		out = append(out, found)
+	}
+	return out, nil
+}
+
+func applyLandlockRuleset(workspace string, readOnly bool, execPath string, declaredReadRoots []string) error {
+	abi, err := activeLandlockABI()
+	if err != nil {
+		return fmt.Errorf("query Landlock ABI: %w", err)
+	}
+	if abi < RequiredLandlockABI {
+		return fmt.Errorf("Landlock ABI %d cannot enforce required ABI %d filesystem rights", abi, RequiredLandlockABI)
+	}
+	closure, err := exactReadClosure(execPath, declaredReadRoots)
+	if err != nil {
+		return err
+	}
+	// V3 without BestEffort is deliberate: RestrictPaths fails if the kernel
+	// cannot enforce every filesystem access right this policy claims.
+	cfg := landlock.V3
+	rules := make([]landlock.Rule, 0, len(closure)+1)
+	for _, path := range closure {
+		info, err := os.Stat(path)
+		if err != nil {
+			return fmt.Errorf("stat read root %q: %w", path, err)
+		}
+		if info.IsDir() {
+			rules = append(rules, landlock.RODirs(path))
+		} else if path == "/dev/null" {
+			// Runtime stdio commonly opens the null device for output. Grant
+			// this exact device node, never its parent directory.
+			rules = append(rules, landlock.RWFiles(path))
+		} else {
+			rules = append(rules, landlock.ROFiles(path))
 		}
 	}
 	if readOnly {
-		ro = append(ro, landlock.RODirs(workspace).IgnoreIfMissing())
-		return cfg.RestrictPaths(ro...)
+		rules = append(rules, landlock.RODirs(workspace))
+	} else {
+		rules = append(rules, landlock.RWDirs(workspace))
 	}
-	rules := append([]landlock.Rule{}, ro...)
-	rules = append(rules, landlock.RWDirs(workspace))
 	return cfg.RestrictPaths(rules...)
 }
 
-// RunSandboxExec is the entry point for the hidden `gov __sandbox_exec`
-// subcommand (see cmd/gov/main.go's run(), which intercepts SandboxExecArg
-// before any normal CLI dispatch). It applies the Landlock ruleset to
-// itself, then replaces its own process image with the real backend via
-// execve -- the restriction survives that exec, so the process the caller
-// (Plan.Wrap's launch chain) actually observes running IS the confined one,
-// not a wrapper sitting in front of an unconfined child.
-//
-// argv is os.Args[1:] with the "__sandbox_exec" token already stripped:
-// --workspace <path> [--readonly] -- <bin> [args...]
 func RunSandboxExec(argv []string) int {
 	fs := flag.NewFlagSet("__sandbox_exec", flag.ContinueOnError)
 	workspace := fs.String("workspace", "", "workspace path Landlock grants write access to")
 	readOnly := fs.Bool("readonly", false, "deny writes everywhere, including workspace")
+	var readRoots stringListFlag
+	fs.Var(&readRoots, "read-root", "exact contract-declared external read path (repeatable)")
 	if err := fs.Parse(argv); err != nil {
 		fmt.Fprintln(os.Stderr, "enforce: parse sandbox-exec args:", err)
 		return 2
@@ -76,23 +241,18 @@ func RunSandboxExec(argv []string) int {
 		fmt.Fprintln(os.Stderr, "enforce: sandbox-exec requires --workspace and -- <bin> [args...]")
 		return 2
 	}
-	if err := applyLandlockRuleset(*workspace, *readOnly, rest[0]); err != nil {
+	if err := applyLandlockRuleset(*workspace, *readOnly, rest[0], readRoots); err != nil {
 		fmt.Fprintln(os.Stderr, "enforce: apply landlock ruleset:", err)
 		return 1
 	}
-	bin := rest[0]
-	path := bin
-	if _, err := os.Stat(bin); err != nil {
-		resolved, lerr := exec.LookPath(bin)
-		if lerr != nil {
-			fmt.Fprintln(os.Stderr, "enforce: resolve sandboxed executable:", lerr)
-			return 1
-		}
-		path = resolved
-	}
-	if err := syscall.Exec(path, rest, os.Environ()); err != nil {
+	if err := syscall.Exec(rest[0], rest, os.Environ()); err != nil {
 		fmt.Fprintln(os.Stderr, "enforce: exec sandboxed executable:", err)
 		return 1
 	}
-	return 0 // unreachable: syscall.Exec only returns on error
+	return 0
 }
+
+type stringListFlag []string
+
+func (f *stringListFlag) String() string         { return strings.Join(*f, ",") }
+func (f *stringListFlag) Set(value string) error { *f = append(*f, value); return nil }

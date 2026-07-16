@@ -1,0 +1,244 @@
+# Sol v7 mandatory final attack corpus (report §"Mandatory final attack
+# corpus", 38 cases). This is the single source of truth the identity-based
+# release gate (Session 7, HS4) consumes — it replaces the old count-based
+# MIN_REDTEAM_TESTS/EXPECTED_REDTEAM_SKIPS gate, which validated skip *count*,
+# not the exact identity/reason of each skip.
+#
+# Do not rename an entry's `name` without updating every file that reserves
+# it (search the exact string across internal/redteam/ first) — the gate,
+# claims verification, and release.sh all key off these exact strings, and a
+# silent rename would look identical to "case removed, unrelated case added"
+# to the drift check.
+#
+# Fields:
+#   case        - the corpus case number (1-38), independent of the v6
+#                 TestAttackN / TestV6CaseN series already in this package.
+#   name        - the exact Go test function name in internal/redteam/.
+#   session     - which plan session (agents/governator-sol-upgrade7-plan.md)
+#                 owns fixing and proving this case.
+#   required    - true: this case must PASS (never SKIP or be absent) before
+#                 a real release ships. Every case in this corpus is
+#                 required=true; nothing in this plan is optional forever —
+#                 `conditional` (below) is the only sanctioned exception, and
+#                 only when a session has verified the constraint for real.
+#   conditional - true only when the case is genuinely inexpressible on some
+#                 environments (e.g. no live systemd --user manager, no
+#                 second uid, no kernel Landlock ABI support) *and* an
+#                 allowed_skip predicate+reason has been recorded by the
+#                 session that verified the constraint. False here means "no
+#                 conditional skip is currently authorized" — do not flip
+#                 this speculatively; only the session implementing the case
+#                 may add a predicate once it has confirmed the constraint is
+#                 real, not a shortcut.
+#   allowed_skip
+#     predicate  - a capability key the gate checks against the
+#                  environment_capabilities recorded in test-summary.json
+#                  (e.g. "has_systemd_user", "has_second_uid",
+#                  "landlock_abi_supports_required_rights"). Absent/false
+#                  capability + case skipped with a reason that matches
+#                  `reason` below = allowed. Anything else = unexpected skip,
+#                  which blocks the release.
+#     reason     - the exact (or prefix-matched) t.Skip reason the gate
+#                  expects. A skip with a *different* reason at the same
+#                  case name is treated as unexpected — this is exactly the
+#                  HS4 defect ("the wrong test skipping while the count stays
+#                  the same passes the gate") this manifest exists to close.
+#   status      - informational only, not consumed by the gate: whether the
+#                 case has a real black-box fixture (`implemented`) or is
+#                 still a named `t.Skip` placeholder reserved for its owning
+#                 session (`not_yet_implemented`). A `not_yet_implemented`
+#                 case is still `required: true` — the gate will (correctly)
+#                 refuse to release while any required case is not passing,
+#                 regardless of this field.
+version: 1
+cases:
+  - case: 1
+    name: TestV7Case1LowRiskEffectfulExternalWriteRejectedWithoutContainment
+    session: S2
+    required: true
+    status: implemented
+  - case: 2
+    name: TestV7Case2LegacyEffectfulExternalWriteRejectedWithoutContainment
+    session: S2
+    required: true
+    status: implemented
+  - case: 3
+    name: TestV7Case3EmptyRiskNoNetworkRejectedWithoutContainment
+    session: S2
+    required: true
+    status: implemented
+  - case: 4
+    name: TestV7Case4LowRiskHostSecretUnreadableUnderNarrowLandlock
+    session: S5
+    required: true
+    status: not_yet_implemented
+  - case: 5
+    name: TestV7Case5ValidatorExternalWriteBlockedOrContained
+    session: S1
+    required: true
+    status: not_yet_implemented
+  - case: 6
+    name: TestV7Case6ValidatorNetworkExfiltrationBlockedOrContained
+    session: S1
+    required: true
+    status: not_yet_implemented
+  - case: 7
+    name: TestV7Case7CleanupValidatorExternalWriteBlockedOrContained
+    session: S1
+    required: true
+    status: not_yet_implemented
+  - case: 8
+    name: TestV7Case8CleanupValidatorDetachedDescendantExtinctionFailureBlocksApproval
+    session: S1
+    required: true
+    status: not_yet_implemented
+  - case: 9
+    name: TestV7Case9GraphProviderExternalWriteBlockedOrContained
+    session: S1
+    required: true
+    status: not_yet_implemented
+  - case: 10
+    name: TestV7Case10GraphProviderNetworkExfiltrationBlockedOrContained
+    session: S1
+    required: true
+    status: not_yet_implemented
+  - case: 11
+    name: TestV7Case11AssayerExternalWriteBlockedOrContained
+    session: S1
+    required: true
+    status: not_yet_implemented
+  - case: 12
+    name: TestV7Case12AssayerNetworkExfiltrationBlockedOrContained
+    session: S1
+    required: true
+    status: not_yet_implemented
+  - case: 13
+    name: TestV7Case13BashReplacementCannotChangeExecutedBytes
+    session: S4
+    required: true
+    status: implemented
+  - case: 14
+    name: TestV7Case14GitReplacementCannotChangeExecutedBytes
+    session: S4
+    required: true
+    status: implemented
+  - case: 15
+    name: TestV7Case15PythonReplacementCannotChangeExecutedBytes
+    session: S4
+    required: true
+    status: implemented
+  - case: 16
+    name: TestV7Case16GovernatorSelfIdentityUsesRunningObject
+    session: S4
+    required: true
+    status: implemented
+  - case: 17
+    name: TestV7Case17ValidatorInterpreterChangeInvalidatesReplay
+    session: S6
+    required: true
+    status: not_yet_implemented
+  - case: 18
+    name: TestV7Case18ValidatorScriptBytesChangeInvalidatesReplay
+    session: S6
+    required: true
+    status: not_yet_implemented
+  - case: 19
+    name: TestV7Case19AmbientPATHMutationAfterConstructionCannotRedirectStage
+    session: S3
+    required: true
+    status: implemented
+  - case: 20
+    name: TestV7Case20ControllerValuesMutationAfterConstructionCannotReachStage
+    session: S3
+    required: true
+    status: implemented
+  - case: 21
+    name: TestV7Case21RTKMinimalismAnnotationChangeInvalidatesReplay
+    session: S6
+    required: true
+    status: not_yet_implemented
+  - case: 22
+    name: TestV7Case22GraphSnapshotChangeBetweenInspectionAndPrepInvalidatesReplay
+    session: S6
+    required: true
+    status: not_yet_implemented
+  - case: 23
+    name: TestV7Case23ConsumedArtifactChangeBetweenHashAndStagingInvalidatesReplay
+    session: S6
+    required: true
+    status: not_yet_implemented
+  - case: 24
+    name: TestV7Case24ProtectedManifestChangeBetweenLoadAndHashInvalidatesReplay
+    session: S6
+    required: true
+    status: not_yet_implemented
+  - case: 25
+    name: TestV7Case25AssayerCommitChangeInvalidatesReplay
+    session: S6
+    required: true
+    status: not_yet_implemented
+  - case: 26
+    name: TestV7Case26AssayerProfileChangeInvalidatesReplay
+    session: S6
+    required: true
+    status: not_yet_implemented
+  - case: 27
+    name: TestV7Case27GitIdentityChangeInvalidatesReplay
+    session: S6
+    required: true
+    status: not_yet_implemented
+  - case: 28
+    name: TestV7Case28BashIdentityChangeInvalidatesReplay
+    session: S6
+    required: true
+    status: not_yet_implemented
+  - case: 29
+    name: TestV7Case29ModelVisibleCanaryChangeInvalidatesReplay
+    session: S6
+    required: true
+    status: not_yet_implemented
+  - case: 30
+    name: TestV7Case30UnknownRequiredIdentityDisablesStrictReplay
+    session: S6
+    required: true
+    status: not_yet_implemented
+  - case: 31
+    name: TestV7Case31MissingReleaseBinaryBlocksGate
+    session: S7
+    required: true
+    status: implemented
+  - case: 32
+    name: TestV7Case32VersionMismatchBlocksGate
+    session: S7
+    required: true
+    status: implemented
+  - case: 33
+    name: TestV7Case33MissingManifestTestBlocksGate
+    session: S7
+    required: true
+    status: implemented
+  - case: 34
+    name: TestV7Case34SubstitutedSkipAtConstantCountBlocksGate
+    session: S7
+    required: true
+    status: implemented
+  - case: 35
+    name: TestV7Case35ArchiveModeStrippedBlocksGate
+    session: S7
+    required: true
+    status: implemented
+  - case: 36
+    name: TestV7Case36InstalledHashMismatchBlocksGate
+    session: S7
+    required: true
+    status: implemented
+  - case: 37
+    name: TestV7Case37AssayerVersionLacksTagBlocksRelease
+    session: S8
+    required: true
+    status: not_yet_implemented
+  - case: 38
+    name: TestV7Case38NoApplicableChecksBlocksApproval
+    session: S8
+    required: true
+    status: not_yet_implemented

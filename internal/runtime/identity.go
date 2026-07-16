@@ -7,6 +7,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
+	"runtime"
 	"runtime/debug"
 	"strings"
 
@@ -15,6 +17,7 @@ import (
 	"github.com/cousingary/governator/internal/contracts"
 	"github.com/cousingary/governator/internal/prompts"
 	"github.com/cousingary/governator/internal/runner"
+	"github.com/cousingary/governator/internal/toolregistry"
 )
 
 // ExecutionIdentity captures every trust-bearing input that must remain
@@ -31,32 +34,39 @@ import (
 // — whose current HEAD equals that post-merge HEAD — matches. Every other
 // field is a snapshot of the environment at replay-check time.
 type ExecutionIdentity struct {
-	ContractHash           string
-	ApprovedHead           string
-	ConfigHash             string
-	ProtectedManifestHash  string
-	OrgPolicyHash          string
-	ProjectDoctrineHash    string
-	PromptVersion          string
-	PromptChecksum         string
-	CompiledPromptHash     string
-	ValidatorSetHash       string
-	ValidatorToolsetHash   string
-	ControllerToolsetHash  string
-	AssayerEnvironmentHash string
-	ConsumedArtifactsHash  string
-	GraphProviderHash      string
-	GraphSnapshotHash      string
-	GovernatorSelfSHA256   string
-	AssayerProfileHash     string
-	BackendAdapter         string
-	BackendAdapterVersion  string
-	BackendBinaryPath      string
-	BackendBinarySHA256    string
-	ModelID                string
-	CapabilityAttestID     string
-	RunnerConfigHash       string
-	GovernatorVersion      string
+	ContractHash              string
+	ApprovedHead              string
+	ConfigHash                string
+	ProtectedManifestHash     string
+	OrgPolicyHash             string
+	ProjectDoctrineHash       string
+	PromptVersion             string
+	PromptChecksum            string
+	CompiledPromptHash        string
+	ValidatorSetHash          string
+	ValidatorToolsetHash      string
+	ControllerToolsetHash     string
+	ControllerEnvironmentHash string
+	AssayerEnvironmentHash    string
+	ConsumedArtifactsHash     string
+	GraphProviderHash         string
+	GraphSnapshotHash         string
+	GovernatorSelfSHA256      string
+	AssayerProfileHash        string
+	BackendAdapter            string
+	BackendAdapterVersion     string
+	BackendBinaryPath         string
+	BackendBinarySHA256       string
+	ModelID                   string
+	CapabilityAttestID        string
+	RunnerConfigHash          string
+	GovernatorVersion         string
+	// V2 binds the exact transaction participants and final model-visible prompt.
+	Participants               map[string]ExecutableIdentity
+	ExactPromptHash            string
+	CredentialIdentityHash     string
+	StrictReplayEligible       bool
+	StrictReplayDisabledReason string
 
 	// Sol P1-2: model/provider identity declared on the backend's
 	// config.Backend entry (agents.BackendIdentity). "model = backend name,
@@ -99,6 +109,7 @@ func (id ExecutionIdentity) Hash() string {
 	fmt.Fprintf(&b, "validator_set_hash=%s\n", id.ValidatorSetHash)
 	fmt.Fprintf(&b, "validator_toolset_hash=%s\n", id.ValidatorToolsetHash)
 	fmt.Fprintf(&b, "controller_toolset_hash=%s\n", id.ControllerToolsetHash)
+	fmt.Fprintf(&b, "controller_environment_hash=%s\n", id.ControllerEnvironmentHash)
 	fmt.Fprintf(&b, "assayer_environment_hash=%s\n", id.AssayerEnvironmentHash)
 	fmt.Fprintf(&b, "consumed_artifacts_hash=%s\n", id.ConsumedArtifactsHash)
 	fmt.Fprintf(&b, "graph_provider_hash=%s\n", id.GraphProviderHash)
@@ -123,6 +134,11 @@ func (id ExecutionIdentity) Hash() string {
 	fmt.Fprintf(&b, "capability_attest_id=%s\n", id.CapabilityAttestID)
 	fmt.Fprintf(&b, "runner_config_hash=%s\n", id.RunnerConfigHash)
 	fmt.Fprintf(&b, "governator_version=%s\n", id.GovernatorVersion)
+	fmt.Fprintf(&b, "participants=%s\n", hashJSON(id.Participants))
+	fmt.Fprintf(&b, "exact_prompt_hash=%s\n", id.ExactPromptHash)
+	fmt.Fprintf(&b, "credential_identity_hash=%s\n", id.CredentialIdentityHash)
+	fmt.Fprintf(&b, "strict_replay_eligible=%t\n", id.StrictReplayEligible)
+	fmt.Fprintf(&b, "strict_replay_disabled_reason=%s\n", id.StrictReplayDisabledReason)
 	sum := sha256.Sum256([]byte(b.String()))
 	return hex.EncodeToString(sum[:])
 }
@@ -147,49 +163,53 @@ func (id ExecutionIdentity) Hash() string {
 // the same "unreadable:pi" sentinel regardless of which binary that name
 // actually resolved to — a swapped executable never changed the identity.
 func computeExecutionIdentity(cfg config.Config, c contracts.Contract, agent agents.Agent, resolution agents.PathResolution, identity agents.BackendIdentity, dockerImage *runner.ImageIdentity, envPolicyHash, head, hash string, promptVer prompts.Version, capabilityAttestID string, bundle PolicyBundle, dynamicHashes ...string) ExecutionIdentity {
-	compiledPromptHash, consumedArtifactsHash, graphProviderHash, graphSnapshotHash := dynamicIdentityHashes(dynamicHashes...)
+	compiledPromptHash, consumedArtifactsHash, graphProviderHash, graphSnapshotHash, controllerEnvironmentHash, validatorToolsetHash := dynamicIdentityHashes(dynamicHashes...)
+	if validatorToolsetHash == "unknown" {
+		validatorToolsetHash = hashJSON(contractValidatorToolset(c))
+	}
 	return ExecutionIdentity{
-		ContractHash:           hash,
-		ApprovedHead:           head,
-		ConfigHash:             cfg.Hash(),
-		ProtectedManifestHash:  hashFileContent(cfg.ProtectedManifest),
-		OrgPolicyHash:          hashJSON(bundle.OrgRules),
-		ProjectDoctrineHash:    hashJSON(bundle.ProjectRules),
-		PromptVersion:          promptVer.ID,
-		PromptChecksum:         promptVer.Checksum,
-		CompiledPromptHash:     compiledPromptHash,
-		ValidatorSetHash:       hashJSON(contractValidatorSet(c)),
-		ValidatorToolsetHash:   hashJSON(contractValidatorToolset(c)),
-		ControllerToolsetHash:  hashJSON(map[string]string{"backend_path": resolution.CanonicalPath, "backend_sha256": resolution.SHA256}),
-		AssayerEnvironmentHash: hashJSON(assayerInputs(cfg, c)),
-		ConsumedArtifactsHash:  consumedArtifactsHash,
-		GraphProviderHash:      graphProviderHash,
-		GraphSnapshotHash:      graphSnapshotHash,
-		GovernatorSelfSHA256:   governatorSelfSHA256(),
-		AssayerProfileHash:     hashJSON(assayerInputs(cfg, c)),
-		BackendAdapter:         agent.Name(),
-		BackendAdapterVersion:  adapterVersion(agent),
-		BackendBinaryPath:      resolution.CanonicalPath,
-		BackendBinarySHA256:    resolution.SHA256,
-		ModelID:                agent.Name(),
-		BackendProvider:        identity.Provider,
-		BackendAccountID:       identity.AccountID,
-		BackendOrgID:           identity.OrgID,
-		BackendModelRevision:   identity.ModelRevision,
-		BackendEndpoint:        identity.Endpoint,
-		BackendReasoningMode:   identity.ReasoningMode,
-		BackendApprovalMode:    identity.ApprovalMode,
-		BackendSandboxMode:     identity.SandboxMode,
-		BackendIdentityHash:    identity.ConfigHash,
-		BackendIdentityKnown:   identity.Known(),
-		CapabilityAttestID:     capabilityAttestID,
-		RunnerConfigHash:       hashJSON(runnerConfig(c, dockerImage, envPolicyHash)),
-		GovernatorVersion:      governatorBuildID(),
+		ContractHash:              hash,
+		ApprovedHead:              head,
+		ConfigHash:                cfg.Hash(),
+		ProtectedManifestHash:     hashFileContent(cfg.ProtectedManifest),
+		OrgPolicyHash:             hashJSON(bundle.OrgRules),
+		ProjectDoctrineHash:       hashJSON(bundle.ProjectRules),
+		PromptVersion:             promptVer.ID,
+		PromptChecksum:            promptVer.Checksum,
+		CompiledPromptHash:        compiledPromptHash,
+		ValidatorSetHash:          hashJSON(contractValidatorSet(c)),
+		ValidatorToolsetHash:      validatorToolsetHash,
+		ControllerToolsetHash:     hashJSON(map[string]string{"backend_path": resolution.CanonicalPath, "backend_sha256": resolution.SHA256}),
+		ControllerEnvironmentHash: controllerEnvironmentHash,
+		AssayerEnvironmentHash:    hashJSON(assayerInputs(cfg, c)),
+		ConsumedArtifactsHash:     consumedArtifactsHash,
+		GraphProviderHash:         graphProviderHash,
+		GraphSnapshotHash:         graphSnapshotHash,
+		GovernatorSelfSHA256:      governatorSelfSHA256(),
+		AssayerProfileHash:        hashJSON(assayerInputs(cfg, c)),
+		BackendAdapter:            agent.Name(),
+		BackendAdapterVersion:     adapterVersion(agent),
+		BackendBinaryPath:         resolution.CanonicalPath,
+		BackendBinarySHA256:       resolution.SHA256,
+		ModelID:                   agent.Name(),
+		BackendProvider:           identity.Provider,
+		BackendAccountID:          identity.AccountID,
+		BackendOrgID:              identity.OrgID,
+		BackendModelRevision:      identity.ModelRevision,
+		BackendEndpoint:           identity.Endpoint,
+		BackendReasoningMode:      identity.ReasoningMode,
+		BackendApprovalMode:       identity.ApprovalMode,
+		BackendSandboxMode:        identity.SandboxMode,
+		BackendIdentityHash:       identity.ConfigHash,
+		BackendIdentityKnown:      identity.Known(),
+		CapabilityAttestID:        capabilityAttestID,
+		RunnerConfigHash:          hashJSON(runnerConfig(c, dockerImage, envPolicyHash)),
+		GovernatorVersion:         governatorBuildID(),
 	}
 }
 
-func dynamicIdentityHashes(values ...string) (compiledPromptHash, consumedArtifactsHash, graphProviderHash, graphSnapshotHash string) {
-	defaults := []string{"unknown", "none", "unknown", "unknown"}
+func dynamicIdentityHashes(values ...string) (compiledPromptHash, consumedArtifactsHash, graphProviderHash, graphSnapshotHash, controllerEnvironmentHash, validatorToolsetHash string) {
+	defaults := []string{"unknown", "none", "unknown", "unknown", "unknown", "unknown"}
 	for i, v := range values {
 		if i >= len(defaults) {
 			break
@@ -198,7 +218,7 @@ func dynamicIdentityHashes(values ...string) (compiledPromptHash, consumedArtifa
 			defaults[i] = v
 		}
 	}
-	return defaults[0], defaults[1], defaults[2], defaults[3]
+	return defaults[0], defaults[1], defaults[2], defaults[3], defaults[4], defaults[5]
 }
 
 // replayMatch looks up the most recent APPROVED run whose stored identity hash
@@ -258,11 +278,111 @@ func contractValidatorSet(c contracts.Contract) map[string][]string {
 	return out
 }
 
+type resolvedValidatorTool struct {
+	Name          string `json:"name"`
+	CanonicalPath string `json:"canonical_path"`
+	SHA256        string `json:"sha256"`
+	Device        uint64 `json:"device"`
+	Inode         uint64 `json:"inode"`
+}
+
+type resolvedValidatorFile struct {
+	Path   string `json:"path"`
+	SHA256 string `json:"sha256"`
+}
+
+type resolvedValidatorSpec struct {
+	Command string                  `json:"command"`
+	Tools   []resolvedValidatorTool `json:"tools"`
+	Files   []resolvedValidatorFile `json:"files"`
+}
+
+func resolveValidatorToolset(c contracts.Contract, root string, registries ...*toolregistry.Registry) (string, error) {
+	if len(c.Success.ValidatorSpecs) == 0 {
+		return hashJSON(contractValidatorToolset(c)), nil
+	}
+	var registry *toolregistry.Registry
+	if len(registries) > 0 {
+		registry = registries[0]
+	} else {
+		var err error
+		registry, err = toolregistry.Load()
+		if err != nil {
+			return "", fmt.Errorf("load validator tool registry: %w", err)
+		}
+	}
+	if registry == nil {
+		return "", fmt.Errorf("validator tool registry is not frozen")
+	}
+	rootAbs, err := filepath.Abs(root)
+	if err != nil {
+		return "", err
+	}
+	resolved := make([]resolvedValidatorSpec, 0, len(c.Success.ValidatorSpecs))
+	for _, spec := range c.Success.ValidatorSpecs {
+		item := resolvedValidatorSpec{Command: spec.Command}
+		for _, name := range spec.Tools {
+			identity, err := registry.Resolve(name, name)
+			if err != nil {
+				return "", fmt.Errorf("resolve validator tool %q: %w", name, err)
+			}
+			item.Tools = append(item.Tools, resolvedValidatorTool{Name: name, CanonicalPath: identity.CanonicalPath, SHA256: identity.SHA256, Device: identity.Device, Inode: identity.Inode})
+		}
+		for _, declared := range spec.Files {
+			abs := filepath.Join(rootAbs, filepath.FromSlash(declared))
+			rel, err := filepath.Rel(rootAbs, abs)
+			if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(os.PathSeparator)) {
+				return "", fmt.Errorf("validator file %q escapes workspace root", declared)
+			}
+			hash := hashFileContent(abs)
+			if strings.HasPrefix(hash, "unreadable:") {
+				return "", fmt.Errorf("validator file %q is unreadable", declared)
+			}
+			item.Files = append(item.Files, resolvedValidatorFile{Path: filepath.ToSlash(rel), SHA256: hash})
+		}
+		resolved = append(resolved, item)
+	}
+	return hashJSON(resolved), nil
+}
+
+func validatorToolDirectories(c contracts.Contract, registry *toolregistry.Registry) ([][]string, error) {
+	if len(c.Success.ValidatorSpecs) == 0 {
+		return nil, nil
+	}
+	if registry == nil {
+		return nil, fmt.Errorf("validator tool registry is not frozen")
+	}
+	if len(c.Success.ValidatorSpecs) != len(c.Success.Validators) {
+		return nil, fmt.Errorf("structured and legacy validators cannot be mixed")
+	}
+	out := make([][]string, len(c.Success.ValidatorSpecs))
+	for i, spec := range c.Success.ValidatorSpecs {
+		seen := map[string]bool{}
+		for _, name := range spec.Tools {
+			identity, err := registry.Resolve(name, name)
+			if err != nil {
+				return nil, fmt.Errorf("resolve validator tool %q: %w", name, err)
+			}
+			dir := filepath.Dir(identity.CanonicalPath)
+			if !seen[dir] {
+				out[i] = append(out[i], dir)
+				seen[dir] = true
+			}
+		}
+	}
+	return out, nil
+}
+
 func contractValidatorToolset(c contracts.Contract) map[string][]string {
 	return contractValidatorSet(c)
 }
 
 func governatorSelfSHA256() string {
+	// Hash the object this process is actually executing, not a pathname that
+	// a same-user process can replace between os.Executable and open.
+	if runtime.GOOS == "linux" {
+		return hashFileContent("/proc/self/exe")
+	}
 	exe, err := os.Executable()
 	if err != nil {
 		return "unknown:" + err.Error()
@@ -272,6 +392,17 @@ func governatorSelfSHA256() string {
 
 // assayerInputs gathers the bridge config and the contract's assay declaration
 // so a changed Assayer profile or enforcement mode invalidates replay.
+func resolvedAssayerEnvironmentHash(cfg config.Config, c contracts.Contract) string {
+	files := map[string]string{}
+	for _, rel := range []string{"assayer/profiles.py", "assayer/checks.py", "assayer/registry.py", "pyproject.toml", "requirements.txt", "requirements.lock", "uv.lock", "poetry.lock", "PINNED_COMMIT", ".git/HEAD"} {
+		path := filepath.Join(cfg.Assay.Repo, rel)
+		if cfg.Assay.Repo != "" {
+			files[rel] = hashFileContent(path)
+		}
+	}
+	return hashJSON(map[string]any{"files": files, "python": cfg.Assay.Python, "bridge": cfg.Assay, "contract": c.Assay})
+}
+
 func assayerInputs(cfg config.Config, c contracts.Contract) map[string]any {
 	out := map[string]any{"bridge": cfg.Assay}
 	if c.Assay != nil {

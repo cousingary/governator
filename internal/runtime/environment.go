@@ -4,8 +4,10 @@ import (
 	"fmt"
 
 	"github.com/cousingary/governator/internal/config"
+	"github.com/cousingary/governator/internal/contextgraph"
 	"github.com/cousingary/governator/internal/controllerenv"
 	"github.com/cousingary/governator/internal/protectedpaths"
+	"github.com/cousingary/governator/internal/toolregistry"
 )
 
 // RunEnvironment is the immutable snapshot of every configuration-derived
@@ -26,10 +28,7 @@ import (
 // before any run decision (lock, quota, routing, containment, policy gate,
 // launch). Every subsequent execution-critical read of configuration takes
 // its value from this struct, never from config.Current() again.
-type ControllerEnvironment struct {
-	Environment     []string
-	EnvironmentHash string
-}
+type ControllerEnvironment = controllerenv.Frozen
 
 type RunEnvironment struct {
 	// Config is the full effective configuration, loaded once via
@@ -54,6 +53,8 @@ type RunEnvironment struct {
 	// config file.
 	CredentialRoots []string
 	Controller      ControllerEnvironment
+	ToolRegistry    *toolregistry.Registry
+	GraphStatus     contextgraph.Status
 }
 
 // buildRunEnvironment loads and freezes every configuration-derived input a
@@ -68,16 +69,23 @@ func buildRunEnvironment() (RunEnvironment, error) {
 	if err != nil {
 		return RunEnvironment{}, fmt.Errorf("load protected-path manifest %q: %w", cfg.ProtectedManifest, err)
 	}
-	controllerEnv := controllerenv.Base()
+	registry, err := toolregistry.Load()
+	if err != nil {
+		return RunEnvironment{}, fmt.Errorf("load trusted-tool registry: %w", err)
+	}
+	graphStatus, err := contextgraph.ResolveConfigWithRegistry(cfg, registry)
+	if err != nil {
+		return RunEnvironment{}, fmt.Errorf("resolve graph provider: %w", err)
+	}
+	controllerEnv := controllerenv.Freeze()
 	return RunEnvironment{
 		Config:                cfg,
 		ConfigHash:            cfg.Hash(),
 		ProtectedManifestPath: cfg.ProtectedManifest,
 		ProtectedPatterns:     patterns,
 		CredentialRoots:       append([]string(nil), cfg.Credentials.Roots...),
-		Controller: ControllerEnvironment{
-			Environment:     append([]string(nil), controllerEnv...),
-			EnvironmentHash: controllerenv.Hash(controllerEnv),
-		},
+		Controller:            controllerEnv,
+		ToolRegistry:          registry,
+		GraphStatus:           graphStatus,
 	}, nil
 }
