@@ -1502,7 +1502,9 @@ var secrets = []*regexp.Regexp{
 
 func commandMatches(pattern, command string) bool {
 	var b strings.Builder
-	b.WriteString("^")
+	// (?s) makes '.' span newlines: allowed.execute wildcards must match
+	// real multi-line backend commands (e.g. heredocs), not just one line.
+	b.WriteString("(?s)^")
 	for _, c := range pattern {
 		if c == '*' {
 			b.WriteString(".*")
