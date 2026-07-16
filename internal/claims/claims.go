@@ -757,9 +757,18 @@ func verifyArtifactManifest(repoRoot, artifactPath, manifestPath string) (bool, 
 	if strings.TrimSpace(manifest.TestSummaryPath) == "" {
 		ok = false
 		problems = append(problems, "absent from shipped binary: manifest lacks required test_summary_path")
-	} else if summaryOK, summaryProblems := verifyTestSummary(repoRoot, manifest.TestSummaryPath, manifest.SourceCommit); !summaryOK {
-		ok = false
-		problems = append(problems, summaryProblems...)
+	} else {
+		// test_summary_path is a bare filename release.sh writes as a
+		// sibling of build-manifest.json (both land in OUT_DIR, e.g.
+		// dist/) -- never at repoRoot, and never inside the artifact
+		// tarball itself (that ships only the gov binary). Resolve it
+		// against the manifest's own directory, not repoRoot, or a real
+		// release build fails its own artifact-provenance check.
+		manifestDir := filepath.Dir(absOrRepo(repoRoot, manifestPath))
+		if summaryOK, summaryProblems := verifyTestSummary(manifestDir, manifest.TestSummaryPath, manifest.SourceCommit); !summaryOK {
+			ok = false
+			problems = append(problems, summaryProblems...)
+		}
 	}
 	if !passingResult(manifest.AcceptanceResult) || strings.TrimSpace(manifest.AcceptanceRunID) == "" {
 		ok = false

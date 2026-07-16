@@ -410,7 +410,7 @@ func main() {
   "claims_hash": "`+claimsHash+`",
   "test_run_id": "unit-test",
   "test_result": "PASS",
-  "test_summary_path": "evidence/test-summary.json",
+  "test_summary_path": "test-summary.json",
   "acceptance_run_id": "acceptance-test",
   "acceptance_result": "PASS",
   "binaries": {"targets": [{"platform": "linux_amd64", "sha256": "`+artifactHash+`"}]}
