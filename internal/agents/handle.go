@@ -311,12 +311,48 @@ func (h *BackendExecutionHandle) sealedExecutablePath() (string, error) {
 		_ = os.RemoveAll(dir)
 		return "", fmt.Errorf("backend identity: chmod sealed exec copy: %w", err)
 	}
+	// Node-based backends (codex, opencode, ...) resolve sibling npm
+	// dependencies -- e.g. codex's own optional platform-native package --
+	// via node_modules lookups that walk up from the running script's own
+	// directory. The sealed copy above is deliberately isolated from its
+	// original directory tree for integrity, which breaks that lookup for
+	// any backend that needs it (observed: codex's findCodexExecutable()
+	// throwing "Missing optional dependency @openai/codex-linux-x64").
+	// Restore just the dependency-discovery path via a symlink -- it is not
+	// re-verified/immutable, the same trust boundary the pre-sealing exec
+	// path always had for the whole executable -- while the sealed backend
+	// file itself stays the verified, immutable copy. Skipped silently for
+	// non-Node backends that have no node_modules to find.
+	if nm := nearestNodeModules(h.CanonicalPath); nm != "" {
+		_ = os.Symlink(nm, filepath.Join(dir, "node_modules"))
+	}
 	if err := os.Chmod(dir, 0500); err != nil {
 		_ = os.RemoveAll(dir)
 		return "", fmt.Errorf("backend identity: chmod sealed exec dir: %w", err)
 	}
 	h.sealedDir = dir
 	return outPath, nil
+}
+
+// nearestNodeModules walks up from executablePath's own directory looking
+// for a sibling node_modules directory, mirroring Node's own module
+// resolution search order. Returns "" if none is found within a bounded
+// number of levels -- most backends aren't Node CLIs at all, so absence is
+// the common, unremarkable case, not an error.
+func nearestNodeModules(executablePath string) string {
+	dir := filepath.Dir(executablePath)
+	for i := 0; i < 12; i++ {
+		candidate := filepath.Join(dir, "node_modules")
+		if info, err := os.Stat(candidate); err == nil && info.IsDir() {
+			return candidate
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			break
+		}
+		dir = parent
+	}
+	return ""
 }
 
 // VerifyUnchanged re-stats and re-hashes h's canonical path RIGHT NOW and
