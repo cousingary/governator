@@ -1119,3 +1119,20 @@ claims:
           - TestV6Case31AssayerLeaseRenewedThroughSlowDownstreamCallPreventsDuplicate
           - TestV6Case32UnknownOutboxOperationIsDeadLettered
           - TestV6Case33AssayerPytestExitsCleanlyOnSupportedPythonVersions
+
+  - id: sol7-s9-readonly-write-carveout
+    title: "A read-only-mode contract (ModeScout/ModeVerifier/ModeArchitect, which enforce.NewPlanForExecutable maps to a Landlock ruleset denying writes to the entire workspace) can still land its declared Produces artifact and RESULT.json: Plan.WithWriteRoots(dirs, files) records pre-existing paths beneath the workspace to grant read-write to despite ReadOnly, Wrap emits --write-dir/--write-file, and RunSandboxExec's ruleset construction grants landlock.RWDirs/RWFiles for them, refusing (fail-closed) anything that escapes the workspace or does not already exist on disk. The runtime launch site pre-creates an empty RESULT.json (whenever the Plan is active and read-only) and .governator/artifacts/ (when the contract declares Produces) on the host side, unconfined, before building the write-root list -- Landlock binds a rule to an already-opened path, so a not-yet-created directory or file could not be granted a rule in advance. Fixes a real defect: any read-only-mode job (including every production panel run) was previously unable to complete under genuinely active Landlock enforcement at all."
+    first_shipped_version: v1.0.2-rc1
+    claimed_maturity: tested
+    implementation:
+      - file: internal/enforce/enforce.go
+        symbols: [WithWriteRoots]
+      - file: internal/enforce/landlock.go
+        symbols: [writeCarveOuts, applyLandlockRuleset, RunSandboxExec]
+      - file: internal/runtime/runtime.go
+        symbols: [runOnce]
+    tests:
+      - file: internal/runtime/panel_test.go
+        funcs:
+          - TestRunPanelQuorumProceedsWithoutStraggler
+          - TestRunPanelQuorumSkipsMemberOnceSatisfied
