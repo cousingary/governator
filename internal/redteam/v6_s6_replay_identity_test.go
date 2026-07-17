@@ -184,18 +184,27 @@ func TestV6Case23GraphDatabaseChangeBeforeReplayInvalidatesReplay(t *testing.T) 
 	root := fixtureRepo(t)
 	home := t.TempDir()
 
-	dbFile := filepath.Join(t.TempDir(), "graph.db")
-	if err := os.WriteFile(dbFile, []byte("graph-state-v1"), 0644); err != nil {
-		t.Fatal(err)
-	}
+	// Force govBinary's one-time build (sync.Once) to happen now, under the
+	// real ambient HOME, before the HOME override below. Otherwise, if this
+	// is the first test in the process to call runGoverned (as it is when
+	// run standalone via -run), the build's own module-cache resolution
+	// happens under the redirected HOME instead -- a full, slow re-download
+	// into an empty cache, with read-only module files t.TempDir() cleanup
+	// can't remove.
+	_ = govBinary(t)
 
 	// A compiled ELF binary, not a #!/bin/sh script -- see TestV6Case24's
 	// comment just below for why (scopedCommandOutput's enforce.Plan has no
-	// declared interpreter closure by design). Reads $GOV_V6_GRAPH_DB's size
-	// at call time so the reported fingerprint tracks the file's live
-	// content, same as the original script.
-	fakeCodegraph := buildFakeCodegraphBinary(t, "", `
-		dbFile := os.Getenv("GOV_V6_GRAPH_DB")
+	// declared interpreter closure by design). Reads the marker file's size
+	// at call time via $HOME (forwarded through the frozen controller
+	// environment, unlike an arbitrary env var) so the reported fingerprint
+	// tracks the file's live content, same as the original script. Built
+	// BEFORE the HOME override below: buildFakeCodegraphBinary shells out to
+	// `go build`, which resolves its own module cache under $HOME/go/pkg/mod
+	// -- redirecting HOME first forces a fresh, slow module download here
+	// and leaves read-only cache files t.TempDir() cleanup can't remove.
+	fakeCodegraph := buildFakeCodegraphBinary(t, "\t\"path/filepath\"\n", `
+		dbFile := filepath.Join(os.Getenv("HOME"), "graph.db")
 		info, statErr := os.Stat(dbFile)
 		var size int64
 		if statErr == nil {
@@ -204,6 +213,29 @@ func TestV6Case23GraphDatabaseChangeBeforeReplayInvalidatesReplay(t *testing.T) 
 		fmt.Printf("{\"version\":\"1.0.0\",\"initialized\":true,\"projectPath\":\"\",\"indexPath\":%q,\"fileCount\":1,\"nodeCount\":1,\"edgeCount\":1,\"dbSizeBytes\":%d}\n", dbFile, size)
 		return
 `, "")
+
+	// The live "db" file cannot live in root's own working tree: the graph
+	// provider stage reads root directly (contextgraph.CurrentWithStatus
+	// runs on the bare repo, before any per-run worktree is even created),
+	// but an untracked file sitting there fails runtime's "live root dirty
+	// before merge" check and quarantines the run (confirmed empirically:
+	// placing it under root turned this test's own APPROVED assertion into
+	// a QUARANTINED failure). It also cannot travel via an ad hoc env var
+	// like the original GOV_V6_GRAPH_DB: controllerenv.Allowlist (PATH/HOME/
+	// TMPDIR/LANG/LC_ALL/TZ/XDG_RUNTIME_DIR) strips every other env var
+	// before a controller subprocess launches, so the fake binary always
+	// saw "" regardless of what the test set, making the fingerprint check
+	// below silently vacuous (empty on every run, not just an unchanged
+	// one). HOME, in contrast, IS on the allowlist and is read fresh from
+	// the process environment at Freeze()-time (controllerenv.With), so
+	// redirecting it to a test-owned temp dir is the one channel that both
+	// reaches the subprocess and stays outside the git-tracked workspace.
+	graphHome := t.TempDir()
+	t.Setenv("HOME", graphHome)
+	dbFile := filepath.Join(graphHome, "graph.db")
+	if err := os.WriteFile(dbFile, []byte("graph-state-v1"), 0644); err != nil {
+		t.Fatal(err)
+	}
 
 	registryFile := filepath.Join(t.TempDir(), "tools.yaml")
 	t.Setenv("GOV_TOOLREGISTRY_FILE", registryFile)
@@ -214,7 +246,6 @@ func TestV6Case23GraphDatabaseChangeBeforeReplayInvalidatesReplay(t *testing.T) 
 	t.Setenv("GOV_GRAPH_MODE", "auto")
 	t.Setenv("GOV_GRAPH_PROVIDER", "codegraph")
 	t.Setenv("GOV_GRAPH_BIN", fakeCodegraph)
-	t.Setenv("GOV_V6_GRAPH_DB", dbFile)
 
 	c := baseContract(root)
 	bin := fakeBackend(t, standardBackendBody(""))
