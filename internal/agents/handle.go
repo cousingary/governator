@@ -15,7 +15,10 @@ import (
 	"syscall"
 
 	"github.com/cousingary/governator/internal/config"
+	"github.com/cousingary/governator/internal/containment"
 	"github.com/cousingary/governator/internal/controllerenv"
+	"github.com/cousingary/governator/internal/enforce"
+	"github.com/cousingary/governator/internal/stage"
 )
 
 // BackendIdentity is the operator-declared model/provider identity behind a
@@ -355,6 +358,33 @@ func nearestNodeModules(executablePath string) string {
 	return ""
 }
 
+// ExtendPlanForSealedLaunch grows plan's Landlock read closure to cover the
+// object that will ACTUALLY execute under a scope-wrapped launch, before
+// Wrap is called. LaunchCommand's scoped branch never execs handle's
+// original CanonicalPath -- it copies the verified bytes into a fresh
+// sealedExecutablePath() directory and execs that copy instead (scope
+// wrappers such as unshare/systemd-run reopen their argv[0] by path, so the
+// fd-passing trick fdLaunchArgs uses for the unscoped case cannot reach
+// them). A Plan built from CanonicalPath alone denies read/execute of that
+// sealed copy, so the wrapped process fails closed on every launch attempt
+// (verified: TestV6Case25 without this fix reaches QUARANTINED via "agent
+// exit code 1" / VALIDATION_FAILED, never via an actual blocked secret read
+// -- the backend never runs at all). Calling sealedExecutablePath() here is
+// safe to repeat: it caches h.sealedDir and LaunchCommand's own later call
+// returns the identical path, not a second copy. A no-op when plan is
+// inactive or handle is nil -- nothing to extend for a launch Wrap will
+// leave unchanged anyway.
+func (h *BackendExecutionHandle) ExtendPlanForSealedLaunch(plan enforce.Plan) (enforce.Plan, error) {
+	if h == nil || !plan.Active {
+		return plan, nil
+	}
+	sealed, err := h.sealedExecutablePath()
+	if err != nil {
+		return enforce.Plan{}, err
+	}
+	return plan.WithExecutableAndReadRoots(sealed, filepath.Dir(sealed))
+}
+
 // VerifyUnchanged re-stats and re-hashes h's canonical path RIGHT NOW and
 // fails closed if the file is missing or no longer matches what ResolveHandle
 // captured. Used on launch paths that must exec through a wrapper binary
@@ -528,4 +558,72 @@ func LaunchCommand(ctx context.Context, handle *BackendExecutionHandle, bin stri
 		return cmd, nil
 	}
 	return exec.CommandContext(ctx, bin, args...), nil
+}
+
+// LaunchStaged runs a governed backend command through internal/stage.
+// Executor when a descendant-owning Scope and enforcement Plan are both
+// present (Sol redteam v7 S1 gap-closure) -- the composition
+// agents.defaultExecutor and runner.LocalWorktreeRunner.executor's
+// "hasScope" branch each built independently before this migration, now
+// shared here so both get the SAME unique per-stage scope naming
+// (RunID-StageID-nonce, closing the S1 "scope names reused" secondary
+// finding for the backend specifically -- shellStage already has this for
+// validators) and the SAME descendant-extinction proof StageExecutor
+// already gives every other migrated stage, instead of registering into
+// the run's single shared Scope the way the backend did before this
+// migration.
+//
+// The launch itself is still exactly LaunchCommand's existing
+// sealed-copy-or-fd logic (via a CommandFactory), including
+// ExtendPlanForSealedLaunch -- this migration is about WHERE the scope,
+// timeout, and extinction bookkeeping live, not about changing how the
+// process is actually built or confined.
+//
+// scope's OWN RunID/IsStrong are reused to derive this stage's identity and
+// containment strength rather than threading a second copy of the run's
+// requireStrong decision through context: stage.Executor.Run always builds
+// its own NEW, independent per-stage Scope internally (it never reads one
+// from ctx), so scope here is consulted only for its metadata, never
+// launched into directly.
+func LaunchStaged(ctx context.Context, handle *BackendExecutionHandle, bin string, args []string, workdir string, out io.Writer, scope *containment.Scope, plan enforce.Plan) (exitCode int, descendantsGone bool, err error) {
+	execID := stage.ExecutableIdentity{CanonicalPath: bin}
+	var allowedEnv []string
+	if handle != nil {
+		execID = stage.ExecutableIdentity{CanonicalPath: handle.CanonicalPath, SHA256: handle.SHA256}
+		allowedEnv = handle.AllowedEnv
+	}
+	envValues := BuildAllowedEnv(allowedEnv)
+	factory := func(c context.Context, s *containment.Scope, p enforce.Plan, b string, a []string, d string) (*exec.Cmd, error) {
+		if handle != nil {
+			extended, eerr := handle.ExtendPlanForSealedLaunch(p)
+			if eerr != nil {
+				return nil, eerr
+			}
+			p = extended
+		}
+		return LaunchCommand(c, handle, b, a, func(cc context.Context, launchBin string, launchArgs []string) *exec.Cmd {
+			wb, wa := p.Wrap(launchBin, launchArgs)
+			return s.Command(cc, wb, wa, d)
+		})
+	}
+	res, runErr := stage.NewExecutor().Run(ctx, stage.StageSpec{
+		RunID:            scope.RunID(),
+		StageID:          "backend",
+		Executable:       execID,
+		Arguments:        args,
+		WorkingDirectory: workdir,
+		Environment:      stage.FrozenEnvironment{Values: envValues, Hash: controllerenv.Hash(envValues)},
+		DescendantPolicy: stage.DescendantPolicy{RequireStrong: scope.IsStrong()},
+		EnforcementPlan:  plan,
+		CommandFactory:   factory,
+		// The backend can stream large transcripts over a long run --
+		// unlike a quick validator/Assayer call, so Output (the internal,
+		// otherwise-unbounded capture buffer stage.Executor.Run always
+		// keeps) is never consulted here. out gets the real, streaming
+		// transcript writer directly; matches the pre-migration byte-exact
+		// behavior instead of buffering the whole run in memory first.
+		Stdout: out,
+		Stderr: out,
+	})
+	return res.ExitStatus, res.DescendantsGone, runErr
 }

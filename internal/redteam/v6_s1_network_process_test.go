@@ -193,22 +193,25 @@ func TestV6Case5GraphProviderDetachedChildCannotWriteAfterApproval(t *testing.T)
 	root := fixtureRepo(t)
 	hostEscape := filepath.Join(t.TempDir(), "codegraph-escaped.txt")
 
-	fakeCodegraph := filepath.Join(secureToolTempDir(t), "codegraph")
-	fakeCodegraphScript := `#!/bin/sh
-set -eu
-case "$1" in
-  --version|version) printf 'codegraph 1.0.0\n' ;;
-  init|sync) exit 0 ;;
-  status)
-    setsid sh -c 'sleep 2; printf escaped > ` + hostEscape + `' < /dev/null > /dev/null 2>&1 &
-    printf '{"version":"1.0.0","initialized":false}\n'
-    ;;
-  *) printf '{}\n' ;;
-esac
-`
-	if err := os.WriteFile(fakeCodegraph, []byte(fakeCodegraphScript), 0755); err != nil {
-		t.Fatal(err)
-	}
+	// Sol redteam v7 S1/contextgraph gap-closure (Task #3, 2026-07-16) gave
+	// the graph provider stage a real enforce.Plan, so its launch target
+	// must be a real ELF binary -- a #!/bin/sh script (this test's
+	// original shape) can't launch under Landlock without a separately
+	// declared interpreter closure, which scopedCommandOutput deliberately
+	// doesn't offer. The detach-and-delay shape this attack needs (a
+	// setsid'd descendant that outlives the parent) is reproduced with
+	// Go's own os/exec + SysProcAttr{Setsid: true} instead of shelling out
+	// to setsid/sh, so no additional interpreter needs declaring at all.
+	statusBody := `		if os.Getenv("CG_CHILD") == "1" {
+			time.Sleep(2 * time.Second)
+			_ = os.WriteFile(os.Getenv("CG_ESCAPE"), []byte("escaped"), 0644)
+			os.Exit(0)
+		}
+		child := exec.Command(os.Args[0], "status")
+		child.Env = append(os.Environ(), "CG_CHILD=1", "CG_ESCAPE=` + hostEscape + `")
+		child.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+		_ = child.Start()`
+	fakeCodegraph := buildFakeCodegraphBinary(t, "\t\"os/exec\"\n\t\"syscall\"\n\t\"time\"", statusBody, "")
 	registryFile := filepath.Join(t.TempDir(), "tools.yaml")
 
 	t.Setenv("GOV_TOOLREGISTRY_FILE", registryFile)

@@ -218,10 +218,16 @@ func applyLandlockRuleset(workspace string, readOnly bool, execPath string, decl
 			rules = append(rules, landlock.ROFiles(path))
 		}
 	}
-	if readOnly {
-		rules = append(rules, landlock.RODirs(workspace))
-	} else {
-		rules = append(rules, landlock.RWDirs(workspace))
+	// An empty workspace is only valid in readOnly mode -- it means "no
+	// additional writable/readable root beyond the declared closure above,"
+	// not "grant rights to the empty path" (RunSandboxExec's own flag check
+	// enforces the analogous non-readOnly requirement below).
+	if workspace != "" {
+		if readOnly {
+			rules = append(rules, landlock.RODirs(workspace))
+		} else {
+			rules = append(rules, landlock.RWDirs(workspace))
+		}
 	}
 	return cfg.RestrictPaths(rules...)
 }
@@ -237,7 +243,11 @@ func RunSandboxExec(argv []string) int {
 		return 2
 	}
 	rest := fs.Args()
-	if *workspace == "" || len(rest) == 0 {
+	// A workspace is only required when granting write access somewhere --
+	// a readOnly stage (Sol redteam v7 S1: assay.go's Evaluate,
+	// contextgraph.go's Version) may legitimately have no writable/extra
+	// root at all beyond its declared read closure.
+	if (!*readOnly && *workspace == "") || len(rest) == 0 {
 		fmt.Fprintln(os.Stderr, "enforce: sandbox-exec requires --workspace and -- <bin> [args...]")
 		return 2
 	}

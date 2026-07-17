@@ -228,6 +228,19 @@ func NewPlanForExecutable(active bool, workspace string, readOnly, allowNetwork,
 	}, nil
 }
 
+// ExecutableReadClosure resolves executable's own file plus its ELF runtime
+// dependencies (dynamic loader + shared libraries, when it is an ELF
+// binary) into the same exact-file list exactReadClosure computes
+// internally for a Plan's primary executable. Exported so a contract or
+// fixture that needs a SECOND executable readable under the sandbox --
+// most commonly a script's own interpreter, since exactReadClosure's own
+// doc comment already requires "non-ELF executables (scripts) must declare
+// their interpreter ... through ReadRoots" -- can compute that interpreter's
+// full closure instead of hand-enumerating its shared libraries.
+func ExecutableReadClosure(executable string) ([]string, error) {
+	return exactReadClosure(executable, nil)
+}
+
 // Wrap rewrites bin/args so the process that actually starts is already
 // confined: Landlock is applied to it before it execs into bin (see
 // RunSandboxExec), and -- unless the run is permitted network access -- the

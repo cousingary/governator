@@ -21,7 +21,16 @@ import (
 // that needs host-level containment (DockerRunner) supplies its own executor
 // so the same bin/args/workdir/timeout/output contract launches inside a
 // container instead, without any backend adapter needing to change.
-type Executor func(ctx context.Context, bin string, args []string, workdir string, out io.Writer, timeout time.Duration) (exitCode int, timedOut bool, err error)
+//
+// descendantsGone (Sol redteam v7 S1 gap-closure, migrating the backend
+// launch to internal/stage.Executor): true when this launch's descendant
+// scope confirmed kernel-verified extinction of every process it owned, or
+// when there was nothing to prove (no Scope in context -- doctor probes,
+// direct adapter tests, DockerRunner's own separate container-level
+// containment model). false means extinction was attempted and failed;
+// callers must treat that as fatal to the run, the same posture
+// runtime.runOnce already gives its own run-level Scope's Extinguish call.
+type Executor func(ctx context.Context, bin string, args []string, workdir string, out io.Writer, timeout time.Duration) (exitCode int, timedOut bool, descendantsGone bool, err error)
 
 type Request struct {
 	Prompt     string
@@ -45,6 +54,10 @@ type Request struct {
 type Result struct {
 	ExitCode int
 	TimedOut bool
+	// DescendantsGone mirrors Executor's descendantsGone return (Sol
+	// redteam v7 S1 gap-closure): whether the backend launch's descendant
+	// scope confirmed kernel-verified extinction, or had nothing to prove.
+	DescendantsGone bool
 }
 
 type Agent interface {
@@ -80,39 +93,35 @@ type runCLIRequest struct {
 // unchanged from runCLI so LocalWorktreeRunner-driven runs (every caller that
 // leaves Request.Executor nil) behave identically to before the Runner
 // abstraction existed.
-func defaultExecutor(ctx context.Context, bin string, args []string, workdir string, out io.Writer, timeout time.Duration) (int, bool, error) {
+//
+// Sol redteam v7 S1 gap-closure: when a descendant-owning Scope is present
+// (a governed runtime.Runner is driving this launch), the backend now routes
+// through internal/stage.Executor via LaunchStaged, giving it the same
+// unique per-stage scope naming and descendant-extinction proof every other
+// migrated stage (validators, Assayer) already has, instead of registering
+// into the run's single shared Scope the way it did before this migration.
+func defaultExecutor(ctx context.Context, bin string, args []string, workdir string, out io.Writer, timeout time.Duration) (int, bool, bool, error) {
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	handle, _ := HandleFromContext(ctx)
-	var cmd *exec.Cmd
-	var err error
 	scope, hasScope := containment.ScopeFromContext(ctx)
 	plan, _ := enforce.PlanFromContext(ctx)
 	if hasScope {
-		cmd, err = LaunchCommand(ctx, handle, bin, args, func(c context.Context, b string, a []string) *exec.Cmd {
-			// Session 5 (Sol P0-3): wrap bin/args in Governator's own
-			// externally enforced sandbox (Landlock + network namespace)
-			// BEFORE the S2 descendant-owning Scope wraps the launch again.
-			// A no-op Plan (Active false -- most runs, which never require
-			// host containment) returns b/a unchanged, so this composes with
-			// every Scope method identically to before Session 5 existed.
-			wb, wa := plan.Wrap(b, a)
-			return scope.Command(c, wb, wa, workdir)
-		})
-	} else {
-		// No Scope in context means this launch never went through a
-		// governed runtime.Runner (doctor probes, direct adapter tests) --
-		// keep the pre-S2 process-group behavior rather than requiring
-		// every caller to construct a Scope.
-		cmd, err = LaunchCommand(ctx, handle, bin, args, nil)
-		if err == nil {
-			cmd.Dir = workdir
-			cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-		}
+		exitCode, descendantsGone, runErr := LaunchStaged(ctx, handle, bin, args, workdir, out, scope, plan)
+		return exitCode, ctx.Err() != nil, descendantsGone, runErr
 	}
+	// No Scope in context means this launch never went through a governed
+	// runtime.Runner (doctor probes, direct adapter tests) -- keep the
+	// pre-S2 process-group behavior rather than requiring every caller to
+	// construct a Scope. Nothing to prove extinguished, so descendantsGone
+	// is trivially true (matches Executor's documented "or when there was
+	// nothing to prove" case).
+	cmd, err := LaunchCommand(ctx, handle, bin, args, nil)
 	if err != nil {
-		return 0, false, err
+		return 0, false, true, err
 	}
+	cmd.Dir = workdir
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	// Sol P1-14 / v6 S3: filter every launched backend environment down
 	// to the fixed baseline plus the backend's declared extras. Do this even
 	// when handle is nil (tests, doctor-style probes, or legacy callers),
@@ -125,10 +134,7 @@ func defaultExecutor(ctx context.Context, bin string, args []string, workdir str
 	cmd.Env = BuildAllowedEnv(allowedEnv)
 	cmd.Stdout, cmd.Stderr = out, out
 	if err := cmd.Start(); err != nil {
-		return 0, false, err
-	}
-	if hasScope && cmd.Process != nil {
-		scope.Started(cmd.Process.Pid)
+		return 0, false, true, err
 	}
 	done := make(chan error, 1)
 	go func() { done <- cmd.Wait() }()
@@ -136,22 +142,17 @@ func defaultExecutor(ctx context.Context, bin string, args []string, workdir str
 	case err := <-done:
 		if err != nil {
 			if ee, ok := err.(*exec.ExitError); ok {
-				return ee.ExitCode(), false, nil
+				return ee.ExitCode(), false, true, nil
 			}
-			return 0, false, err
+			return 0, false, true, err
 		}
-		return 0, false, nil
+		return 0, false, true, nil
 	case <-ctx.Done():
-		// Best-effort immediate stop on cancellation; this signal alone
-		// does not prove the whole descendant tree is dead (that is
-		// exactly the bug report P0-4 describes) -- the runtime's
-		// containment.Scope.Extinguish call after Launch returns is the
-		// actual authority, run unconditionally regardless of this path.
 		if cmd.Process != nil {
 			_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
 		}
 		<-done
-		return -1, true, ctx.Err()
+		return -1, true, true, ctx.Err()
 	}
 }
 
@@ -183,14 +184,14 @@ func runCLI(parent context.Context, r runCLIRequest) (Result, error) {
 			bin = r.resolvedBin
 		}
 	}
-	code, timedOut, runErr := execute(parent, bin, args, r.workdir, out, r.timeout)
+	code, timedOut, descendantsGone, runErr := execute(parent, bin, args, r.workdir, out, r.timeout)
 	if timedOut {
-		return Result{ExitCode: -1, TimedOut: true}, runErr
+		return Result{ExitCode: -1, TimedOut: true, DescendantsGone: descendantsGone}, runErr
 	}
 	if runErr != nil {
-		return Result{}, runErr
+		return Result{DescendantsGone: descendantsGone}, runErr
 	}
-	return Result{ExitCode: code}, nil
+	return Result{ExitCode: code, DescendantsGone: descendantsGone}, nil
 }
 
 func New(name string) (Agent, error) {

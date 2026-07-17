@@ -463,6 +463,22 @@ func replaceEntry(ff *fileFormat, entry Entry) {
 	ff.Tools = append(ff.Tools, entry)
 }
 
+// parentWritable reports whether any ancestor of path is writable by a
+// party other than its owner in a way that could let that party actually
+// tamper with path: group- or world-writable AND not sticky-bit protected.
+// The sticky bit -- not ownership -- is the mechanism that makes a shared
+// world-writable directory like /tmp (every OS ships it mode 1777) safe:
+// it restricts rename/unlink within the directory to each file's own owner
+// (or the directory owner, or root), which is exactly the guarantee this
+// check needs regardless of who currently owns the directory itself. An
+// ownership-based exemption (this function's first-draft fix) is wrong: a
+// directory the current process owns but has left plain group/world-writable
+// with no sticky bit is just as tamperable by another user as one it
+// doesn't own -- ownership of the directory grants the OWNER rights, not
+// protection from everyone else with the write bit. Checking the writable
+// bit alone (the pre-fix form) flagged every /tmp-descended path --
+// including any test fixture's t.TempDir() registry -- as "untrusted" on
+// every ordinary Linux host, not just this sandbox.
 func parentWritable(path string) bool {
 	dir := filepath.Dir(path)
 	for {
@@ -470,7 +486,9 @@ func parentWritable(path string) bool {
 		if err != nil {
 			return true
 		}
-		if info.Mode()&0o022 != 0 {
+		groupOrWorldWritable := info.Mode()&0o022 != 0
+		sticky := info.Mode()&os.ModeSticky != 0
+		if groupOrWorldWritable && !sticky {
 			return true
 		}
 		parent := filepath.Dir(dir)

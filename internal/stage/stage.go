@@ -159,7 +159,13 @@ func (Executor) Run(ctx context.Context, spec StageSpec) (StageResult, error) {
 	}
 	cmd, err := factory(ctx, scope, effectivePlan, bin, args, spec.WorkingDirectory)
 	if err != nil {
-		return StageResult{}, err
+		// Nothing was launched (a handle-aware factory's own verification --
+		// e.g. agents.LaunchCommand's VerifyUnchanged detecting a swapped
+		// executable -- failed before Start()), so there is nothing this
+		// scope could have failed to extinguish. DescendantsGone false here
+		// would misreport a pre-launch rejection as an extinction failure to
+		// any caller that (correctly) treats DescendantsGone as a hard gate.
+		return StageResult{DescendantsGone: true}, err
 	}
 	cmd.Env = append([]string(nil), spec.Environment.Values...)
 	if spec.Stdin != nil {

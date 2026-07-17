@@ -213,23 +213,23 @@ func (d *DockerRunner) Launch(ctx context.Context, ws Workspace, req LaunchReque
 }
 
 func (d *DockerRunner) executor(ws Workspace) agents.Executor {
-	return func(ctx context.Context, bin string, args []string, workdir string, out io.Writer, timeout time.Duration) (int, bool, error) {
+	return func(ctx context.Context, bin string, args []string, workdir string, out io.Writer, timeout time.Duration) (int, bool, bool, error) {
 		runCtx, cancel := context.WithTimeout(ctx, timeout)
 		defer cancel()
 		dockerArgs, err := d.runArgs(ws, bin, args)
 		if err != nil {
-			return 0, false, err
+			return 0, false, true, err
 		}
 		dockerBin, dberr := resolveDocker()
 		if dberr != nil {
-			return 0, false, dberr
+			return 0, false, true, dberr
 		}
 		cmd := exec.CommandContext(runCtx, dockerBin, dockerArgs...)
 		cmd.Env = append([]string(nil), d.ControllerEnvironment.Values...)
 		capped := &cappedWriter{w: out, remaining: d.Config.EffectiveOutputCapBytes()}
 		cmd.Stdout, cmd.Stderr = capped, capped
 		if err := cmd.Start(); err != nil {
-			return 0, false, err
+			return 0, false, true, err
 		}
 		done := make(chan error, 1)
 		go func() { done <- cmd.Wait() }()
@@ -264,7 +264,17 @@ func (d *DockerRunner) executor(ws Workspace) agents.Executor {
 		d.mu.Lock()
 		d.trunc = stats
 		d.mu.Unlock()
-		return code, timedOut, runErr
+		// DockerRunner has its own complete containment model (container
+		// resource limits, network policy, credential mounts) independent
+		// of internal/stage's descendant-owning Scope, which this launch
+		// never touches (Sol redteam v7 S1/S4/S6 gap-closure session,
+		// 2026-07-16: investigated migrating this to stage.Executor.Run and
+		// found it unsafe -- see internal/stage/no_bypass_test.go's
+		// docker.go entry). There is nothing this executor tracks that
+		// descendantsGone could meaningfully report, so it always reports
+		// true -- the same "nothing to prove" posture agents.defaultExecutor
+		// uses for its own no-Scope branch.
+		return code, timedOut, true, runErr
 	}
 }
 

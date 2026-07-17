@@ -71,47 +71,47 @@ cases:
     name: TestV7Case4LowRiskHostSecretUnreadableUnderNarrowLandlock
     session: S5
     required: true
-    status: not_yet_implemented
+    status: implemented
   - case: 5
     name: TestV7Case5ValidatorExternalWriteBlockedOrContained
     session: S1
     required: true
-    status: not_yet_implemented
+    status: implemented
   - case: 6
     name: TestV7Case6ValidatorNetworkExfiltrationBlockedOrContained
     session: S1
     required: true
-    status: not_yet_implemented
+    status: implemented
   - case: 7
     name: TestV7Case7CleanupValidatorExternalWriteBlockedOrContained
     session: S1
     required: true
-    status: not_yet_implemented
+    status: implemented
   - case: 8
     name: TestV7Case8CleanupValidatorDetachedDescendantExtinctionFailureBlocksApproval
     session: S1
     required: true
-    status: not_yet_implemented
+    status: implemented
   - case: 9
     name: TestV7Case9GraphProviderExternalWriteBlockedOrContained
     session: S1
     required: true
-    status: not_yet_implemented
+    status: implemented
   - case: 10
     name: TestV7Case10GraphProviderNetworkExfiltrationBlockedOrContained
     session: S1
     required: true
-    status: not_yet_implemented
+    status: implemented
   - case: 11
     name: TestV7Case11AssayerExternalWriteBlockedOrContained
     session: S1
     required: true
-    status: not_yet_implemented
+    status: implemented
   - case: 12
     name: TestV7Case12AssayerNetworkExfiltrationBlockedOrContained
     session: S1
     required: true
-    status: not_yet_implemented
+    status: implemented
   - case: 13
     name: TestV7Case13BashReplacementCannotChangeExecutedBytes
     session: S4
@@ -136,12 +136,12 @@ cases:
     name: TestV7Case17ValidatorInterpreterChangeInvalidatesReplay
     session: S6
     required: true
-    status: not_yet_implemented
+    status: implemented
   - case: 18
     name: TestV7Case18ValidatorScriptBytesChangeInvalidatesReplay
     session: S6
     required: true
-    status: not_yet_implemented
+    status: implemented
   - case: 19
     name: TestV7Case19AmbientPATHMutationAfterConstructionCannotRedirectStage
     session: S3
@@ -156,52 +156,52 @@ cases:
     name: TestV7Case21RTKMinimalismAnnotationChangeInvalidatesReplay
     session: S6
     required: true
-    status: not_yet_implemented
+    status: implemented
   - case: 22
     name: TestV7Case22GraphSnapshotChangeBetweenInspectionAndPrepInvalidatesReplay
     session: S6
     required: true
-    status: not_yet_implemented
+    status: implemented
   - case: 23
     name: TestV7Case23ConsumedArtifactChangeBetweenHashAndStagingInvalidatesReplay
     session: S6
     required: true
-    status: not_yet_implemented
+    status: implemented
   - case: 24
     name: TestV7Case24ProtectedManifestChangeBetweenLoadAndHashInvalidatesReplay
     session: S6
     required: true
-    status: not_yet_implemented
+    status: implemented
   - case: 25
     name: TestV7Case25AssayerCommitChangeInvalidatesReplay
     session: S6
     required: true
-    status: not_yet_implemented
+    status: implemented
   - case: 26
     name: TestV7Case26AssayerProfileChangeInvalidatesReplay
     session: S6
     required: true
-    status: not_yet_implemented
+    status: implemented
   - case: 27
     name: TestV7Case27GitIdentityChangeInvalidatesReplay
     session: S6
     required: true
-    status: not_yet_implemented
+    status: implemented
   - case: 28
     name: TestV7Case28BashIdentityChangeInvalidatesReplay
     session: S6
     required: true
-    status: not_yet_implemented
+    status: implemented
   - case: 29
     name: TestV7Case29ModelVisibleCanaryChangeInvalidatesReplay
     session: S6
     required: true
-    status: not_yet_implemented
+    status: implemented
   - case: 30
     name: TestV7Case30UnknownRequiredIdentityDisablesStrictReplay
     session: S6
     required: true
-    status: not_yet_implemented
+    status: implemented
   - case: 31
     name: TestV7Case31MissingReleaseBinaryBlocksGate
     session: S7
@@ -236,9 +236,9 @@ cases:
     name: TestV7Case37AssayerVersionLacksTagBlocksRelease
     session: S8
     required: true
-    status: not_yet_implemented
+    status: implemented
   - case: 38
     name: TestV7Case38NoApplicableChecksBlocksApproval
     session: S8
     required: true
-    status: not_yet_implemented
+    status: implemented

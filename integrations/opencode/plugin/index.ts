@@ -29,7 +29,7 @@ export const GovernatorGate: Plugin = async ({ directory }) => ({
 			return;
 		}
 		const decision = JSON.parse(result.stdout) as GateDecision;
-		if (!decision.allow) output.status = "deny";
+		output.status = decision.allow ? "allow" : "deny";
 	},
 });
 

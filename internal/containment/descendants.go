@@ -160,6 +160,24 @@ func NewScope(runID string, requireStrong bool) (*Scope, error) {
 // Method reports which primitive this Scope actually uses.
 func (s *Scope) Method() ScopeMethod { return s.method }
 
+// RunID returns the identifier this Scope was constructed with -- the same
+// value the caller passed to NewScope. Exposed so a per-stage caller (Sol
+// redteam v7 S1: a governed backend routed through internal/stage.Executor)
+// can derive its own unique per-stage scope name from the SAME run
+// identity the outer, run-level Scope already carries, without needing a
+// second context key threaded alongside WithScope purely to repeat a value
+// this Scope already has.
+func (s *Scope) RunID() string { return s.runID }
+
+// IsStrong reports whether this Scope's underlying primitive actually owns
+// its descendants (systemd-user-scope, cgroup-direct, pid-namespace) as
+// opposed to the pre-S2 process-group-only degraded fallback. Exposed so a
+// per-stage caller deriving a NEW, separate Scope for its own launch (Sol
+// redteam v7 S1) can request the same strength the outer run-level Scope
+// already achieved on this host, rather than needing its own independent
+// copy of the run's requireStrong policy decision threaded through.
+func (s *Scope) IsStrong() bool { return s.method != scopeDegraded }
+
 func newSystemdUserScope(runID string) (*Scope, error) {
 	identity, err := toolregistry.ResolveTrusted("systemd-run", "systemd-run")
 	if err != nil {
@@ -175,7 +193,21 @@ func newSystemdUserScope(runID string) (*Scope, error) {
 	probeCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 	probeUnit := "governator-probe-" + sanitizeName(runID) + "-" + nonce()
-	probe := exec.CommandContext(probeCtx, identity.CanonicalPath, "--user", "--scope", "--quiet", "--collect", "--wait", "--unit="+probeUnit, "--", "/bin/true")
+	// --wait is redundant with --scope (a scope invocation already blocks
+	// until its command exits, unlike --unit's default fire-and-forget) and
+	// at least some systemd versions (confirmed: systemd on this project's
+	// own dev host) reject the combination outright ("--wait may not be
+	// combined with --scope"), which silently failed this probe on every
+	// run and forced every containment scope down to the weaker
+	// pid-namespace fallback -- never systemd-user-scope, the preferred,
+	// strongest primitive -- without any test or caller noticing, since
+	// NewScope's fallback chain has no logging of individual method
+	// failures. Found while building Sol redteam v7 case 8's fixture: a
+	// scope-selection probe (TestZZScopeProbe-shaped) showed pid-namespace
+	// selected even with systemd-run enrolled and /run/systemd/system +
+	// the user bus both present, which should be impossible if the probe
+	// itself were succeeding.
+	probe := exec.CommandContext(probeCtx, identity.CanonicalPath, "--user", "--scope", "--quiet", "--collect", "--unit="+probeUnit, "--", "/bin/true")
 	probe.Env = controllerenv.Base()
 	if out, err := probe.CombinedOutput(); err != nil {
 		return nil, fmt.Errorf("containment: systemd user scope probe failed: %w: %s", err, strings.TrimSpace(string(out)))

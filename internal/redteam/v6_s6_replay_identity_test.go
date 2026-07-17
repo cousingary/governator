@@ -101,6 +101,7 @@ func TestV6Case22ConsumedArtifactChangeBeforeConsumerReplayInvalidatesReplay(t *
 		Success:     contracts.Success{RequiredFiles: []string{"output/result.txt"}, Validators: []string{"test -f output/result.txt"}},
 		Produces:    []contracts.ArtifactSpec{{Name: "art", Path: ".governator/artifacts/art.txt", MaxBytes: 1024}},
 		OnViolation: "quarantine",
+		Local:       &contracts.LocalRunnerConfig{ReadRoots: shellReadRootsForFixtures()},
 	}
 	producerBody := func(content string) string {
 		return `mkdir -p .governator/artifacts
@@ -129,6 +130,7 @@ printf '{"type":"result","total_cost_usd":0.25}\n'
 		Consumes:        []string{"art"},
 		ArtifactSources: map[string]string{"art": "v6-case22-producer"},
 		OnViolation:     "quarantine",
+		Local:           &contracts.LocalRunnerConfig{ReadRoots: shellReadRootsForFixtures()},
 	}
 	consumerBody := `mkdir -p output
 cat .governator/consumed/art > output/result.txt
@@ -249,18 +251,21 @@ func TestV6Case24GraphProviderChangeBeforeReplayInvalidatesReplay(t *testing.T) 
 	root := fixtureRepo(t)
 	home := t.TempDir()
 
-	graphScript := func(fileCount string) string {
-		return `
-case "$1" in
-  --version|version) printf 'codegraph 1.0.0\n' ;;
-  init|sync) exit 0 ;;
-  status) printf '{"version":"1.0.0","initialized":true,"projectPath":"","indexPath":"","fileCount":` + fileCount + `,"nodeCount":1,"edgeCount":1,"dbSizeBytes":1}\n' ;;
-  *) printf '{}\n' ;;
-esac
-`
+	// Sol redteam v7 S1/contextgraph gap-closure (Task #3, 2026-07-16) gave
+	// the graph provider stage a real enforce.Plan, so its launch target
+	// must be a real ELF binary now -- a #!/bin/sh script fixture (this
+	// test's original shape) can no longer even launch under Landlock
+	// without a separately declared interpreter closure, which
+	// scopedCommandOutput deliberately does not offer (production graph
+	// providers are compiled tools, not scripts). buildFakeCodegraphBinary
+	// is the shared compiled-binary equivalent (see
+	// v7_s1_stage_containment_test.go's cases 9/10, which hit this exact
+	// gap first).
+	statusJSON := func(fileCount string) string {
+		return `{"version":"1.0.0","initialized":true,"projectPath":"","indexPath":"","fileCount":` + fileCount + `,"nodeCount":1,"edgeCount":1,"dbSizeBytes":1}`
 	}
-	providerA := s6SecureExecutable(t, fakeBackend(t, graphScript("1")))
-	providerB := s6SecureExecutable(t, fakeBackend(t, graphScript("2")))
+	providerA := buildFakeCodegraphBinary(t, "", "", statusJSON("1"))
+	providerB := buildFakeCodegraphBinary(t, "", "", statusJSON("2"))
 
 	registryFile := filepath.Join(t.TempDir(), "tools.yaml")
 	t.Setenv("GOV_TOOLREGISTRY_FILE", registryFile)

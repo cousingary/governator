@@ -118,6 +118,44 @@ func fakeBackend(t *testing.T, body string) string {
 	return bin
 }
 
+var (
+	shellReadRootsOnce sync.Once
+	shellReadRootsList []string
+)
+
+// shellReadRootsForFixtures declares the exact Landlock read roots every
+// fakeBackend fixture's POSIX shell script needs to actually launch under a
+// real Landlock-enforced run instead of crashing before it ever attempts
+// the behavior the test means to exercise. enforce.exactReadClosure's own
+// doc comment requires a script's interpreter be contract-declared (a
+// script isn't ELF, so it gets no automatic runtime closure the way the
+// backend executable itself would); the corpus's fixture bodies also shell
+// out to a handful of externally-invoked (non-builtin) coreutils that need
+// the same treatment. Computed once per test process via
+// enforce.ExecutableReadClosure, which resolves each tool's own ELF
+// dependency closure (dynamic loader + shared libraries) — never a bare
+// /bin or /usr/bin directory, which forbiddenBroadReadRoots rejects outright.
+func shellReadRootsForFixtures() []string {
+	shellReadRootsOnce.Do(func() {
+		var out []string
+		add := func(path string) {
+			closure, err := enforce.ExecutableReadClosure(path)
+			if err != nil {
+				return
+			}
+			out = append(out, closure...)
+		}
+		add("/bin/sh")
+		for _, tool := range []string{"mkdir", "cat", "chmod", "find", "ls", "rm", "sed", "sleep", "dd", "setsid", "timeout"} {
+			if resolved, lerr := exec.LookPath(tool); lerr == nil {
+				add(resolved)
+			}
+		}
+		shellReadRootsList = out
+	})
+	return shellReadRootsList
+}
+
 // baseContract is the minimal valid job contract every attack starts from:
 // permitted to write output/**, one required file, quarantine on violation.
 // Individual tests narrow or widen Allowed/Forbidden/Success as the attack
@@ -132,6 +170,7 @@ func baseContract(root string) contracts.Contract {
 		Preflight:   contracts.Preflight{IntendedWrites: []string{"output/**"}},
 		Success:     contracts.Success{RequiredFiles: []string{"output/result.txt"}, Validators: []string{"test -f output/result.txt"}},
 		OnViolation: "quarantine",
+		Local:       &contracts.LocalRunnerConfig{ReadRoots: shellReadRootsForFixtures()},
 	}
 }
 
@@ -174,12 +213,13 @@ func enrollRealControllerTools(t *testing.T) {
 		{"git", "/usr/bin/git"},
 		{"bash", "/usr/bin/bash"},
 		{"unshare", "/usr/bin/unshare"},
+		{"systemd-run", "/usr/bin/systemd-run"},
 	} {
 		path := tool.abs
 		if _, err := os.Stat(path); err != nil {
 			looked, lookErr := exec.LookPath(tool.name)
 			if lookErr != nil {
-				if tool.name == "unshare" {
+				if tool.name == "unshare" || tool.name == "systemd-run" {
 					continue
 				}
 				t.Fatal(lookErr)
@@ -261,4 +301,57 @@ printf 'ok\n' > output/result.txt
 printf '{"status":"complete","files_changed":["output/result.txt"],"commands_run":0,"validation":{"self_checked":true},"violations":[],"blockers":[],"next_recommended_action":"none"}\n' > RESULT.json
 printf '{"type":"result","total_cost_usd":0.25}\n'
 `
+}
+
+// buildFakeCodegraphBinary compiles a tiny real ELF binary standing in for
+// a governed graph-provider tool. Unlike fakeBackend's POSIX shell scripts
+// (which need their interpreter's Landlock read-closure separately
+// declared -- see shellReadRootsForFixtures), a real compiled binary's own
+// exactReadClosure is self-sufficient: internal/contextgraph/graph.go's
+// scopedCommandOutput (Sol redteam v7 S1/contextgraph gap-closure, Task #3)
+// only ever declares the executable's own path, no interpreter, matching
+// how a production graph-provider tool (a real compiled binary, not a
+// script) is actually shaped. statusJSON defaults to a plain
+// not-yet-initialized status line when empty, so most callers can pass "".
+func buildFakeCodegraphBinary(t *testing.T, extraImports, statusBody, statusJSON string) string {
+	t.Helper()
+	if statusJSON == "" {
+		statusJSON = `{"version":"1.0.0","initialized":false}`
+	}
+	dir := t.TempDir()
+	src := filepath.Join(dir, "main.go")
+	source := `package main
+
+import (
+	"fmt"
+	"os"
+` + extraImports + `
+)
+
+func main() {
+	if len(os.Args) < 2 {
+		fmt.Println("{}")
+		return
+	}
+	switch os.Args[1] {
+	case "version":
+		fmt.Println("codegraph 1.0.0")
+	case "status":
+` + statusBody + `
+		fmt.Println(` + "`" + statusJSON + "`" + `)
+	default:
+		fmt.Println("{}")
+	}
+}
+`
+	if err := os.WriteFile(src, []byte(source), 0644); err != nil {
+		t.Fatal(err)
+	}
+	out := filepath.Join(dir, "codegraph")
+	cmd := exec.Command("go", "build", "-buildvcs=false", "-o", out, src)
+	cmd.Dir = dir
+	if combined, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("build fake codegraph binary: %v: %s", err, combined)
+	}
+	return out
 }

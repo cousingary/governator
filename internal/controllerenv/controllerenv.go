@@ -12,7 +12,17 @@ import (
 )
 
 // Allowlist is the minimal controller environment surface from Sol v6 S3.
-var Allowlist = []string{"PATH", "HOME", "TMPDIR", "LANG", "LC_ALL", "TZ"}
+// XDG_RUNTIME_DIR (Sol redteam v7 S8/case-8 gap-closure): without it (or
+// DBUS_SESSION_BUS_ADDRESS, which this list still deliberately omits as a
+// broader trust surface), `systemd-run --user` cannot locate the caller's
+// D-Bus session ("Failed to connect to bus: No medium found") -- so
+// newSystemdUserScope's probe always failed, on every host, silently
+// degrading every containment scope to the weaker pid-namespace fallback
+// without any caller or test noticing (proof.Method just read
+// "pid-namespace" instead of the intended, strongest "systemd-user-scope").
+// A per-user runtime directory path is not a secret or an injection vector
+// -- the same trust level as the already-allowlisted HOME/TMPDIR.
+var Allowlist = []string{"PATH", "HOME", "TMPDIR", "LANG", "LC_ALL", "TZ", "XDG_RUNTIME_DIR"}
 
 var injectionVars = map[string]bool{
 	"BASH_ENV": true, "ENV": true, "SHELLOPTS": true, "BASHOPTS": true,

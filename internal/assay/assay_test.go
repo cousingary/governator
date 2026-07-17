@@ -11,7 +11,26 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/cousingary/governator/internal/enforce"
 )
+
+// TestMain forces enforce.Supported() false for this package's whole test
+// run. This suite verifies Evaluate's wire protocol (JSON parsing, timeout,
+// sha-mismatch, nonzero-exit handling) against ad hoc stub `cli.py` scripts
+// in t.TempDir() -- it was never meant to exercise real Landlock
+// containment, which needs a real `gov` binary wired up via
+// enforce.SelfExeOverride the way internal/redteam's corpus does (that
+// corpus, not this package, owns cases 11/12's actual containment
+// assertions). Without this, a host that genuinely has Landlock/unshare
+// (this sandbox does) makes Evaluate's now-real enforce.Plan active, which
+// then requires `gov __sandbox_exec` -- unavailable from a plain `go test`
+// binary -- and every stub-based test here fails for an environmental
+// reason unrelated to what it actually checks.
+func TestMain(m *testing.M) {
+	enforce.ForceUnsupported = true
+	os.Exit(m.Run())
+}
 
 func requirePython3(t *testing.T) {
 	t.Helper()
@@ -176,6 +195,15 @@ func TestBlocks(t *testing.T) {
 		{VerdictError, EnforcementAdvisory, false},
 		{VerdictFail, EnforcementTelemetry, false},
 		{VerdictError, EnforcementTelemetry, false},
+		// Sol redteam v7 S8 (corpus case 38): a blocking profile that
+		// resolved to zero checks must block exactly like VerdictError does
+		// -- "nothing was verified" is never a pass under a blocking
+		// profile. Under advisory/telemetry it never blocks, same as every
+		// other verdict at those enforcement levels (a check-less advisory
+		// profile was never going to block anything).
+		{VerdictNoApplicableChecks, EnforcementBlocking, true},
+		{VerdictNoApplicableChecks, EnforcementAdvisory, false},
+		{VerdictNoApplicableChecks, EnforcementTelemetry, false},
 		// Fail-closed at the subprocess trust boundary: any verdict string
 		// that isn't a known-good pass/advisory must block under blocking
 		// enforcement — an unrecognized verdict means "not verified," not

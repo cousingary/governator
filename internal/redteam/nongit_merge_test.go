@@ -47,6 +47,7 @@ func TestAttack23NonGitMergeFailureHalfwayThrough(t *testing.T) {
 		Preflight:   contracts.Preflight{IntendedWrites: []string{"a.txt", "sub/b.txt"}},
 		Success:     contracts.Success{RequiredFiles: []string{"a.txt"}, Validators: []string{"test -f a.txt"}},
 		OnViolation: "quarantine",
+		Local:       &contracts.LocalRunnerConfig{ReadRoots: shellReadRootsForFixtures()},
 	}
 	bin := fakeBackend(t, `
 printf 'a\n' > a.txt

@@ -93,6 +93,14 @@ func dockerBuildFakeBackendImage(t *testing.T, tag, script string) {
 // this, t.TempDir()'s cleanup can't remove root-owned output it created.
 func dockerContract(root, image string) contracts.Contract {
 	c := baseContract(root)
+	// baseContract's Local.ReadRoots (Sol redteam v7 S1/S4/S6 gap-closure
+	// session, 2026-07-16) is a LocalRunnerConfig -- validateRunner rejects
+	// it outright unless Runner is "local" or unset; a docker-runner
+	// contract has no Landlock/local-interpreter concept to declare roots
+	// for in the first place (the container's own filesystem is the
+	// confinement boundary), so clear it rather than leaving a
+	// local-runner-only field on a docker contract.
+	c.Local = nil
 	c.Runner = "docker"
 	c.Docker = &contracts.DockerRunnerConfig{
 		Image:   image,

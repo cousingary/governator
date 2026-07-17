@@ -3013,6 +3013,11 @@ func (r *Runner) runOnce(ctx context.Context, c contracts.Contract) (RunRecord, 
 	if agentTimeout <= 0 {
 		aerr = context.DeadlineExceeded
 		ar.TimedOut = true
+		// Nothing was ever launched on this path, so there is nothing for
+		// the backend's own stage-level descendant scope to have failed to
+		// extinguish (Sol redteam v7 S1 gap-closure) -- the zero value
+		// would otherwise read as "extinction failed" below.
+		ar.DescendantsGone = true
 	} else {
 		// Sol P1.1 (finding #8) / Sol P1-5 (attack 18): this is the governed
 		// action's execution boundary — the last point before the backend
@@ -3079,6 +3084,18 @@ func (r *Runner) runOnce(ctx context.Context, c contracts.Contract) (RunRecord, 
 	}
 	if descErr != nil {
 		return RunRecord{}, fmt.Errorf("descendant containment: extinction not confirmed before final-state capture: %w", descErr)
+	}
+	// Sol redteam v7 S1 gap-closure: the backend launch itself now routes
+	// through internal/stage.Executor (agents.LaunchStaged) when a Scope is
+	// present, which builds and extinguishes its OWN independent per-stage
+	// scope rather than registering into the run-level `descendants` scope
+	// above -- the same shape shellStage's validators already use. This
+	// run-level check therefore no longer covers the backend's own
+	// descendants; ar.DescendantsGone (populated by every agents.Executor
+	// implementation) is the equivalent proof for the backend specifically,
+	// and must block the run exactly as strictly as descErr does above.
+	if !ar.DescendantsGone {
+		return RunRecord{}, fmt.Errorf("descendant containment: backend stage did not confirm descendant extinction")
 	}
 	// Sol P0-3/P1-15 (Session 5) effect ledger: when this launch went through
 	// Governator's own externally enforced sandbox, record what that

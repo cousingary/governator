@@ -274,34 +274,34 @@ func (r *LocalWorktreeRunner) Launch(ctx context.Context, ws Workspace, req Laun
 // agents.defaultExecutor, which is unexported) so every backend adapter's
 // runCLI keeps funneling through Request.Executor unchanged.
 func (r *LocalWorktreeRunner) executor() agents.Executor {
-	return func(ctx context.Context, bin string, args []string, workdir string, out io.Writer, timeout time.Duration) (int, bool, error) {
+	return func(ctx context.Context, bin string, args []string, workdir string, out io.Writer, timeout time.Duration) (int, bool, bool, error) {
 		runCtx, cancel := context.WithTimeout(ctx, timeout)
 		defer cancel()
 		handle, _ := agents.HandleFromContext(runCtx)
-		var cmd *exec.Cmd
-		var launchErr error
 		scope, hasScope := containment.ScopeFromContext(runCtx)
-		plan, _ := enforce.PlanFromContext(runCtx)
+		capped := &cappedWriter{w: out, remaining: r.Config.EffectiveOutputCapBytes()}
 		if hasScope {
-			cmd, launchErr = agents.LaunchCommand(runCtx, handle, bin, args, func(c context.Context, b string, a []string) *exec.Cmd {
-				// Session 5 (Sol P0-3): wrap bin/args in Governator's own
-				// externally enforced sandbox (Landlock + network namespace)
-				// BEFORE the S2 descendant-owning Scope wraps the launch
-				// again -- identical composition to agents.defaultExecutor.
-				// A no-op Plan (most runs) returns b/a unchanged.
-				wb, wa := plan.Wrap(b, a)
-				return scope.Command(c, wb, wa, workdir)
-			})
-		} else {
-			cmd, launchErr = agents.LaunchCommand(runCtx, handle, bin, args, nil)
-			if launchErr == nil {
-				cmd.Dir = workdir
-				cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-			}
+			// Sol redteam v7 S1 gap-closure: identical composition to
+			// agents.defaultExecutor's own hasScope branch, shared via
+			// agents.LaunchStaged so both callers get the same unique
+			// per-stage scope naming and descendant-extinction proof.
+			plan, _ := enforce.PlanFromContext(runCtx)
+			code, descendantsGone, runErr := agents.LaunchStaged(runCtx, handle, bin, args, workdir, capped, scope, plan)
+			timedOut := runCtx.Err() != nil
+			capped.mu.Lock()
+			stats := truncationStats{accepted: capped.accepted, discarded: capped.discarded, truncated: capped.discarded > 0}
+			capped.mu.Unlock()
+			r.mu.Lock()
+			r.trunc = stats
+			r.mu.Unlock()
+			return code, timedOut, descendantsGone, runErr
 		}
+		cmd, launchErr := agents.LaunchCommand(runCtx, handle, bin, args, nil)
 		if launchErr != nil {
-			return 0, false, launchErr
+			return 0, false, true, launchErr
 		}
+		cmd.Dir = workdir
+		cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 		var allowedEnv []string
 		if handle != nil {
 			allowedEnv = handle.AllowedEnv
@@ -310,13 +310,9 @@ func (r *LocalWorktreeRunner) executor() agents.Executor {
 		if len(cmd.Env) == 0 {
 			cmd.Env = controllerenv.Base()
 		}
-		capped := &cappedWriter{w: out, remaining: r.Config.EffectiveOutputCapBytes()}
 		cmd.Stdout, cmd.Stderr = capped, capped
 		if err := cmd.Start(); err != nil {
-			return 0, false, err
-		}
-		if hasScope && cmd.Process != nil {
-			scope.Started(cmd.Process.Pid)
+			return 0, false, true, err
 		}
 		done := make(chan error, 1)
 		go func() { done <- cmd.Wait() }()
@@ -349,7 +345,7 @@ func (r *LocalWorktreeRunner) executor() agents.Executor {
 		r.mu.Lock()
 		r.trunc = stats
 		r.mu.Unlock()
-		return code, timedOut, runErr
+		return code, timedOut, true, runErr
 	}
 }
 

@@ -14,6 +14,7 @@ import (
 
 	"github.com/cousingary/governator/internal/config"
 	"github.com/cousingary/governator/internal/controllerenv"
+	"github.com/cousingary/governator/internal/enforce"
 	stageexec "github.com/cousingary/governator/internal/stage"
 	"github.com/cousingary/governator/internal/toolregistry"
 )
@@ -114,11 +115,24 @@ func ResolveConfigWithRegistry(cfg config.Config, registry *toolregistry.Registr
 	return status, nil
 }
 
+// scopedCommandOutput builds its own enforce.Plan rather than reading one
+// from ctx: the run-level Plan (internal/runtime.runOnce) is injected into
+// context only after this stage's one real call site (the pre-replay graph
+// inspection) already runs, so pulling PlanFromContext here would silently
+// see the zero value. The graph provider is treated as read-only workspace
+// access -- every known invocation (version/status/init/sync) inspects the
+// project, never writes into it -- so a provider that unexpectedly needs to
+// write fails loudly (Landlock denial) rather than this call silently
+// granting write access nobody asked for.
 func scopedCommandOutput(ctx context.Context, status Status, args []string, dir string, env controllerenv.Frozen) ([]byte, error) {
 	if err := env.Validate(); err != nil {
 		return nil, err
 	}
 	executable, err := stageexec.HashExecutable(status.Path)
+	if err != nil {
+		return nil, err
+	}
+	plan, err := enforce.NewPlanForExecutable(true, dir, true, false, false, status.Path, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -132,8 +146,19 @@ func scopedCommandOutput(ctx context.Context, status Status, args []string, dir 
 		NetworkPolicy:    stageexec.NetworkPolicyDenied,
 		CredentialPolicy: stageexec.CredentialPolicyNone,
 		DescendantPolicy: stageexec.DescendantPolicy{RequireStrong: true},
+		EnforcementPlan:  plan,
 	})
-	return []byte(result.Output), err
+	if err != nil {
+		return []byte(result.Output), err
+	}
+	// StageResult.ExitStatus and err are deliberately distinct (see
+	// assay.Evaluate's identical fix this session): err is nil for a plain
+	// nonzero exit, so a caller that only checks err treats a blocked or
+	// failing provider command as success.
+	if result.ExitStatus != 0 {
+		return []byte(result.Output), fmt.Errorf("%s %v: exit status %d", status.Provider, args, result.ExitStatus)
+	}
+	return []byte(result.Output), nil
 }
 
 func Version(ctx context.Context, status Status) (string, error) {

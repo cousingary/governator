@@ -245,6 +245,27 @@ else
   echo "$ASSAYER_SUMMARY" >"$ASSAYER_LOG"
 fi
 
+# Sol redteam v7 S8 (corpus case 37): a passing pytest matrix says nothing
+# about whether the Assayer commit under test is the one its own declared
+# version claims to be -- the audit found Assayer at declared version 1.1.0
+# with no Git tag at all. scripts/assayer_verify.sh is factored out (mirrors
+# release_verify.sh) so it can also be driven directly and hermetically by
+# internal/redteam/v7_pending_cases_test.go's TestV7Case37.
+ASSAYER_VERSION_TAG_LOG="$OUT_DIR/test-assayer-version-tag.log"
+if [ -d "$ASSAYER_REPO" ]; then
+  if "$ROOT/scripts/assayer_verify.sh" --assayer-repo "$ASSAYER_REPO" >"$ASSAYER_VERSION_TAG_LOG" 2>&1; then
+    ASSAYER_VERSION_TAG_RESULT=PASS
+  else
+    ASSAYER_VERSION_TAG_RESULT=FAIL
+    cat "$ASSAYER_VERSION_TAG_LOG" >&2
+  fi
+  ASSAYER_VERSION_TAG_SUMMARY=$(tail -1 "$ASSAYER_VERSION_TAG_LOG")
+else
+  ASSAYER_VERSION_TAG_RESULT=SKIPPED
+  ASSAYER_VERSION_TAG_SUMMARY="ASSAYER_REPO ${ASSAYER_REPO} not present on this machine"
+  echo "$ASSAYER_VERSION_TAG_SUMMARY" >"$ASSAYER_VERSION_TAG_LOG"
+fi
+
 if [ "$UNIT_RESULT" != PASS ] || [ "$RACE_RESULT" != PASS ] || [ "$INTEGRATION_RESULT" != PASS ] || [ "$CORPUS_RESULT" != PASS ] || [ "$REDTEAM_RESULT" != PASS ] || [ "$REDTEAM_RACE_RESULT" != PASS ] || [ "$FUZZ_OK" != true ]; then
   echo "release: refusing to package — a required test tier failed" >&2
   exit 1
@@ -255,6 +276,10 @@ if [ "$REDTEAM_GATE_OK" != true ]; then
 fi
 if [ "$ASSAYER_RESULT" != PASS ]; then
   echo "release: refusing to package — the Assayer matrix is ${ASSAYER_RESULT}, not PASS (blocking release gate, P0-7)" >&2
+  exit 1
+fi
+if [ "$ASSAYER_VERSION_TAG_RESULT" != PASS ]; then
+  echo "release: refusing to package — Assayer version/tag provenance is ${ASSAYER_VERSION_TAG_RESULT}, not PASS (blocking release gate, Sol v7 S8 case 37): ${ASSAYER_VERSION_TAG_SUMMARY}" >&2
   exit 1
 fi
 
@@ -409,7 +434,7 @@ python3 - "$TEST_SUMMARY" "$COMMIT" "$GO_VERSION" "$BUILD_TS" "$GO_SUM_HASH" \
   "$REDTEAM_RESULT" "$REDTEAM_SECONDS" "$REDTEAM_STARTED" "$REDTEAM_ENDED" "$REDTEAM_LOG_SHA" \
   "$REDTEAM_TESTS_DISCOVERED" "$REDTEAM_TESTS_RUN" "$REDTEAM_TESTS_SKIPPED" "$REDTEAM_TESTS_FAILED" "$REDTEAM_GATE_OK" "$REDTEAM_GATE_JSON" "$REDTEAM_MANIFEST" \
   "$REDTEAM_RACE_RESULT" "$REDTEAM_RACE_SECONDS" "$REDTEAM_RACE_STARTED" "$REDTEAM_RACE_ENDED" "$REDTEAM_RACE_LOG_SHA" \
-  "$FUZZ_RESULTS_JSON" "$ASSAYER_RESULT" "$ASSAYER_SUMMARY" <<'PYTESTSUMMARY'
+  "$FUZZ_RESULTS_JSON" "$ASSAYER_RESULT" "$ASSAYER_SUMMARY" "$ASSAYER_VERSION_TAG_RESULT" "$ASSAYER_VERSION_TAG_SUMMARY" <<'PYTESTSUMMARY'
 import json, pathlib, sys
 
 (summary_path, commit, go_version, build_ts, go_sum_sha256,
@@ -420,7 +445,8 @@ import json, pathlib, sys
  redteam_result, redteam_seconds, redteam_started, redteam_ended, redteam_log_sha,
  redteam_tests_discovered, redteam_tests_run, redteam_tests_skipped, redteam_tests_failed, redteam_gate_ok, redteam_gate_json_path, redteam_manifest_path,
  redteam_race_result, redteam_race_seconds, redteam_race_started, redteam_race_ended, redteam_race_log_sha,
- fuzz_results_path, assayer_result, assayer_summary) = sys.argv[1:]
+ fuzz_results_path, assayer_result, assayer_summary,
+ assayer_version_tag_result, assayer_version_tag_summary) = sys.argv[1:]
 
 redteam_gate = json.loads(pathlib.Path(redteam_gate_json_path).read_text())
 
@@ -482,7 +508,14 @@ data = {
             "log_sha256": redteam_race_log_sha,
         },
         "fuzz": fuzz,
-        "assayer_matrix": {"result": assayer_result, "summary": assayer_summary.strip()},
+        "assayer_matrix": {
+            "result": assayer_result,
+            "summary": assayer_summary.strip(),
+            # Sol v7 S8 (corpus case 37): a matching Git tag for Assayer's
+            # own declared version, proving which commit "the shipped
+            # Assayer" actually is -- see scripts/assayer_verify.sh.
+            "version_tag": {"result": assayer_version_tag_result, "summary": assayer_version_tag_summary.strip()},
+        },
     },
 }
 overall = "PASS"
@@ -496,10 +529,12 @@ for f in fuzz:
         overall = "FAIL"
 if assayer_result != "PASS":
     overall = "FAIL"
+if assayer_version_tag_result != "PASS":
+    overall = "FAIL"
 data["overall_result"] = overall
 pathlib.Path(summary_path).write_text(json.dumps(data, indent=2, sort_keys=True) + "\n")
 PYTESTSUMMARY
-rm -f "$FUZZ_RESULTS_JSON" "$UNIT_LOG" "$RACE_LOG" "$INTEGRATION_LOG" "$CORPUS_LOG" "$REDTEAM_LOG" "$REDTEAM_RACE_LOG" "$ASSAYER_LOG" "$OUT_DIR"/test-fuzz-*.log
+rm -f "$FUZZ_RESULTS_JSON" "$UNIT_LOG" "$RACE_LOG" "$INTEGRATION_LOG" "$CORPUS_LOG" "$REDTEAM_LOG" "$REDTEAM_RACE_LOG" "$ASSAYER_LOG" "$ASSAYER_VERSION_TAG_LOG" "$OUT_DIR"/test-fuzz-*.log
 
 # ---------------------------------------------------------------------------
 # Acceptance smoke test: extract the exact distributable archive for THIS

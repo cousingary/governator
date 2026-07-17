@@ -27,6 +27,8 @@ import (
 	"time"
 
 	"github.com/cousingary/governator/internal/controllerenv"
+	"github.com/cousingary/governator/internal/enforce"
+	"github.com/cousingary/governator/internal/stage"
 	"github.com/cousingary/governator/internal/toolregistry"
 )
 
@@ -38,6 +40,16 @@ const (
 	VerdictAdvisory = "advisory"
 	VerdictFail     = "fail"
 	VerdictError    = "error"
+
+	// VerdictNoApplicableChecks is Assayer's verdict when a blocking
+	// profile resolved to zero checks (Sol redteam v7 S8, corpus case 38:
+	// a profile/registry/config error producing an empty check list must
+	// not read as a silent pass). Distinct from VerdictError -- "nothing
+	// was actually verified" is a different failure than "a check crashed"
+	// -- but Blocks() treats both identically: neither is VerdictPass nor
+	// VerdictAdvisory, so both block under blocking enforcement with no
+	// verdict-name-specific logic required.
+	VerdictNoApplicableChecks = "no_applicable_checks"
 
 	// VerdictSkipped never comes from Assayer; it is what Governator
 	// records when internal/config's Assay.Repo is unset (plan 3A point 6:
@@ -221,20 +233,55 @@ func Evaluate(ctx context.Context, cfg Config, req Request, artifactPath string)
 	}
 	cliPath := filepath.Join(cfg.Repo, "cli.py")
 
-	cmd := exec.CommandContext(runCtx, pythonIdentity.CanonicalPath, cliPath, "evaluate", "--profile", req.CheckProfile)
-	cmd.Env = controllerenv.Base()
-	cmd.Dir = cfg.Repo
-	cmd.Stdin = bytes.NewReader(payload)
+	// Sol redteam v7 S1 (StageExecutor migration): this subprocess previously
+	// ran with no descendant scope, no Landlock, no network policy at all --
+	// exactly the gap corpus cases 11/12 (AssayerExternalWriteBlockedOrContained
+	// / AssayerNetworkExfiltrationBlockedOrContained) target. `evaluate` reads
+	// its artifact content from stdin (never the filesystem) and writes only
+	// its verdict to stdout (see cli.py's own doc comment), so it needs no
+	// write access anywhere and no network -- a plain, deny-network,
+	// read-only-beyond-declared-roots Plan. active=true unconditionally but
+	// highRisk=false: a host without Landlock/unshare runs unconfined exactly
+	// as this call site always has, rather than introducing a new hard
+	// failure mode for existing installations.
+	envValues := controllerenv.Base()
+	declaredRoots := append([]string{cfg.Repo}, pythonStdlibReadRoots(runCtx, pythonIdentity.CanonicalPath)...)
+	plan, planErr := enforce.NewPlanForExecutable(true, "", true, false, false, pythonIdentity.CanonicalPath, declaredRoots)
+	if planErr != nil {
+		return errorVerdict(fmt.Sprintf("assay: construct enforcement plan: %s", planErr))
+	}
 	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
-
-	runErr := cmd.Run()
+	stageRes, runErr := stage.NewExecutor().Run(runCtx, stage.StageSpec{
+		RunID:            firstNonEmpty(req.RunID, "assay"),
+		StageID:          "assay-evaluate",
+		Executable:       stage.ExecutableIdentity{CanonicalPath: pythonIdentity.CanonicalPath, SHA256: pythonIdentity.SHA256},
+		Arguments:        []string{cliPath, "evaluate", "--profile", req.CheckProfile},
+		WorkingDirectory: cfg.Repo,
+		Environment:      stage.FrozenEnvironment{Values: envValues, Hash: controllerenv.Hash(envValues)},
+		ReadRoots:        []string{cfg.Repo},
+		NetworkPolicy:    stage.NetworkPolicyDenied,
+		CredentialPolicy: stage.CredentialPolicyNone,
+		Timeout:          timeout,
+		DescendantPolicy: stage.DescendantPolicy{RequireStrong: true},
+		EnforcementPlan:  plan,
+		Stdin:            bytes.NewReader(payload),
+		Stdout:           &stdout,
+		Stderr:           &stderr,
+	})
 	if runCtx.Err() == context.DeadlineExceeded {
 		return errorVerdict(fmt.Sprintf("assay: subprocess timed out after %s", timeout))
 	}
+	// StageResult.ExitStatus and runErr are deliberately distinct: runErr is
+	// only a launch/wait infrastructure failure (couldn't start, killed by
+	// context deadline, descendant-extinction failure); a plain nonzero
+	// application exit code comes back as ExitStatus with runErr nil (see
+	// stage.Executor.Run's cmd.Wait() handling). Both are "the subprocess
+	// didn't succeed" from this caller's perspective.
 	if runErr != nil {
 		return errorVerdict(fmt.Sprintf("assay: subprocess exit: %s; stderr: %s", runErr, strings.TrimSpace(stderr.String())))
+	}
+	if stageRes.ExitStatus != 0 {
+		return errorVerdict(fmt.Sprintf("assay: subprocess exit: exit status %d; stderr: %s", stageRes.ExitStatus, strings.TrimSpace(stderr.String())))
 	}
 
 	var v Verdict
@@ -269,6 +316,59 @@ func Blocks(verdict, enforcement string) bool {
 		return false
 	}
 	return verdict != VerdictPass && verdict != VerdictAdvisory
+}
+
+// pythonStdlibReadRoots resolves python's own standard-library and
+// site-packages directories via sysconfig so a Landlock-confined invocation
+// can still import stdlib modules -- the exact same "an interpreter must
+// declare its own runtime" requirement enforce.exactReadClosure's doc
+// comment already states for shell scripts, except Python's runtime is a
+// directory tree of .py/.so files discovered dynamically (sysconfig paths
+// vary by distro/version), not a fixed ELF dependency graph the executable's
+// own closure computation would find. Read-only diagnostic probe (same
+// permanently-legitimate shape as agents/resolution.go's probeVersion) --
+// best-effort: any failure returns nil, so a python this can't introspect
+// just runs with no stdlib read root (whatever failure that causes downstream
+// is not a NEW failure mode introduced by this migration).
+func pythonStdlibReadRoots(ctx context.Context, python string) []string {
+	probeCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(probeCtx, python, "-c",
+		"import sysconfig\n"+
+			"for k in ('stdlib','platstdlib','purelib','platlib'):\n"+
+			"    print(sysconfig.get_path(k))\n")
+	cmd.Env = controllerenv.Base()
+	out, err := cmd.Output()
+	if err != nil {
+		return nil
+	}
+	seen := map[string]bool{}
+	var roots []string
+	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || seen[line] {
+			continue
+		}
+		if _, statErr := os.Stat(line); statErr != nil {
+			continue
+		}
+		seen[line] = true
+		roots = append(roots, line)
+	}
+	return roots
+}
+
+// firstNonEmpty returns req.RunID for the stage's identity when set, or a
+// fixed placeholder for callers (tests, or any future caller) that never
+// populated it -- StageSpec requires a non-empty RunID, but that requirement
+// is about tagging this stage's descendant scope uniquely, not about
+// validating the caller's request shape (Request.RunID has its own
+// validation elsewhere, if any).
+func firstNonEmpty(s, fallback string) string {
+	if strings.TrimSpace(s) != "" {
+		return s
+	}
+	return fallback
 }
 
 func sha256File(path string) (string, error) {

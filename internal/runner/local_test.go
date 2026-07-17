@@ -40,7 +40,7 @@ func gitFixture(t *testing.T) string {
 // testLocalExecutor is a minimal agents.Executor used only by fakeAgent below,
 // standing in for agents' own (unexported) defaultExecutor so tests can drive
 // LaunchRequest without a real backend CLI binary.
-func testLocalExecutor(ctx context.Context, bin string, args []string, workdir string, out io.Writer, timeout time.Duration) (int, bool, error) {
+func testLocalExecutor(ctx context.Context, bin string, args []string, workdir string, out io.Writer, timeout time.Duration) (int, bool, bool, error) {
 	cctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	cmd := exec.CommandContext(cctx, bin, args...)
@@ -48,15 +48,15 @@ func testLocalExecutor(ctx context.Context, bin string, args []string, workdir s
 	cmd.Stdout, cmd.Stderr = out, out
 	err := cmd.Run()
 	if cctx.Err() != nil {
-		return -1, true, cctx.Err()
+		return -1, true, true, cctx.Err()
 	}
 	if err != nil {
 		if ee, ok := err.(*exec.ExitError); ok {
-			return ee.ExitCode(), false, nil
+			return ee.ExitCode(), false, true, nil
 		}
-		return 0, false, err
+		return 0, false, true, err
 	}
-	return 0, false, nil
+	return 0, false, true, nil
 }
 
 // fakeAgent is a minimal agents.Agent whose Run always delegates process
@@ -82,14 +82,14 @@ func (f fakeAgent) Run(ctx context.Context, req agents.Request) (agents.Result, 
 		execute = testLocalExecutor
 	}
 	var out bytes.Buffer
-	code, timedOut, err := execute(ctx, bin, args, req.Workdir, &out, req.Timeout)
+	code, timedOut, descendantsGone, err := execute(ctx, bin, args, req.Workdir, &out, req.Timeout)
 	if timedOut {
-		return agents.Result{ExitCode: -1, TimedOut: true}, err
+		return agents.Result{ExitCode: -1, TimedOut: true, DescendantsGone: descendantsGone}, err
 	}
 	if err != nil {
-		return agents.Result{}, err
+		return agents.Result{DescendantsGone: descendantsGone}, err
 	}
-	return agents.Result{ExitCode: code}, nil
+	return agents.Result{ExitCode: code, DescendantsGone: descendantsGone}, nil
 }
 
 func TestLocalWorktreeRunnerGitLifecycleApproved(t *testing.T) {

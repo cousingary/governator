@@ -64,6 +64,103 @@ func TestNoRawProcessLaunchOutsideStageExecutor(t *testing.T) {
 		// gov's own `--claude-shadow` maintenance script invocation
 		// (unrelated to contract/backend execution).
 		"cmd/gov/main.go": 1,
+		// Tool-version resolution probes (pre-launch identity resolution
+		// against an already-registry-verified binary, run in a disposable
+		// scratch cwd with a bounded timeout) — the exact same shape as
+		// doctor.go's --version/--help probes above, not stage execution
+		// against contract-declared authority. Reclassified from
+		// migrationPending (S1/S4/S6 gap-closure session, 2026-07-16):
+		// StageExecutor's descendant-scope/Landlock/network envelope has no
+		// meaningful application to "run the already-verified binary with
+		// --version and read stdout."
+		"internal/agents/resolution.go": 1,
+		// Assayer environment probes (git rev-parse HEAD / python3
+		// --version): same reasoning as resolution.go above — read-only,
+		// best-effort diagnostic metadata resolved through the trusted-tool
+		// registry, not governed job execution. Reclassified from
+		// migrationPending (S1/S4/S6 gap-closure session, 2026-07-16).
+		"internal/assay/environment.go": 2,
+		// Governor's OWN best-effort pre-delete recovery snapshot hook,
+		// invoked from the interactive PreToolUse gate plane before any
+		// contract/RunID/job exists at all — there is no "stage" or
+		// "authority" to route through StageExecutor here, and a failure is
+		// explicitly non-blocking by design (see the doc comment on
+		// PreflightSnapshotIfDelete). Reclassified from migrationPending
+		// (S1/S4/S6 gap-closure session, 2026-07-16).
+		"internal/runtime/gate.go": 1,
+		// The real Assayer CLI invocation now routes through
+		// stage.Executor (S1/S4/S6 gap-closure session, 2026-07-16, closes
+		// corpus cases 11/12's underlying gap). The one remaining raw call
+		// is pythonStdlibReadRoots' `python3 -c "import sysconfig; ..."`
+		// probe -- read-only, same permanently-legitimate shape as
+		// agents/resolution.go's probeVersion above, needed to compute the
+		// Landlock read closure BEFORE the confined launch, not a stage
+		// launch itself.
+		"internal/assay/assay.go": 1,
+		// runner.shell() -- git worktree add/remove, branch delete, cp
+		// --reflink for workspace setup/teardown. Verified (S1/S4/S6
+		// gap-closure session, 2026-07-16): every call site is git plumbing,
+		// same primitive category as internal/gitplumb/gitplumb.go above,
+		// not validator/backend command execution -- the ratchet's original
+		// comment mischaracterized this entry. The actual validator/
+		// cleanup-validator execution path (runtime.shellStage) was already
+		// fully migrated to stageexec.NewExecutor().Run in the same commit
+		// that added this ratchet (verified: shellStage contains zero raw
+		// exec.Command/CommandContext calls, only the stageexec.Executor
+		// call).
+		"internal/runner/runner.go": 1,
+		// runtime.shell() -- identical git-plumbing-only helper (git
+		// rev-parse/reset --hard/clean -fd/revert), same reasoning as
+		// runner.go above. Reclassified from migrationPending (S1/S4/S6
+		// gap-closure session, 2026-07-16).
+		"internal/runtime/runtime.go": 1,
+		// Docker CLI: ALL 6 raw calls, including `docker run` itself.
+		// 5 are container/image LIFECYCLE MANAGEMENT against a
+		// container/image Governor already owns by name/reference (image
+		// inspect, daemon-reachability info, container inspect, stop,
+		// rm -f) -- docker-daemon API calls no different in kind from
+		// internal/containment/descendants.go's already-exempted systemd-run
+		// scope primitive above, not stage launches. The 6th, `docker run`
+		// itself (docker.go's executor()), was investigated for migration to
+		// stage.Executor.Run and found NOT SAFE to migrate as-is (S1/S4/S6
+		// gap-closure session, 2026-07-16): DockerRunner's own timeout
+		// handling calls d.Stop() (`docker stop -t 5`, a graceful
+		// daemon-level stop) before giving up, because SIGKILLing the local
+		// `docker run` CLI client (foreground, no --rm/--init/--sig-proxy)
+		// does NOT stop the remote container -- Docker does not forward a
+		// hard kill of the attached client to the daemon-managed container.
+		// stage.Executor.Run's generic ctx.Done() branch only SIGKILLs the
+		// process group; swapping it in would silently leak running
+		// containers on every DockerRunner timeout, exactly the failure
+		// docker.go's own Destroy/RemoveContainer doc comments say the
+		// runtime's outbox retry mechanism exists to prevent. StageExecutor
+		// has no on-timeout hook to run docker.go's graceful stop first;
+		// adding one would change the one shared abstraction every other
+		// migrated stage depends on, out of scope here. DockerRunner already
+		// provides its own complete containment model (container resource
+		// limits, network policy, credential mounts) independent of
+		// Landlock/StageExecutor, so the security case for forcing this
+		// composition is weak relative to the regression risk.
+		"internal/runner/docker.go": 6,
+		// agents.LaunchCommand: the backend's sealed-copy-or-fd launch
+		// primitive, now the foundational mechanism agents.LaunchStaged
+		// plugs into stage.Executor.Run via a CommandFactory (Sol redteam
+		// v7 S1 gap-closure, 2026-07-16) -- deliberately reused rather than
+		// rewritten, exactly the same "foundational launch primitive a
+		// CommandFactory invokes, not a bypass of it" role internal/
+		// toolregistry/handle.go's entry above already has. 2 of the
+		// file's 5 raw calls are probeVersion (permanently-legitimate
+		// read-only version probes, same as agents/resolution.go above);
+		// the other 3 are LaunchCommand's own sealed/fd exec sites, invoked
+		// exclusively through stage.Executor.Run's CommandFactory when a
+		// Scope is present (agents.defaultExecutor / runner.
+		// LocalWorktreeRunner.executor both route through agents.
+		// LaunchStaged now) or directly for the no-Scope case (doctor
+		// probes, direct adapter tests -- nothing governed to route
+		// through StageExecutor). Reclassified from migrationPending
+		// (S1/S4/S6 gap-closure session, 2026-07-16): this was the last
+		// entry there, closing Category B.
+		"internal/agents/handle.go": 5,
 	}
 
 	// Category B: known S1/S4/S6 migration gaps — real governed-stage
@@ -71,29 +168,19 @@ func TestNoRawProcessLaunchOutsideStageExecutor(t *testing.T) {
 	// tracked in the findings log; this list exists so the count cannot grow
 	// further while those sessions are pending, and must shrink (ideally to
 	// zero, with the file's entry deleted) as each is migrated.
-	migrationPending := map[string]int{
-		// agents.LaunchCommand and friends: the backend/validator launch
-		// path findings.md's S2 entry documents as discarding the
-		// StageExecutor-computed enforcement wrap for sealed handles.
-		"internal/agents/handle.go": 5,
-		// Tool-version resolution probes (pre-launch identity resolution,
-		// not stage execution) plus a legacy launch path.
-		"internal/agents/resolution.go": 1,
-		// Real Assayer CLI invocation (corpus cases 11/12 target this
-		// exact call site).
-		"internal/assay/assay.go": 1,
-		// Assayer environment probes (git rev-parse / python3 --version)
-		// used to resolve the Assayer toolchain before launch.
-		"internal/assay/environment.go": 2,
-		// Docker CLI launches for the container backend/runner path.
-		"internal/runner/docker.go": 6,
-		// Bash validator/backend command execution — the pre-S1 path
-		// StageExecutor is meant to fully replace.
-		"internal/runner/runner.go":   1,
-		"internal/runtime/runtime.go": 1,
-		// Python snapshot pre-delete hook execution.
-		"internal/runtime/gate.go": 1,
-	}
+	//
+	// Empty as of the S1/S4/S6 gap-closure session (2026-07-16): every real
+	// governed-stage launch this ratchet originally flagged here
+	// (agents/handle.go's LaunchCommand, runner/runner.go and runtime/
+	// runtime.go's shell(), assay/assay.go's Assayer invocation) has either
+	// been migrated to route through internal/stage.Executor, or was
+	// investigated and found to be a permanently-legitimate non-stage call
+	// (git plumbing, read-only probes) and moved to the permanent bucket
+	// above with its reasoning recorded there. internal/runner/docker.go's
+	// `docker run` is the one deliberate, documented exception (see its
+	// permanent-bucket entry above) -- not a migration gap, a considered
+	// decision not to migrate.
+	migrationPending := map[string]int{}
 
 	allowed := map[string]int{}
 	for k, v := range permanent {
