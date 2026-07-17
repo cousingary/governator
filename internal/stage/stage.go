@@ -16,6 +16,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -171,14 +172,19 @@ func (Executor) Run(ctx context.Context, spec StageSpec) (StageResult, error) {
 	if spec.Stdin != nil {
 		cmd.Stdin = spec.Stdin
 	}
-	var capture bytes.Buffer
-	stdout := io.Writer(&capture)
-	stderr := io.Writer(&capture)
+	// os/exec copies Stdout and Stderr from two separate goroutines, so a
+	// shared destination needs its own locking: a plain bytes.Buffer isn't
+	// safe for concurrent writes, and it's exactly that combination (a
+	// backend writing to both stdout and stderr) that a bare bytes.Buffer
+	// here used to data-race on.
+	capture := &syncBuffer{}
+	stdout := io.Writer(capture)
+	stderr := io.Writer(capture)
 	if spec.Stdout != nil {
-		stdout = io.MultiWriter(spec.Stdout, &capture)
+		stdout = io.MultiWriter(spec.Stdout, capture)
 	}
 	if spec.Stderr != nil {
-		stderr = io.MultiWriter(spec.Stderr, &capture)
+		stderr = io.MultiWriter(spec.Stderr, capture)
 	}
 	lwOut := &limitWriter{w: stdout, remaining: spec.OutputLimit}
 	lwErr := &limitWriter{w: stderr, remaining: spec.OutputLimit}
@@ -235,6 +241,27 @@ func (Executor) Run(ctx context.Context, spec StageSpec) (StageResult, error) {
 		return res, extinctionErr
 	}
 	return res, runErr
+}
+
+// syncBuffer is a mutex-guarded bytes.Buffer: os/exec copies a Cmd's Stdout
+// and Stderr from two independent goroutines, so any single destination
+// both point at needs its own locking -- a bare bytes.Buffer is not safe
+// for concurrent writes.
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (s *syncBuffer) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.buf.Write(p)
+}
+
+func (s *syncBuffer) String() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.buf.String()
 }
 
 type limitWriter struct {
