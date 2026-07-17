@@ -79,15 +79,21 @@ func TestV7Case37AssayerVersionLacksTagBlocksRelease(t *testing.T) {
 	}
 }
 
-// TestV7Case37bAssayerVersionTagPointsAtWrongCommitBlocksRelease is the
-// companion drift case to 37: a tag exists for the declared version, but a
-// commit landed afterward (e.g. an unreviewed hotfix) without moving or
-// re-cutting the tag, so "v1.1.0" no longer names the commit that would
-// actually ship. Not a separately manifest-numbered corpus case -- it
-// isolates the drift branch of the same fix from the missing-tag branch
-// TestV7Case37 asserts, exactly as TestAttack24/25 isolate mode vs identity
-// in release_test.go.
-func TestV7Case37bAssayerVersionTagPointsAtWrongCommitBlocksRelease(t *testing.T) {
+// TestV7AssayerVersionTagPointsAtWrongCommitBlocksRelease is the companion
+// drift case to 37: a tag exists for the declared version, but a commit
+// landed afterward (e.g. an unreviewed hotfix) without moving or re-cutting
+// the tag, so "v1.1.0" no longer names the commit that would actually ship.
+// Not a separately manifest-numbered corpus case -- it isolates the drift
+// branch of the same fix from the missing-tag branch TestV7Case37 asserts,
+// exactly as TestAttack24/25 isolate mode vs identity in release_test.go.
+// Deliberately does NOT use the TestV7CaseN naming convention (unlike its
+// name before this fix) -- internal/redteamgate/gate.go's name-drift check
+// treats ANY TestV7Case-prefixed name found in the log as claiming corpus
+// membership, manifest or not, so a name in that shape here would fail
+// release.sh's redteam-gate verify step with "unmanifested TestV7Case
+// test(s) found (name drift)" even though this test intentionally isn't a
+// corpus case.
+func TestV7AssayerVersionTagPointsAtWrongCommitBlocksRelease(t *testing.T) {
 	repo := buildAssayerRepoFixture(t, "1.1.0")
 	cmd := exec.Command("git", "tag", "v1.1.0")
 	cmd.Dir = repo
