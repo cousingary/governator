@@ -172,6 +172,7 @@ func panelExecContract(root, id, jobType, agent string, produces []contracts.Art
 	return contracts.Contract{
 		JobID: id, JobType: jobType, Agent: agent, Mode: contracts.ModeArchitect,
 		Workspace:     contracts.Workspace{Root: root, Worktree: "auto"},
+		Local:         &contracts.LocalRunnerConfig{ReadRoots: shellReadRootsForFixtures()},
 		Allowed:       contracts.Permissions{Read: []string{"**"}, Write: []string{}, Execute: []string{"test -f *"}},
 		Forbidden:     contracts.Forbidden{Paths: []string{".git/**"}, Commands: []string{"rm -rf"}, Behaviors: []string{"network"}},
 		Budget:        contracts.Budget{MaxMinutes: 5, MaxCommands: 5, MaxFilesChanged: 1, MaxLinesChanged: 1, MaxNewFiles: 1, MaxTokens: 1000},
@@ -293,11 +294,13 @@ printf '{"summary":"judged","recommendation":"n/a"}' > .governator/artifacts/pan
 	}
 
 	statusByID := map[string]string{}
+	msgByID := map[string]string{}
 	for _, j := range summary.Jobs {
 		statusByID[j.JobID] = j.Status
+		msgByID[j.JobID] = j.Taxonomy + ": " + j.Error
 	}
 	if statusByID["m1"] != "APPROVED" || statusByID["m2"] != "APPROVED" {
-		t.Fatalf("expected m1,m2 APPROVED, got %+v", statusByID)
+		t.Fatalf("expected m1,m2 APPROVED, got %+v messages=%+v", statusByID, msgByID)
 	}
 	if statusByID["m3"] != "TIMEOUT" {
 		t.Fatalf("expected m3 TIMEOUT (hard timeout elapsed before its turn), got %q", statusByID["m3"])

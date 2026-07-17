@@ -3,6 +3,7 @@ package runtime
 import (
 	"context"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -13,6 +14,7 @@ import (
 	"github.com/cousingary/governator/internal/policy"
 	"github.com/cousingary/governator/internal/prompts"
 	"github.com/cousingary/governator/internal/runner"
+	"github.com/cousingary/governator/internal/toolregistry"
 )
 
 // writePromptVersion writes a single prompt file at <root>/<agent>/<mode>/<ver>.md
@@ -136,13 +138,67 @@ func TestRunnerConfigHashesLocalConfig(t *testing.T) {
 // no longer bypass current trust gates.
 func TestReplayPositiveIdenticalEnvironmentReplays(t *testing.T) {
 	root, _, _, _ := replayEnv(t)
-	r1 := runOnce(t, root)
+	// Not runOnce/contract(): those declare a legacy string Success.Validators
+	// with no ValidatorSpecs, which runOnce's own callers rely on to prove
+	// "changed X invalidates replay" vacuously-but-harmlessly (identity.go
+	// marks validator_tools/validator_scripts Known:false for exactly that
+	// shape, per Sol v7 RB4 -- an unverified validator toolchain must never
+	// be trusted for replay -- which correctly disables StrictReplayEligible
+	// entirely). Proving a REAL positive replay needs a contract whose
+	// validator toolchain is actually resolved and known, so this test gets
+	// its own contract with a ValidatorSpec declaring "test" as its
+	// executable tool (schema.Validate requires at least one), which in
+	// turn needs its own isolated tool registry with "test" enrolled --
+	// mirrors internal/redteam/v7_s6_strict_replay_test.go's
+	// strictReplayContract/s6EnrollControllerTools pattern.
+	toolsReg := filepath.Join(t.TempDir(), "tools.yaml")
+	t.Setenv("GOV_TOOLREGISTRY_FILE", toolsReg)
+	// contract()'s Forbidden.Behaviors=["network"] makes the externally
+	// enforced sandbox mandatory (containment resolves "unshare" through
+	// this same registry), so git/bash/unshare need enrolling here too, not
+	// just "test" -- an isolated registry file starts with none of the
+	// default entries' paths/hashes actually filled in.
+	for _, name := range []string{"git", "bash", "unshare", "test"} {
+		bin, err := exec.LookPath(name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := toolregistry.Enroll(name, bin); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// identity.StrictReplayEligible = handle.Identity.Known(), which requires
+	// Provider+ModelRevision declared on the backend's config entry -- unset
+	// by any built-in default, so without this, StrictReplayEligible is
+	// false on every run and the replay probe always sends "" (never
+	// matches), independent of anything else being identical. Mirrors
+	// internal/redteam/v7_s6_strict_replay_test.go's strictReplayConfig.
+	configPath := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(configPath, []byte("backends:\n  claude-code:\n    provider: test-provider\n    model_revision: test-rev-v1\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("GOV_CONFIG", configPath)
+	c := contract(root)
+	c.Success.ValidatorSpecs = []contracts.ValidatorSpec{{Command: "test -f output/result.txt", Tools: []string{"test"}}}
+	r1, err := New().Run(context.Background(), c)
+	if err != nil {
+		t.Fatalf("first run: %v", err)
+	}
 	if r1.Status != "APPROVED" {
 		t.Fatalf("first run: %s: %s", r1.Status, r1.Message)
 	}
-	r2 := runOnce(t, root)
+	// No reset needed: runOnce finalizes the stored identity's ApprovedHead
+	// to the post-merge HEAD (see runtime.go's "Finalize the
+	// ExecutionIdentity's ApprovedHead to the post-merge HEAD" comment), and
+	// run1's approval just advanced root's live HEAD to exactly that commit
+	// -- so run2, called immediately after with the same contract, starts
+	// from the very HEAD run1's stored identity was keyed on.
+	r2, err := New().Run(context.Background(), c)
+	if err != nil {
+		t.Fatalf("second run: %v", err)
+	}
 	if !r2.Replayed {
-		t.Fatal("identical environment should replay, got a fresh run")
+		t.Fatalf("identical environment should replay, got a fresh run: r1.IdentityHash=%s r2.IdentityHash=%s r1.ID=%s r2.ID=%s r2.Message=%s", r1.IdentityHash, r2.IdentityHash, r1.ID, r2.ID, r2.Message)
 	}
 	if r2.ID != r1.ID {
 		t.Fatalf("expected replay of %s, got %s", r1.ID, r2.ID)

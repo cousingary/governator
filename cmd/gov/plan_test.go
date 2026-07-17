@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -36,18 +37,39 @@ func planProjectRoot(t *testing.T) string {
 // writing output/result.txt, it writes a canned jobs/testplan/PLAN.yaml
 // (the fixed --out this file's tests always pass) so each test can drive
 // gov plan's downstream validation/explode logic with a controlled manifest.
+//
+// A compiled ELF binary, not a #!/bin/sh script: `gov plan`'s own contract
+// (cmd/gov/main.go, the plan command) is built by production code with no
+// test-injectable local.read_roots hook -- unlike the test-authored YAML
+// fixtures elsewhere in this package, there's nowhere to declare an
+// interpreter closure for a script fixture here, so the fake backend must be
+// a real ELF binary (whose own ELF dependency closure exactRead Closure
+// resolves automatically) instead.
 func planFakeBin(t *testing.T, planYAML string) string {
 	t.Helper()
-	bin := filepath.Join(t.TempDir(), "fake-claude-plan")
-	script := "#!/bin/sh\n" +
-		"mkdir -p jobs/testplan\n" +
-		"cat > jobs/testplan/PLAN.yaml <<'PLANEOF'\n" + planYAML + "\nPLANEOF\n" +
-		`printf '{"status":"complete","files_changed":["jobs/testplan/PLAN.yaml"],"commands_run":0,"validation":{"self_checked":true},"violations":[],"blockers":[],"next_recommended_action":"none"}\n' > RESULT.json` + "\n" +
-		`printf '{"type":"result","total_cost_usd":0.10}\n'` + "\n"
-	if err := os.WriteFile(bin, []byte(script), 0755); err != nil {
+	dir := t.TempDir()
+	src := filepath.Join(dir, "main.go")
+	source := `package main
+
+import "os"
+
+func main() {
+	os.MkdirAll("jobs/testplan", 0755)
+	os.WriteFile("jobs/testplan/PLAN.yaml", []byte(` + fmt.Sprintf("%q", planYAML) + `), 0644)
+	os.WriteFile("RESULT.json", []byte(` + fmt.Sprintf("%q", `{"status":"complete","files_changed":["jobs/testplan/PLAN.yaml"],"commands_run":0,"validation":{"self_checked":true},"violations":[],"blockers":[],"next_recommended_action":"none"}`) + `), 0644)
+	os.Stdout.WriteString(` + fmt.Sprintf("%q", `{"type":"result","total_cost_usd":0.10}`+"\n") + `)
+}
+`
+	if err := os.WriteFile(src, []byte(source), 0644); err != nil {
 		t.Fatal(err)
 	}
-	return bin
+	out := filepath.Join(dir, "fake-claude-plan")
+	cmd := exec.Command("go", "build", "-buildvcs=false", "-o", out, src)
+	cmd.Dir = dir
+	if combined, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("build fake plan backend: %v: %s", err, combined)
+	}
+	return out
 }
 
 func planJobYAML(jobID, root string, dependsOn []string) string {
@@ -69,7 +91,8 @@ func planJobYAML(jobID, root string, dependsOn []string) string {
     on_violation: quarantine
     risk_class: low
     depends_on: %s
-    %s`, jobID, jobID, root, deps, strings.ReplaceAll(readRootsYAML(), "\n", "\n    "))
+    %s
+`, jobID, jobID, root, deps, strings.TrimRight(strings.ReplaceAll(readRootsYAML(), "\n", "\n    "), " \n"))
 }
 
 func TestPlanCommandEndToEndWritesValidatedJobFilesAndShow(t *testing.T) {

@@ -189,18 +189,21 @@ func TestV6Case23GraphDatabaseChangeBeforeReplayInvalidatesReplay(t *testing.T) 
 		t.Fatal(err)
 	}
 
-	fakeCodegraph := fakeBackend(t, `
-case "$1" in
-  --version|version) printf 'codegraph 1.0.0\n' ;;
-  init|sync) exit 0 ;;
-  status)
-    size=$(wc -c < "$GOV_V6_GRAPH_DB")
-    printf '{"version":"1.0.0","initialized":true,"projectPath":"","indexPath":"%s","fileCount":1,"nodeCount":1,"edgeCount":1,"dbSizeBytes":%s}\n' "$GOV_V6_GRAPH_DB" "$size"
-    ;;
-  *) printf '{}\n' ;;
-esac
-`)
-	fakeCodegraph = s6SecureExecutable(t, fakeCodegraph)
+	// A compiled ELF binary, not a #!/bin/sh script -- see TestV6Case24's
+	// comment just below for why (scopedCommandOutput's enforce.Plan has no
+	// declared interpreter closure by design). Reads $GOV_V6_GRAPH_DB's size
+	// at call time so the reported fingerprint tracks the file's live
+	// content, same as the original script.
+	fakeCodegraph := buildFakeCodegraphBinary(t, "", `
+		dbFile := os.Getenv("GOV_V6_GRAPH_DB")
+		info, statErr := os.Stat(dbFile)
+		var size int64
+		if statErr == nil {
+			size = info.Size()
+		}
+		fmt.Printf("{\"version\":\"1.0.0\",\"initialized\":true,\"projectPath\":\"\",\"indexPath\":%q,\"fileCount\":1,\"nodeCount\":1,\"edgeCount\":1,\"dbSizeBytes\":%d}\n", dbFile, size)
+		return
+`, "")
 
 	registryFile := filepath.Join(t.TempDir(), "tools.yaml")
 	t.Setenv("GOV_TOOLREGISTRY_FILE", registryFile)

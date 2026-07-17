@@ -26,9 +26,21 @@ func repairAlwaysFailBackend(t *testing.T, bin string) {
 	repairFakeBackend(t, bin, "rm -f output/result.txt\n")
 }
 
-func repairFailOnceBackend(t *testing.T, bin string, marker string) {
+// repairFailOnceBackend distinguishes the original attempt from the repair
+// attempt by inspecting the compiled prompt itself (repairTask's contracts
+// always start "Repair run ...") rather than an external marker file: each
+// RunWithAutoRepair attempt gets a brand new disposable worktree, so there is
+// no in-workspace state a confined backend could persist across attempts,
+// and a marker file outside the workspace is now correctly refused by real
+// Landlock enforcement (Sol v7 S1/S2) rather than silently allowed.
+func repairFailOnceBackend(t *testing.T, bin string) {
 	t.Helper()
-	repairFakeBackend(t, bin, "if [ ! -f \""+marker+"\" ]; then touch \""+marker+"\"; rm -f output/result.txt; else printf 'ok\\n' > output/result.txt; fi\n")
+	repairFakeBackend(t, bin, `for arg in "$@"; do last="$arg"; done
+case "$last" in
+  *"Repair run"*) printf 'ok\n' > output/result.txt ;;
+  *) rm -f output/result.txt ;;
+esac
+`)
 }
 
 func repairContract(root string, r *contracts.Repair) contracts.Contract {
@@ -166,8 +178,7 @@ func TestAutoRepairClampsAtTwoAttemptsRegardlessOfYAML(t *testing.T) {
 func TestAutoRepairStopsOnceApproved(t *testing.T) {
 	root, bin := fixture(t)
 	home := t.TempDir()
-	marker := filepath.Join(t.TempDir(), "marker")
-	repairFailOnceBackend(t, bin, marker) // fails once, then succeeds
+	repairFailOnceBackend(t, bin) // fails once, then succeeds
 	t.Setenv("GOV_HOME", home)
 	t.Setenv("GOV_CLAUDE_BIN", bin)
 

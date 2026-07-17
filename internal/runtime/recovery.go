@@ -10,6 +10,7 @@ import (
 	"sort"
 	"time"
 
+	"github.com/cousingary/governator/internal/controllerenv"
 	"github.com/cousingary/governator/internal/lifecycle"
 	"github.com/cousingary/governator/internal/observability"
 	"github.com/cousingary/governator/internal/quota"
@@ -286,7 +287,7 @@ func destroyLeftoverWorkspace(ctx context.Context, db *sql.DB, r RunRecord, stag
 	}
 	var rn runner.Runner = &runner.LocalWorktreeRunner{}
 	if kind == "docker" {
-		rn = &runner.DockerRunner{}
+		rn = &runner.DockerRunner{ControllerEnvironment: controllerenv.Freeze()}
 	}
 	destroyCtx, cancel := context.WithTimeout(ctx, workspaceCleanupTimeout)
 	defer cancel()

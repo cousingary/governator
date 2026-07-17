@@ -12,6 +12,7 @@ import (
 
 	"github.com/cousingary/governator/internal/observability"
 	"github.com/cousingary/governator/internal/runner"
+	"github.com/cousingary/governator/internal/toolregistry"
 )
 
 // requireDockerCLI skips cleanly when Docker isn't usable in this
@@ -85,10 +86,17 @@ func TestSol3RecoveryRemovesLeftoverDockerContainer(t *testing.T) {
 
 // TestSol3RecoveryLeavesRunRunningWhenContainerCleanupFails reproduces the
 // other half of audit finding #13's correction: a cleanup failure must never
-// be silently absorbed into an ABANDONED/QUARANTINED verdict. DOCKER_HOST is
-// pointed at an unreachable socket so `docker rm -f` fails with a real
-// connection error (not the tolerable "no such container" case), forcing a
-// genuine teardown failure.
+// be silently absorbed into an ABANDONED/QUARANTINED verdict. A fake "docker"
+// binary enrolled in an isolated tool registry always fails with a message
+// that is not the tolerable "no such container" case, forcing a genuine
+// teardown failure. DOCKER_HOST cannot be used for this anymore:
+// RemoveContainer runs docker under controllerenv's frozen, allowlisted
+// environment (Sol P1-1/S3), which does not pass DOCKER_HOST through to the
+// child process at all, so pointing it at an unreachable socket from the
+// test process no longer has any effect on the confined docker invocation --
+// and docker itself normalizes any never-existed name (even a syntactically
+// odd one) to "No such container", so an invalid container name doesn't
+// force a real failure either.
 func TestSol3RecoveryLeavesRunRunningWhenContainerCleanupFails(t *testing.T) {
 	requireDockerCLI(t)
 	db, _, root := recoveryFixture(t)
@@ -97,12 +105,20 @@ func TestSol3RecoveryLeavesRunRunningWhenContainerCleanupFails(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	fakeDocker := filepath.Join(t.TempDir(), "docker")
+	if err := os.WriteFile(fakeDocker, []byte("#!/bin/sh\necho 'Cannot connect to the Docker daemon: fake unreachable daemon' >&2\nexit 1\n"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	toolsReg := filepath.Join(t.TempDir(), "tools.yaml")
+	t.Setenv("GOV_TOOLREGISTRY_FILE", toolsReg)
+	if _, err := toolregistry.Enroll("docker", fakeDocker); err != nil {
+		t.Fatal(err)
+	}
+
 	runID := "run-docker-cleanup-fail"
 	container := "gov-" + runID
 	seedInterruptedRun(t, db, runID, root, work, "")
 	stage(t, db, runID, "WORKSPACE_READY", workspaceReadyDockerDetail(work, root, container))
-
-	t.Setenv("DOCKER_HOST", "unix:///nonexistent/gov-sol3-test.sock")
 
 	v, err := recoverInterruptedRun(context.Background(), db, RunRecord{ID: runID, Root: root, Worktree: work, Status: "RUNNING"}, false)
 	if err != nil {

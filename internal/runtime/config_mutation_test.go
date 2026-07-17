@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 // writeGovConfigDoctrine writes a minimal config.yaml declaring only
@@ -54,11 +55,19 @@ func TestSol3ConfigMutationDuringRunDoesNotAlterDoctrineEnforcement(t *testing.T
 		writeGovConfigDoctrine(t, cfgPath, "block")
 		t.Setenv("GOV_CONFIG", cfgPath)
 
+		// The mutation is now performed by the test process itself, not by
+		// the confined backend script: a governed job writing to a path
+		// outside its workspace (this config file lives in its own
+		// t.TempDir()) is now correctly refused by real Landlock enforcement
+		// (Sol v7 S1/S2) rather than silently allowed, which is exactly what
+		// this test wants to prove doesn't matter -- an EXTERNAL mid-run
+		// mutation (an operator editing config.yaml while a job is running)
+		// is the realistic version of this scenario anyway.
 		codex := writeFakeBackend(t, `mkdir -p output
+sleep 0.3
 printf 'ok\n' > output/result.txt
 printf '{"status":"complete","files_changed":["output/result.txt"],"commands_run":0,"validation":{"self_checked":true},"violations":[],"blockers":[],"next_recommended_action":"none"}\n' > RESULT.json
 printf '{"type":"item.completed","item":{"type":"command_execution","command":"git status"}}\n'
-printf 'doctrine:\n  unenforceable_rule_action: flag\n' > `+shQuote(cfgPath)+`
 `)
 		t.Setenv("GOV_CODEX_BIN", codex)
 
@@ -66,7 +75,16 @@ printf 'doctrine:\n  unenforceable_rule_action: flag\n' > `+shQuote(cfgPath)+`
 		c.Agent = "codex"
 		c.Allowed.Execute = append(c.Allowed.Execute, "*")
 
-		rec, err := New().Run(context.Background(), c)
+		recCh := make(chan RunRecord, 1)
+		errCh := make(chan error, 1)
+		go func() {
+			rec, err := New().Run(context.Background(), c)
+			recCh <- rec
+			errCh <- err
+		}()
+		time.Sleep(50 * time.Millisecond)
+		writeGovConfigDoctrine(t, cfgPath, "flag")
+		rec, err := <-recCh, <-errCh
 		if err != nil {
 			t.Fatalf("Run: %v", err)
 		}
@@ -97,11 +115,13 @@ printf 'doctrine:\n  unenforceable_rule_action: flag\n' > `+shQuote(cfgPath)+`
 		writeGovConfigDoctrine(t, cfgPath, "flag")
 		t.Setenv("GOV_CONFIG", cfgPath)
 
+		// See the sibling subtest above for why this mutation now happens
+		// from the test process rather than the confined backend script.
 		codex := writeFakeBackend(t, `mkdir -p output
+sleep 0.3
 printf 'ok\n' > output/result.txt
 printf '{"status":"complete","files_changed":["output/result.txt"],"commands_run":0,"validation":{"self_checked":true},"violations":[],"blockers":[],"next_recommended_action":"none"}\n' > RESULT.json
 printf '{"type":"item.completed","item":{"type":"command_execution","command":"git status"}}\n'
-printf 'doctrine:\n  unenforceable_rule_action: block\n' > `+shQuote(cfgPath)+`
 `)
 		t.Setenv("GOV_CODEX_BIN", codex)
 
@@ -109,7 +129,16 @@ printf 'doctrine:\n  unenforceable_rule_action: block\n' > `+shQuote(cfgPath)+`
 		c.Agent = "codex"
 		c.Allowed.Execute = append(c.Allowed.Execute, "*")
 
-		rec, err := New().Run(context.Background(), c)
+		recCh := make(chan RunRecord, 1)
+		errCh := make(chan error, 1)
+		go func() {
+			rec, err := New().Run(context.Background(), c)
+			recCh <- rec
+			errCh <- err
+		}()
+		time.Sleep(50 * time.Millisecond)
+		writeGovConfigDoctrine(t, cfgPath, "block")
+		rec, err := <-recCh, <-errCh
 		if err != nil {
 			t.Fatalf("Run: %v", err)
 		}
