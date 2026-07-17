@@ -2999,6 +2999,34 @@ func (r *Runner) runOnce(ctx context.Context, c contracts.Contract) (RunRecord, 
 	if enforcePlanErr != nil {
 		return RunRecord{}, fmt.Errorf("external enforcement: %w", enforcePlanErr)
 	}
+	if enforcePlan.Active && enforcePlan.ReadOnly {
+		// Sol v7 S9: a read-only-mode contract's own compiled prompt still
+		// instructs the backend to "write RESULT.json in the worktree" (every
+		// mode, unconditionally), and a Produces-declaring contract (panel
+		// members/comparison/judge) needs to land its artifact too --
+		// Landlock's readOnly ruleset otherwise denies both with no
+		// carve-out, so read-only jobs could never actually complete under
+		// real enforcement. Both paths are pre-created here (host-side,
+		// unconfined) because Landlock binds a rule to an already-opened
+		// path; a not-yet-created directory or file can't be granted a rule
+		// in advance.
+		var writeDirs, writeFiles []string
+		resultPath := filepath.Join(work, "RESULT.json")
+		if _, err := os.Stat(resultPath); os.IsNotExist(err) {
+			if err := os.WriteFile(resultPath, nil, 0644); err != nil {
+				return RunRecord{}, fmt.Errorf("pre-create RESULT.json for read-only enforcement: %w", err)
+			}
+		}
+		writeFiles = append(writeFiles, resultPath)
+		if len(c.Produces) > 0 {
+			artifactsDir := filepath.Join(work, ".governator", "artifacts")
+			if err := os.MkdirAll(artifactsDir, 0755); err != nil {
+				return RunRecord{}, fmt.Errorf("pre-create .governator/artifacts for read-only enforcement: %w", err)
+			}
+			writeDirs = append(writeDirs, artifactsDir)
+		}
+		enforcePlan = enforcePlan.WithWriteRoots(writeDirs, writeFiles)
+	}
 	ctx = enforce.WithPlan(ctx, enforcePlan)
 	// Sol P0-6 / Session 3: thread the run's single resolved handle to
 	// whichever executor rn.Launch ends up calling (agents.defaultExecutor

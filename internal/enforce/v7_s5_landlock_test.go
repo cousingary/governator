@@ -76,7 +76,7 @@ func TestS5KernelPolicyAllowsRuntimeAndDeniesUndeclaredReads(t *testing.T) {
 		if err != nil {
 			os.Exit(90)
 		}
-		if err := applyLandlockRuleset(workspace, false, shell, nil); err != nil {
+		if err := applyLandlockRuleset(workspace, false, shell, nil, nil, nil); err != nil {
 			os.Exit(91)
 		}
 		if _, err := os.ReadFile(filepath.Join(workspace, "allowed")); err != nil {

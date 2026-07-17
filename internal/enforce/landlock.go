@@ -187,7 +187,54 @@ func elfRuntimeFiles(path string) ([]string, error) {
 	return out, nil
 }
 
-func applyLandlockRuleset(workspace string, readOnly bool, execPath string, declaredReadRoots []string) error {
+// writeCarveOuts resolves the declared extra write-dir/write-file paths
+// (Sol v7 S9: read-only-mode jobs still need to land Produces artifacts and
+// RESULT.json) into RWDirs/RWFiles rules, refusing anything that would
+// escape the workspace it's meant to carve an exception into -- a caller
+// error here must never silently grant write access outside the workspace,
+// which would defeat the whole point of an otherwise read-only Plan.
+func writeCarveOuts(workspace string, writeDirs, writeFiles []string) ([]landlock.Rule, error) {
+	var rules []landlock.Rule
+	within := func(kind, path string) error {
+		if workspace == "" {
+			return fmt.Errorf("%s %q declared with no workspace to scope it to", kind, path)
+		}
+		absWorkspace, err := filepath.Abs(workspace)
+		if err != nil {
+			return err
+		}
+		absPath, err := filepath.Abs(path)
+		if err != nil {
+			return fmt.Errorf("resolve %s %q: %w", kind, path, err)
+		}
+		rel, err := filepath.Rel(absWorkspace, absPath)
+		if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+			return fmt.Errorf("%s %q escapes workspace %q", kind, path, absWorkspace)
+		}
+		return nil
+	}
+	for _, dir := range writeDirs {
+		if err := within("write-dir", dir); err != nil {
+			return nil, err
+		}
+		if info, err := os.Stat(dir); err != nil || !info.IsDir() {
+			return nil, fmt.Errorf("write-dir %q must already exist as a directory (pre-create it before launch): %v", dir, err)
+		}
+		rules = append(rules, landlock.RWDirs(dir))
+	}
+	for _, file := range writeFiles {
+		if err := within("write-file", file); err != nil {
+			return nil, err
+		}
+		if info, err := os.Stat(file); err != nil || info.IsDir() {
+			return nil, fmt.Errorf("write-file %q must already exist as a regular file (pre-create it before launch): %v", file, err)
+		}
+		rules = append(rules, landlock.RWFiles(file))
+	}
+	return rules, nil
+}
+
+func applyLandlockRuleset(workspace string, readOnly bool, execPath string, declaredReadRoots, writeDirs, writeFiles []string) error {
 	abi, err := activeLandlockABI()
 	if err != nil {
 		return fmt.Errorf("query Landlock ABI: %w", err)
@@ -229,6 +276,13 @@ func applyLandlockRuleset(workspace string, readOnly bool, execPath string, decl
 			rules = append(rules, landlock.RWDirs(workspace))
 		}
 	}
+	if len(writeDirs) > 0 || len(writeFiles) > 0 {
+		carveOuts, err := writeCarveOuts(workspace, writeDirs, writeFiles)
+		if err != nil {
+			return err
+		}
+		rules = append(rules, carveOuts...)
+	}
 	return cfg.RestrictPaths(rules...)
 }
 
@@ -238,6 +292,10 @@ func RunSandboxExec(argv []string) int {
 	readOnly := fs.Bool("readonly", false, "deny writes everywhere, including workspace")
 	var readRoots stringListFlag
 	fs.Var(&readRoots, "read-root", "exact contract-declared external read path (repeatable)")
+	var writeDirs stringListFlag
+	fs.Var(&writeDirs, "write-dir", "pre-existing directory beneath workspace granted RW despite --readonly (repeatable)")
+	var writeFiles stringListFlag
+	fs.Var(&writeFiles, "write-file", "pre-existing file beneath workspace granted RW despite --readonly (repeatable)")
 	if err := fs.Parse(argv); err != nil {
 		fmt.Fprintln(os.Stderr, "enforce: parse sandbox-exec args:", err)
 		return 2
@@ -251,7 +309,7 @@ func RunSandboxExec(argv []string) int {
 		fmt.Fprintln(os.Stderr, "enforce: sandbox-exec requires --workspace and -- <bin> [args...]")
 		return 2
 	}
-	if err := applyLandlockRuleset(*workspace, *readOnly, rest[0], readRoots); err != nil {
+	if err := applyLandlockRuleset(*workspace, *readOnly, rest[0], readRoots, writeDirs, writeFiles); err != nil {
 		fmt.Fprintln(os.Stderr, "enforce: apply landlock ruleset:", err)
 		return 1
 	}

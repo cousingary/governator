@@ -60,6 +60,15 @@ type Plan struct {
 	// narrow directories; it is never reconstructed inside the sandbox.
 	ReadRoots   []string
 	LandlockABI int
+	// WriteDirs/WriteFiles are pre-existing paths beneath Workspace granted
+	// RW despite ReadOnly (Sol v7 S9): a read-only-mode contract still needs
+	// to land Produces artifacts and RESULT.json, and Landlock's readOnly
+	// ruleset otherwise denies writes everywhere with no carve-out. The
+	// caller must create these paths before Wrap's launch -- Landlock binds
+	// rules to an opened path, so a not-yet-created artifact directory or
+	// RESULT.json can't be granted in advance.
+	WriteDirs  []string
+	WriteFiles []string
 
 	selfExe string
 	// unsharePath is the trusted-tool registry's verified canonical path to
@@ -265,6 +274,19 @@ func (p Plan) WithExecutableAndReadRoots(executable string, roots ...string) (Pl
 	return p, nil
 }
 
+// WithWriteRoots grants RW on pre-existing dirs/files beneath Workspace even
+// when ReadOnly is set (Sol v7 S9). The caller must have already created
+// every path (Landlock binds rules to an opened path, so a not-yet-created
+// artifact directory or RESULT.json can't be granted in advance).
+func (p Plan) WithWriteRoots(dirs, files []string) Plan {
+	if !p.Active {
+		return p
+	}
+	p.WriteDirs = append(append([]string(nil), p.WriteDirs...), dirs...)
+	p.WriteFiles = append(append([]string(nil), p.WriteFiles...), files...)
+	return p
+}
+
 func (p Plan) Wrap(bin string, args []string) (string, []string) {
 	if !p.Active {
 		return bin, args
@@ -275,6 +297,12 @@ func (p Plan) Wrap(bin string, args []string) (string, []string) {
 	}
 	for _, root := range p.ReadRoots {
 		inner = append(inner, "--read-root", root)
+	}
+	for _, dir := range p.WriteDirs {
+		inner = append(inner, "--write-dir", dir)
+	}
+	for _, file := range p.WriteFiles {
+		inner = append(inner, "--write-file", file)
 	}
 	inner = append(inner, "--")
 	inner = append(inner, bin)

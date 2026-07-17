@@ -284,7 +284,7 @@ printf '{"summary":"judged","recommendation":"n/a"}' > .governator/artifacts/pan
 
 	spec := contracts.PanelSpec{
 		ID: "panel", Members: []string{"m1", "m2", "m3"}, ComparisonJob: "cmp", Judge: "judge",
-		MinSuccess: 2, HardTimeoutSeconds: 15,
+		MinSuccess: 2, HardTimeoutSeconds: 8,
 	}
 	levels := [][]contracts.Contract{{m1, m2, m3}, {cmp}, {judge}}
 
