@@ -2389,7 +2389,16 @@ func hookCmd(args []string) int {
 	if in.ToolInput == nil {
 		in.ToolInput = map[string]any{}
 	}
-	decision := govruntime.GateDecide(in)
+	var decision govruntime.GateDecision
+	if in.ToolName == "apply_patch" {
+		// Codex's apply_patch tool carries the raw patch envelope in
+		// tool_input.command, not a clean file_path — GateDecide's F2 branch
+		// can't read it directly, so route through the dedicated adapter.
+		cmd, _ := in.ToolInput["command"].(string)
+		decision = govruntime.GateDecideApplyPatch(in.CWD, cmd)
+	} else {
+		decision = govruntime.GateDecide(in)
+	}
 	if runID != "" {
 		recordHookDecision(runID, in, decision)
 	}
