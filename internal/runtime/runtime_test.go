@@ -35,9 +35,55 @@ func git(t *testing.T, dir string, args ...string) {
 	}
 }
 
+// govTestBinaryOnce/govTestBinaryPath/govTestBinaryErr/govTestBinary build
+// the real cmd/gov CLI exactly once per test process, mirroring
+// internal/redteam/harness_test.go's govBinary(t). Authority-derived
+// containment (Sol v7 S2) now requires the real Landlock+netns enforcement
+// wrap for every contract() fixture here (NetworkForbidden is always set),
+// and enforce.Plan.Wrap re-execs through enforce.SelfExeOverride (or
+// os.Executable() when unset) + "__sandbox_exec" -- inside `go test`,
+// os.Executable() resolves to the compiled test binary, which has no
+// __sandbox_exec subcommand, so every enforced launch failed with "unshare:
+// failed to execute __sandbox_exec: No such file or directory" before this
+// fix (that opaque failure surfaced to callers only as
+// TRANSCRIPT_FORMAT_INVALID / agent exit code 127, since the transcript
+// audit saw unshare's stderr line as the process's entire non-JSON output).
+var (
+	govTestBinaryOnce sync.Once
+	govTestBinaryPath string
+	govTestBinaryErr  error
+)
+
+func govTestBinary(t *testing.T) string {
+	t.Helper()
+	govTestBinaryOnce.Do(func() {
+		dir, err := os.MkdirTemp("", "gov-runtime-test-bin")
+		if err != nil {
+			govTestBinaryErr = err
+			return
+		}
+		out := filepath.Join(dir, "gov")
+		cmd := exec.Command("go", "build", "-buildvcs=false", "-o", out, "./cmd/gov")
+		cmd.Dir = filepath.Join("..", "..")
+		if combined, err := cmd.CombinedOutput(); err != nil {
+			govTestBinaryErr = fmt.Errorf("%w: %s", err, combined)
+			return
+		}
+		govTestBinaryPath = out
+	})
+	if govTestBinaryErr != nil {
+		t.Fatalf("build gov binary: %v", govTestBinaryErr)
+	}
+	return govTestBinaryPath
+}
+
 func fixture(t *testing.T) (string, string) {
 	t.Helper()
 	t.Setenv("GOV_TEST_ALLOW_FAKE_ENV", "1")
+	if enforce.SelfExeOverride == "" {
+		enforce.SelfExeOverride = govTestBinary(t)
+		t.Cleanup(func() { enforce.SelfExeOverride = "" })
+	}
 	root := t.TempDir()
 	git(t, root, "init", "-b", "main")
 	git(t, root, "config", "user.email", "test@example.invalid")
@@ -71,6 +117,42 @@ if [ -n "$FAKE_MARKER_FILE" ] && [ ! -f "$FAKE_MARKER_FILE" ]; then touch "$FAKE
 	return root, bin
 }
 
+// shellReadRootsOnce/shellReadRootsList/shellReadRootsForFixtures mirror
+// internal/redteam/harness_test.go's helper of the same name: this package's
+// fixture(t) bakes a #!/bin/sh fake backend, and now that StageExecutor
+// routes every launch through real Landlock enforcement on a capable host,
+// the kernel refuses to even open /bin/sh (and the coreutils the fixture
+// shells out to) unless the contract's Local.ReadRoots declares their exact
+// read closure -- exactRead Closure's own doc comment says non-ELF
+// executables "must declare their interpreter and script through ReadRoots."
+// Duplicated per-package rather than shared, matching the existing pattern:
+// internal/redteam already defines its own copy for its own fixtures.
+var (
+	shellReadRootsOnce sync.Once
+	shellReadRootsList []string
+)
+
+func shellReadRootsForFixtures() []string {
+	shellReadRootsOnce.Do(func() {
+		var out []string
+		add := func(path string) {
+			closure, err := enforce.ExecutableReadClosure(path)
+			if err != nil {
+				return
+			}
+			out = append(out, closure...)
+		}
+		add("/bin/sh")
+		for _, tool := range []string{"mkdir", "cat", "chmod", "find", "ls", "rm", "sed", "sleep", "dd", "setsid", "timeout", "printf", "grep", "git", "ln", "mkfifo", "touch"} {
+			if resolved, lerr := exec.LookPath(tool); lerr == nil {
+				add(resolved)
+			}
+		}
+		shellReadRootsList = out
+	})
+	return shellReadRootsList
+}
+
 func contract(root string) contracts.Contract {
 	return contracts.Contract{
 		Task: "write deterministic test output", JobID: "phase1-test", JobType: "test", Agent: "claude-code", Mode: contracts.ModeSurgeon,
@@ -81,6 +163,7 @@ func contract(root string) contracts.Contract {
 		Preflight:   contracts.Preflight{IntendedWrites: []string{"output/**"}},
 		Success:     contracts.Success{RequiredFiles: []string{"output/result.txt"}, Validators: []string{"test -f output/result.txt"}},
 		OnViolation: "quarantine",
+		Local:       &contracts.LocalRunnerConfig{ReadRoots: shellReadRootsForFixtures()},
 	}
 }
 
@@ -648,11 +731,20 @@ func TestCageLeakIsQuarantined(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if r.Status != "QUARANTINED" || !strings.Contains(r.Message, "out-of-worktree mutation") {
+	// Two valid containment outcomes now reach QUARANTINED here (Sol v7
+	// S1/S2): the post-hoc "out-of-worktree mutation" ledger check (if the
+	// write reached disk) or a real Landlock EACCES on the write itself,
+	// which never reaches the ledger and instead surfaces as noise in the
+	// transcript audit -- a strictly stronger security outcome (the leak
+	// never landed on disk at all) that this test predates.
+	if r.Status != "QUARANTINED" || !(strings.Contains(r.Message, "out-of-worktree mutation") || strings.Contains(r.Message, "malformed JSON")) {
 		t.Fatalf("%s: %s", r.Status, r.Message)
 	}
 	if _, err := os.Stat(filepath.Join(root, "output", "result.txt")); !os.IsNotExist(err) {
 		t.Fatalf("quarantined work merged: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(root, "leak.txt")); !os.IsNotExist(err) {
+		t.Fatalf("leak file present outside the workspace: %v", err)
 	}
 }
 
@@ -672,8 +764,14 @@ func TestProtectedPathLeakIsQuarantined(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if r.Status != "QUARANTINED" || !strings.Contains(r.Message, "protected path mutation") {
+	// See TestCageLeakIsQuarantined: real Landlock enforcement can now block
+	// the leaking write itself (EACCES), which is a strictly stronger outcome
+	// than the post-hoc protected-path ledger check this test predates.
+	if r.Status != "QUARANTINED" || !(strings.Contains(r.Message, "protected path mutation") || strings.Contains(r.Message, "malformed JSON")) {
 		t.Fatalf("%s: %s", r.Status, r.Message)
+	}
+	if _, err := os.Stat(filepath.Join(protected, "leak.txt")); !os.IsNotExist(err) {
+		t.Fatalf("leak file present in protected path: %v", err)
 	}
 }
 
@@ -969,6 +1067,59 @@ func TestWriteOutsideIntendedScopeIsQuarantined(t *testing.T) {
 	}
 }
 
+// buildRuntimeTestCodegraphBinary compiles a tiny real ELF binary standing in
+// for the graph provider in TestRunBuildsDisposableGraphAndRecordsFingerprint
+// -- see that test's call site for why a compiled binary is required instead
+// of a #!/bin/sh script. Mirrors internal/redteam/harness_test.go's
+// buildFakeCodegraphBinary.
+func buildRuntimeTestCodegraphBinary(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	src := filepath.Join(dir, "main.go")
+	source := `package main
+
+import (
+	"fmt"
+	"os"
+	"path/filepath"
+)
+
+func main() {
+	if len(os.Args) < 2 {
+		fmt.Println("{}")
+		return
+	}
+	switch os.Args[1] {
+	case "version":
+		fmt.Println("codegraph 0.24.0")
+	case "init", "sync":
+		project := os.Args[len(os.Args)-1]
+		os.MkdirAll(filepath.Join(project, ".codegraph"), 0755)
+		os.WriteFile(filepath.Join(project, ".codegraph", "codegraph.db"), []byte("runtime graph database"), 0644)
+	case "status":
+		project := os.Args[len(os.Args)-1]
+		os.MkdirAll(filepath.Join(project, ".codegraph"), 0755)
+		os.WriteFile(filepath.Join(project, ".codegraph", "codegraph.db"), []byte("runtime graph database"), 0644)
+		fmt.Printf("{\"initialized\":true,\"projectPath\":%q,\"indexPath\":%q,\"fileCount\":7,\"nodeCount\":31,\"edgeCount\":44,\"dbSizeBytes\":22}\n", project, filepath.Join(project, ".codegraph", "codegraph.db"))
+	case "query":
+		fmt.Println("[]")
+	default:
+		os.Exit(1)
+	}
+}
+`
+	if err := os.WriteFile(src, []byte(source), 0644); err != nil {
+		t.Fatal(err)
+	}
+	out := filepath.Join(dir, "codegraph")
+	cmd := exec.Command("go", "build", "-buildvcs=false", "-o", out, src)
+	cmd.Dir = dir
+	if combined, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("build fake codegraph binary: %v: %s", err, combined)
+	}
+	return out
+}
+
 func secureRuntimeTempDir(t *testing.T) string {
 	t.Helper()
 	home := "/home/lam"
@@ -990,32 +1141,17 @@ func secureRuntimeTempDir(t *testing.T) string {
 func TestRunBuildsDisposableGraphAndRecordsFingerprint(t *testing.T) {
 	root, agentBin := fixture(t)
 	home := t.TempDir()
-	graphBin := filepath.Join(secureRuntimeTempDir(t), "codegraph")
-	graphScript := `#!/bin/sh
-for arg in "$@"; do project="$arg"; done
-case "$1" in
-  version) echo 'codegraph 0.24.0' ;;
-  init|sync)
-    mkdir -p "$project/.codegraph"
-    exclude=$(git -C "$project" rev-parse --git-path info/exclude 2>/dev/null || true)
-    if [ -n "$exclude" ]; then mkdir -p "$(dirname "$exclude")"; grep -qxF .codegraph "$exclude" 2>/dev/null || printf '.codegraph\n' >> "$exclude"; fi
-    printf 'runtime graph database' > "$project/.codegraph/codegraph.db"
-    ;;
-  status)
-    mkdir -p "$project/.codegraph"
-    exclude=$(git -C "$project" rev-parse --git-path info/exclude 2>/dev/null || true)
-    if [ -n "$exclude" ]; then mkdir -p "$(dirname "$exclude")"; grep -qxF .codegraph "$exclude" 2>/dev/null || printf '.codegraph\n' >> "$exclude"; fi
-    printf 'runtime graph database' > "$project/.codegraph/codegraph.db"
-    printf '{"initialized":true,"projectPath":"%s","indexPath":"%s/.codegraph/codegraph.db","fileCount":7,"nodeCount":31,"edgeCount":44,"dbSizeBytes":22}\n' "$project" "$project"
-    (sleep 0.05; rm -rf "$project/.codegraph") >/dev/null 2>&1 &
-    ;;
-  query) printf '[]\n' ;;
-  *) exit 1 ;;
-esac
-`
-	if err := os.WriteFile(graphBin, []byte(graphScript), 0755); err != nil {
-		t.Fatal(err)
-	}
+	// A compiled ELF binary, not a #!/bin/sh script: the graph provider
+	// stage's enforce.Plan (internal/contextgraph's scopedCommandOutput) is
+	// deliberately readOnly with no declared interpreter closure -- real
+	// graph providers are compiled tools, never scripts -- so a shell-script
+	// fixture can't even launch under real Landlock enforcement (mirrors
+	// internal/redteam/harness_test.go's buildFakeCodegraphBinary, which
+	// dropped this same fixture's git-exclude-file bookkeeping and
+	// background self-cleanup for the same reason: a spawned `git`
+	// subprocess has no read access of its own under this Plan, and this
+	// test asserts neither behavior, only the fingerprint/counts below).
+	graphBin := buildRuntimeTestCodegraphBinary(t)
 	promptFile := filepath.Join(t.TempDir(), "prompt.txt")
 	t.Setenv("GOV_HOME", home)
 	t.Setenv("GOV_CLAUDE_BIN", agentBin)
@@ -1038,6 +1174,11 @@ esac
 	}
 	if _, err := toolregistry.Enroll("codegraph", graphBin); err != nil {
 		t.Fatal(err)
+	}
+	if unsharePath, err := exec.LookPath("unshare"); err == nil {
+		if _, err := toolregistry.Enroll("unshare", unsharePath); err != nil {
+			t.Fatal(err)
+		}
 	}
 
 	record, err := New().Run(context.Background(), contract(root))

@@ -273,13 +273,18 @@ func TestV6Case30LowRiskEffectfulJobStillGetsStrongDescendantContainment(t *test
 	if canonical, everr := filepath.EvalSymlinks(realBash); everr == nil {
 		realBash = canonical
 	}
-	registryYAML := "tools:\n" +
-		"  - name: git\n    kind: trusted_controller\n    path: " + realGit + "\n" +
-		"  - name: bash\n    kind: trusted_controller\n    path: " + realBash + "\n"
-	if err := os.WriteFile(registryFile, []byte(registryYAML), 0644); err != nil {
+	t.Setenv("GOV_TOOLREGISTRY_FILE", registryFile)
+	// toolregistry.Enroll, not hand-written YAML: it computes the mandatory
+	// sha256/mode/device/inode fields internal/toolregistry's S4 hardening
+	// requires and writes the registry file at exactly 0600 -- a hand-rolled
+	// entry omitting sha256 fails registry load before this test's own
+	// scenario ever runs.
+	if _, err := toolregistry.Enroll("git", realGit); err != nil {
 		t.Fatal(err)
 	}
-	t.Setenv("GOV_TOOLREGISTRY_FILE", registryFile)
+	if _, err := toolregistry.Enroll("bash", realBash); err != nil {
+		t.Fatal(err)
+	}
 	// Starve PATH so systemd-run/unshare (containment.NewScope's two
 	// primitive fallbacks ahead of the process-group degrade) cannot
 	// ambient-resolve; git/bash stay usable via the explicit pins above,

@@ -19,6 +19,50 @@ import (
 	"github.com/cousingary/governator/internal/toolregistry"
 )
 
+// cmdGovShellReadRootsOnce/cmdGovShellReadRootsList/cmdGovShellReadRootsForFixtures
+// mirror internal/redteam/harness_test.go's helper of the same name: batch
+// job fixtures below bake a #!/bin/sh fake backend, and real Landlock
+// enforcement (Sol v7 S1/S2 -- every job here forbids network, which always
+// requires the enforcement wrap) refuses to open /bin/sh (or the coreutils
+// it shells out to) unless the job's declared local.read_roots covers their
+// exact read closure.
+var (
+	cmdGovShellReadRootsOnce sync.Once
+	cmdGovShellReadRootsList []string
+)
+
+func cmdGovShellReadRootsForFixtures() []string {
+	cmdGovShellReadRootsOnce.Do(func() {
+		var out []string
+		add := func(path string) {
+			closure, err := enforce.ExecutableReadClosure(path)
+			if err != nil {
+				return
+			}
+			out = append(out, closure...)
+		}
+		add("/bin/sh")
+		for _, tool := range []string{"mkdir", "cat", "chmod", "find", "ls", "rm", "sed", "sleep", "dd", "setsid", "timeout", "printf", "grep", "git", "ln", "mkfifo", "touch"} {
+			if resolved, lerr := exec.LookPath(tool); lerr == nil {
+				add(resolved)
+			}
+		}
+		cmdGovShellReadRootsList = out
+	})
+	return cmdGovShellReadRootsList
+}
+
+// readRootsYAML renders cmdGovShellReadRootsForFixtures() as a local.read_roots
+// YAML block, indented to sit under a job fixture's top-level keys.
+func readRootsYAML() string {
+	var b strings.Builder
+	b.WriteString("local:\n  read_roots:\n")
+	for _, root := range cmdGovShellReadRootsForFixtures() {
+		b.WriteString("    - \"" + root + "\"\n")
+	}
+	return b.String()
+}
+
 func batchGit(t *testing.T, dir string, args ...string) {
 	t.Helper()
 	cmd := exec.Command("git", args...)
@@ -66,7 +110,7 @@ success:
   required_files: ["output/result.txt"]
   validators: ["test -f output/result.txt"]
 on_violation: quarantine
-`, jobID, root)
+%s`, jobID, root, readRootsYAML())
 	path := filepath.Join(jobsDir, jobID+".yaml")
 	if err := os.WriteFile(path, []byte(yaml), 0644); err != nil {
 		t.Fatal(err)

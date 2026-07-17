@@ -13,6 +13,7 @@ import (
 
 	"github.com/cousingary/governator/internal/agents"
 	"github.com/cousingary/governator/internal/contracts"
+	"github.com/cousingary/governator/internal/controllerenv"
 	"github.com/cousingary/governator/internal/toolregistry"
 )
 
@@ -76,7 +77,7 @@ func TestDockerRunnerLifecycleAndResourceLimits(t *testing.T) {
 		CPULimit:    "0.5",
 		PIDsLimit:   64,
 		Network:     "deny",
-	}}
+	}, ControllerEnvironment: controllerenv.Freeze()}
 	t.Cleanup(func() {
 		ws := Workspace{Container: "gov-docker-test"}
 		_ = d.Destroy(context.Background(), ws, true)
@@ -132,7 +133,7 @@ func TestDockerRunnerNetworkAllowOptIn(t *testing.T) {
 	home := t.TempDir()
 	ctx := context.Background()
 
-	d := &DockerRunner{Config: contracts.DockerRunnerConfig{Image: dockerTestImage, Network: "allow"}}
+	d := &DockerRunner{Config: contracts.DockerRunnerConfig{Image: dockerTestImage, Network: "allow"}, ControllerEnvironment: controllerenv.Freeze()}
 	ws, err := d.Prepare(ctx, PrepareRequest{Root: root, Home: home, ID: "docker-test-net", Git: false})
 	if err != nil {
 		t.Fatalf("Prepare: %v", err)

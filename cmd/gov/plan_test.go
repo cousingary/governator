@@ -69,7 +69,7 @@ func planJobYAML(jobID, root string, dependsOn []string) string {
     on_violation: quarantine
     risk_class: low
     depends_on: %s
-`, jobID, jobID, root, deps)
+    %s`, jobID, jobID, root, deps, strings.ReplaceAll(readRootsYAML(), "\n", "\n    "))
 }
 
 func TestPlanCommandEndToEndWritesValidatedJobFilesAndShow(t *testing.T) {
@@ -320,7 +320,7 @@ success:
 on_violation: quarantine
 risk_class: low
 depends_on: %s
-`, jobID, root, deps)
+%s`, jobID, root, deps, readRootsYAML())
 	path := filepath.Join(jobsDir, jobID+".yaml")
 	if err := os.WriteFile(path, []byte(yaml), 0644); err != nil {
 		t.Fatal(err)

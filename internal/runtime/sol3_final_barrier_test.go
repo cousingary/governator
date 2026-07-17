@@ -66,11 +66,19 @@ func TestSol3FinalBarrierQuarantinesValidatorProtectedPathMutation(t *testing.T)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if r.Status != "QUARANTINED" || !strings.Contains(r.Message, "final barrier protected path mutation") {
+	// Real Landlock enforcement (Sol v7 S1/S2) can now block the validator's
+	// leaking write itself before it ever lands on disk -- a strictly
+	// stronger outcome than the post-hoc "final barrier protected path
+	// mutation" ledger check this test predates, surfacing instead as an
+	// ordinary nonzero validator exit.
+	if r.Status != "QUARANTINED" || !(strings.Contains(r.Message, "final barrier protected path mutation") || strings.Contains(r.Message, "validator failed")) {
 		t.Fatalf("status=%s message=%s", r.Status, r.Message)
 	}
 	if _, err := os.Stat(filepath.Join(root, "output", "result.txt")); !os.IsNotExist(err) {
 		t.Fatalf("protected-path quarantine merged output: %v", err)
+	}
+	if _, err := os.Stat(protectedFile); !os.IsNotExist(err) {
+		t.Fatalf("protected file was written: %v", err)
 	}
 	if status := finalBarrierGitStatus(t, root); status != "" {
 		t.Fatalf("live root has git changes after quarantine: %q", status)

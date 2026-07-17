@@ -156,7 +156,12 @@ func TestGitCheckFailsLoudlyOnUntrustedGit(t *testing.T) {
 	}
 	reg := filepath.Join(t.TempDir(), "tools.yaml")
 	regBody := "tools:\n  - name: git\n    kind: trusted_controller\n    path: " + fakeGit + "\n    sha256: " + strings.Repeat("0", 64) + "\n"
-	if err := os.WriteFile(reg, []byte(regBody), 0644); err != nil {
+	// 0600, not 0644: internal/toolregistry's registry-file-identity check
+	// (Sol v7 S4 registry hardening) rejects any mode other than exactly
+	// 0600 before ever reaching the untrusted-binary comparison this test
+	// means to exercise -- a 0644 fixture file was masking the intended
+	// assertion behind an unrelated (correct) mode-check rejection.
+	if err := os.WriteFile(reg, []byte(regBody), 0600); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("GOV_TOOLREGISTRY_FILE", reg)
