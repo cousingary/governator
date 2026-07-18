@@ -37,6 +37,8 @@ import (
 	"os/exec"
 	"path/filepath"
 	"testing"
+
+	"github.com/cousingary/governator/internal/enforce"
 )
 
 func fixtureAssayerRepo(t *testing.T) string {
@@ -53,6 +55,9 @@ func fixtureAssayerRepo(t *testing.T) string {
 
 func TestEvaluateAgainstRealCLIPassAndFail(t *testing.T) {
 	requirePython3Mandatory(t)
+	if !enforce.Supported() {
+		t.Skip("this host cannot provide external enforcement (Landlock/unshare unavailable); fail-closed behavior is covered by TestV8Case6AssayerFailsClosedWithoutExternalSandbox")
+	}
 	repo := fixtureAssayerRepo(t)
 
 	dir := t.TempDir()
