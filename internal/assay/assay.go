@@ -21,13 +21,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
 
 	"github.com/cousingary/governator/internal/controllerenv"
-	"github.com/cousingary/governator/internal/enforce"
 	"github.com/cousingary/governator/internal/stage"
 	"github.com/cousingary/governator/internal/toolregistry"
 )
@@ -222,34 +220,38 @@ func Evaluate(ctx context.Context, cfg Config, req Request, artifactPath string)
 	if python == "" {
 		python = "python3"
 	}
-	// Session 2 (post-v4 hardening plan item C): python3 is the Assayer
-	// interpreter -- resolve+verify through the trusted-tool registry
-	// rather than a bare argv0, using cfg.Python (or the "python3" default
-	// above) as the requested binary so an operator's configured
-	// interpreter path is still honored, just now verified too.
-	pythonIdentity, perr := toolregistry.ResolveTrusted("python3", python)
+	// Session 3: resolve the interpreter as a sealed executable handle and
+	// run a sealed copy of cli.py so neither the interpreter nor the script
+	// is re-opened from a mutable pathname at launch time.
+	registry, rerr := toolregistry.Load()
+	if rerr != nil {
+		return errorVerdict(fmt.Sprintf("assay: load trusted-tool registry: %s", rerr))
+	}
+	pythonHandle, perr := registry.ResolveHandle("python3", python, toolregistry.KindTrustedController)
 	if perr != nil {
-		return errorVerdict(fmt.Sprintf("assay: resolve trusted python3: %s", perr))
+		return errorVerdict(fmt.Sprintf("assay: resolve trusted python3 handle: %s", perr))
 	}
-	cliPath := filepath.Join(cfg.Repo, "cli.py")
+	defer pythonHandle.Close()
+	pythonIdentity := pythonHandle.Identity
+	cliPath, cleanupCLI, cerr := stage.SealReadonlyCopy(filepath.Join(cfg.Repo, "cli.py"))
+	if cerr != nil {
+		return errorVerdict(fmt.Sprintf("assay: seal cli.py: %s", cerr))
+	}
+	defer cleanupCLI()
 
-	// Sol redteam v7 S1 (StageExecutor migration): this subprocess previously
-	// ran with no descendant scope, no Landlock, no network policy at all --
-	// exactly the gap corpus cases 11/12 (AssayerExternalWriteBlockedOrContained
-	// / AssayerNetworkExfiltrationBlockedOrContained) target. `evaluate` reads
-	// its artifact content from stdin (never the filesystem) and writes only
-	// its verdict to stdout (see cli.py's own doc comment), so it needs no
-	// write access anywhere and no network -- a plain, deny-network,
-	// read-only-beyond-declared-roots Plan. active=true unconditionally but
-	// highRisk=false: a host without Landlock/unshare runs unconfined exactly
-	// as this call site always has, rather than introducing a new hard
-	// failure mode for existing installations.
+	// Sol redteam v7 S1 / v8 S2: this subprocess now declares authority and
+	// lets stage.Executor compile the only acceptable enforcement plan from
+	// it. `evaluate` reads its artifact content from stdin and writes only its
+	// verdict to stdout, so it needs no write access and no network. A host
+	// that cannot provide the requested external sandbox now fails closed.
 	envValues := controllerenv.Base()
-	declaredRoots := append([]string{cfg.Repo}, pythonStdlibReadRoots(runCtx, pythonIdentity.CanonicalPath)...)
-	plan, planErr := enforce.NewPlanForExecutable(true, "", true, false, false, pythonIdentity.CanonicalPath, declaredRoots)
-	if planErr != nil {
-		return errorVerdict(fmt.Sprintf("assay: construct enforcement plan: %s", planErr))
+	authority := stage.StageAuthority{
+		ReadRoots:          []string{cfg.Repo, filepath.Dir(cliPath)},
+		Network:            stage.NetworkPolicyDenied,
+		Credentials:        stage.CredentialPolicyNone,
+		RequireStrongScope: true,
 	}
+	authority.ReadRoots = append(authority.ReadRoots, pythonStdlibReadRoots(runCtx, pythonHandle)...)
 	var stdout, stderr bytes.Buffer
 	stageRes, runErr := stage.NewExecutor().Run(runCtx, stage.StageSpec{
 		RunID:            firstNonEmpty(req.RunID, "assay"),
@@ -258,17 +260,18 @@ func Evaluate(ctx context.Context, cfg Config, req Request, artifactPath string)
 		Arguments:        []string{cliPath, "evaluate", "--profile", req.CheckProfile},
 		WorkingDirectory: cfg.Repo,
 		Environment:      stage.FrozenEnvironment{Values: envValues, Hash: controllerenv.Hash(envValues)},
-		ReadRoots:        []string{cfg.Repo},
-		NetworkPolicy:    stage.NetworkPolicyDenied,
-		CredentialPolicy: stage.CredentialPolicyNone,
+		ReadRoots:        nil,
+		NetworkPolicy:    authority.Network,
+		CredentialPolicy: authority.Credentials,
 		Timeout:          timeout,
 		OutputLimit:      10 << 20,
 		OutputCapture:    stage.CaptureRequiredComplete,
-		DescendantPolicy: stage.DescendantPolicy{RequireStrong: true},
-		EnforcementPlan:  plan,
+		DescendantPolicy: stage.DescendantPolicy{RequireStrong: authority.RequireStrongScope},
+		Authority:        authority,
 		Stdin:            bytes.NewReader(payload),
 		Stdout:           &stdout,
 		Stderr:           &stderr,
+		ExecutableHandle: pythonHandle,
 	})
 	if runCtx.Err() == context.DeadlineExceeded {
 		return errorVerdict(fmt.Sprintf("assay: subprocess timed out after %s", timeout))
@@ -332,13 +335,16 @@ func Blocks(verdict, enforcement string) bool {
 // best-effort: any failure returns nil, so a python this can't introspect
 // just runs with no stdlib read root (whatever failure that causes downstream
 // is not a NEW failure mode introduced by this migration).
-func pythonStdlibReadRoots(ctx context.Context, python string) []string {
+func pythonStdlibReadRoots(ctx context.Context, python *toolregistry.Handle) []string {
 	probeCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
-	cmd := exec.CommandContext(probeCtx, python, "-c",
+	cmd, err := python.Command(probeCtx, "-c",
 		"import sysconfig\n"+
 			"for k in ('stdlib','platstdlib','purelib','platlib'):\n"+
 			"    print(sysconfig.get_path(k))\n")
+	if err != nil {
+		return nil
+	}
 	cmd.Env = controllerenv.Base()
 	out, err := cmd.Output()
 	if err != nil {

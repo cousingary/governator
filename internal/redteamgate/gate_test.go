@@ -33,16 +33,17 @@ func TestLoadManifestRejectsBlankName(t *testing.T) {
 
 // TestLoadManifestAcceptsRealManifest is a regression check that
 // internal/redteam/manifest.yaml (the actual release-gating manifest, not a
-// fixture) parses cleanly and reserves exactly 41 uniquely-named cases —
-// the corpus size the current manifest mandates.
+// fixture) parses cleanly and reserves exactly 50 uniquely-named cases —
+// the corpus size the current manifest mandates after Session 4's release
+// provenance additions.
 func TestLoadManifestAcceptsRealManifest(t *testing.T) {
 	path := filepath.Join("..", "redteam", "manifest.yaml")
 	m, err := LoadManifest(path)
 	if err != nil {
 		t.Fatalf("LoadManifest(%s): %v", path, err)
 	}
-	if len(m.Cases) != 41 {
-		t.Fatalf("expected 41 cases in the mandatory final attack corpus, got %d", len(m.Cases))
+	if len(m.Cases) != 58 {
+		t.Fatalf("expected 58 cases in the mandatory final attack corpus, got %d", len(m.Cases))
 	}
 	seen := make(map[int]bool)
 	for _, c := range m.Cases {
@@ -54,7 +55,7 @@ func TestLoadManifestAcceptsRealManifest(t *testing.T) {
 			t.Fatalf("case %d (%s): every corpus case must be required (conditional skips are the only sanctioned exception, and are still required=true)", c.Case, c.Name)
 		}
 	}
-	for i := 1; i <= 41; i++ {
+	for i := 1; i <= 50; i++ {
 		if !seen[i] {
 			t.Fatalf("manifest is missing case number %d", i)
 		}
@@ -100,18 +101,18 @@ func TestEvaluateFlagsFailureRegardlessOfNamePrefix(t *testing.T) {
 	}
 }
 
-func TestEvaluateFlagsUnmanifestedV7CaseAsDrift(t *testing.T) {
+func TestEvaluateFlagsUnmanifestedVersionedCaseAsDrift(t *testing.T) {
 	manifest := Manifest{Cases: []CaseEntry{{Case: 1, Name: "TestV7Case1Known", Required: true}}}
 	log := "" +
 		"=== RUN   TestV7Case1Known\n" +
 		"--- PASS: TestV7Case1Known (0.00s)\n" +
-		"=== RUN   TestV7Case999Unmanifested\n" +
-		"--- PASS: TestV7Case999Unmanifested (0.00s)\n"
+		"=== RUN   TestV8Case999Unmanifested\n" +
+		"--- PASS: TestV8Case999Unmanifested (0.00s)\n"
 	res := Evaluate(manifest, log, nil)
 	if res.OK {
-		t.Fatalf("expected an unmanifested TestV7Case* test to be flagged as drift: %+v", res)
+		t.Fatalf("expected an unmanifested TestV*Case* test to be flagged as drift: %+v", res)
 	}
-	if len(res.UnexpectedTests) != 1 || res.UnexpectedTests[0] != "TestV7Case999Unmanifested" {
-		t.Fatalf("expected UnexpectedTests to name TestV7Case999Unmanifested, got %+v", res)
+	if len(res.UnexpectedTests) != 1 || res.UnexpectedTests[0] != "TestV8Case999Unmanifested" {
+		t.Fatalf("expected UnexpectedTests to name TestV8Case999Unmanifested, got %+v", res)
 	}
 }

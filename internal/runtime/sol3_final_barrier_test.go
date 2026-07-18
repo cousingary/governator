@@ -128,7 +128,7 @@ func TestSol3FinalBarrierAllowsCleanupFormatterRewrite(t *testing.T) {
 	t.Setenv("GOV_CLAUDE_BIN", bin)
 
 	c := contract(root)
-	c.Cleanup = &contracts.Cleanup{Required: true, Validators: []string{"printf 'formatted\\n' > output/result.txt"}}
+	c.Cleanup = &contracts.Cleanup{Required: true, Validators: []string{"printf 'formatted\\n' > output/result.txt"}, ValidatorSpecs: []contracts.ValidatorSpec{{Command: "printf 'formatted\\n' > output/result.txt", Tools: []string{"bash"}, WriteRoots: []string{"output"}}}}
 
 	r, err := New().Run(context.Background(), c)
 	if err != nil {
@@ -156,7 +156,8 @@ func TestSol3FinalBarrierQuarantinesValidatorLineBudgetOverflow(t *testing.T) {
 
 	c := contract(root)
 	c.Budget.MaxLinesChanged = 5
-	c.Success.Validators = []string{"test -f output/result.txt", "printf '1\\n2\\n3\\n4\\n5\\n6\\n7\\n8\\n9\\n10\\n' > output/result.txt"}
+	c.Success.Validators = []string{"test -f output/result.txt"}
+	c.Cleanup = &contracts.Cleanup{Required: true, Validators: []string{"printf '1\\n2\\n3\\n4\\n5\\n6\\n7\\n8\\n9\\n10\\n' > output/result.txt"}, ValidatorSpecs: []contracts.ValidatorSpec{{Command: "printf '1\\n2\\n3\\n4\\n5\\n6\\n7\\n8\\n9\\n10\\n' > output/result.txt", Tools: []string{"bash"}, WriteRoots: []string{"output"}}}}
 
 	r, err := New().Run(context.Background(), c)
 	if err != nil {

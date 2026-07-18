@@ -464,6 +464,10 @@ func TestParseStructuredCleanupValidatorToolset(t *testing.T) {
     - command: python3 cleanup.py
       tools: [python3]
       files: [cleanup.py]
+      write_roots: [output]
+      network: deny
+      credentials: none
+      require_strong_scope: true
 on_violation: quarantine`, 1)
 	contract, err := Parse([]byte(structured))
 	if err != nil {
@@ -476,8 +480,22 @@ on_violation: quarantine`, 1)
 		t.Fatalf("cleanup validator_specs=%#v", contract.Cleanup.ValidatorSpecs)
 	}
 	spec := contract.Cleanup.ValidatorSpecs[0]
-	if len(spec.Tools) != 1 || spec.Tools[0] != "python3" || len(spec.Files) != 1 || spec.Files[0] != "cleanup.py" {
+	if len(spec.Tools) != 1 || spec.Tools[0] != "python3" || len(spec.Files) != 1 || spec.Files[0] != "cleanup.py" || len(spec.WriteRoots) != 1 || spec.WriteRoots[0] != "output" || spec.Network != "deny" || spec.Credentials != "none" || !spec.RequireStrongScope {
 		t.Fatalf("cleanup validator spec=%#v", spec)
+	}
+}
+
+func TestStructuredSuccessValidatorCannotDeclareWriteRoots(t *testing.T) {
+	structured := strings.Replace(validContract,
+		`    - "python3 validators/image/check_transparency.py output/clipart"
+    - "python3 validators/image/check_min_resolution.py --min 2000 output/clipart"`,
+		`    - command: python3 validator.py
+      tools: [python3]
+      files: [validator.py]
+      write_roots: [output]`, 1)
+	_, err := Parse([]byte(structured))
+	if err == nil || !strings.Contains(err.Error(), "success.validators[0].write_roots") {
+		t.Fatalf("expected read-only success-validator error, got %v", err)
 	}
 }
 

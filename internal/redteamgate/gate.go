@@ -81,7 +81,7 @@ type Outcome struct {
 var (
 	resultLineRE = regexp.MustCompile(`^--- (PASS|FAIL|SKIP): (\S+) \(`)
 	runLineRE    = regexp.MustCompile(`^=== RUN\s+(\S+)`)
-	v7CaseNameRE = regexp.MustCompile(`^TestV7Case\d+`)
+	vCaseNameRE  = regexp.MustCompile(`^TestV\d+Case\d+`)
 )
 
 // ParseVerboseLog extracts one Outcome per test from `go test -v` output.
@@ -152,7 +152,7 @@ type Result struct {
 // Evaluate checks a parsed `go test -v -tags redteam` log against the
 // manifest:
 //   - every manifest case must be present in the log (no MissingTests);
-//   - every TestV7Case* test found in the log must be in the manifest (no
+//   - every TestV*Case* test found in the log must be in the manifest (no
 //     UnexpectedTests — this is the name-drift check);
 //   - zero FailedTests anywhere in the suite;
 //   - every SKIP must be individually authorized: the manifest entry must be
@@ -173,7 +173,7 @@ func Evaluate(manifest Manifest, log string, capabilities map[string]bool) Resul
 	for name, o := range outcomes {
 		c, known := byName[name]
 		// A name outside the manifest is only in scope here if it *claims*
-		// to be part of this corpus (TestV7Case* prefix) — that is the
+		// to be part of this corpus (TestV*Case* prefix) — that is the
 		// name-drift signal (UnexpectedTests). An unrelated package test
 		// (a helper, a v6 TestAttackN/TestV6CaseN case, anything not
 		// claiming manifest membership) is not this gate's concern and must
@@ -182,7 +182,7 @@ func Evaluate(manifest Manifest, log string, capabilities map[string]bool) Resul
 		// *is* in the manifest is always processed, regardless of its
 		// literal prefix — manifest membership, not string shape, is the
 		// source of truth for "is this a corpus case."
-		if !known && !v7CaseNameRE.MatchString(name) {
+		if !known && !vCaseNameRE.MatchString(name) {
 			continue
 		}
 		res.Discovered++
@@ -225,7 +225,7 @@ func Evaluate(manifest Manifest, log string, capabilities map[string]bool) Resul
 		res.Problems = append(res.Problems, fmt.Sprintf("missing required corpus test(s): %s", strings.Join(res.MissingTests, ", ")))
 	}
 	if len(res.UnexpectedTests) > 0 {
-		res.Problems = append(res.Problems, fmt.Sprintf("unmanifested TestV7Case test(s) found (name drift): %s", strings.Join(res.UnexpectedTests, ", ")))
+		res.Problems = append(res.Problems, fmt.Sprintf("unmanifested TestV*Case* test(s) found (name drift): %s", strings.Join(res.UnexpectedTests, ", ")))
 	}
 	if len(res.FailedTests) > 0 {
 		res.Problems = append(res.Problems, fmt.Sprintf("failed corpus test(s): %s", strings.Join(res.FailedTests, ", ")))

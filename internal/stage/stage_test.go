@@ -3,11 +3,14 @@ package stage
 import (
 	"context"
 	"errors"
+	"os/exec"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/cousingary/governator/internal/containment"
 	"github.com/cousingary/governator/internal/controllerenv"
+	"github.com/cousingary/governator/internal/enforce"
 )
 
 func TestExecutorUsesOnlyFrozenEnvironment(t *testing.T) {
@@ -144,5 +147,67 @@ func TestExecutorCaptureNoneDoesNotRetainStreamedOutput(t *testing.T) {
 	}
 	if res.Output != "" {
 		t.Fatalf("capture-none retained output %q", res.Output)
+	}
+}
+
+func TestExecutorRejectsAuthorityThatNeedsSandboxWithoutSupport(t *testing.T) {
+	executable, err := HashExecutable("/bin/true")
+	if err != nil {
+		t.Fatal(err)
+	}
+	enforce.ForceUnsupported = true
+	defer func() { enforce.ForceUnsupported = false }()
+	env := controllerenv.Base()
+	_, err = NewExecutor().Run(context.Background(), StageSpec{
+		RunID: "phase3", StageID: "authority-no-plan", Executable: executable,
+		Environment:      FrozenEnvironment{Values: env, Hash: controllerenv.Hash(env)},
+		OutputCapture:    CaptureNone,
+		DescendantPolicy: DescendantPolicy{RequireStrong: true},
+		Authority:        StageAuthority{ReadRoots: []string{"."}, Network: NetworkPolicyDenied, Credentials: CredentialPolicyNone, RequireStrongScope: true},
+		CommandFactory: func(context.Context, *containment.Scope, enforce.Plan, string, []string, string) (*exec.Cmd, error) {
+			return nil, nil
+		},
+	})
+	if err == nil || !strings.Contains(err.Error(), "construct authority plan") {
+		t.Fatalf("missing sandbox error = %v", err)
+	}
+}
+
+func TestExecutorRejectsAuthorityStrongScopeMismatch(t *testing.T) {
+	executable, err := HashExecutable("/bin/true")
+	if err != nil {
+		t.Fatal(err)
+	}
+	env := controllerenv.Base()
+	_, err = NewExecutor().Run(context.Background(), StageSpec{
+		RunID: "phase3", StageID: "scope-mismatch", Executable: executable,
+		Environment:   FrozenEnvironment{Values: env, Hash: controllerenv.Hash(env)},
+		OutputCapture: CaptureNone,
+		Authority:     StageAuthority{RequireStrongScope: true},
+	})
+	if err == nil || !strings.Contains(err.Error(), "requires strong descendant scope") {
+		t.Fatalf("scope mismatch error = %v", err)
+	}
+}
+
+func TestExecutorRejectsAuthorityPlanContradiction(t *testing.T) {
+	executable, err := HashExecutable("/bin/true")
+	if err != nil {
+		t.Fatal(err)
+	}
+	env := controllerenv.Base()
+	_, err = NewExecutor().Run(context.Background(), StageSpec{
+		RunID: "phase3", StageID: "plan-contradiction", Executable: executable,
+		Environment:      FrozenEnvironment{Values: env, Hash: controllerenv.Hash(env)},
+		OutputCapture:    CaptureNone,
+		DescendantPolicy: DescendantPolicy{RequireStrong: true},
+		Authority:        StageAuthority{ReadRoots: []string{"."}, Network: NetworkPolicyDenied, Credentials: CredentialPolicyNone, RequireStrongScope: true},
+		EnforcementPlan:  enforce.Plan{Active: true, ReadOnly: true, AllowNetwork: true},
+		CommandFactory: func(context.Context, *containment.Scope, enforce.Plan, string, []string, string) (*exec.Cmd, error) {
+			return nil, nil
+		},
+	})
+	if err == nil || !strings.Contains(err.Error(), "authority denies network but plan allows it") {
+		t.Fatalf("plan contradiction error = %v", err)
 	}
 }

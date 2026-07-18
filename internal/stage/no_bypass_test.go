@@ -53,17 +53,15 @@ func TestNoRawProcessLaunchOutsideStageExecutor(t *testing.T) {
 		// Read-only `--version`/`--help`/`worktree -h` diagnostic probes for
 		// the doctor health-check command; never executes a governed job.
 		"internal/doctor/doctor.go": 7,
-		// The systemd-run descendant-scope probe and scope launch: this is
-		// the containment PRIMITIVE StageExecutor's DescendantPolicy is
-		// built on, not a bypass of it.
-		"internal/containment/descendants.go": 5,
+		// Four raw launches remain: the cgroup-direct and degraded primitives,
+		// plus defensive primitivePath fallbacks used only when a test
+		// constructs a Scope directly without a real sealed handle. Production
+		// systemd-run/unshare launches now use sealed handles.
+		"internal/containment/descendants.go": 4,
 		// The sealed-handle `/proc/self/fd/<n>` launch mechanism itself
 		// (report §S4 "Required correction": "launch via fexecve or
 		// /proc/self/fd/<n>") — foundational launch primitive, not a bypass.
 		"internal/toolregistry/handle.go": 1,
-		// gov's own `--claude-shadow` maintenance script invocation
-		// (unrelated to contract/backend execution).
-		"cmd/gov/main.go": 1,
 		// Tool-version resolution probes (pre-launch identity resolution
 		// against an already-registry-verified binary, run in a disposable
 		// scratch cwd with a bounded timeout) — the exact same shape as
@@ -74,12 +72,6 @@ func TestNoRawProcessLaunchOutsideStageExecutor(t *testing.T) {
 		// meaningful application to "run the already-verified binary with
 		// --version and read stdout."
 		"internal/agents/resolution.go": 1,
-		// Assayer environment probes (git rev-parse HEAD / python3
-		// --version): same reasoning as resolution.go above — read-only,
-		// best-effort diagnostic metadata resolved through the trusted-tool
-		// registry, not governed job execution. Reclassified from
-		// migrationPending (S1/S4/S6 gap-closure session, 2026-07-16).
-		"internal/assay/environment.go": 2,
 		// Governor's OWN best-effort pre-delete recovery snapshot hook,
 		// invoked from the interactive PreToolUse gate plane before any
 		// contract/RunID/job exists at all — there is no "stage" or
@@ -88,15 +80,6 @@ func TestNoRawProcessLaunchOutsideStageExecutor(t *testing.T) {
 		// PreflightSnapshotIfDelete). Reclassified from migrationPending
 		// (S1/S4/S6 gap-closure session, 2026-07-16).
 		"internal/runtime/gate.go": 1,
-		// The real Assayer CLI invocation now routes through
-		// stage.Executor (S1/S4/S6 gap-closure session, 2026-07-16, closes
-		// corpus cases 11/12's underlying gap). The one remaining raw call
-		// is pythonStdlibReadRoots' `python3 -c "import sysconfig; ..."`
-		// probe -- read-only, same permanently-legitimate shape as
-		// agents/resolution.go's probeVersion above, needed to compute the
-		// Landlock read closure BEFORE the confined launch, not a stage
-		// launch itself.
-		"internal/assay/assay.go": 1,
 		// runner.shell() -- git worktree add/remove, branch delete, cp
 		// --reflink for workspace setup/teardown. Verified (S1/S4/S6
 		// gap-closure session, 2026-07-16): every call site is git plumbing,
@@ -114,34 +97,6 @@ func TestNoRawProcessLaunchOutsideStageExecutor(t *testing.T) {
 		// runner.go above. Reclassified from migrationPending (S1/S4/S6
 		// gap-closure session, 2026-07-16).
 		"internal/runtime/runtime.go": 1,
-		// Docker CLI: ALL 6 raw calls, including `docker run` itself.
-		// 5 are container/image LIFECYCLE MANAGEMENT against a
-		// container/image Governor already owns by name/reference (image
-		// inspect, daemon-reachability info, container inspect, stop,
-		// rm -f) -- docker-daemon API calls no different in kind from
-		// internal/containment/descendants.go's already-exempted systemd-run
-		// scope primitive above, not stage launches. The 6th, `docker run`
-		// itself (docker.go's executor()), was investigated for migration to
-		// stage.Executor.Run and found NOT SAFE to migrate as-is (S1/S4/S6
-		// gap-closure session, 2026-07-16): DockerRunner's own timeout
-		// handling calls d.Stop() (`docker stop -t 5`, a graceful
-		// daemon-level stop) before giving up, because SIGKILLing the local
-		// `docker run` CLI client (foreground, no --rm/--init/--sig-proxy)
-		// does NOT stop the remote container -- Docker does not forward a
-		// hard kill of the attached client to the daemon-managed container.
-		// stage.Executor.Run's generic ctx.Done() branch only SIGKILLs the
-		// process group; swapping it in would silently leak running
-		// containers on every DockerRunner timeout, exactly the failure
-		// docker.go's own Destroy/RemoveContainer doc comments say the
-		// runtime's outbox retry mechanism exists to prevent. StageExecutor
-		// has no on-timeout hook to run docker.go's graceful stop first;
-		// adding one would change the one shared abstraction every other
-		// migrated stage depends on, out of scope here. DockerRunner already
-		// provides its own complete containment model (container resource
-		// limits, network policy, credential mounts) independent of
-		// Landlock/StageExecutor, so the security case for forcing this
-		// composition is weak relative to the regression risk.
-		"internal/runner/docker.go": 6,
 		// agents.LaunchCommand: the backend's sealed-copy-or-fd launch
 		// primitive, now the foundational mechanism agents.LaunchStaged
 		// plugs into stage.Executor.Run via a CommandFactory (Sol redteam

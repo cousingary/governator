@@ -118,6 +118,9 @@ func New(mode string, dockerCfg *contracts.DockerRunnerConfig, localCfg *contrac
 		if err := CheckDockerAvailable(frozen); err != nil {
 			return nil, fmt.Errorf("runner: docker requested but unavailable: %w", err)
 		}
+		if resolvedImage == nil || strings.TrimSpace(resolvedImage.ID) == "" {
+			return nil, fmt.Errorf("runner: docker requested but no resolved image identity was supplied for %q", dockerCfg.Image)
+		}
 		return &DockerRunner{Config: *dockerCfg, CredentialRoots: credentialRoots, ControllerEnvironment: frozen, ResolvedImage: resolvedImage}, nil
 	default:
 		return nil, fmt.Errorf("runner: unknown mode %q", mode)

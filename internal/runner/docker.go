@@ -67,12 +67,16 @@ func ResolveImageIdentity(ctx context.Context, image string, environments ...con
 	if strings.TrimSpace(image) == "" {
 		return ImageIdentity{}, fmt.Errorf("resolve image identity: empty image reference")
 	}
-	bin, berr := resolveDocker()
+	handle, berr := resolveDockerHandle()
 	if berr != nil {
 		return ImageIdentity{}, fmt.Errorf("resolve image identity %q: %w", image, berr)
 	}
+	defer handle.Close()
 	out, err := func() ([]byte, error) {
-		cmd := exec.CommandContext(ctx, bin, "image", "inspect", image, "--format", "{{json .}}")
+		cmd, cerr := handle.Command(ctx, "image", "inspect", image, "--format", "{{json .}}")
+		if cerr != nil {
+			return nil, cerr
+		}
 		cmd.Env = append([]string(nil), env.Values...)
 		return cmd.Output()
 	}()
@@ -105,12 +109,16 @@ func ResolveImageIdentity(ctx context.Context, image string, environments ...con
 // registry-backed call site in this codebase (gitplumb.TrustedGitPath,
 // enforce.NewPlan): callers must see the current trust state, not a stale
 // snapshot from earlier in the process's life.
-func resolveDocker() (string, error) {
-	identity, err := toolregistry.ResolveTrusted("docker", "docker")
+func resolveDockerHandle() (*toolregistry.Handle, error) {
+	registry, err := toolregistry.Load()
 	if err != nil {
-		return "", fmt.Errorf("resolve trusted docker: %w", err)
+		return nil, fmt.Errorf("load trusted-tool registry: %w", err)
 	}
-	return identity.CanonicalPath, nil
+	handle, err := registry.ResolveHandle("docker", "docker", toolregistry.KindTrustedController)
+	if err != nil {
+		return nil, fmt.Errorf("resolve trusted docker handle: %w", err)
+	}
+	return handle, nil
 }
 
 // CheckDockerAvailable reports whether a working `docker` CLI and a
@@ -125,13 +133,17 @@ func CheckDockerAvailable(environments ...controllerenv.Frozen) error {
 	if err := env.Validate(); err != nil {
 		return err
 	}
-	bin, err := resolveDocker()
+	handle, err := resolveDockerHandle()
 	if err != nil {
 		return err
 	}
+	defer handle.Close()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, bin, "info")
+	cmd, cerr := handle.Command(ctx, "info")
+	if cerr != nil {
+		return cerr
+	}
 	cmd.Env = append([]string(nil), env.Values...)
 	if out, err := cmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("docker daemon unreachable: %v: %s", err, trimmed(out))
@@ -229,11 +241,15 @@ func (d *DockerRunner) executor(ws Workspace) agents.Executor {
 		if err != nil {
 			return 0, false, false, err
 		}
-		dockerBin, dberr := resolveDocker()
+		dockerHandle, dberr := resolveDockerHandle()
 		if dberr != nil {
 			return 0, false, false, dberr
 		}
-		cmd := exec.CommandContext(runCtx, dockerBin, dockerArgs...)
+		defer dockerHandle.Close()
+		cmd, cerr := dockerHandle.Command(runCtx, dockerArgs...)
+		if cerr != nil {
+			return 0, false, false, cerr
+		}
 		env := d.controllerEnvironment()
 		cmd.Env = append([]string(nil), env.Values...)
 		capped := &cappedWriter{w: out, remaining: d.Config.EffectiveOutputCapBytes()}
@@ -347,16 +363,20 @@ func (d *DockerRunner) runArgs(ws Workspace, bin string, args []string) ([]strin
 		return nil, err
 	}
 	out = append(out, credArgs...)
-	out = append(out, d.runtimeImageRef(), bin)
+	runtimeImage, err := d.runtimeImageRef()
+	if err != nil {
+		return nil, err
+	}
+	out = append(out, runtimeImage, bin)
 	out = append(out, args...)
 	return out, nil
 }
 
-func (d *DockerRunner) runtimeImageRef() string {
+func (d *DockerRunner) runtimeImageRef() (string, error) {
 	if d.ResolvedImage != nil && strings.TrimSpace(d.ResolvedImage.ID) != "" {
-		return d.ResolvedImage.ID
+		return d.ResolvedImage.ID, nil
 	}
-	return d.Config.Image
+	return "", fmt.Errorf("docker runtime image is unresolved; refusing mutable configured reference %q", d.Config.Image)
 }
 
 func (d *DockerRunner) verifyStartedContainer(ctx context.Context, ws Workspace) error {
@@ -666,11 +686,15 @@ func inspectContainer(ctx context.Context, name string, frozen controllerenv.Fro
 	if err := frozen.Validate(); err != nil {
 		return dockerInspect{}, false, err
 	}
-	bin, err := resolveDocker()
+	handle, err := resolveDockerHandle()
 	if err != nil {
 		return dockerInspect{}, false, err
 	}
-	cmd := exec.CommandContext(ctx, bin, "inspect", name, "--format", "{{json .}}")
+	defer handle.Close()
+	cmd, cerr := handle.Command(ctx, "inspect", name, "--format", "{{json .}}")
+	if cerr != nil {
+		return dockerInspect{}, false, cerr
+	}
 	cmd.Env = append([]string(nil), frozen.Values...)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
@@ -794,11 +818,15 @@ func (d *DockerRunner) Stop(ctx context.Context, ws Workspace) error {
 	if ws.Container == "" {
 		return nil
 	}
-	bin, err := resolveDocker()
+	handle, err := resolveDockerHandle()
 	if err != nil {
 		return err
 	}
-	cmd := exec.CommandContext(ctx, bin, "stop", "-t", "5", ws.Container)
+	defer handle.Close()
+	cmd, cerr := handle.Command(ctx, "stop", "-t", "5", ws.Container)
+	if cerr != nil {
+		return cerr
+	}
 	cmd.Env = append([]string(nil), d.controllerEnvironment().Values...)
 	return cmd.Run()
 }
@@ -833,11 +861,15 @@ func RemoveContainer(ctx context.Context, name string, environments ...controlle
 	if err := env.Validate(); err != nil {
 		return err
 	}
-	bin, berr := resolveDocker()
+	handle, berr := resolveDockerHandle()
 	if berr != nil {
 		return berr
 	}
-	cmd := exec.CommandContext(ctx, bin, "rm", "-f", name)
+	defer handle.Close()
+	cmd, cerr := handle.Command(ctx, "rm", "-f", name)
+	if cerr != nil {
+		return cerr
+	}
 	cmd.Env = append([]string(nil), env.Values...)
 	out, err := cmd.CombinedOutput()
 	if err != nil && !containerAlreadyGone(string(out)) {

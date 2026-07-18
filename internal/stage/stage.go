@@ -56,6 +56,18 @@ type DescendantPolicy struct {
 	RequireStrong bool `json:"require_strong"`
 }
 
+type StageAuthority struct {
+	ReadRoots          []string         `json:"read_roots,omitempty"`
+	WriteRoots         []string         `json:"write_roots,omitempty"`
+	Network            NetworkPolicy    `json:"network,omitempty"`
+	Credentials        CredentialPolicy `json:"credentials,omitempty"`
+	RequireStrongScope bool             `json:"require_strong_scope,omitempty"`
+}
+
+func (a StageAuthority) RequiresExternalEnforcement() bool {
+	return len(a.ReadRoots) > 0 || len(a.WriteRoots) > 0 || a.Network == NetworkPolicyDenied || a.Credentials == CredentialPolicyNone
+}
+
 type OutputCaptureMode string
 
 const (
@@ -68,10 +80,18 @@ const (
 var ErrOutputLimitExceeded = errors.New("STAGE_OUTPUT_LIMIT_EXCEEDED")
 
 type EffectLedger struct {
-	ScopeMethod          string   `json:"scope_method,omitempty"`
-	WorkspaceFDScanClean bool     `json:"workspace_fd_scan_clean"`
-	LandlockABI          int      `json:"landlock_abi,omitempty"`
-	KernelReadEnvelope   []string `json:"kernel_read_envelope,omitempty"`
+	ScopeMethod             string   `json:"scope_method,omitempty"`
+	WorkspaceFDScanClean    bool     `json:"workspace_fd_scan_clean"`
+	LandlockABI             int      `json:"landlock_abi,omitempty"`
+	KernelReadEnvelope      []string `json:"kernel_read_envelope,omitempty"`
+	DeclaredNetworkPolicy   string   `json:"declared_network_policy,omitempty"`
+	EnforcedNetworkPolicy   string   `json:"enforced_network_policy,omitempty"`
+	ObservedNetworkAttempts int      `json:"observed_network_attempts,omitempty"`
+	DeclaredWriteRoots      []string `json:"declared_write_roots,omitempty"`
+	ActualWriteSet          []string `json:"actual_write_set,omitempty"`
+	CredentialExposure      string   `json:"credential_exposure,omitempty"`
+	PeakProcessCount        int      `json:"peak_process_count,omitempty"`
+	OutputConsequence       string   `json:"output_consequence,omitempty"`
 }
 
 // CommandFactory lets callers with already-sealed launch logic build the exact
@@ -96,6 +116,7 @@ type StageSpec struct {
 	OutputLimit      int64
 	OutputCapture    OutputCaptureMode
 	DescendantPolicy DescendantPolicy
+	Authority        StageAuthority
 	EnforcementPlan  enforce.Plan
 	Stdin            io.Reader
 	Stdout           io.Writer
@@ -148,9 +169,87 @@ func (Executor) Run(ctx context.Context, spec StageSpec) (StageResult, error) {
 	if captureMode != CaptureNone && spec.OutputLimit <= 0 {
 		return StageResult{}, fmt.Errorf("stage: output limit required for capture mode %q", captureMode)
 	}
-	effectivePlan, err := spec.EnforcementPlan.WithExecutableAndReadRoots(spec.Executable.CanonicalPath, spec.ReadRoots...)
-	if err != nil {
-		return StageResult{}, fmt.Errorf("stage: resolve read policy: %w", err)
+	authority := spec.Authority
+	authorityNetworkDeclared := authority.Network != "" && authority.Network != NetworkPolicyUnspecified
+	specNetworkDeclared := spec.NetworkPolicy != "" && spec.NetworkPolicy != NetworkPolicyUnspecified
+	hasAuthority := len(authority.ReadRoots) > 0 || len(authority.WriteRoots) > 0 || authorityNetworkDeclared || authority.Credentials != "" || authority.RequireStrongScope || len(spec.ReadRoots) > 0 || len(spec.WriteRoots) > 0 || specNetworkDeclared || spec.CredentialPolicy != ""
+	if hasAuthority {
+		if len(authority.ReadRoots) == 0 {
+			authority.ReadRoots = append([]string(nil), spec.ReadRoots...)
+		}
+		if len(authority.WriteRoots) == 0 {
+			authority.WriteRoots = append([]string(nil), spec.WriteRoots...)
+		}
+		if authority.Network == NetworkPolicyUnspecified {
+			authority.Network = spec.NetworkPolicy
+		}
+		if authority.Network == NetworkPolicyUnspecified {
+			authority.Network = NetworkPolicyDenied
+		}
+		if authority.Credentials == "" {
+			authority.Credentials = spec.CredentialPolicy
+		}
+		if authority.Credentials == "" {
+			authority.Credentials = CredentialPolicyNone
+		}
+	}
+	if authority.RequireStrongScope && !spec.DescendantPolicy.RequireStrong {
+		return StageResult{}, fmt.Errorf("stage: authority requires strong descendant scope")
+	}
+	if hasAuthority && spec.ExecutableHandle == nil && spec.CommandFactory == nil {
+		return StageResult{}, fmt.Errorf("stage: authority-bearing stages require an executable handle or sealed command factory")
+	}
+	effectivePlan := spec.EnforcementPlan
+	var err error
+	if hasAuthority {
+		if authority.RequiresExternalEnforcement() {
+			compiledPlan, cerr := enforce.NewPlanForExecutable(true, spec.WorkingDirectory, true, authority.Network == NetworkPolicyAllowed, true, spec.Executable.CanonicalPath, authority.ReadRoots)
+			if cerr != nil {
+				return StageResult{}, fmt.Errorf("stage: construct authority plan: %w", cerr)
+			}
+			if effectivePlan.Active {
+				if authority.Network == NetworkPolicyDenied && effectivePlan.AllowNetwork {
+					return StageResult{}, fmt.Errorf("stage: authority denies network but plan allows it")
+				}
+				if authority.Network == NetworkPolicyAllowed && !effectivePlan.AllowNetwork {
+					return StageResult{}, fmt.Errorf("stage: authority allows network but plan denies it")
+				}
+				if !effectivePlan.ReadOnly {
+					return StageResult{}, fmt.Errorf("stage: authoritative stages require a read-only base plan plus explicit write roots")
+				}
+				if effectivePlan.Workspace != "" && compiledPlan.Workspace != "" && filepath.Clean(effectivePlan.Workspace) != filepath.Clean(compiledPlan.Workspace) {
+					return StageResult{}, fmt.Errorf("stage: authority workspace %q contradicts supplied plan workspace %q", compiledPlan.Workspace, effectivePlan.Workspace)
+				}
+			}
+			effectivePlan = compiledPlan
+			if len(authority.WriteRoots) > 0 {
+				writeDirs := make([]string, 0, len(authority.WriteRoots))
+				writeFiles := make([]string, 0, len(authority.WriteRoots))
+				for _, root := range authority.WriteRoots {
+					abs, aerr := filepath.Abs(root)
+					if aerr != nil {
+						return StageResult{}, fmt.Errorf("stage: resolve write root %q: %w", root, aerr)
+					}
+					info, serr := os.Stat(abs)
+					if serr != nil {
+						return StageResult{}, fmt.Errorf("stage: stat write root %q: %w", root, serr)
+					}
+					if info.IsDir() {
+						writeDirs = append(writeDirs, abs)
+					} else {
+						writeFiles = append(writeFiles, abs)
+					}
+				}
+				effectivePlan = effectivePlan.WithWriteRoots(writeDirs, writeFiles)
+			}
+		} else if effectivePlan.Active {
+			return StageResult{}, fmt.Errorf("stage: authority does not require an external sandbox but supplied plan is active")
+		}
+	} else {
+		effectivePlan, err = spec.EnforcementPlan.WithExecutableAndReadRoots(spec.Executable.CanonicalPath, spec.ReadRoots...)
+		if err != nil {
+			return StageResult{}, fmt.Errorf("stage: resolve read policy: %w", err)
+		}
 	}
 	if spec.Timeout > 0 {
 		var cancel context.CancelFunc
@@ -289,14 +388,49 @@ func (Executor) Run(ctx context.Context, spec StageSpec) (StageResult, error) {
 			}
 		}
 	}
+	declaredNetwork := string(authority.Network)
+	if declaredNetwork == "" || declaredNetwork == string(NetworkPolicyUnspecified) {
+		declaredNetwork = string(spec.NetworkPolicy)
+	}
+	enforcedNetwork := "unobserved"
+	if effectivePlan.Active {
+		enforcedNetwork = string(NetworkPolicyDenied)
+		if effectivePlan.AllowNetwork {
+			enforcedNetwork = string(NetworkPolicyAllowed)
+		}
+	}
+	declaredWrites := append([]string(nil), effectivePlan.WriteDirs...)
+	declaredWrites = append(declaredWrites, effectivePlan.WriteFiles...)
+	credentialExposure := "unobserved"
+	if authority.Credentials == CredentialPolicyNone || spec.CredentialPolicy == CredentialPolicyNone {
+		credentialExposure = string(CredentialPolicyNone)
+	} else if authority.Credentials == CredentialPolicyDeclared || spec.CredentialPolicy == CredentialPolicyDeclared {
+		credentialExposure = string(CredentialPolicyDeclared)
+	}
+	outputConsequence := "complete"
+	if limiter.Exceeded() {
+		if captureMode == CaptureRequiredComplete {
+			outputConsequence = "truncated_run_aborted"
+		} else {
+			outputConsequence = "truncated_nonblocking"
+		}
+	}
 	res := StageResult{
 		ExitStatus:         exit,
 		ExecutableIdentity: spec.Executable,
 		EnvironmentHash:    spec.Environment.Hash,
 		ObservedEffects: EffectLedger{
-			ScopeMethod:          string(proof.Method),
-			WorkspaceFDScanClean: proof.WorkspaceFDScanClean,
-			LandlockABI:          effectivePlan.LandlockABI, KernelReadEnvelope: append([]string(nil), effectivePlan.ReadRoots...),
+			ScopeMethod:             string(proof.Method),
+			WorkspaceFDScanClean:    proof.WorkspaceFDScanClean,
+			LandlockABI:             effectivePlan.LandlockABI,
+			KernelReadEnvelope:      append([]string(nil), effectivePlan.ReadRoots...),
+			DeclaredNetworkPolicy:   declaredNetwork,
+			EnforcedNetworkPolicy:   enforcedNetwork,
+			ObservedNetworkAttempts: -1,
+			DeclaredWriteRoots:      declaredWrites,
+			CredentialExposure:      credentialExposure,
+			PeakProcessCount:        proof.ProcessesObservedPeak,
+			OutputConsequence:       outputConsequence,
 		},
 		OutputTruncated: limiter.Exceeded(),
 		DescendantsGone: extinctionErr == nil,

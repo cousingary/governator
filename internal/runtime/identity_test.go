@@ -577,7 +577,8 @@ func TestResolveValidatorToolsetBindsStructuredCleanupValidators(t *testing.T) {
 	}
 }
 
-func TestResolvedAssayerEnvironmentHashBindsCLIAndLockfile(t *testing.T) {
+func writeAssayerIdentityFixture(t *testing.T) string {
+	t.Helper()
 	repo := t.TempDir()
 	if err := os.MkdirAll(filepath.Join(repo, "assayer"), 0755); err != nil {
 		t.Fatal(err)
@@ -593,10 +594,19 @@ func TestResolvedAssayerEnvironmentHashBindsCLIAndLockfile(t *testing.T) {
 		"assayer/profiles.py":   "PROFILES = {}\n",
 		"assayer/store.py":      "",
 	} {
-		if err := os.WriteFile(filepath.Join(repo, filepath.FromSlash(path)), []byte(content), 0644); err != nil {
+		full := filepath.Join(repo, filepath.FromSlash(path))
+		if err := os.MkdirAll(filepath.Dir(full), 0755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(full, []byte(content), 0644); err != nil {
 			t.Fatal(err)
 		}
 	}
+	return repo
+}
+
+func TestResolvedAssayerEnvironmentHashBindsCLI(t *testing.T) {
+	repo := writeAssayerIdentityFixture(t)
 	cfg := config.BuiltIn()
 	cfg.Assay.Repo = repo
 	first := resolvedAssayerEnvironmentHash(cfg, contracts.Contract{})
@@ -607,11 +617,18 @@ func TestResolvedAssayerEnvironmentHashBindsCLIAndLockfile(t *testing.T) {
 	if first == second {
 		t.Fatal("assayer cli.py byte change did not change assayer environment hash")
 	}
+}
+
+func TestResolvedAssayerEnvironmentHashBindsLockfile(t *testing.T) {
+	repo := writeAssayerIdentityFixture(t)
+	cfg := config.BuiltIn()
+	cfg.Assay.Repo = repo
+	first := resolvedAssayerEnvironmentHash(cfg, contracts.Contract{})
 	if err := os.WriteFile(filepath.Join(repo, "requirements-lock.txt"), []byte("package==2.0\n"), 0644); err != nil {
 		t.Fatal(err)
 	}
-	third := resolvedAssayerEnvironmentHash(cfg, contracts.Contract{})
-	if second == third {
+	second := resolvedAssayerEnvironmentHash(cfg, contracts.Contract{})
+	if first == second {
 		t.Fatal("assayer requirements-lock.txt change did not change assayer environment hash")
 	}
 }

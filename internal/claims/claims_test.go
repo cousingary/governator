@@ -405,11 +405,11 @@ func main() {
       "result": "PASS",
       "source_commit": "`+commit+`",
       "log_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-      "tests_discovered": 41,
-      "tests_run": 41,
+      "tests_discovered": 58,
+      "tests_run": 58,
       "tests_skipped": 0,
       "tests_failed": 0,
-      "identity_gate": {"ok": true, "discovered": 41, "run": 41, "skipped": 0, "failed": 0}
+      "identity_gate": {"ok": true, "discovered": 58, "run": 58, "skipped": 0, "failed": 0}
     }
   }
 }`)
@@ -418,6 +418,9 @@ func main() {
   "source_commit": "`+commit+`",
   "go_version": "",
   "build_flags": "test ldflags",
+  "archive_path": "`+filepath.ToSlash(artifact)+`",
+  "archive_sha256": "archive-sha-unused-in-this-test",
+  "extracted_binary_sha256": "`+artifactHash+`",
   "artifact_path": "`+filepath.ToSlash(artifact)+`",
   "artifact_sha256": "`+artifactHash+`",
   "build_info": {},
@@ -491,6 +494,50 @@ func main() {
 	}
 	if r := results[0]; r.OK() || !containsSubstring(r.Problems, "dirty=true") {
 		t.Fatalf("expected dirty self-reporting binary to fail verification, got %+v", r)
+	}
+
+	writeFile(t, root, "evidence/release.json", `{
+  "version": "v1.4.1",
+  "source_commit": "`+commit+`",
+  "go_version": "",
+  "build_flags": "test ldflags",
+  "archive_path": "`+filepath.ToSlash(artifact)+`",
+  "archive_sha256": "archive-sha-unused-in-this-test",
+  "extracted_binary_sha256": "`+artifactHash+`",
+  "artifact_path": "`+filepath.ToSlash(artifact)+`",
+  "artifact_sha256": "`+artifactHash+`",
+  "build_info": {},
+  "claims_hash": "`+claimsHash+`",
+  "test_run_id": "unit-test",
+  "test_result": "PASS",
+  "test_summary_path": "test-summary.json",
+  "acceptance_run_id": "acceptance-test",
+  "acceptance_result": "PASS",
+  "binaries": {"targets": [{"platform": "linux_amd64", "sha256": "`+artifactHash+`"}]}
+}`)
+	claim.BinaryBuildEvidence.ArtifactPath = artifact
+
+	registryFile := filepath.Join(t.TempDir(), "tools.yaml")
+	writeFile(t, filepath.Dir(registryFile), filepath.Base(registryFile), "tools:\n  - name: git\n    kind: trusted_controller\n    path: /usr/bin/git\n")
+	t.Setenv("GOV_TOOLREGISTRY_FILE", registryFile)
+
+	results, err = Verify(root, Document{Claims: []Claim{claim}})
+	if err != nil {
+		t.Fatalf("Verify with broken trusted-tool registry: %v", err)
+	}
+	if r := results[0]; r.OK() || !containsSubstring(r.Problems, "resolve trusted git") {
+		t.Fatalf("expected shipped verification to fail closed on a broken trusted-tool registry, got %+v", r)
+	}
+
+	results, err = VerifyWithOptions(root, Document{Claims: []Claim{claim}}, VerifyOptions{
+		ClaimsPath:       filepath.Join(root, "docs", "claims.yaml"),
+		PortableVerifier: true,
+	})
+	if err != nil {
+		t.Fatalf("Verify portable release profile: %v", err)
+	}
+	if r := results[0]; !r.OK() || r.ComputedMaturity != MaturityShipped {
+		t.Fatalf("expected portable release profile to verify without the trusted-tool registry, got %+v", r)
 	}
 }
 

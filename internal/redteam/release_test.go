@@ -189,8 +189,11 @@ func buildReleaseFixtureDist(t *testing.T, opts releaseFixtureOpts) (distDir, re
 	}
 
 	archiveName := fmt.Sprintf("gov_%s_%s.tar.gz", opts.version, platform)
+	archiveSHA := ""
 	if !opts.omitArchive {
-		writeSingleFileTarGz(t, filepath.Join(distDir, archiveName), "gov", artifactBin, opts.mode)
+		archivePath := filepath.Join(distDir, archiveName)
+		writeSingleFileTarGz(t, archivePath, "gov", artifactBin, opts.mode)
+		archiveSHA = fileSHA256Hex(t, archivePath)
 	}
 
 	manifest := map[string]any{
@@ -202,6 +205,9 @@ func buildReleaseFixtureDist(t *testing.T, opts releaseFixtureOpts) (distDir, re
 		"claims_hash":              claimsHash,
 		"adapter_protocol_version": "adapter-protocol-v1",
 		"artifacts":                []any{},
+		"archive_path":             archiveName,
+		"archive_sha256":           archiveSHA,
+		"extracted_binary_sha256":  artifactSHA,
 		"artifact_path":            archiveName,
 		"artifact_sha256":          artifactSHA,
 		"build_info":               map[string]string{"vcs_revision": opts.manifestCommit},

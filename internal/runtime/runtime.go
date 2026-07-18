@@ -48,6 +48,8 @@ import (
 	"github.com/cousingary/governator/internal/toolregistry"
 )
 
+var RuntimeGOOS = goruntime.GOOS
+
 type RunRecord struct {
 	ID              string                    `json:"id"`
 	JobID           string                    `json:"job_id"`
@@ -670,7 +672,7 @@ func shell(ctx context.Context, dir, command string) (int, string, error) {
 // just runID+"-"+stage -- reused across every validator in one run, which
 // StageExecutor's runID+stageID+nonce naming fixes) and none of the
 // filesystem/network/credential envelope a governed backend gets.
-func shellStage(ctx context.Context, runID, stageName, dir, command string, requireStrong bool, frozen ControllerEnvironment, trustedToolDirs []string, registry *toolregistry.Registry) (int, string, error, error) {
+func shellStage(ctx context.Context, runID, stageName, dir, command string, authority stageexec.StageAuthority, frozen ControllerEnvironment, trustedToolDirs []string, registry *toolregistry.Registry) (int, string, error, error) {
 	if registry == nil {
 		return -1, "", fmt.Errorf("controller tool registry is not frozen"), nil
 	}
@@ -695,7 +697,10 @@ func shellStage(ctx context.Context, runID, stageName, dir, command string, requ
 	}
 	pathValue := strings.Join(pathParts, string(os.PathListSeparator))
 	stageEnv := frozen.With(map[string]string{"PATH": pathValue})
-	enforcementPlan, _ := enforce.PlanFromContext(ctx)
+	readRoots := append([]string(nil), authority.ReadRoots...)
+	readRoots = append(readRoots, filepath.Dir(gitIdentity.CanonicalPath))
+	readRoots = append(readRoots, trustedToolDirs...)
+	authority.ReadRoots = readRoots
 	res, err := stageexec.NewExecutor().Run(ctx, stageexec.StageSpec{
 		RunID:            runID,
 		StageID:          stageName,
@@ -703,12 +708,12 @@ func shellStage(ctx context.Context, runID, stageName, dir, command string, requ
 		Arguments:        []string{"--noprofile", "--norc", "-c", command},
 		WorkingDirectory: dir,
 		Environment:      stageexec.FrozenEnvironment{Values: stageEnv.Values, Hash: stageEnv.Hash},
-		NetworkPolicy:    stageexec.NetworkPolicyDenied,
-		CredentialPolicy: stageexec.CredentialPolicyNone,
+		NetworkPolicy:    authority.Network,
+		CredentialPolicy: authority.Credentials,
 		OutputLimit:      10 << 20,
 		OutputCapture:    stageexec.CaptureRequiredComplete,
-		DescendantPolicy: stageexec.DescendantPolicy{RequireStrong: requireStrong},
-		EnforcementPlan:  enforcementPlan,
+		DescendantPolicy: stageexec.DescendantPolicy{RequireStrong: authority.RequireStrongScope},
+		Authority:        authority,
 		ExecutableHandle: bashHandle,
 	})
 	out := res.Output
@@ -721,6 +726,52 @@ func shellStage(ctx context.Context, runID, stageName, dir, command string, requ
 		out += "descendant containment: " + err.Error()
 	}
 	return res.ExitStatus, out, err, extinctionErr
+}
+
+func stagePathRoots(root string, paths []string) []string {
+	if len(paths) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(paths))
+	for _, p := range paths {
+		if strings.TrimSpace(p) == "" {
+			continue
+		}
+		if filepath.IsAbs(p) {
+			out = append(out, filepath.Clean(p))
+		} else {
+			out = append(out, filepath.Join(root, filepath.FromSlash(p)))
+		}
+	}
+	return out
+}
+
+func validatorAuthority(root string, spec *contracts.ValidatorSpec, writeable bool, requireStrong bool) stageexec.StageAuthority {
+	authority := stageexec.StageAuthority{
+		ReadRoots:          []string{root},
+		Network:            stageexec.NetworkPolicyDenied,
+		Credentials:        stageexec.CredentialPolicyNone,
+		RequireStrongScope: requireStrong,
+	}
+	if spec == nil {
+		return authority
+	}
+	authority.ReadRoots = append(authority.ReadRoots, stagePathRoots(root, spec.Files)...)
+	authority.ReadRoots = append(authority.ReadRoots, stagePathRoots(root, spec.ReadRoots)...)
+	authority.WriteRoots = append(authority.WriteRoots, stagePathRoots(root, spec.WriteRoots)...)
+	if strings.TrimSpace(spec.Network) == string(stageexec.NetworkPolicyAllowed) {
+		authority.Network = stageexec.NetworkPolicyAllowed
+	}
+	if strings.TrimSpace(spec.Credentials) == string(stageexec.CredentialPolicyDeclared) {
+		authority.Credentials = stageexec.CredentialPolicyDeclared
+	}
+	if spec.RequireStrongScope {
+		authority.RequireStrongScope = true
+	}
+	if !writeable {
+		authority.WriteRoots = nil
+	}
+	return authority
 }
 
 func localReadRoots(cfg *contracts.LocalRunnerConfig) []string {
@@ -3142,11 +3193,24 @@ func (r *Runner) runOnce(ctx context.Context, c contracts.Contract) (RunRecord, 
 		if !enforcePlan.AllowNetwork {
 			method = "landlock+netns"
 		}
+		enforcedNetwork := "deny"
+		if enforcePlan.AllowNetwork {
+			enforcedNetwork = "allow"
+		}
 		enfRec := observability.EnforcementRecord{
-			RunID: id, Method: method, NetworkNamespaced: !enforcePlan.AllowNetwork,
-			ProcessesObservedPeak: descProof.ProcessesObservedPeak,
-			LandlockABI:           enforcePlan.LandlockABI, KernelReadEnvelope: append([]string(nil), enforcePlan.ReadRoots...),
-			Created: time.Now().UTC().Format(time.RFC3339Nano),
+			RunID:                   id,
+			Method:                  method,
+			NetworkNamespaced:       !enforcePlan.AllowNetwork,
+			ProcessesObservedPeak:   descProof.ProcessesObservedPeak,
+			LandlockABI:             enforcePlan.LandlockABI,
+			KernelReadEnvelope:      append([]string(nil), enforcePlan.ReadRoots...),
+			DeclaredNetworkPolicy:   enforcedNetwork,
+			EnforcedNetworkPolicy:   enforcedNetwork,
+			ObservedNetworkAttempts: -1,
+			DeclaredWriteRoots:      append(append([]string(nil), enforcePlan.WriteDirs...), enforcePlan.WriteFiles...),
+			CredentialExposure:      "unobserved",
+			OutputConsequence:       "unobserved",
+			Created:                 time.Now().UTC().Format(time.RFC3339Nano),
 		}
 		if err := observability.RecordEnforcement(db, enfRec); err != nil {
 			payload, _ := json.Marshal(enfRec)
@@ -3393,7 +3457,12 @@ func (r *Runner) runOnce(ctx context.Context, c contracts.Contract) (RunRecord, 
 		if validatorIndex < len(successValidatorToolDirs) {
 			toolDirs = successValidatorToolDirs[validatorIndex]
 		}
-		code, out, e, extinctionErr := shellStage(vctx, id, "success-validator", work, v, requireStrongDescendants, env.Controller, toolDirs, env.ToolRegistry)
+		var validatorSpec *contracts.ValidatorSpec
+		if validatorIndex < len(c.Success.ValidatorSpecs) {
+			validatorSpec = &c.Success.ValidatorSpecs[validatorIndex]
+		}
+		authority := validatorAuthority(work, validatorSpec, false, requireStrongDescendants)
+		code, out, e, extinctionErr := shellStage(vctx, id, "success-validator", work, v, authority, env.Controller, toolDirs, env.ToolRegistry)
 		cancel()
 		if extinctionErr != nil {
 			violations = append(violations, "success validator descendant containment: "+extinctionErr.Error())
@@ -3434,7 +3503,12 @@ func (r *Runner) runOnce(ctx context.Context, c contracts.Contract) (RunRecord, 
 			if i < len(cleanupValidatorToolDirs) {
 				toolDirs = cleanupValidatorToolDirs[i]
 			}
-			code, out, e, extinctionErr := shellStage(vctx, id, "cleanup-validator", work, v, requireStrongDescendants, env.Controller, toolDirs, env.ToolRegistry)
+			var validatorSpec *contracts.ValidatorSpec
+			if i < len(c.Cleanup.ValidatorSpecs) {
+				validatorSpec = &c.Cleanup.ValidatorSpecs[i]
+			}
+			authority := validatorAuthority(work, validatorSpec, true, requireStrongDescendants)
+			code, out, e, extinctionErr := shellStage(vctx, id, "cleanup-validator", work, v, authority, env.Controller, toolDirs, env.ToolRegistry)
 			cancel()
 			// Sol redteam v7 S1 cleanup-specific fail-open defect: Required
 			// governs whether a nonzero cleanup EXIT CODE blocks the merge
@@ -3652,6 +3726,9 @@ func (r *Runner) runOnce(ctx context.Context, c contracts.Contract) (RunRecord, 
 		}
 		commands = append(commands, observability.CommandFact{Command: command, Classification: classification})
 	}
+	if RuntimeGOOS == "darwin" {
+		violations = append(violations, "darwin builds are feature-limited and may not approve or merge governed runs")
+	}
 	if len(violations) == 0 && infraKind == agents.InfraNone {
 		rec.Status = "APPROVED"
 		rec.Message = "merge gate passed"
@@ -3746,6 +3823,52 @@ func (r *Runner) runOnce(ctx context.Context, c contracts.Contract) (RunRecord, 
 			return ledgerPending(opRunCompletion, err, string(payload))
 		}
 		return rec, err
+	}
+	if enforcePlan.Active {
+		method := "landlock"
+		if !enforcePlan.AllowNetwork {
+			method = "landlock+netns"
+		}
+		enforcedNetwork := "deny"
+		if enforcePlan.AllowNetwork {
+			enforcedNetwork = "allow"
+		}
+		actualWriteSet := make([]string, 0, len(files))
+		for _, file := range files {
+			actualWriteSet = append(actualWriteSet, file.Path)
+		}
+		credentialExposure := "none"
+		if c.Docker != nil && len(c.Docker.CredentialMounts) > 0 {
+			credentialExposure = "declared"
+		}
+		outputConsequence := "complete"
+		if obs.OutputTruncated {
+			if requiresCompleteTranscript(c) {
+				outputConsequence = "truncated_blocks_approval"
+			} else {
+				outputConsequence = "truncated_nonblocking"
+			}
+		}
+		enfRec := observability.EnforcementRecord{
+			RunID:                   id,
+			Method:                  method,
+			NetworkNamespaced:       !enforcePlan.AllowNetwork,
+			ProcessesObservedPeak:   descProof.ProcessesObservedPeak,
+			LandlockABI:             enforcePlan.LandlockABI,
+			KernelReadEnvelope:      append([]string(nil), enforcePlan.ReadRoots...),
+			DeclaredNetworkPolicy:   enforcedNetwork,
+			EnforcedNetworkPolicy:   enforcedNetwork,
+			ObservedNetworkAttempts: -1,
+			DeclaredWriteRoots:      append(append([]string(nil), enforcePlan.WriteDirs...), enforcePlan.WriteFiles...),
+			ActualWriteSet:          actualWriteSet,
+			CredentialExposure:      credentialExposure,
+			OutputConsequence:       outputConsequence,
+			Created:                 time.Now().UTC().Format(time.RFC3339Nano),
+		}
+		if err := observability.RecordEnforcement(db, enfRec); err != nil {
+			payload, _ := json.Marshal(enfRec)
+			noteOperationalFailure(db, id, opStageEvent, err, string(payload))
+		}
 	}
 	artifactsCreated := time.Now().UTC().Format(time.RFC3339Nano)
 	if err := observability.RecordArtifacts(db, artifactRecords, artifactsCreated); err != nil {

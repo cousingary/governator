@@ -1136,3 +1136,59 @@ claims:
         funcs:
           - TestRunPanelQuorumProceedsWithoutStraggler
           - TestRunPanelQuorumSkipsMemberOnceSatisfied
+
+  - id: sol8-stage-authority
+    title: "Authority-bearing helper stages derive one fail-closed containment plan from StageAuthority instead of inheriting a run-level sandbox: validators compile explicit read/write roots, Assayer and the context-graph provider request their own deny-network/no-credential strong scopes, contradictory supplied plans are rejected, and an authority-bearing stage without a sealed executable handle or command factory is refused before launch."
+    first_shipped_version: v1.0.2-rc2
+    claimed_maturity: tested
+    implementation:
+      - file: internal/stage/stage.go
+        symbols: [StageAuthority, RequiresExternalEnforcement, Run, EffectLedger]
+      - file: internal/runtime/runtime.go
+        symbols: [shellStage, validatorAuthority]
+      - file: internal/assay/assay.go
+        symbols: [Evaluate]
+      - file: internal/contextgraph/graph.go
+        symbols: [Inspect]
+    tests:
+      - file: internal/redteam/v8_phase2_authority_test.go
+        funcs:
+          - TestV8Case3ValidatorNetworkDenyDoesNotInheritBackendAllow
+          - TestV8Case4SuccessValidatorCannotRewriteBackendOutput
+          - TestV8Case5CleanupValidatorCannotWriteOutsideDeclaredRoots
+          - TestV8Case6AssayerFailsClosedWithoutExternalSandbox
+          - TestV8Case7GraphProviderFailsClosedWithoutExternalSandbox
+          - TestV8Case8AuthorityRejectsContradictorySuppliedPlan
+        build_tag: redteam
+
+  - id: sol8-effect-ledger-reconciliation
+    title: "The enforcement ledger reconciles declared authority with what Governator actually proved: declared vs enforced network policy, an observed-network-attempt counter, declared write roots vs actual write set, credential exposure, peak process count, kernel read envelope, Landlock ABI, and output consequence are recorded per run in enforcement_events and surfaced from stage/runtime execution evidence."
+    first_shipped_version: v1.0.2-rc2
+    claimed_maturity: tested
+    implementation:
+      - file: internal/observability/enforcement.go
+        symbols: [EnforcementRecord, RecordEnforcement, EnforcementForRun]
+      - file: internal/stage/stage.go
+        symbols: [EffectLedger, Run]
+      - file: internal/runtime/runtime.go
+        symbols: [runOnce]
+    tests:
+      - file: internal/observability/enforcement_s5_test.go
+        funcs:
+          - TestS5EnforcementEvidenceRoundTrip
+      - file: internal/runtime/sol5_enforcement_ledger_test.go
+        funcs:
+          - TestSol5EnforcementLedgerRecordsExternalObservation
+
+  - id: sol8-darwin-non-approving
+    title: "Darwin builds are feature-limited/non-approving: the runtime refuses approval or merge on darwin even when a backend otherwise produced valid output, so a Darwin artifact can be distributed only as an explicitly non-approving build."
+    first_shipped_version: v1.0.2-rc2
+    claimed_maturity: tested
+    implementation:
+      - file: internal/runtime/runtime.go
+        symbols: [runOnce]
+    tests:
+      - file: internal/redteam/v8_session4_release_test.go
+        funcs:
+          - TestV8Case22DarwinBuildRefusesApprovalOrMerge
+        build_tag: redteam

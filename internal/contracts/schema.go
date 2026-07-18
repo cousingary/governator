@@ -711,9 +711,14 @@ type Preflight struct {
 }
 
 type ValidatorSpec struct {
-	Command string   `yaml:"command" json:"command"`
-	Tools   []string `yaml:"tools,omitempty" json:"tools,omitempty"`
-	Files   []string `yaml:"files,omitempty" json:"files,omitempty"`
+	Command            string   `yaml:"command" json:"command"`
+	Tools              []string `yaml:"tools,omitempty" json:"tools,omitempty"`
+	Files              []string `yaml:"files,omitempty" json:"files,omitempty"`
+	ReadRoots          []string `yaml:"read_roots,omitempty" json:"read_roots,omitempty"`
+	WriteRoots         []string `yaml:"write_roots,omitempty" json:"write_roots,omitempty"`
+	Network            string   `yaml:"network,omitempty" json:"network,omitempty"`
+	Credentials        string   `yaml:"credentials,omitempty" json:"credentials,omitempty"`
+	RequireStrongScope bool     `yaml:"require_strong_scope,omitempty" json:"require_strong_scope,omitempty"`
 }
 
 type Success struct {
@@ -735,7 +740,7 @@ func decodeValidatorSequence(value *yaml.Node, field string) ([]string, []Valida
 		case yaml.MappingNode:
 			for j := 0; j < len(item.Content); j += 2 {
 				key := item.Content[j].Value
-				if key != "command" && key != "tools" && key != "files" {
+				if key != "command" && key != "tools" && key != "files" && key != "read_roots" && key != "write_roots" && key != "network" && key != "credentials" && key != "require_strong_scope" {
 					return nil, nil, fmt.Errorf("validator field %s is not supported", key)
 				}
 			}
@@ -1035,6 +1040,21 @@ func (c Contract) Validate() error {
 		}
 		validateNonBlank(prefix+".tools", spec.Tools, add)
 		validatePathPatterns(prefix+".files", spec.Files, add)
+		validatePathPatterns(prefix+".read_roots", spec.ReadRoots, add)
+		validatePathPatterns(prefix+".write_roots", spec.WriteRoots, add)
+		switch strings.TrimSpace(spec.Network) {
+		case "", "deny", "allow":
+		default:
+			add(prefix+".network", "must be 'deny' or 'allow' when set")
+		}
+		switch strings.TrimSpace(spec.Credentials) {
+		case "", "none", "declared":
+		default:
+			add(prefix+".credentials", "must be 'none' or 'declared' when set")
+		}
+		if len(spec.WriteRoots) > 0 {
+			add(prefix+".write_roots", "success validators are read-only; move mutations to cleanup.validators")
+		}
 	}
 
 	if c.Output != nil {
@@ -1074,6 +1094,18 @@ func (c Contract) Validate() error {
 			}
 			validateNonBlank(prefix+".tools", spec.Tools, add)
 			validatePathPatterns(prefix+".files", spec.Files, add)
+			validatePathPatterns(prefix+".read_roots", spec.ReadRoots, add)
+			validatePathPatterns(prefix+".write_roots", spec.WriteRoots, add)
+			switch strings.TrimSpace(spec.Network) {
+			case "", "deny", "allow":
+			default:
+				add(prefix+".network", "must be 'deny' or 'allow' when set")
+			}
+			switch strings.TrimSpace(spec.Credentials) {
+			case "", "none", "declared":
+			default:
+				add(prefix+".credentials", "must be 'none' or 'declared' when set")
+			}
 		}
 	}
 

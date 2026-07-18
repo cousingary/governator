@@ -115,14 +115,13 @@ type Scope struct {
 	method   ScopeMethod
 	runID    string
 	unitName string // ScopeSystemdUserScope only
-	// primitivePath is the trusted-tool registry's verified canonical path
-	// to this Scope's underlying primitive binary (systemd-run for
-	// ScopeSystemdUserScope, unshare for ScopePIDNamespace) -- resolved
-	// once when the Scope is constructed and used by Command instead of a
-	// bare argv0 os/exec would resolve via ambient PATH (Session 2,
-	// post-v4 hardening plan item C). Unused for ScopeCgroupDirect/
-	// scopeDegraded, which never exec a controller-tool binary of their own.
-	primitivePath string
+	// primitiveHandle pins the verified-open primitive binary (systemd-run for
+	// ScopeSystemdUserScope, unshare for ScopePIDNamespace) so scope launch
+	// itself never re-opens a mutable pathname. primitivePath is retained only
+	// as a defensive fallback when a test constructs a Scope directly without a
+	// real handle.
+	primitiveHandle *toolregistry.Handle
+	primitivePath   string
 
 	mu         sync.Mutex
 	pid        int // outer-namespace pid of the launched wrapper/process
@@ -179,9 +178,13 @@ func (s *Scope) RunID() string { return s.runID }
 func (s *Scope) IsStrong() bool { return s.method != scopeDegraded }
 
 func newSystemdUserScope(runID string) (*Scope, error) {
-	identity, err := toolregistry.ResolveTrusted("systemd-run", "systemd-run")
+	registry, err := toolregistry.Load()
 	if err != nil {
-		return nil, fmt.Errorf("containment: resolve trusted systemd-run: %w", err)
+		return nil, fmt.Errorf("containment: load trusted-tool registry: %w", err)
+	}
+	handle, err := registry.ResolveHandle("systemd-run", "systemd-run", toolregistry.KindTrustedController)
+	if err != nil {
+		return nil, fmt.Errorf("containment: resolve trusted systemd-run handle: %w", err)
 	}
 	if _, err := os.Stat("/run/systemd/system"); err != nil {
 		return nil, fmt.Errorf("containment: systemd is not PID 1 (no /run/systemd/system): %w", err)
@@ -207,16 +210,22 @@ func newSystemdUserScope(runID string) (*Scope, error) {
 	// selected even with systemd-run enrolled and /run/systemd/system +
 	// the user bus both present, which should be impossible if the probe
 	// itself were succeeding.
-	probe := exec.CommandContext(probeCtx, identity.CanonicalPath, "--user", "--scope", "--quiet", "--collect", "--unit="+probeUnit, "--", "/bin/true")
+	probe, err := handle.Command(probeCtx, "--user", "--scope", "--quiet", "--collect", "--unit="+probeUnit, "--", "/bin/true")
+	if err != nil {
+		_ = handle.Close()
+		return nil, fmt.Errorf("containment: systemd user scope probe: %w", err)
+	}
 	probe.Env = controllerenv.Base()
 	if out, err := probe.CombinedOutput(); err != nil {
+		_ = handle.Close()
 		return nil, fmt.Errorf("containment: systemd user scope probe failed: %w: %s", err, strings.TrimSpace(string(out)))
 	}
 	return &Scope{
-		method:        ScopeSystemdUserScope,
-		runID:         runID,
-		unitName:      "governator-" + sanitizeName(runID) + "-" + nonce(),
-		primitivePath: identity.CanonicalPath,
+		method:          ScopeSystemdUserScope,
+		runID:           runID,
+		unitName:        "governator-" + sanitizeName(runID) + "-" + nonce(),
+		primitiveHandle: handle,
+		primitivePath:   handle.Identity.CanonicalPath,
 	}, nil
 }
 
@@ -261,11 +270,15 @@ func newDirectCgroupScope(runID string) (*Scope, error) {
 }
 
 func newPIDNamespaceScope(runID string) (*Scope, error) {
-	identity, err := toolregistry.ResolveTrusted("unshare", "unshare")
+	registry, err := toolregistry.Load()
 	if err != nil {
-		return nil, fmt.Errorf("containment: resolve trusted unshare: %w", err)
+		return nil, fmt.Errorf("containment: load trusted-tool registry: %w", err)
 	}
-	return &Scope{method: ScopePIDNamespace, runID: runID, primitivePath: identity.CanonicalPath}, nil
+	handle, err := registry.ResolveHandle("unshare", "unshare", toolregistry.KindTrustedController)
+	if err != nil {
+		return nil, fmt.Errorf("containment: resolve trusted unshare handle: %w", err)
+	}
+	return &Scope{method: ScopePIDNamespace, runID: runID, primitiveHandle: handle, primitivePath: handle.Identity.CanonicalPath}, nil
 }
 
 func sanitizeName(runID string) string {
@@ -344,7 +357,12 @@ func (s *Scope) Command(ctx context.Context, bin string, args []string, dir stri
 func (s *Scope) Started(pid int) {
 	s.mu.Lock()
 	s.pid = pid
+	h := s.primitiveHandle
+	s.primitiveHandle = nil
 	s.mu.Unlock()
+	if h != nil {
+		_ = h.Close()
+	}
 	switch s.method {
 	case ScopeSystemdUserScope:
 		s.resolveCgroupFromPID(pid)
@@ -409,6 +427,15 @@ func (s *Scope) Extinguish(ctx context.Context, deadline time.Duration, workspac
 	if deadline <= 0 {
 		deadline = DefaultExtinctionDeadline
 	}
+	defer func() {
+		s.mu.Lock()
+		h := s.primitiveHandle
+		s.primitiveHandle = nil
+		s.mu.Unlock()
+		if h != nil {
+			_ = h.Close()
+		}
+	}()
 	start := time.Now()
 	proof := Proof{Method: s.method, ProcessesObservedPeak: -1}
 

@@ -39,6 +39,13 @@ func requirePython3(t *testing.T) {
 	}
 }
 
+func requireExternalSandbox(t *testing.T) {
+	t.Helper()
+	if enforce.ForceUnsupported || !enforce.Supported() {
+		t.Skip("external sandbox unavailable in this unit-test harness")
+	}
+}
+
 func writeArtifact(t *testing.T, dir, content string) (path, sha string) {
 	t.Helper()
 	path = filepath.Join(dir, "artifact.json")
@@ -87,6 +94,7 @@ func TestEvaluateShaMismatchBeforeEvaluationIsError(t *testing.T) {
 // single file write).
 func TestEvaluateShaMismatchAfterEvaluationIsError(t *testing.T) {
 	requirePython3(t)
+	requireExternalSandbox(t)
 	stubDir := t.TempDir()
 	stub := `import sys, time, json
 time.sleep(0.3)
@@ -116,6 +124,7 @@ print(json.dumps({"verdict":"pass","failed_checks":[],"had_error":False,"trace_i
 
 func TestEvaluateNonzeroExitIsError(t *testing.T) {
 	requirePython3(t)
+	requireExternalSandbox(t)
 	stubDir := t.TempDir()
 	stub := "import sys\nsys.stderr.write('boom')\nsys.exit(1)\n"
 	if err := os.WriteFile(filepath.Join(stubDir, "cli.py"), []byte(stub), 0o755); err != nil {
@@ -136,6 +145,7 @@ func TestEvaluateNonzeroExitIsError(t *testing.T) {
 
 func TestEvaluateTimeout(t *testing.T) {
 	requirePython3(t)
+	requireExternalSandbox(t)
 	stubDir := t.TempDir()
 	stub := "import time\ntime.sleep(5)\n"
 	if err := os.WriteFile(filepath.Join(stubDir, "cli.py"), []byte(stub), 0o755); err != nil {
@@ -158,6 +168,7 @@ func TestEvaluateTimeout(t *testing.T) {
 
 func TestEvaluateUnparseableStdoutIsError(t *testing.T) {
 	requirePython3(t)
+	requireExternalSandbox(t)
 	stubDir := t.TempDir()
 	stub := "print('not json')\n"
 	if err := os.WriteFile(filepath.Join(stubDir, "cli.py"), []byte(stub), 0o755); err != nil {
@@ -284,6 +295,7 @@ func TestDescribeEnvironmentPythonVersion(t *testing.T) {
 // declared path, not the name, and pass.
 func TestSol3ArtifactDeclaredPathReachesRealAssayerFilePathCheck(t *testing.T) {
 	requirePython3(t)
+	requireExternalSandbox(t)
 	repo, err := filepath.Abs(filepath.Join("testdata", "assayer_fixture"))
 	if err != nil {
 		t.Fatal(err)

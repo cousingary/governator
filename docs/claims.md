@@ -50,7 +50,7 @@ penalized for lacking acceptance evidence it never promised.
 ## Usage
 
 ```
-gov claims verify [--file <path>] [--repo <path>] [--artifact <path>] [--manifest <path>] [--release]
+gov claims verify [--file <path>] [--repo <path>] [--artifact <path>] [--manifest <path>] [--release] [--portable-release]
 ```
 
 Defaults to `docs/claims.yaml` against the current directory. Exits non-zero
@@ -62,16 +62,24 @@ unless both `--artifact` and `--manifest` are also given. The bare CI/local
 pre-commit form (no `--release`, no artifact) is unaffected — it verifies
 claim-to-source consistency and has nothing to do with a built binary.
 `scripts/release_verify.sh` is the only caller that passes `--release`.
+`--portable-release` is the third-party verification profile: it still
+requires `--artifact` + `--manifest`, but resolves Git read-only from the
+local environment instead of Governator's operational trusted-tool registry
+and hashes the exact `--file` claims ledger rather than assuming
+`docs/claims.yaml` under `--repo`.
 
 ## Release artifact provenance
 
 `scripts/release.sh` is the canonical release builder. It refuses a dirty
-tree, runs the full test/fuzz/Assayer matrix, builds every platform into
-`dist/`, then writes `dist/build-manifest.json` — the one document every
-other release file's identity must agree with: version, source commit, build
-timestamp, claims hash, adapter protocol version, every platform artifact,
-plus (S8) the host-platform artifact's own path/SHA-256, Go buildinfo,
-`test_result`/`test_run_id`, and `acceptance_result`/`acceptance_run_id`.
+tree, re-executes itself from a disposable detached checkout, re-checks
+cleanliness before each platform build, runs the full test/fuzz/Assayer
+matrix, builds every platform into `dist/`, writes
+`dist/architecture-build-metadata.json`, then writes `dist/build-manifest.json`
+— the one document every other release file's identity must agree with:
+version, source commit, build timestamp, claims hash, adapter protocol
+version, every platform artifact, plus (S8/S4) the host-platform archive
+path/SHA-256, extracted binary SHA-256, Go buildinfo, `test_result`/
+`test_run_id`, and `acceptance_result`/`acceptance_run_id`.
 The manifest is written only after the acceptance smoke test (extract, check
 the binary is exactly mode `0755`, hash-match, self-reported version/commit/
 claims-hash match) has already run — never before both are known.
@@ -90,10 +98,8 @@ if every symbol and YAML key exists — this is what closes report attack 25
 assertion in both the acceptance step and `release_verify.sh`.
 
 If `GOV_RELEASE_HMAC_KEY` is present, `scripts/release.sh` adds a
-`manifest_hmac_sha256` over the unsigned manifest JSON. If
-`GOV_RELEASE_MINISIGN_KEY` (path to an unencrypted minisign secret key) and
-the `minisign` binary are both available, it additionally writes
-`checksums.txt.minisig` — an Ed25519 signature verifiable by anyone holding
-only the public key, unlike the shared-secret HMAC. Neither is fabricated
-when unconfigured: an unsigned release says so in plain text, and a missing
-minisign key simply means no `.minisig` file ships.
+`manifest_hmac_sha256` over the unsigned manifest JSON. `checksums.txt.minisig`
+is now mandatory for rc/production releases: if `GOV_RELEASE_MINISIGN_KEY`
+(path to an unencrypted minisign secret key) or the `minisign` binary is
+missing, the release fails. Only clearly marked local candidates may remain
+unsigned.

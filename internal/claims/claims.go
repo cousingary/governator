@@ -105,27 +105,36 @@ type BinaryEvidence struct {
 // VerifyOptions lets the CLI bind a claims verification run to the exact
 // release artifact under inspection without editing docs/claims.yaml.
 type VerifyOptions struct {
-	ArtifactPath string
-	ManifestPath string
+	ArtifactPath     string
+	ManifestPath     string
+	ClaimsPath       string
+	PortableVerifier bool
 }
 
 type BuildManifest struct {
-	Version          string            `json:"version"`
-	SourceCommit     string            `json:"source_commit"`
-	GoVersion        string            `json:"go_version"`
-	BuildFlags       string            `json:"build_flags"`
-	ArtifactPath     string            `json:"artifact_path"`
-	ArtifactSHA256   string            `json:"artifact_sha256"`
-	BuildInfo        map[string]string `json:"build_info"`
-	ClaimsHash       string            `json:"claims_hash"`
-	TestRunID        string            `json:"test_run_id"`
-	TestResult       string            `json:"test_result"`
-	TestSummaryPath  string            `json:"test_summary_path"`
-	AcceptanceRunID  string            `json:"acceptance_run_id"`
-	AcceptanceResult string            `json:"acceptance_result"`
+	Version               string            `json:"version"`
+	SourceCommit          string            `json:"source_commit"`
+	GoVersion             string            `json:"go_version"`
+	BuildFlags            string            `json:"build_flags"`
+	ArchivePath           string            `json:"archive_path"`
+	ArchiveSHA256         string            `json:"archive_sha256"`
+	ExtractedBinarySHA256 string            `json:"extracted_binary_sha256"`
+	ArtifactPath          string            `json:"artifact_path,omitempty"`
+	ArtifactSHA256        string            `json:"artifact_sha256,omitempty"`
+	BuildInfo             map[string]string `json:"build_info"`
+	ClaimsHash            string            `json:"claims_hash"`
+	TestRunID             string            `json:"test_run_id"`
+	TestResult            string            `json:"test_result"`
+	TestSummaryPath       string            `json:"test_summary_path"`
+	AcceptanceRunID       string            `json:"acceptance_run_id"`
+	AcceptanceResult      string            `json:"acceptance_result"`
 }
 
 // Claim is one docs/claims.yaml entry.
+func (m BuildManifest) expectedExtractedBinarySHA256() string {
+	return firstNonEmpty(m.ExtractedBinarySHA256, m.ArtifactSHA256)
+}
+
 type Claim struct {
 	ID                  string          `yaml:"id"`
 	Title               string          `yaml:"title"`
@@ -213,7 +222,7 @@ func VerifyWithOptions(repoRoot string, doc Document, opts VerifyOptions) ([]Res
 			ClaimedMaturity:  MaturityShipped,
 			ComputedMaturity: MaturityShipped,
 		}
-		if ok, problems := verifyArtifactManifest(repoRoot, opts.ArtifactPath, opts.ManifestPath); !ok {
+		if ok, problems := verifyArtifactManifest(repoRoot, opts.ArtifactPath, opts.ManifestPath, opts.ClaimsPath); !ok {
 			artifactResult.ComputedMaturity = MaturityAccepted
 			artifactResult.Problems = problems
 		}
@@ -423,10 +432,10 @@ func verifyShipped(repoRoot string, c Claim, opts VerifyOptions) (bool, []string
 	var problems []string
 	ok := true
 
-	if err := gitCheck(repoRoot, "cat-file", "-e", be.Commit+"^{commit}"); err != nil {
+	if err := gitCheck(repoRoot, opts.PortableVerifier, "cat-file", "-e", be.Commit+"^{commit}"); err != nil {
 		return false, []string{fmt.Sprintf("absent from shipped binary: commit %s not found: %v", be.Commit, err)}
 	}
-	if err := gitCheck(repoRoot, "merge-base", "--is-ancestor", be.Commit, "HEAD"); err != nil {
+	if err := gitCheck(repoRoot, opts.PortableVerifier, "merge-base", "--is-ancestor", be.Commit, "HEAD"); err != nil {
 		ok = false
 		problems = append(problems, fmt.Sprintf("absent from shipped binary: commit %s is not an ancestor of HEAD", be.Commit))
 	}
@@ -454,7 +463,7 @@ func verifyShipped(repoRoot string, c Claim, opts VerifyOptions) (bool, []string
 				ok = false
 				problems = append(problems, fmt.Sprintf("absent from shipped binary: evidence file %s does not record commit %s with a binary hash", be.EvidenceFile, be.Commit))
 			}
-			if gateOK, gateProblems := verifyReleaseGateEvidence(repoRoot, parsed, be.Commit); !gateOK {
+			if gateOK, gateProblems := verifyReleaseGateEvidence(repoRoot, parsed, be.Commit, opts.PortableVerifier); !gateOK {
 				ok = false
 				problems = append(problems, gateProblems...)
 			}
@@ -468,14 +477,14 @@ func verifyShipped(repoRoot string, c Claim, opts VerifyOptions) (bool, []string
 	}
 
 	if be.Version != "" {
-		if versionOK, versionProblems := verifyVersionTagProvenance(repoRoot, be.Commit, be.Version); !versionOK {
+		if versionOK, versionProblems := verifyVersionTagProvenance(repoRoot, be.Commit, be.Version, opts.PortableVerifier); !versionOK {
 			ok = false
 			problems = append(problems, versionProblems...)
 		}
 	}
 
 	for _, fs := range c.Implementation {
-		blob, err := gitShow(repoRoot, be.Commit, fs.File)
+		blob, err := gitShow(repoRoot, opts.PortableVerifier, be.Commit, fs.File)
 		if err != nil {
 			ok = false
 			problems = append(problems, fmt.Sprintf("absent from shipped binary: %s did not exist at %s: %v", fs.File, be.Commit, err))
@@ -500,7 +509,7 @@ func verifyShipped(repoRoot string, c Claim, opts VerifyOptions) (bool, []string
 // name-by-name comparison against internal/redteam/manifest.yaml via `gov
 // redteam-gate verify`) is what actually replaces the old count-only gate
 // (Sol v7 S7, HS4) — see identity_gate below.
-const minRedteamTestCount = 41
+const minRedteamTestCount = 58
 
 // verifyClaimedRedteamCases checks that every redteam manifest case number a
 // claim declares (Claim.RedteamCases) is neither missing, name-drifted,
@@ -548,7 +557,7 @@ func verifyClaimedRedteamCases(repoRoot string, cases []int, evidence map[string
 	return len(problems) == 0, problems
 }
 
-func verifyReleaseGateEvidence(repoRoot string, evidence map[string]any, commit string) (bool, []string) {
+func verifyReleaseGateEvidence(repoRoot string, evidence map[string]any, commit string, portable bool) (bool, []string) {
 	var problems []string
 	ok := true
 	if strings.TrimSpace(commit) == "" {
@@ -562,7 +571,7 @@ func verifyReleaseGateEvidence(repoRoot string, evidence map[string]any, commit 
 		}
 	}
 	if version, _ := stringAt(evidence, "version"); version != "" {
-		if versionOK, versionProblems := verifyVersionTagProvenance(repoRoot, commit, version); !versionOK {
+		if versionOK, versionProblems := verifyVersionTagProvenance(repoRoot, commit, version, portable); !versionOK {
 			ok = false
 			problems = append(problems, versionProblems...)
 		}
@@ -672,7 +681,7 @@ func verifyRedteamSuite(suite map[string]any, commit string) (bool, []string) {
 	return ok, problems
 }
 
-func verifyVersionTagProvenance(repoRoot, commit, version string) (bool, []string) {
+func verifyVersionTagProvenance(repoRoot, commit, version string, portable bool) (bool, []string) {
 	v := strings.TrimSpace(version)
 	if v == "" || strings.Contains(v, "candidate") || strings.Contains(v, "rc") || strings.Contains(v, "+") {
 		return true, nil
@@ -681,7 +690,7 @@ func verifyVersionTagProvenance(repoRoot, commit, version string) (bool, []strin
 	if !strings.HasPrefix(tag, "v") {
 		tag = "v" + tag
 	}
-	out, err := gitOutput(repoRoot, "rev-parse", tag+"^{commit}")
+	out, err := gitOutput(repoRoot, portable, "rev-parse", tag+"^{commit}")
 	if err != nil {
 		return true, nil
 	}
@@ -805,7 +814,7 @@ func verifyReleaseArtifact(repoRoot string, c Claim, opts VerifyOptions) (bool, 
 	}
 	manifestPath := firstNonEmpty(opts.ManifestPath, be.ManifestPath, be.EvidenceFile)
 	artifactPath := firstNonEmpty(opts.ArtifactPath, be.ArtifactPath)
-	ok, problems := verifyArtifactManifest(repoRoot, artifactPath, manifestPath)
+	ok, problems := verifyArtifactManifest(repoRoot, artifactPath, manifestPath, opts.ClaimsPath)
 	if !ok {
 		return ok, problems
 	}
@@ -830,7 +839,7 @@ func verifyReleaseArtifact(repoRoot string, c Claim, opts VerifyOptions) (bool, 
 	return true, nil
 }
 
-func verifyArtifactManifest(repoRoot, artifactPath, manifestPath string) (bool, []string) {
+func verifyArtifactManifest(repoRoot, artifactPath, manifestPath, claimsPath string) (bool, []string) {
 	manifest, artifactFull, artifactLabel, err := loadBuildManifest(repoRoot, artifactPath, manifestPath)
 	if err != nil {
 		return false, []string{err.Error()}
@@ -842,9 +851,9 @@ func verifyArtifactManifest(repoRoot, artifactPath, manifestPath string) (bool, 
 	if err != nil {
 		ok = false
 		problems = append(problems, fmt.Sprintf("absent from shipped binary: artifact %s: %v", artifactLabel, err))
-	} else if !strings.EqualFold(artifactHash, strings.TrimSpace(manifest.ArtifactSHA256)) {
+	} else if expected := manifest.expectedExtractedBinarySHA256(); !strings.EqualFold(artifactHash, expected) {
 		ok = false
-		problems = append(problems, fmt.Sprintf("absent from shipped binary: artifact sha256 mismatch: manifest=%s actual=%s", manifest.ArtifactSHA256, artifactHash))
+		problems = append(problems, fmt.Sprintf("absent from shipped binary: artifact sha256 mismatch: manifest=%s actual=%s", expected, artifactHash))
 	}
 
 	if !passingResult(manifest.TestResult) || strings.TrimSpace(manifest.TestRunID) == "" {
@@ -872,13 +881,13 @@ func verifyArtifactManifest(repoRoot, artifactPath, manifestPath string) (bool, 
 		problems = append(problems, "absent from shipped binary: manifest lacks a passing acceptance_run_id/acceptance_result")
 	}
 
-	claimsPath := filepath.Join(repoRoot, "docs", "claims.yaml")
-	if actualClaimsHash, err := fileSHA256(claimsPath); err != nil {
+	claimsLabel := firstNonEmpty(claimsPath, filepath.Join(repoRoot, "docs", "claims.yaml"))
+	if actualClaimsHash, err := fileSHA256(absOrRepo(repoRoot, claimsLabel)); err != nil {
 		ok = false
-		problems = append(problems, fmt.Sprintf("absent from shipped binary: docs/claims.yaml: %v", err))
+		problems = append(problems, fmt.Sprintf("absent from shipped binary: claims file %s: %v", claimsLabel, err))
 	} else if manifest.ClaimsHash != actualClaimsHash {
 		ok = false
-		problems = append(problems, fmt.Sprintf("absent from shipped binary: manifest claims_hash %s does not match docs/claims.yaml %s", manifest.ClaimsHash, actualClaimsHash))
+		problems = append(problems, fmt.Sprintf("absent from shipped binary: manifest claims_hash %s does not match %s %s", manifest.ClaimsHash, claimsLabel, actualClaimsHash))
 	}
 
 	bi, err := buildinfo.ReadFile(artifactFull)
@@ -949,7 +958,7 @@ func loadBuildManifest(repoRoot, artifactPath, manifestPath string) (BuildManife
 	if err := json.Unmarshal(data, &manifest); err != nil {
 		return manifest, "", "", fmt.Errorf("absent from shipped binary: build manifest %s is not valid JSON: %v", manifestPath, err)
 	}
-	artifactLabel := firstNonEmpty(artifactPath, manifest.ArtifactPath)
+	artifactLabel := firstNonEmpty(artifactPath, manifest.ArchivePath, manifest.ArtifactPath)
 	if artifactLabel == "" {
 		return manifest, "", "", fmt.Errorf("absent from shipped binary: no artifact path provided by CLI or manifest")
 	}
@@ -1084,10 +1093,28 @@ func containsPlatformHash(v any, platform string) bool {
 	return false
 }
 
-func gitOutput(repoRoot string, args ...string) ([]byte, error) {
-	gitPath, gerr := gitplumb.TrustedGitPath()
+func resolveGitPath(portable bool) (string, error) {
+	if !portable {
+		gitPath, err := gitplumb.TrustedGitPath()
+		if err != nil {
+			return "", fmt.Errorf("resolve trusted git: %w", err)
+		}
+		return gitPath, nil
+	}
+	gitPath, err := exec.LookPath("git")
+	if err != nil {
+		return "", fmt.Errorf("resolve portable git: %w", err)
+	}
+	if canonical, cerr := filepath.EvalSymlinks(gitPath); cerr == nil {
+		gitPath = canonical
+	}
+	return gitPath, nil
+}
+
+func gitOutput(repoRoot string, portable bool, args ...string) ([]byte, error) {
+	gitPath, gerr := resolveGitPath(portable)
 	if gerr != nil {
-		return nil, fmt.Errorf("resolve trusted git: %w", gerr)
+		return nil, gerr
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), probeTimeout)
 	defer cancel()
@@ -1105,12 +1132,10 @@ func gitOutput(repoRoot string, args ...string) ([]byte, error) {
 	return out.Bytes(), nil
 }
 
-func gitCheck(repoRoot string, args ...string) error {
-	// Session 2 (post-v4 hardening plan item C): route through the trusted-
-	// tool registry like every other git invocation in this codebase.
-	gitPath, gerr := gitplumb.TrustedGitPath()
+func gitCheck(repoRoot string, portable bool, args ...string) error {
+	gitPath, gerr := resolveGitPath(portable)
 	if gerr != nil {
-		return fmt.Errorf("resolve trusted git: %w", gerr)
+		return gerr
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), probeTimeout)
 	defer cancel()
@@ -1127,10 +1152,10 @@ func gitCheck(repoRoot string, args ...string) error {
 	return nil
 }
 
-func gitShow(repoRoot, commit, path string) ([]byte, error) {
-	gitPath, gerr := gitplumb.TrustedGitPath()
+func gitShow(repoRoot string, portable bool, commit, path string) ([]byte, error) {
+	gitPath, gerr := resolveGitPath(portable)
 	if gerr != nil {
-		return nil, fmt.Errorf("resolve trusted git: %w", gerr)
+		return nil, gerr
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), probeTimeout)
 	defer cancel()

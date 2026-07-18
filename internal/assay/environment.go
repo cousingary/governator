@@ -6,13 +6,11 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
 
 	"github.com/cousingary/governator/internal/controllerenv"
-	"github.com/cousingary/governator/internal/gitplumb"
 	"github.com/cousingary/governator/internal/toolregistry"
 )
 
@@ -77,22 +75,21 @@ func assayerCommit(repo string) string {
 	// when repo directly owns a .git entry (a real clone, or a worktree/
 	// submodule pointer file — both live directly at the repo root).
 	if _, err := os.Stat(filepath.Join(repo, ".git")); err == nil {
-		// Session 2 (post-v4 hardening plan item C): route through the same
-		// trusted-tool registry resolution every other git invocation in
-		// this codebase uses, rather than a bare "git" argv0 -- this probe
-		// is best-effort diagnostic metadata (see the doc comment above), so
-		// an unresolvable/untrusted git just leaves AssayerCommit empty,
-		// same as any other failure here.
-		if gitPath, gerr := gitplumb.TrustedGitPath(); gerr == nil {
-			ctx, cancel := context.WithTimeout(context.Background(), environmentProbeTimeout)
-			defer cancel()
-			cmd := exec.CommandContext(ctx, gitPath, "-C", repo, "rev-parse", "HEAD")
-			cmd.Env = controllerenv.Base()
-			var out bytes.Buffer
-			cmd.Stdout = &out
-			if err := cmd.Run(); err == nil {
-				if commit := strings.TrimSpace(out.String()); commit != "" {
-					return commit
+		if registry, gerr := toolregistry.Load(); gerr == nil {
+			if gitHandle, herr := registry.ResolveHandle("git", "git", toolregistry.KindTrustedController); herr == nil {
+				defer gitHandle.Close()
+				ctx, cancel := context.WithTimeout(context.Background(), environmentProbeTimeout)
+				defer cancel()
+				cmd, err := gitHandle.Command(ctx, "-C", repo, "rev-parse", "HEAD")
+				if err == nil {
+					cmd.Env = controllerenv.Base()
+					var out bytes.Buffer
+					cmd.Stdout = &out
+					if err := cmd.Run(); err == nil {
+						if commit := strings.TrimSpace(out.String()); commit != "" {
+							return commit
+						}
+					}
 				}
 			}
 		}
@@ -123,14 +120,21 @@ func pythonVersion(python string) string {
 	// Session 2 (post-v4 hardening plan item C): resolve+verify through the
 	// trusted-tool registry; best-effort like the rest of this file, so an
 	// unresolvable/untrusted python3 just leaves PythonVersion empty.
-	identity, ierr := toolregistry.ResolveTrusted("python3", python)
+	registry, rerr := toolregistry.Load()
+	if rerr != nil {
+		return ""
+	}
+	pythonHandle, ierr := registry.ResolveHandle("python3", python, toolregistry.KindTrustedController)
 	if ierr != nil {
 		return ""
 	}
-	python = identity.CanonicalPath
+	defer pythonHandle.Close()
 	ctx, cancel := context.WithTimeout(context.Background(), environmentProbeTimeout)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, python, "--version")
+	cmd, err := pythonHandle.Command(ctx, "--version")
+	if err != nil {
+		return ""
+	}
 	cmd.Env = controllerenv.Base()
 	var out bytes.Buffer
 	cmd.Stdout = &out

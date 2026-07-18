@@ -257,3 +257,88 @@ cases:
     session: rc2-phase3
     required: true
     status: implemented
+  - case: 42
+    name: TestV8Case3ValidatorNetworkDenyDoesNotInheritBackendAllow
+    session: rc2-phase2
+    required: true
+    status: implemented
+  - case: 43
+    name: TestV8Case4SuccessValidatorCannotRewriteBackendOutput
+    session: rc2-phase2
+    required: true
+    status: implemented
+  - case: 44
+    name: TestV8Case5CleanupValidatorCannotWriteOutsideDeclaredRoots
+    session: rc2-phase2
+    required: true
+    status: implemented
+  - case: 45
+    name: TestV8Case6AssayerFailsClosedWithoutExternalSandbox
+    session: rc2-phase2
+    required: true
+    status: implemented
+  - case: 46
+    name: TestV8Case7GraphProviderFailsClosedWithoutExternalSandbox
+    session: rc2-phase2
+    required: true
+    status: implemented
+  - case: 47
+    name: TestV8Case8AuthorityRejectsContradictorySuppliedPlan
+    session: rc2-phase2
+    required: true
+    status: implemented
+  - case: 48
+    name: TestV8Case20DirtyReleaseArtifactRejected
+    session: rc2-phase4
+    required: true
+    status: implemented
+  - case: 49
+    name: TestV8Case21UnsignedRCReleaseRejected
+    session: rc2-phase4
+    required: true
+    status: implemented
+  - case: 50
+    name: TestV8Case22DarwinBuildRefusesApprovalOrMerge
+    session: rc2-phase4
+    required: true
+    status: implemented
+  - case: 51
+    name: TestResolvedAssayerEnvironmentHashBindsCLI
+    session: rc2-phase5
+    required: true
+    status: implemented
+  - case: 52
+    name: TestV8Case14AssayerBranchAdvanceInvalidatesReplay
+    session: rc2-phase5
+    required: true
+    status: implemented
+  - case: 53
+    name: TestResolvedAssayerEnvironmentHashBindsLockfile
+    session: rc2-phase5
+    required: true
+    status: implemented
+  - case: 54
+    name: TestV8Case16CleanupInterpreterSwapInvalidatesReplay
+    session: rc2-phase5
+    required: true
+    status: implemented
+  - case: 55
+    name: TestGateDecideApplyPatchMissingCommandDenies
+    session: rc2-phase5
+    required: true
+    status: implemented
+  - case: 56
+    name: TestGateDecideApplyPatchMalformedEnvelopeDenies
+    session: rc2-phase5
+    required: true
+    status: implemented
+  - case: 57
+    name: TestGateDecideApplyPatchUnknownDirectiveDenies
+    session: rc2-phase5
+    required: true
+    status: implemented
+  - case: 58
+    name: TestV8Case24NoApplicableChecksBlockApproval
+    session: rc2-phase5
+    required: true
+    status: implemented

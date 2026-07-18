@@ -14,7 +14,22 @@ func TestS5EnforcementEvidenceRoundTrip(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer db.Close()
-	want := EnforcementRecord{RunID: "s5", Method: "landlock", NetworkNamespaced: true, ProcessesObservedPeak: 2, LandlockABI: 3, KernelReadEnvelope: []string{"/exact/tool", "/exact/lib"}, Created: "now"}
+	want := EnforcementRecord{
+		RunID:                   "s5",
+		Method:                  "landlock",
+		NetworkNamespaced:       true,
+		ProcessesObservedPeak:   2,
+		LandlockABI:             3,
+		KernelReadEnvelope:      []string{"/exact/tool", "/exact/lib"},
+		DeclaredNetworkPolicy:   "deny",
+		EnforcedNetworkPolicy:   "deny",
+		ObservedNetworkAttempts: -1,
+		DeclaredWriteRoots:      []string{"/workspace/output", "/workspace/RESULT.json"},
+		ActualWriteSet:          []string{"output/result.txt"},
+		CredentialExposure:      "none",
+		OutputConsequence:       "complete",
+		Created:                 "now",
+	}
 	if err := RecordEnforcement(db, want); err != nil {
 		t.Fatal(err)
 	}

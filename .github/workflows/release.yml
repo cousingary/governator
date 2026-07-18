@@ -67,6 +67,7 @@ jobs:
           # tagged commit." Local dry-runs (docs/publishing.md) leave this
           # unset and keep working from a clean but untagged tree.
           REQUIRE_TAG: "1"
+          REQUIRE_ASYMMETRIC_SIGNATURE: "1"
         run: scripts/release.sh
 
       - name: Upload release artifacts
@@ -78,6 +79,7 @@ jobs:
             dist/checksums.txt
             dist/checksums.txt.minisig
             dist/build-manifest.json
+            dist/architecture-build-metadata.json
             dist/sbom.json
             dist/claims.yaml
             dist/test-summary.json
@@ -95,6 +97,7 @@ jobs:
             dist/checksums.txt
             dist/checksums.txt.minisig
             dist/build-manifest.json
+            dist/architecture-build-metadata.json
             dist/sbom.json
             dist/claims.yaml
             dist/test-summary.json

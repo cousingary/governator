@@ -3,10 +3,12 @@ package contextgraph
 import (
 	"context"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
 
+	"github.com/cousingary/governator/internal/enforce"
 	"github.com/cousingary/governator/internal/toolregistry"
 )
 
@@ -24,6 +26,19 @@ func secureGraphTempDir(t *testing.T) string {
 	return dir
 }
 
+func requireExternalSandbox(t *testing.T) {
+	t.Helper()
+	if enforce.SelfExeOverride == "" {
+		t.Skip("contextgraph stage tests require a real gov sandbox harness")
+	}
+	if unsharePath, err := exec.LookPath("unshare"); err == nil {
+		_, _ = toolregistry.Enroll("unshare", unsharePath)
+	}
+	if !enforce.Supported() {
+		t.Skip("external sandbox unavailable on this host")
+	}
+}
+
 func graphEnv(t *testing.T, mode, bin string) {
 	t.Helper()
 	t.Setenv("HOME", t.TempDir())
@@ -31,7 +46,6 @@ func graphEnv(t *testing.T, mode, bin string) {
 	t.Setenv("GOV_GRAPH_MODE", mode)
 	t.Setenv("GOV_GRAPH_PROVIDER", "codegraph")
 	t.Setenv("GOV_GRAPH_BIN", bin)
-	t.Setenv("GOV_CONTAINMENT_FORCE_DEGRADED", "1")
 }
 
 // trustCodegraph registers "codegraph" as a trusted controller tool for
@@ -78,6 +92,7 @@ exit 1
 		t.Fatal(err)
 	}
 	graphEnv(t, "required", bin)
+	requireExternalSandbox(t)
 	trustCodegraph(t, bin)
 	status, err := Resolve()
 	if err != nil {
@@ -125,6 +140,7 @@ esac
 		t.Fatal(err)
 	}
 	graphEnv(t, "required", bin)
+	requireExternalSandbox(t)
 	trustCodegraph(t, bin)
 	project := t.TempDir()
 
@@ -161,6 +177,7 @@ func TestPrepareAutoDegradesOnProviderFailure(t *testing.T) {
 		t.Fatal(err)
 	}
 	graphEnv(t, "auto", bin)
+	requireExternalSandbox(t)
 	trustCodegraph(t, bin)
 	snapshot, err := Prepare(context.Background(), t.TempDir())
 	if err != nil {

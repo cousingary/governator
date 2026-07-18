@@ -11,7 +11,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"runtime"
 	"runtime/debug"
@@ -40,6 +39,7 @@ import (
 	govruntime "github.com/cousingary/governator/internal/runtime"
 	"github.com/cousingary/governator/internal/snapshots"
 	"github.com/cousingary/governator/internal/spend"
+	stageexec "github.com/cousingary/governator/internal/stage"
 	"github.com/cousingary/governator/internal/toolregistry"
 	"gopkg.in/yaml.v3"
 )
@@ -1928,13 +1928,14 @@ func versionCmd(args []string) int {
 // fail when a claim is unwired, untested, stale, missing its acceptance
 // artifact, or absent from the shipped binary).
 func claimsCmd(args []string) int {
-	usage := "usage: gov claims verify [--file <path>] [--repo <path>] [--artifact <path>] [--manifest <path>] [--release]"
+	usage := "usage: gov claims verify [--file <path>] [--repo <path>] [--artifact <path>] [--manifest <path>] [--release] [--portable-release]"
 	if len(args) < 1 || args[0] != "verify" {
 		return bad(usage)
 	}
 	file := "docs/claims.yaml"
 	repo := "."
 	release := false
+	portableRelease := false
 	opts := claims.VerifyOptions{}
 	rest := args[1:]
 	for len(rest) > 0 {
@@ -1966,6 +1967,10 @@ func claimsCmd(args []string) int {
 		case "--release":
 			release = true
 			rest = rest[1:]
+		case "--portable-release":
+			portableRelease = true
+			release = true
+			rest = rest[1:]
 		default:
 			return bad(usage)
 		}
@@ -1985,6 +1990,10 @@ func claimsCmd(args []string) int {
 		fmt.Fprintln(os.Stderr, "claims: --release requires both --artifact and --manifest")
 		return bad(usage)
 	}
+	if portableRelease {
+		opts.PortableVerifier = true
+	}
+	opts.ClaimsPath = file
 	doc, err := claims.Load(file)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "claims:", err)
@@ -2413,13 +2422,20 @@ func hookCmd(args []string) int {
 
 	goOutput := govruntime.HookPayload(decision)
 	shadowHash, shadowHashErr := fileSHA256(shadow)
-	pythonIdentity, pythonErr := toolregistry.ResolveTrusted("python3", "python3")
+	registry, registryErr := toolregistry.Load()
+	var pythonHandle *toolregistry.Handle
+	var pythonErr error
+	if registryErr == nil {
+		pythonHandle, pythonErr = registry.ResolveHandle("python3", "python3", toolregistry.KindTrustedController)
+	}
 	event := observability.ParityEvent{Payload: string(data), GoDecision: string(goOutput), ShadowScriptPath: shadow, ShadowScriptSHA256: shadowHash}
-	if shadowHashErr != nil || pythonErr != nil {
+	if shadowHashErr != nil || registryErr != nil || pythonErr != nil {
 		event.PythonUnavailable = true
 		event.Match = false
 		if shadowHashErr != nil {
 			event.PythonDecision = "shadow_unavailable: " + shadowHashErr.Error()
+		} else if registryErr != nil {
+			event.PythonDecision = "python_unavailable: " + registryErr.Error()
 		} else {
 			event.PythonDecision = "python_unavailable: " + pythonErr.Error()
 		}
@@ -2431,9 +2447,26 @@ func hookCmd(args []string) int {
 	// delete on a slow drvfs mount measured at ~13s in practice, and 2s was
 	// marking those legitimate runs py_unavailable instead of letting the
 	// authoritative legacy decision land (governator ledger, 2026-07-06).
+	defer pythonHandle.Close()
+	sealedShadow, cleanupShadow, sealErr := stageexec.SealReadonlyCopy(shadow)
+	if sealErr != nil {
+		event.PythonUnavailable = true
+		event.Match = false
+		event.PythonDecision = "shadow_unavailable: " + sealErr.Error()
+		_ = observability.RecordParity(govruntime.Home(), event)
+		return govruntime.EmitHookJSON(decision)
+	}
+	defer cleanupShadow()
 	ctx, cancel := context.WithTimeout(context.Background(), 35*time.Second)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, pythonIdentity.CanonicalPath, shadow)
+	cmd, cerr := pythonHandle.Command(ctx, sealedShadow)
+	if cerr != nil {
+		event.PythonUnavailable = true
+		event.Match = false
+		event.PythonDecision = "python_unavailable: " + cerr.Error()
+		_ = observability.RecordParity(govruntime.Home(), event)
+		return govruntime.EmitHookJSON(decision)
+	}
 	cmd.Env = controllerenv.Base()
 	cmd.Stdin = bytes.NewReader(data)
 	var pythonOutput bytes.Buffer
@@ -2801,7 +2834,7 @@ Usage:
   gov attest <backend>
   gov doctor
   gov health [reset <backend>]
-  gov claims verify [--file <path>] [--repo <path>] [--artifact <path>] [--manifest <path>] [--release]
+  gov claims verify [--file <path>] [--repo <path>] [--artifact <path>] [--manifest <path>] [--release] [--portable-release]
   gov redteam-gate verify --manifest <path> --log <path> [--capabilities <json>]
   gov version`)
 }

@@ -14,7 +14,6 @@ import (
 
 	"github.com/cousingary/governator/internal/config"
 	"github.com/cousingary/governator/internal/controllerenv"
-	"github.com/cousingary/governator/internal/enforce"
 	stageexec "github.com/cousingary/governator/internal/stage"
 	"github.com/cousingary/governator/internal/toolregistry"
 )
@@ -115,27 +114,27 @@ func ResolveConfigWithRegistry(cfg config.Config, registry *toolregistry.Registr
 	return status, nil
 }
 
-// scopedCommandOutput builds its own enforce.Plan rather than reading one
-// from ctx: the run-level Plan (internal/runtime.runOnce) is injected into
-// context only after this stage's one real call site (the pre-replay graph
-// inspection) already runs, so pulling PlanFromContext here would silently
-// see the zero value. The graph provider is treated as read-only workspace
-// access -- every known invocation (version/status/init/sync) inspects the
-// project, never writes into it -- so a provider that unexpectedly needs to
-// write fails loudly (Landlock denial) rather than this call silently
-// granting write access nobody asked for.
+// scopedCommandOutput declares stage authority directly and lets
+// stage.Executor compile the matching sandbox. The graph provider is treated
+// as read-only workspace access -- every known invocation
+// (version/status/init/sync) inspects the project, never writes into it -- so
+// a provider that unexpectedly needs to write fails loudly rather than this
+// call silently granting write access nobody asked for.
 func scopedCommandOutput(ctx context.Context, status Status, args []string, dir string, env controllerenv.Frozen) ([]byte, error) {
 	if err := env.Validate(); err != nil {
 		return nil, err
 	}
-	executable, err := stageexec.HashExecutable(status.Path)
+	registry, err := toolregistry.Load()
 	if err != nil {
 		return nil, err
 	}
-	plan, err := enforce.NewPlanForExecutable(true, dir, true, false, false, status.Path, nil)
+	providerHandle, err := registry.ResolveHandle(status.Provider, status.Bin, toolregistry.KindTrustedController)
 	if err != nil {
 		return nil, err
 	}
+	defer providerHandle.Close()
+	executable := stageexec.ExecutableIdentity{CanonicalPath: providerHandle.Identity.CanonicalPath, SHA256: providerHandle.Identity.SHA256}
+	authority := stageexec.StageAuthority{ReadRoots: []string{dir}, Network: stageexec.NetworkPolicyDenied, Credentials: stageexec.CredentialPolicyNone, RequireStrongScope: true}
 	result, err := stageexec.NewExecutor().Run(ctx, stageexec.StageSpec{
 		RunID:            "contextgraph",
 		StageID:          status.Provider,
@@ -143,12 +142,13 @@ func scopedCommandOutput(ctx context.Context, status Status, args []string, dir 
 		Arguments:        append([]string(nil), args...),
 		WorkingDirectory: dir,
 		Environment:      stageexec.FrozenEnvironment{Values: append([]string(nil), env.Values...), Hash: env.Hash},
-		NetworkPolicy:    stageexec.NetworkPolicyDenied,
-		CredentialPolicy: stageexec.CredentialPolicyNone,
+		NetworkPolicy:    authority.Network,
+		CredentialPolicy: authority.Credentials,
 		OutputLimit:      2 << 20,
 		OutputCapture:    stageexec.CaptureRequiredComplete,
-		DescendantPolicy: stageexec.DescendantPolicy{RequireStrong: true},
-		EnforcementPlan:  plan,
+		DescendantPolicy: stageexec.DescendantPolicy{RequireStrong: authority.RequireStrongScope},
+		Authority:        authority,
+		ExecutableHandle: providerHandle,
 	})
 	if err != nil {
 		return []byte(result.Output), err

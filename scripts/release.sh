@@ -17,13 +17,40 @@ set -euo pipefail
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$ROOT"
 
-if ! git diff --quiet || ! git diff --cached --quiet; then
-  echo "release: refusing to build from a dirty tree" >&2
-  exit 1
+require_clean_tree() {
+  local stage=${1:-release}
+  if [ -n "$(git status --porcelain --untracked-files=all)" ]; then
+    echo "release: refusing to build from a dirty tree (${stage})" >&2
+    exit 1
+  fi
+}
+
+if [ "${GOV_RELEASE_IN_SCRATCH:-0}" != 1 ]; then
+  require_clean_tree "source checkout"
+  SOURCE_ROOT=$ROOT
+  OUT_DIR_ABS=$(python3 -c 'import os,sys; root,out=sys.argv[1:3]; print(out if os.path.isabs(out) else os.path.join(root, out))' "$SOURCE_ROOT" "${OUT_DIR:-dist}")
+  SCRATCH_PARENT=$(mktemp -d)
+  SCRATCH_TREE="$SCRATCH_PARENT/governator-release"
+  cleanup() {
+    git -C "$SOURCE_ROOT" worktree remove --force "$SCRATCH_TREE" >/dev/null 2>&1 || rm -rf "$SCRATCH_PARENT"
+  }
+  trap cleanup EXIT
+  git worktree add --detach "$SCRATCH_TREE" HEAD >/dev/null
+  ARCH_DOC_DEFAULT="$SOURCE_ROOT/../agents/governator_architecture.md"
+  export GOV_RELEASE_IN_SCRATCH=1
+  export GOV_RELEASE_SOURCE_ROOT="$SOURCE_ROOT"
+  export OUT_DIR="$OUT_DIR_ABS"
+  if [ -z "${GOV_ARCHITECTURE_DOC:-}" ] && [ -f "$ARCH_DOC_DEFAULT" ]; then
+    export GOV_ARCHITECTURE_DOC="$ARCH_DOC_DEFAULT"
+  fi
+  (cd "$SCRATCH_TREE" && "$SCRATCH_TREE/scripts/release.sh")
+  exit $?
 fi
 
+require_clean_tree "detached scratch checkout"
 COMMIT=$(git rev-parse HEAD)
 SHORT_COMMIT=$(git rev-parse --short=12 HEAD)
+SOURCE_ROOT=${GOV_RELEASE_SOURCE_ROOT:-$ROOT}
 if [ -z "${VERSION:-}" ]; then
   EXACT_TAG=$(git describe --tags --exact-match HEAD 2>/dev/null || true)
   if [ -n "$EXACT_TAG" ]; then
@@ -59,6 +86,33 @@ else
       ;;
   esac
 fi
+
+if [ -z "${REQUIRE_ASYMMETRIC_SIGNATURE:-}" ]; then
+  case "$VERSION" in
+    local-candidate-*|*-candidate*|*+*) REQUIRE_ASYMMETRIC_SIGNATURE=0 ;;
+    *) REQUIRE_ASYMMETRIC_SIGNATURE=1 ;;
+  esac
+fi
+
+ARCHITECTURE_DOC=${GOV_ARCHITECTURE_DOC:-$SOURCE_ROOT/../agents/governator_architecture.md}
+if [ -f "$ARCHITECTURE_DOC" ]; then
+  ARCH_DOC_COMMIT=$(python3 -c 'import pathlib,re,sys
+text=pathlib.Path(sys.argv[1]).read_text()
+m=re.search(r"Source HEAD `([0-9a-f]{7,40})`", text)
+print(m.group(1) if m else "")' "$ARCHITECTURE_DOC")
+  if [ -z "$ARCH_DOC_COMMIT" ]; then
+    echo "release: architecture doc $ARCHITECTURE_DOC does not declare a Source HEAD commit" >&2
+    exit 1
+  fi
+  case "$COMMIT" in
+    ${ARCH_DOC_COMMIT}* ) ;;
+    * )
+      echo "release: architecture doc Source HEAD ${ARCH_DOC_COMMIT} does not match release HEAD ${COMMIT}" >&2
+      exit 1
+      ;;
+  esac
+fi
+
 BUILD_TS=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 CLAIMS_HASH=$(sha256sum docs/claims.yaml | awk '{print $1}')
 ADAPTER_PROTOCOL_VERSION=${ADAPTER_PROTOCOL_VERSION:-adapter-protocol-v1}
@@ -359,11 +413,13 @@ fi
 # ---------------------------------------------------------------------------
 HOST_PLATFORM_ID="$(go env GOOS)_$(go env GOARCH)"
 HOST_ARCHIVE_NAME=""
+HOST_ARCHIVE_SHA=""
 HOST_BIN_SHA=""
 
 ARTIFACTS_JSON="$OUT_DIR/.artifacts.jsonl"
 : >"$ARTIFACTS_JSON"
 for platform in $PLATFORMS; do
+  require_clean_tree "before build ${platform}"
   GOOS_VALUE=${platform%/*}
   GOARCH_VALUE=${platform#*/}
   PLATFORM_ID="${GOOS_VALUE}_${GOARCH_VALUE}"
@@ -406,13 +462,24 @@ for platform in $PLATFORMS; do
   SIZE=$(stat -c%s "$ARCHIVE" 2>/dev/null || stat -f%z "$ARCHIVE")
   python3 -c "
 import json, sys
+platform_id = sys.argv[1]
+feature_limited = platform_id.startswith('darwin_')
 print(json.dumps({
-    'platform': sys.argv[1], 'archive': sys.argv[2], 'archive_sha256': sys.argv[3],
-    'binary_sha256': sys.argv[4], 'size_bytes': int(sys.argv[5]),
+    'platform': platform_id,
+    'archive_path': sys.argv[2],
+    'archive_sha256': sys.argv[3],
+    'extracted_binary_sha256': sys.argv[4],
+    'archive': sys.argv[2],
+    'binary_sha256': sys.argv[4],
+    'size_bytes': int(sys.argv[5]),
+    'feature_limited': feature_limited,
+    'approving': not feature_limited,
+    'known_degraded_modes': ['non-approving'] if feature_limited else [],
 }))" "$PLATFORM_ID" "$ARCHIVE_NAME" "$ARCHIVE_SHA" "$BIN_SHA" "$SIZE" >>"$ARTIFACTS_JSON"
   echo "release: built ${ARCHIVE_NAME} (${ARCHIVE_SHA})" >&2
   if [ "$PLATFORM_ID" = "$HOST_PLATFORM_ID" ]; then
     HOST_ARCHIVE_NAME=$ARCHIVE_NAME
+    HOST_ARCHIVE_SHA=$ARCHIVE_SHA
     HOST_BIN_SHA=$BIN_SHA
   fi
 done
@@ -725,14 +792,35 @@ fi
 # acceptance evidence — written only now, after both are known, so nothing
 # downstream can read a manifest describing a run that hasn't finished yet.
 # ---------------------------------------------------------------------------
+ARCHITECTURE_METADATA="$OUT_DIR/architecture-build-metadata.json"
+ASSAYER_COMMIT=$(git -C "$ASSAYER_REPO" rev-parse HEAD)
+ASSAYER_VERSION=$(git -C "$ASSAYER_REPO" describe --tags --exact-match HEAD 2>/dev/null || echo "untagged-${ASSAYER_COMMIT}")
+python3 - "$ARCHITECTURE_METADATA" "$VERSION" "$COMMIT" "$ASSAYER_COMMIT" "$ASSAYER_VERSION" "$PLATFORMS" <<'PYARCH'
+import json, pathlib, sys
+metadata_path, version, commit, assayer_commit, assayer_version, platforms = sys.argv[1:]
+platform_list = [p for p in platforms.split() if p]
+degraded = []
+for platform in platform_list:
+    if platform.startswith('darwin/'):
+        degraded.append({'platform': platform.replace('/', '_'), 'mode': 'non-approving'})
+pathlib.Path(metadata_path).write_text(json.dumps({
+    'version': version,
+    'source_commit': commit,
+    'assayer_commit': assayer_commit,
+    'assayer_version': assayer_version,
+    'platforms': [p.replace('/', '_') for p in platform_list],
+    'known_degraded_modes': degraded,
+}, indent=2, sort_keys=True) + "\n")
+PYARCH
+
 MANIFEST="$OUT_DIR/build-manifest.json"
 python3 - "$MANIFEST" "$VERSION" "$COMMIT" "$BUILD_TS" "$GO_VERSION" "$LDFLAGS" "$CLAIMS_HASH" "$ADAPTER_PROTOCOL_VERSION" "$ARTIFACTS_JSON" \
-  "$HOST_ARCHIVE_NAME" "$HOST_BIN_SHA" "$TEST_RUN_ID" "$TEST_SUMMARY" "$ACCEPTANCE_RUN_ID" "$ACCEPTANCE_RESULT" <<'PYMANIFEST'
+  "$HOST_ARCHIVE_NAME" "$HOST_ARCHIVE_SHA" "$HOST_BIN_SHA" "$TEST_RUN_ID" "$TEST_SUMMARY" "$ACCEPTANCE_RUN_ID" "$ACCEPTANCE_RESULT" "$(basename "$ARCHITECTURE_METADATA")" <<'PYMANIFEST'
 import json, pathlib, sys
 
 (manifest, version, commit, build_ts, go_version, build_flags, claims_hash,
  adapter_protocol_version, artifacts_path,
- host_archive_name, host_bin_sha, test_run_id, test_summary_path, acceptance_run_id, acceptance_result) = sys.argv[1:]
+ host_archive_name, host_archive_sha, host_bin_sha, test_run_id, test_summary_path, acceptance_run_id, acceptance_result, architecture_metadata_path) = sys.argv[1:]
 
 artifacts = []
 for line in pathlib.Path(artifacts_path).read_text().splitlines():
@@ -751,9 +839,13 @@ data = {
     # Host-platform artifact identity: the specific archive/binary the
     # acceptance smoke test and the full claims-verification stage below
     # both extract and inspect. internal/claims.verifyArtifactManifest reads
-    # artifact_path/artifact_sha256 directly off this manifest.
+    # archive_path/extracted_binary_sha256 directly off this manifest.
+    "archive_path": host_archive_name,
+    "archive_sha256": host_archive_sha,
+    "extracted_binary_sha256": host_bin_sha,
     "artifact_path": host_archive_name,
     "artifact_sha256": host_bin_sha,
+    "architecture_build_metadata_path": architecture_metadata_path,
     "build_info": {"vcs_revision": commit},
     "test_run_id": test_run_id,
     "test_result": "PASS",
@@ -802,7 +894,7 @@ rm -rf "$OUT_DIR"/stage-*
 # production binary").
 # ---------------------------------------------------------------------------
 CHECKSUMS="$OUT_DIR/checksums.txt"
-(cd "$OUT_DIR" && sha256sum -- *.tar.gz build-manifest.json sbom.json claims.yaml test-summary.json acceptance-summary.json claims-verify-report.txt gov >"$(basename "$CHECKSUMS")")
+(cd "$OUT_DIR" && sha256sum -- *.tar.gz build-manifest.json architecture-build-metadata.json sbom.json claims.yaml test-summary.json acceptance-summary.json claims-verify-report.txt gov >"$(basename "$CHECKSUMS")")
 
 # ---------------------------------------------------------------------------
 # signature — HMAC-SHA256 over checksums.txt, keyed by an operator-supplied
@@ -838,12 +930,13 @@ if [ -n "${GOV_RELEASE_MINISIGN_KEY:-}" ] && command -v minisign >/dev/null 2>&1
   if minisign -S -s "$GOV_RELEASE_MINISIGN_KEY" -m "$CHECKSUMS" -x "$MINISIG" -c "gov release ${VERSION} ${COMMIT}" </dev/null >&2; then
     echo "release: signed checksums.txt with minisign (asymmetric, publicly verifiable)" >&2
   else
-    echo "release: minisign signing failed (is GOV_RELEASE_MINISIGN_KEY an unencrypted key?) — continuing HMAC-only" >&2
+    echo "release: minisign signing failed (is GOV_RELEASE_MINISIGN_KEY an unencrypted key?)" >&2
     rm -f "$MINISIG"
   fi
 else
   echo "release: no asymmetric signature — set GOV_RELEASE_MINISIGN_KEY (+ minisign on PATH) to add one" >&2
 fi
+python3 "$ROOT/scripts/release_policy.py" signature --version "$VERSION" --require "$REQUIRE_ASYMMETRIC_SIGNATURE" --minisig "$MINISIG"
 
 echo "release: OK — $OUT_DIR" >&2
 ls -la "$OUT_DIR" >&2
