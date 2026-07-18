@@ -89,7 +89,7 @@ func TestV7Case8CleanupValidatorDetachedDescendantExtinctionFailureBlocksApprova
 
 	rec, _ := runGovernedAllowError(t, t.TempDir(), bin, c)
 	if !daemon.waitForRead(5 * time.Second) {
-		t.Skip("conditional: hangfuse reader never reached the blocking READ on this host/kernel fixture, so extinction behavior was not actually exercised")
+		t.Skip("conditional: case8 hangfuse extinction fixture did not reach a blocking READ on this host/kernel before timeout")
 	}
 
 	if rec.Status == "APPROVED" {

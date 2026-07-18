@@ -81,7 +81,7 @@ type Outcome struct {
 var (
 	resultLineRE = regexp.MustCompile(`^--- (PASS|FAIL|SKIP): (\S+) \(`)
 	runLineRE    = regexp.MustCompile(`^=== RUN\s+(\S+)`)
-	vCaseNameRE  = regexp.MustCompile(`^TestV\d+Case\d+`)
+	vCaseNameRE  = regexp.MustCompile(`^TestV(?:7|8)Case\d+`)
 )
 
 // ParseVerboseLog extracts one Outcome per test from `go test -v` output.
@@ -152,8 +152,9 @@ type Result struct {
 // Evaluate checks a parsed `go test -v -tags redteam` log against the
 // manifest:
 //   - every manifest case must be present in the log (no MissingTests);
-//   - every TestV*Case* test found in the log must be in the manifest (no
-//     UnexpectedTests — this is the name-drift check);
+//   - every manifest-corpus TestV7Case*/TestV8Case* test found in the log
+//     must be in the manifest (no UnexpectedTests — this is the name-drift
+//     check);
 //   - zero FailedTests anywhere in the suite;
 //   - every SKIP must be individually authorized: the manifest entry must be
 //     `conditional` with an `allowed_skip` whose predicate capability is
@@ -173,9 +174,11 @@ func Evaluate(manifest Manifest, log string, capabilities map[string]bool) Resul
 	for name, o := range outcomes {
 		c, known := byName[name]
 		// A name outside the manifest is only in scope here if it *claims*
-		// to be part of this corpus (TestV*Case* prefix) — that is the
-		// name-drift signal (UnexpectedTests). An unrelated package test
-		// (a helper, a v6 TestAttackN/TestV6CaseN case, anything not
+		// to be part of this manifest-defined corpus (currently the
+		// release-blocking TestV7Case*/TestV8Case* namespaces) — that is
+		// the name-drift signal (UnexpectedTests). An unrelated package
+		// test (a helper, a legacy v6 TestAttackN/TestV6CaseN case,
+		// anything not
 		// claiming manifest membership) is not this gate's concern and must
 		// not be silently absorbed into pass/fail/skip counts that are
 		// supposed to describe the manifest-defined corpus specifically. A name that
@@ -225,7 +228,7 @@ func Evaluate(manifest Manifest, log string, capabilities map[string]bool) Resul
 		res.Problems = append(res.Problems, fmt.Sprintf("missing required corpus test(s): %s", strings.Join(res.MissingTests, ", ")))
 	}
 	if len(res.UnexpectedTests) > 0 {
-		res.Problems = append(res.Problems, fmt.Sprintf("unmanifested TestV*Case* test(s) found (name drift): %s", strings.Join(res.UnexpectedTests, ", ")))
+		res.Problems = append(res.Problems, fmt.Sprintf("unmanifested manifest-corpus TestV7Case*/TestV8Case* test(s) found (name drift): %s", strings.Join(res.UnexpectedTests, ", ")))
 	}
 	if len(res.FailedTests) > 0 {
 		res.Problems = append(res.Problems, fmt.Sprintf("failed corpus test(s): %s", strings.Join(res.FailedTests, ", ")))

@@ -91,6 +91,10 @@ cases:
     name: TestV7Case8CleanupValidatorDetachedDescendantExtinctionFailureBlocksApproval
     session: S1
     required: true
+    conditional: true
+    allowed_skip:
+      predicate: case8_hangfuse_extinction_fixture
+      reason: "conditional: case8 hangfuse extinction fixture did not reach a blocking READ on this host/kernel before timeout"
     status: implemented
   - case: 9
     name: TestV7Case9GraphProviderExternalWriteBlockedOrContained

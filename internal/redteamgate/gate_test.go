@@ -110,9 +110,25 @@ func TestEvaluateFlagsUnmanifestedVersionedCaseAsDrift(t *testing.T) {
 		"--- PASS: TestV8Case999Unmanifested (0.00s)\n"
 	res := Evaluate(manifest, log, nil)
 	if res.OK {
-		t.Fatalf("expected an unmanifested TestV*Case* test to be flagged as drift: %+v", res)
+		t.Fatalf("expected an unmanifested TestV7Case*/TestV8Case* test to be flagged as drift: %+v", res)
 	}
 	if len(res.UnexpectedTests) != 1 || res.UnexpectedTests[0] != "TestV8Case999Unmanifested" {
 		t.Fatalf("expected UnexpectedTests to name TestV8Case999Unmanifested, got %+v", res)
+	}
+}
+
+func TestEvaluateIgnoresLegacyV6CaseNamesOutsideManifest(t *testing.T) {
+	manifest := Manifest{Cases: []CaseEntry{{Case: 1, Name: "TestV7Case1Known", Required: true}}}
+	log := "" +
+		"=== RUN   TestV7Case1Known\n" +
+		"--- PASS: TestV7Case1Known (0.00s)\n" +
+		"=== RUN   TestV6Case999Legacy\n" +
+		"--- PASS: TestV6Case999Legacy (0.00s)\n"
+	res := Evaluate(manifest, log, nil)
+	if !res.OK {
+		t.Fatalf("legacy v6 cases should not be treated as manifest drift: %+v", res)
+	}
+	if len(res.UnexpectedTests) != 0 {
+		t.Fatalf("unexpected tests = %+v, want none", res.UnexpectedTests)
 	}
 }
