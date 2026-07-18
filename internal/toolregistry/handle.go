@@ -140,4 +140,3 @@ func (h *Handle) SealedExecutablePath() (string, error) {
 	h.sealedDir = dir
 	return outPath, nil
 }
-
