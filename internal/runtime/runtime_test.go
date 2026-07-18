@@ -2055,14 +2055,22 @@ func TestWallClockBudgetExhaustionQuarantinesSlowValidators(t *testing.T) {
 	// Budget.MaxMinutes must stay >=1 for contract validation, but a
 	// context.WithTimeout wrapping a caller ctx that already has an
 	// earlier deadline keeps that earlier deadline (context.WithDeadline
-	// never extends a parent's deadline) — so the 2s deadline below,
+	// never extends a parent's deadline) — so the 5s deadline below,
 	// not the 1-minute budget, is what actually governs remainingRunBudget.
-	// Keep this above git worktree setup latency under -race, but well below
-	// the two validators' combined 10s sleep time.
+	// This was originally 2s/sleep-5/4s-tolerance, but under a full `go
+	// test ./...` run (not isolated -race sampling) that margin proved too
+	// tight two different ways: git worktree setup alone occasionally
+	// exceeded the 2s deadline (surfacing as a hard "context deadline
+	// exceeded" error instead of a graceful quarantine), and the
+	// kill-then-wait path occasionally took longer than the 4s tolerance
+	// above the deadline. 5s / sleep-20 / 12s keeps the same proportions
+	// (deadline well above setup latency, tolerance well above the
+	// deadline, sum of validators far above the tolerance) with roughly
+	// 2.5x the absolute slack in each direction.
 	c.Budget.MaxMinutes = 1
-	c.Success.Validators = []string{"sleep 5", "sleep 5"}
+	c.Success.Validators = []string{"sleep 20", "sleep 20"}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
 	started := time.Now()
@@ -2074,8 +2082,8 @@ func TestWallClockBudgetExhaustionQuarantinesSlowValidators(t *testing.T) {
 	if r.Status != "QUARANTINED" || !strings.Contains(r.Message, "run deadline exceeded") {
 		t.Fatalf("status=%s message=%s", r.Status, r.Message)
 	}
-	if elapsed > 4*time.Second {
-		t.Fatalf("wall time should track the run budget (~2s), not the sum of slow validators (10s): %s", elapsed)
+	if elapsed > 12*time.Second {
+		t.Fatalf("wall time should track the run budget (~5s), not the sum of slow validators (40s): %s", elapsed)
 	}
 }
 
