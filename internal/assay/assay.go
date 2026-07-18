@@ -245,6 +245,7 @@ func Evaluate(ctx context.Context, cfg Config, req Request, artifactPath string)
 	// verdict to stdout, so it needs no write access and no network. A host
 	// that cannot provide the requested external sandbox now fails closed.
 	envValues := controllerenv.Base()
+	envValues = append(envValues, "PYTHONPATH="+cfg.Repo)
 	authority := stage.StageAuthority{
 		ReadRoots:          []string{cfg.Repo, filepath.Dir(cliPath)},
 		Network:            stage.NetworkPolicyDenied,

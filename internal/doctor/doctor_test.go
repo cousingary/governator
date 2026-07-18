@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/cousingary/governator/internal/enforce"
 	"github.com/cousingary/governator/internal/observability"
 	"github.com/cousingary/governator/internal/toolregistry"
 )
@@ -132,6 +133,12 @@ exit 1
 	t.Setenv("GOV_CONTAINMENT_FORCE_DEGRADED", "1")
 
 	check := checkContextGraph()
+	if !enforce.Supported() {
+		if check.Status != StatusFail || !strings.Contains(check.Detail, "construct authority plan") {
+			t.Fatalf("status = %s detail=%q, want containment failure on unsupported host", check.Status, check.Detail)
+		}
+		return
+	}
 	if check.Status != StatusOK {
 		t.Fatalf("status = %s, want %s: %s", check.Status, StatusOK, check.Detail)
 	}

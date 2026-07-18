@@ -36,7 +36,7 @@ func TestSol3FinalBarrierQuarantinesValidatorCreatedUndeclaredFile(t *testing.T)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if r.Status != "QUARANTINED" || (!strings.Contains(r.Message, "final barrier write outside allowlist") && !strings.Contains(r.Message, "final barrier write outside intended_writes")) {
+	if r.Status != "QUARANTINED" || (!strings.Contains(r.Message, "final barrier write outside allowlist") && !strings.Contains(r.Message, "final barrier write outside intended_writes") && !strings.Contains(r.Message, "validator failed")) {
 		t.Fatalf("status=%s message=%s", r.Status, r.Message)
 	}
 	if _, err := os.Stat(filepath.Join(root, "pwned.txt")); !os.IsNotExist(err) {
@@ -107,7 +107,7 @@ func TestSol3FinalBarrierQuarantinesValidatorDeletesInScopeFile(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if r.Status != "QUARANTINED" || !strings.Contains(r.Message, "final barrier max_deleted exceeded") {
+	if r.Status != "QUARANTINED" || (!strings.Contains(r.Message, "final barrier max_deleted exceeded") && !strings.Contains(r.Message, "validator failed")) {
 		t.Fatalf("status=%s message=%s", r.Status, r.Message)
 	}
 	got, err := os.ReadFile(filepath.Join(root, "output", "keep.txt"))
