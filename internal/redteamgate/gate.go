@@ -19,7 +19,7 @@ import (
 )
 
 // Manifest is internal/redteam/manifest.yaml: the single source of truth for
-// the 38-case mandatory final attack corpus.
+// the mandatory final attack corpus.
 type Manifest struct {
 	Version int         `yaml:"version"`
 	Cases   []CaseEntry `yaml:"cases"`
@@ -178,7 +178,7 @@ func Evaluate(manifest Manifest, log string, capabilities map[string]bool) Resul
 		// (a helper, a v6 TestAttackN/TestV6CaseN case, anything not
 		// claiming manifest membership) is not this gate's concern and must
 		// not be silently absorbed into pass/fail/skip counts that are
-		// supposed to describe the 38-case corpus specifically. A name that
+		// supposed to describe the manifest-defined corpus specifically. A name that
 		// *is* in the manifest is always processed, regardless of its
 		// literal prefix — manifest membership, not string shape, is the
 		// source of truth for "is this a corpus case."

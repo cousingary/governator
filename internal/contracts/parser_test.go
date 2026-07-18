@@ -454,3 +454,44 @@ func TestStructuredValidatorRequiresDeclaredTool(t *testing.T) {
 		t.Fatalf("expected declared-tools validation error, got %v", err)
 	}
 }
+
+func TestParseStructuredCleanupValidatorToolset(t *testing.T) {
+	structured := strings.Replace(validContract,
+		`on_violation: quarantine`,
+		`cleanup:
+  required: true
+  validators:
+    - command: python3 cleanup.py
+      tools: [python3]
+      files: [cleanup.py]
+on_violation: quarantine`, 1)
+	contract, err := Parse([]byte(structured))
+	if err != nil {
+		t.Fatalf("Parse(structured cleanup validator) error = %v", err)
+	}
+	if contract.Cleanup == nil || len(contract.Cleanup.Validators) != 1 || contract.Cleanup.Validators[0] != "python3 cleanup.py" {
+		t.Fatalf("cleanup validators=%#v", contract.Cleanup)
+	}
+	if len(contract.Cleanup.ValidatorSpecs) != 1 {
+		t.Fatalf("cleanup validator_specs=%#v", contract.Cleanup.ValidatorSpecs)
+	}
+	spec := contract.Cleanup.ValidatorSpecs[0]
+	if len(spec.Tools) != 1 || spec.Tools[0] != "python3" || len(spec.Files) != 1 || spec.Files[0] != "cleanup.py" {
+		t.Fatalf("cleanup validator spec=%#v", spec)
+	}
+}
+
+func TestStructuredCleanupValidatorRequiresDeclaredTool(t *testing.T) {
+	structured := strings.Replace(validContract,
+		`on_violation: quarantine`,
+		`cleanup:
+  required: true
+  validators:
+    - command: python3 cleanup.py
+      files: [cleanup.py]
+on_violation: quarantine`, 1)
+	_, err := Parse([]byte(structured))
+	if err == nil || !strings.Contains(err.Error(), "cleanup.validators[0].tools") {
+		t.Fatalf("expected cleanup declared-tools validation error, got %v", err)
+	}
+}

@@ -1,5 +1,5 @@
 # Sol v7 mandatory final attack corpus (report §"Mandatory final attack
-# corpus", 38 cases). This is the single source of truth the identity-based
+# corpus", 41 cases). This is the single source of truth the identity-based
 # release gate (Session 7, HS4) consumes — it replaces the old count-based
 # MIN_REDTEAM_TESTS/EXPECTED_REDTEAM_SKIPS gate, which validated skip *count*,
 # not the exact identity/reason of each skip.
@@ -11,7 +11,7 @@
 # to the drift check.
 #
 # Fields:
-#   case        - the corpus case number (1-38), independent of the v6
+#   case        - the corpus case number (1-41), independent of the v6
 #                 TestAttackN / TestV6CaseN series already in this package.
 #   name        - the exact Go test function name in internal/redteam/.
 #   session     - which plan session (agents/governator-sol-upgrade7-plan.md)
@@ -240,5 +240,20 @@ cases:
   - case: 38
     name: TestV7Case38NoApplicableChecksBlocksApproval
     session: S8
+    required: true
+    status: implemented
+  - case: 39
+    name: TestV8Case1BackendUnlimitedStdoutHitsStageOutputLimit
+    session: rc2-phase3
+    required: true
+    status: implemented
+  - case: 40
+    name: TestV8Case2StdoutAndStderrShareAggregateStageOutputCap
+    session: rc2-phase3
+    required: true
+    status: implemented
+  - case: 41
+    name: TestV8Case9StageWrapperTimeoutBoundsWaitAndExtinguishes
+    session: rc2-phase3
     required: true
     status: implemented

@@ -262,6 +262,8 @@ func Evaluate(ctx context.Context, cfg Config, req Request, artifactPath string)
 		NetworkPolicy:    stage.NetworkPolicyDenied,
 		CredentialPolicy: stage.CredentialPolicyNone,
 		Timeout:          timeout,
+		OutputLimit:      10 << 20,
+		OutputCapture:    stage.CaptureRequiredComplete,
 		DescendantPolicy: stage.DescendantPolicy{RequireStrong: true},
 		EnforcementPlan:  plan,
 		Stdin:            bytes.NewReader(payload),

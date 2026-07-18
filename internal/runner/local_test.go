@@ -189,21 +189,21 @@ func TestLocalWorktreeRunnerNonGitCopy(t *testing.T) {
 }
 
 func TestNewDefaultsToLocal(t *testing.T) {
-	rn, err := New("", nil, nil, nil)
+	rn, err := New("", nil, nil, nil, nil)
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
 	if _, ok := rn.(*LocalWorktreeRunner); !ok {
 		t.Fatalf("New(\"\", nil, nil) = %T, want *LocalWorktreeRunner", rn)
 	}
-	rn, err = New("local", nil, nil, nil)
+	rn, err = New("local", nil, nil, nil, nil)
 	if err != nil || rn == nil {
 		t.Fatalf("New(\"local\", nil, nil): rn=%v err=%v", rn, err)
 	}
 }
 
 func TestNewUnknownModeErrors(t *testing.T) {
-	if _, err := New("bogus", nil, nil, nil); err == nil {
+	if _, err := New("bogus", nil, nil, nil, nil); err == nil {
 		t.Fatal("want error for unknown runner mode")
 	}
 }
@@ -212,7 +212,7 @@ func TestNewUnknownModeErrors(t *testing.T) {
 // without a docker config block must error immediately, never silently run
 // locally instead.
 func TestNewDockerWithoutConfigFailsClosed(t *testing.T) {
-	if _, err := New("docker", nil, nil, nil); err == nil {
+	if _, err := New("docker", nil, nil, nil, nil); err == nil {
 		t.Fatal("want error when runner: docker has no docker config")
 	}
 }
@@ -230,7 +230,7 @@ func TestNewDockerUnavailableFailsClosed(t *testing.T) {
 	}
 	t.Setenv("GOV_TOOLREGISTRY_FILE", registryFile)
 
-	_, err := New("docker", &contracts.DockerRunnerConfig{Image: "example/image:latest"}, nil, nil)
+	_, err := New("docker", &contracts.DockerRunnerConfig{Image: "example/image:latest"}, nil, nil, nil)
 	if err == nil {
 		t.Fatal("want error when docker is unavailable")
 	}
@@ -241,7 +241,7 @@ func TestNewDockerUnavailableFailsClosed(t *testing.T) {
 // mirroring TestNewDockerUnavailableFailsClosed's config-threading coverage
 // on the Docker side.
 func TestNewThreadsLocalConfig(t *testing.T) {
-	rn, err := New("local", nil, &contracts.LocalRunnerConfig{OutputCapBytes: 7}, nil)
+	rn, err := New("local", nil, &contracts.LocalRunnerConfig{OutputCapBytes: 7}, nil, nil)
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}

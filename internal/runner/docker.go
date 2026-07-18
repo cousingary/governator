@@ -3,6 +3,7 @@ package runner
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -167,9 +168,17 @@ type DockerRunner struct {
 	// comment.
 	CredentialRoots       []string
 	ControllerEnvironment controllerenv.Frozen
+	ResolvedImage         *ImageIdentity
 
 	mu    sync.Mutex
 	trunc truncationStats
+}
+
+func (d *DockerRunner) controllerEnvironment() controllerenv.Frozen {
+	if d.ControllerEnvironment.Values != nil {
+		return d.ControllerEnvironment
+	}
+	return controllerenv.Freeze()
 }
 
 // truncationStats is the loud accounting Session 3a replaces the silent
@@ -193,7 +202,7 @@ var metadataSinkholeHosts = []string{
 }
 
 func (d *DockerRunner) Prepare(ctx context.Context, req PrepareRequest) (Workspace, error) {
-	ws, err := prepareWorktree(ctx, req.Root, req.Home, req.ID, req.Git, d.ControllerEnvironment)
+	ws, err := prepareWorktree(ctx, req.Root, req.Home, req.ID, req.Git, d.controllerEnvironment())
 	if err != nil {
 		return Workspace{}, err
 	}
@@ -218,41 +227,45 @@ func (d *DockerRunner) executor(ws Workspace) agents.Executor {
 		defer cancel()
 		dockerArgs, err := d.runArgs(ws, bin, args)
 		if err != nil {
-			return 0, false, true, err
+			return 0, false, false, err
 		}
 		dockerBin, dberr := resolveDocker()
 		if dberr != nil {
-			return 0, false, true, dberr
+			return 0, false, false, dberr
 		}
 		cmd := exec.CommandContext(runCtx, dockerBin, dockerArgs...)
-		cmd.Env = append([]string(nil), d.ControllerEnvironment.Values...)
+		env := d.controllerEnvironment()
+		cmd.Env = append([]string(nil), env.Values...)
 		capped := &cappedWriter{w: out, remaining: d.Config.EffectiveOutputCapBytes()}
 		cmd.Stdout, cmd.Stderr = capped, capped
 		if err := cmd.Start(); err != nil {
-			return 0, false, true, err
+			return 0, false, false, err
 		}
 		done := make(chan error, 1)
 		go func() { done <- cmd.Wait() }()
 		var code int
 		var timedOut bool
 		var runErr error
-		select {
-		case err := <-done:
-			if err != nil {
-				if ee, ok := err.(*exec.ExitError); ok {
-					code = ee.ExitCode()
-				} else {
-					runErr = err
-				}
-			}
-		case <-runCtx.Done():
-			stopCtx, stopCancel := context.WithTimeout(context.Background(), 10*time.Second)
-			_ = d.Stop(stopCtx, ws)
-			stopCancel()
+		if err := d.verifyStartedContainer(context.Background(), ws); err != nil {
+			runErr = errors.Join(err, d.forceStopAndRemove(context.Background(), ws))
 			<-done
 			code = -1
-			timedOut = true
-			runErr = runCtx.Err()
+		} else {
+			select {
+			case err := <-done:
+				if err != nil {
+					if ee, ok := err.(*exec.ExitError); ok {
+						code = ee.ExitCode()
+					} else {
+						runErr = err
+					}
+				}
+			case <-runCtx.Done():
+				code = -1
+				timedOut = true
+				runErr = errors.Join(runCtx.Err(), d.forceStopAndRemove(context.Background(), ws))
+				<-done
+			}
 		}
 		// Record truncation accounting (Session 3a): loud, never silent. The
 		// cap protects the transcript from unbounded growth; surfacing how much
@@ -264,17 +277,11 @@ func (d *DockerRunner) executor(ws Workspace) agents.Executor {
 		d.mu.Lock()
 		d.trunc = stats
 		d.mu.Unlock()
-		// DockerRunner has its own complete containment model (container
-		// resource limits, network policy, credential mounts) independent
-		// of internal/stage's descendant-owning Scope, which this launch
-		// never touches (Sol redteam v7 S1/S4/S6 gap-closure session,
-		// 2026-07-16: investigated migrating this to stage.Executor.Run and
-		// found it unsafe -- see internal/stage/no_bypass_test.go's
-		// docker.go entry). There is nothing this executor tracks that
-		// descendantsGone could meaningfully report, so it always reports
-		// true -- the same "nothing to prove" posture agents.defaultExecutor
-		// uses for its own no-Scope branch.
-		return code, timedOut, true, runErr
+		descendantsGone, extinctionErr := d.proveContainerExtinction(context.Background(), ws)
+		if extinctionErr != nil {
+			runErr = errors.Join(runErr, extinctionErr)
+		}
+		return code, timedOut, descendantsGone, runErr
 	}
 }
 
@@ -340,9 +347,78 @@ func (d *DockerRunner) runArgs(ws Workspace, bin string, args []string) ([]strin
 		return nil, err
 	}
 	out = append(out, credArgs...)
-	out = append(out, d.Config.Image, bin)
+	out = append(out, d.runtimeImageRef(), bin)
 	out = append(out, args...)
 	return out, nil
+}
+
+func (d *DockerRunner) runtimeImageRef() string {
+	if d.ResolvedImage != nil && strings.TrimSpace(d.ResolvedImage.ID) != "" {
+		return d.ResolvedImage.ID
+	}
+	return d.Config.Image
+}
+
+func (d *DockerRunner) verifyStartedContainer(ctx context.Context, ws Workspace) error {
+	if d.ResolvedImage == nil || strings.TrimSpace(d.ResolvedImage.ID) == "" || ws.Container == "" {
+		return nil
+	}
+	env := d.controllerEnvironment()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		insp, absent, err := inspectContainer(ctx, ws.Container, env)
+		if err == nil {
+			if insp.Image != d.ResolvedImage.ID {
+				return fmt.Errorf("docker runtime image mismatch: resolved %s, running %s", d.ResolvedImage.ID, insp.Image)
+			}
+			return nil
+		}
+		if !absent {
+			return fmt.Errorf("docker runtime image verification: %w", err)
+		}
+		if time.Now().After(deadline) {
+			return nil
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+}
+
+func (d *DockerRunner) forceStopAndRemove(ctx context.Context, ws Workspace) error {
+	if ws.Container == "" {
+		return nil
+	}
+	stopCtx, stopCancel := context.WithTimeout(ctx, 10*time.Second)
+	stopErr := d.Stop(stopCtx, ws)
+	stopCancel()
+	if stopErr == nil {
+		return nil
+	}
+	rmCtx, rmCancel := context.WithTimeout(ctx, 10*time.Second)
+	rmErr := RemoveContainer(rmCtx, ws.Container, d.controllerEnvironment())
+	rmCancel()
+	if rmErr != nil {
+		return errors.Join(fmt.Errorf("docker stop %s: %w", ws.Container, stopErr), rmErr)
+	}
+	return fmt.Errorf("docker stop %s: %w (forced removal succeeded)", ws.Container, stopErr)
+}
+
+func (d *DockerRunner) proveContainerExtinction(ctx context.Context, ws Workspace) (bool, error) {
+	if ws.Container == "" {
+		return true, nil
+	}
+	inspectCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	insp, absent, err := inspectContainer(inspectCtx, ws.Container, d.controllerEnvironment())
+	if absent {
+		return true, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("docker extinction proof: inspect %s: %w", ws.Container, err)
+	}
+	if insp.State.Running {
+		return false, fmt.Errorf("docker extinction proof: container %s still running (status=%s)", ws.Container, insp.State.Status)
+	}
+	return true, nil
 }
 
 // credentialContainerRoot is where every docker.credential_mounts entry
@@ -493,7 +569,11 @@ func authorizedCredentialDir(resolved string, allow []string) bool {
 // ("ALL", "no-new-privileges"), and PidsLimit is JSON null (decodes to zero)
 // when no --pids-limit was set.
 type dockerInspect struct {
-	Image  string `json:"Image"`
+	Image string `json:"Image"`
+	State struct {
+		Running bool   `json:"Running"`
+		Status  string `json:"Status"`
+	} `json:"State"`
 	Config struct {
 		User string `json:"User"`
 	} `json:"Config"`
@@ -582,6 +662,30 @@ func imageDigestSuffix(image string) string {
 	return image[idx:]
 }
 
+func inspectContainer(ctx context.Context, name string, frozen controllerenv.Frozen) (dockerInspect, bool, error) {
+	if err := frozen.Validate(); err != nil {
+		return dockerInspect{}, false, err
+	}
+	bin, err := resolveDocker()
+	if err != nil {
+		return dockerInspect{}, false, err
+	}
+	cmd := exec.CommandContext(ctx, bin, "inspect", name, "--format", "{{json .}}")
+	cmd.Env = append([]string(nil), frozen.Values...)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		if containerAbsent(string(out)) {
+			return dockerInspect{}, true, fmt.Errorf("docker inspect %s: %v: %s", name, err, trimmed(out))
+		}
+		return dockerInspect{}, false, fmt.Errorf("docker inspect %s: %v: %s", name, err, trimmed(out))
+	}
+	var insp dockerInspect
+	if err := json.Unmarshal(out, &insp); err != nil {
+		return dockerInspect{}, false, fmt.Errorf("docker inspect %s: parse inspect output: %w", name, err)
+	}
+	return insp, false, nil
+}
+
 func stringSliceContains(list []string, want string) bool {
 	for _, v := range list {
 		if v == want {
@@ -651,29 +755,11 @@ func (d *DockerRunner) Observe(ctx context.Context, ws Workspace) (ObserveResult
 		}
 		return base, nil
 	}
-	dockerBin, dberr := resolveDocker()
-	if dberr != nil {
-		base.Notes = appendDockerNote(base.Notes, "docker_inspect_failed: "+dberr.Error())
-		if hardened {
-			return base, fmt.Errorf("docker hardened observation: resolve trusted docker: %w", dberr)
-		}
-		return base, nil
-	}
-	inspectCmd := exec.CommandContext(ctx, dockerBin, "inspect", ws.Container, "--format", "{{json .}}")
-	inspectCmd.Env = append([]string(nil), d.ControllerEnvironment.Values...)
-	out, err := inspectCmd.Output()
+	insp, _, err := inspectContainer(ctx, ws.Container, d.controllerEnvironment())
 	if err != nil {
 		base.Notes = appendDockerNote(base.Notes, "docker_inspect_failed: "+err.Error())
 		if hardened {
 			return base, fmt.Errorf("docker hardened observation: inspect failed: %w", err)
-		}
-		return base, nil
-	}
-	var insp dockerInspect
-	if err := json.Unmarshal(out, &insp); err != nil {
-		base.Notes = appendDockerNote(base.Notes, "docker_inspect_parse_failed: "+err.Error())
-		if hardened {
-			return base, fmt.Errorf("docker hardened observation: inspect parse failed: %w", err)
 		}
 		return base, nil
 	}
@@ -713,7 +799,7 @@ func (d *DockerRunner) Stop(ctx context.Context, ws Workspace) error {
 		return err
 	}
 	cmd := exec.CommandContext(ctx, bin, "stop", "-t", "5", ws.Container)
-	cmd.Env = append([]string(nil), d.ControllerEnvironment.Values...)
+	cmd.Env = append([]string(nil), d.controllerEnvironment().Values...)
 	return cmd.Run()
 }
 
@@ -725,11 +811,11 @@ func (d *DockerRunner) Stop(ctx context.Context, ws Workspace) error {
 // session exists to prevent.
 func (d *DockerRunner) Destroy(ctx context.Context, ws Workspace, approved bool) error {
 	if ws.Container != "" {
-		if err := RemoveContainer(ctx, ws.Container, d.ControllerEnvironment); err != nil {
+		if err := RemoveContainer(ctx, ws.Container, d.controllerEnvironment()); err != nil {
 			return err
 		}
 	}
-	return destroyWorktree(ctx, ws, approved, d.ControllerEnvironment)
+	return destroyWorktree(ctx, ws, approved, d.controllerEnvironment())
 }
 
 // RemoveContainer force-removes a container, tolerating only the
@@ -764,7 +850,12 @@ func RemoveContainer(ctx context.Context, name string, environments ...controlle
 // the container simply no longer exists (idempotent-success), as opposed to
 // a real failure like an unreachable daemon or a permission error.
 func containerAlreadyGone(out string) bool {
-	return strings.Contains(strings.ToLower(out), "no such container")
+	return containerAbsent(out)
+}
+
+func containerAbsent(out string) bool {
+	low := strings.ToLower(out)
+	return strings.Contains(low, "no such container") || strings.Contains(low, "no such object")
 }
 
 // cappedWriter forwards at most `remaining` bytes to w, and since Session 3a

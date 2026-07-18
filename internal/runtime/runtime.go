@@ -705,6 +705,8 @@ func shellStage(ctx context.Context, runID, stageName, dir, command string, requ
 		Environment:      stageexec.FrozenEnvironment{Values: stageEnv.Values, Hash: stageEnv.Hash},
 		NetworkPolicy:    stageexec.NetworkPolicyDenied,
 		CredentialPolicy: stageexec.CredentialPolicyNone,
+		OutputLimit:      10 << 20,
+		OutputCapture:    stageexec.CaptureRequiredComplete,
 		DescendantPolicy: stageexec.DescendantPolicy{RequireStrong: requireStrong},
 		EnforcementPlan:  enforcementPlan,
 		ExecutableHandle: bashHandle,
@@ -2472,11 +2474,22 @@ func (r *Runner) runOnce(ctx context.Context, c contracts.Contract) (RunRecord, 
 	if err := policy.Enforce(preflight, c); err != nil {
 		return RunRecord{}, err
 	}
+	// Sol P1-1/P1-2: resolve the docker image identity before any
+	// lock/workspace/quota side effect, then hand that exact resolved object
+	// to DockerRunner so launch uses and verifies the same image replay hashed.
+	var dockerImage *runner.ImageIdentity
+	if c.EffectiveRunner() == "docker" && c.Docker != nil {
+		img, ierr := runner.ResolveImageIdentity(ctx, c.Docker.Image, env.Controller)
+		if ierr != nil {
+			return RunRecord{}, ierr
+		}
+		dockerImage = &img
+	}
 	// Runner resolution (Phase 5) happens before any lock/workspace/quota side
 	// effect: a docker request Governator can't satisfy must fail closed with
 	// a clear error here, never silently fall back to LocalWorktreeRunner and
 	// never leave a partially-acquired lock or reservation behind.
-	rn, err := runner.New(c.EffectiveRunner(), c.Docker, c.Local, env.CredentialRoots, env.Controller)
+	rn, err := runner.New(c.EffectiveRunner(), c.Docker, c.Local, env.CredentialRoots, dockerImage, env.Controller)
 	if err != nil {
 		return RunRecord{}, err
 	}
@@ -2799,21 +2812,6 @@ func (r *Runner) runOnce(ctx context.Context, c contracts.Contract) (RunRecord, 
 		}
 	}
 	defer handle.Close()
-	// Sol P1-1: a docker-runner contract's identity must bind to the resolved
-	// image ID/digest, never the operator's configured tag string alone — a
-	// mutable tag can be repointed at a different image between an attested
-	// run and a later replay. Resolved once here, before the container ever
-	// starts, so a run whose image can't be inspected (not pulled locally,
-	// daemon unreachable) fails before any workspace/launch side effect,
-	// exactly like every other pre-launch identity input.
-	var dockerImage *runner.ImageIdentity
-	if c.EffectiveRunner() == "docker" && c.Docker != nil {
-		img, ierr := runner.ResolveImageIdentity(ctx, c.Docker.Image, env.Controller)
-		if ierr != nil {
-			return RunRecord{}, ierr
-		}
-		dockerImage = &img
-	}
 	consumedIdentities, err := consumedArtifactIdentities(db, r.Home, c)
 	if err != nil {
 		return RunRecord{}, err
@@ -2822,7 +2820,7 @@ func (r *Runner) runOnce(ctx context.Context, c contracts.Contract) (RunRecord, 
 	if err != nil {
 		return RunRecord{}, err
 	}
-	validatorToolDirs, err := validatorToolDirectories(c, env.ToolRegistry)
+	successValidatorToolDirs, cleanupValidatorToolDirs, err := validatorToolDirectories(c, env.ToolRegistry)
 	if err != nil {
 		return RunRecord{}, err
 	}
@@ -2853,10 +2851,17 @@ func (r *Runner) runOnce(ctx context.Context, c contracts.Contract) (RunRecord, 
 		assayerParticipantHash = identity.AssayerEnvironmentHash
 	}
 	identity.Participants = resolvedParticipants(env.ToolRegistry, backendToolIdentity, graphStatus, env.Controller.Hash, validatorToolsetHash, assayerParticipantHash)
+	for role, part := range resolvedAssayerParticipants(cfg.Assay, env.Controller.Hash) {
+		identity.Participants[role] = part
+	}
 	if dockerImage != nil {
 		identity.Participants["docker_daemon"] = ExecutableIdentity{Role: "docker_daemon", SHA256: hashJSON(dockerImage), Known: true}
 	}
 	if len(c.Success.Validators) > 0 && len(c.Success.ValidatorSpecs) == 0 {
+		identity.Participants["validator_tools"] = ExecutableIdentity{Role: "validator_tools", Known: false}
+		identity.Participants["validator_scripts"] = ExecutableIdentity{Role: "validator_scripts", Known: false}
+	}
+	if c.Cleanup != nil && len(c.Cleanup.Validators) > 0 && len(c.Cleanup.ValidatorSpecs) == 0 {
 		identity.Participants["validator_tools"] = ExecutableIdentity{Role: "validator_tools", Known: false}
 		identity.Participants["validator_scripts"] = ExecutableIdentity{Role: "validator_scripts", Known: false}
 	}
@@ -3385,8 +3390,8 @@ func (r *Runner) runOnce(ctx context.Context, c contracts.Contract) (RunRecord, 
 			break
 		}
 		var toolDirs []string
-		if validatorIndex < len(validatorToolDirs) {
-			toolDirs = validatorToolDirs[validatorIndex]
+		if validatorIndex < len(successValidatorToolDirs) {
+			toolDirs = successValidatorToolDirs[validatorIndex]
 		}
 		code, out, e, extinctionErr := shellStage(vctx, id, "success-validator", work, v, requireStrongDescendants, env.Controller, toolDirs, env.ToolRegistry)
 		cancel()
@@ -3417,7 +3422,7 @@ func (r *Runner) runOnce(ctx context.Context, c contracts.Contract) (RunRecord, 
 	// merge like a success validator; unset (the default) records the run
 	// for visibility without gating it.
 	if len(violations) == 0 && c.Cleanup != nil {
-		for _, v := range c.Cleanup.Validators {
+		for i, v := range c.Cleanup.Validators {
 			vctx, cancel, deadlineErr := stageTimeout(ctx, "cleanup validator")
 			if deadlineErr != nil {
 				if c.Cleanup.Required {
@@ -3425,7 +3430,11 @@ func (r *Runner) runOnce(ctx context.Context, c contracts.Contract) (RunRecord, 
 				}
 				break
 			}
-			code, out, e, extinctionErr := shellStage(vctx, id, "cleanup-validator", work, v, requireStrongDescendants, env.Controller, nil, env.ToolRegistry)
+			var toolDirs []string
+			if i < len(cleanupValidatorToolDirs) {
+				toolDirs = cleanupValidatorToolDirs[i]
+			}
+			code, out, e, extinctionErr := shellStage(vctx, id, "cleanup-validator", work, v, requireStrongDescendants, env.Controller, toolDirs, env.ToolRegistry)
 			cancel()
 			// Sol redteam v7 S1 cleanup-specific fail-open defect: Required
 			// governs whether a nonzero cleanup EXIT CODE blocks the merge

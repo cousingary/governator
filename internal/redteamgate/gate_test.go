@@ -33,16 +33,16 @@ func TestLoadManifestRejectsBlankName(t *testing.T) {
 
 // TestLoadManifestAcceptsRealManifest is a regression check that
 // internal/redteam/manifest.yaml (the actual release-gating manifest, not a
-// fixture) parses cleanly and reserves exactly 38 uniquely-named cases —
-// the corpus size the plan mandates.
+// fixture) parses cleanly and reserves exactly 41 uniquely-named cases —
+// the corpus size the current manifest mandates.
 func TestLoadManifestAcceptsRealManifest(t *testing.T) {
 	path := filepath.Join("..", "redteam", "manifest.yaml")
 	m, err := LoadManifest(path)
 	if err != nil {
 		t.Fatalf("LoadManifest(%s): %v", path, err)
 	}
-	if len(m.Cases) != 38 {
-		t.Fatalf("expected 38 cases in the mandatory final attack corpus, got %d", len(m.Cases))
+	if len(m.Cases) != 41 {
+		t.Fatalf("expected 41 cases in the mandatory final attack corpus, got %d", len(m.Cases))
 	}
 	seen := make(map[int]bool)
 	for _, c := range m.Cases {
@@ -54,7 +54,7 @@ func TestLoadManifestAcceptsRealManifest(t *testing.T) {
 			t.Fatalf("case %d (%s): every corpus case must be required (conditional skips are the only sanctioned exception, and are still required=true)", c.Case, c.Name)
 		}
 	}
-	for i := 1; i <= 38; i++ {
+	for i := 1; i <= 41; i++ {
 		if !seen[i] {
 			t.Fatalf("manifest is missing case number %d", i)
 		}

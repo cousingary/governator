@@ -722,6 +722,50 @@ type Success struct {
 	ValidatorSpecs []ValidatorSpec `yaml:"-" json:"validator_specs,omitempty"`
 }
 
+func decodeValidatorSequence(value *yaml.Node, field string) ([]string, []ValidatorSpec, error) {
+	if value.Kind != yaml.SequenceNode {
+		return nil, nil, fmt.Errorf("%s must be a sequence", field)
+	}
+	var validators []string
+	var specs []ValidatorSpec
+	for _, item := range value.Content {
+		switch item.Kind {
+		case yaml.ScalarNode:
+			validators = append(validators, item.Value)
+		case yaml.MappingNode:
+			for j := 0; j < len(item.Content); j += 2 {
+				key := item.Content[j].Value
+				if key != "command" && key != "tools" && key != "files" {
+					return nil, nil, fmt.Errorf("validator field %s is not supported", key)
+				}
+			}
+			var spec ValidatorSpec
+			if err := item.Decode(&spec); err != nil {
+				return nil, nil, err
+			}
+			validators = append(validators, spec.Command)
+			specs = append(specs, spec)
+		default:
+			return nil, nil, fmt.Errorf("validator must be a command string or mapping")
+		}
+	}
+	return validators, specs, nil
+}
+
+func marshalValidatorSequence(validators []string, specs []ValidatorSpec) []any {
+	out := make([]any, 0, len(validators))
+	if len(specs) > 0 {
+		for _, spec := range specs {
+			out = append(out, spec)
+		}
+		return out
+	}
+	for _, command := range validators {
+		out = append(out, command)
+	}
+	return out
+}
+
 func (s *Success) UnmarshalYAML(node *yaml.Node) error {
 	if node.Kind != yaml.MappingNode {
 		return fmt.Errorf("success must be a mapping")
@@ -737,30 +781,12 @@ func (s *Success) UnmarshalYAML(node *yaml.Node) error {
 				return err
 			}
 		case "validators":
-			if value.Kind != yaml.SequenceNode {
-				return fmt.Errorf("success.validators must be a sequence")
+			validators, specs, err := decodeValidatorSequence(value, "success.validators")
+			if err != nil {
+				return err
 			}
-			for _, item := range value.Content {
-				switch item.Kind {
-				case yaml.ScalarNode:
-					s.Validators = append(s.Validators, item.Value)
-				case yaml.MappingNode:
-					for j := 0; j < len(item.Content); j += 2 {
-						field := item.Content[j].Value
-						if field != "command" && field != "tools" && field != "files" {
-							return fmt.Errorf("validator field %s is not supported", field)
-						}
-					}
-					var spec ValidatorSpec
-					if err := item.Decode(&spec); err != nil {
-						return err
-					}
-					s.Validators = append(s.Validators, spec.Command)
-					s.ValidatorSpecs = append(s.ValidatorSpecs, spec)
-				default:
-					return fmt.Errorf("validator must be a command string or mapping")
-				}
-			}
+			s.Validators = validators
+			s.ValidatorSpecs = specs
 		default:
 			return fmt.Errorf("field %s not found in type contracts.Success", key)
 		}
@@ -769,20 +795,10 @@ func (s *Success) UnmarshalYAML(node *yaml.Node) error {
 }
 
 func (s Success) MarshalYAML() (any, error) {
-	validators := make([]any, 0, len(s.Validators))
-	if len(s.ValidatorSpecs) > 0 {
-		for _, spec := range s.ValidatorSpecs {
-			validators = append(validators, spec)
-		}
-	} else {
-		for _, command := range s.Validators {
-			validators = append(validators, command)
-		}
-	}
 	return struct {
 		RequiredFiles []string `yaml:"required_files"`
 		Validators    []any    `yaml:"validators"`
-	}{s.RequiredFiles, validators}, nil
+	}{s.RequiredFiles, marshalValidatorSequence(s.Validators, s.ValidatorSpecs)}, nil
 }
 
 type OutputPolicy struct {
@@ -834,8 +850,44 @@ func (r *Repair) EffectiveMaxAttempts() int {
 // for visibility only (false, the default) — useful for a lint pass an
 // operator wants observed before it's enforced.
 type Cleanup struct {
-	Required   bool     `yaml:"required,omitempty" json:"required,omitempty"`
-	Validators []string `yaml:"validators" json:"validators"`
+	Required       bool            `yaml:"required,omitempty" json:"required,omitempty"`
+	Validators     []string        `yaml:"-" json:"validators"`
+	ValidatorSpecs []ValidatorSpec `yaml:"-" json:"validator_specs,omitempty"`
+}
+
+func (c *Cleanup) UnmarshalYAML(node *yaml.Node) error {
+	if node.Kind != yaml.MappingNode {
+		return fmt.Errorf("cleanup must be a mapping")
+	}
+	c.Required = false
+	c.Validators = nil
+	c.ValidatorSpecs = nil
+	for i := 0; i < len(node.Content); i += 2 {
+		key, value := node.Content[i].Value, node.Content[i+1]
+		switch key {
+		case "required":
+			if err := value.Decode(&c.Required); err != nil {
+				return err
+			}
+		case "validators":
+			validators, specs, err := decodeValidatorSequence(value, "cleanup.validators")
+			if err != nil {
+				return err
+			}
+			c.Validators = validators
+			c.ValidatorSpecs = specs
+		default:
+			return fmt.Errorf("field %s not found in type contracts.Cleanup", key)
+		}
+	}
+	return nil
+}
+
+func (c Cleanup) MarshalYAML() (any, error) {
+	return struct {
+		Required   bool  `yaml:"required,omitempty"`
+		Validators []any `yaml:"validators"`
+	}{c.Required, marshalValidatorSequence(c.Validators, c.ValidatorSpecs)}, nil
 }
 
 type ValidationError struct {
@@ -1009,6 +1061,20 @@ func (c Contract) Validate() error {
 			add("cleanup.validators", "must contain at least one command when the cleanup block is present")
 		}
 		validateNonBlank("cleanup.validators", c.Cleanup.Validators, add)
+		if len(c.Cleanup.ValidatorSpecs) > 0 && len(c.Cleanup.ValidatorSpecs) != len(c.Cleanup.Validators) {
+			add("cleanup.validators", "structured and command-string validators cannot be mixed")
+		}
+		for i, spec := range c.Cleanup.ValidatorSpecs {
+			prefix := fmt.Sprintf("cleanup.validators[%d]", i)
+			if strings.TrimSpace(spec.Command) == "" {
+				add(prefix+".command", "is required")
+			}
+			if len(spec.Tools) == 0 {
+				add(prefix+".tools", "must declare at least one executable tool")
+			}
+			validateNonBlank(prefix+".tools", spec.Tools, add)
+			validatePathPatterns(prefix+".files", spec.Files, add)
+		}
 	}
 
 	if strings.TrimSpace(c.RiskClass) != "" && !riskClasses[c.RiskClass] {

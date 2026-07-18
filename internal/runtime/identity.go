@@ -10,9 +10,11 @@ import (
 	"path/filepath"
 	"runtime"
 	"runtime/debug"
+	"sort"
 	"strings"
 
 	"github.com/cousingary/governator/internal/agents"
+	"github.com/cousingary/governator/internal/assay"
 	"github.com/cousingary/governator/internal/config"
 	"github.com/cousingary/governator/internal/contracts"
 	"github.com/cousingary/governator/internal/prompts"
@@ -278,6 +280,20 @@ func contractValidatorSet(c contracts.Contract) map[string][]string {
 	return out
 }
 
+type validatorStageSpec struct {
+	Stage      string
+	Validators []string
+	Specs      []contracts.ValidatorSpec
+}
+
+func validatorStages(c contracts.Contract) []validatorStageSpec {
+	stages := []validatorStageSpec{{Stage: "success", Validators: c.Success.Validators, Specs: c.Success.ValidatorSpecs}}
+	if c.Cleanup != nil {
+		stages = append(stages, validatorStageSpec{Stage: "cleanup", Validators: c.Cleanup.Validators, Specs: c.Cleanup.ValidatorSpecs})
+	}
+	return stages
+}
+
 type resolvedValidatorTool struct {
 	Name          string `json:"name"`
 	CanonicalPath string `json:"canonical_path"`
@@ -298,10 +314,17 @@ type resolvedValidatorSpec struct {
 }
 
 func resolveValidatorToolset(c contracts.Contract, root string, registries ...*toolregistry.Registry) (string, error) {
-	if len(c.Success.ValidatorSpecs) == 0 {
+	var registry *toolregistry.Registry
+	structured := false
+	for _, stage := range validatorStages(c) {
+		if len(stage.Specs) > 0 {
+			structured = true
+			break
+		}
+	}
+	if !structured {
 		return hashJSON(contractValidatorToolset(c)), nil
 	}
-	var registry *toolregistry.Registry
 	if len(registries) > 0 {
 		registry = registries[0]
 	} else {
@@ -318,45 +341,55 @@ func resolveValidatorToolset(c contracts.Contract, root string, registries ...*t
 	if err != nil {
 		return "", err
 	}
-	resolved := make([]resolvedValidatorSpec, 0, len(c.Success.ValidatorSpecs))
-	for _, spec := range c.Success.ValidatorSpecs {
-		item := resolvedValidatorSpec{Command: spec.Command}
-		for _, name := range spec.Tools {
-			identity, err := registry.Resolve(name, name)
-			if err != nil {
-				return "", fmt.Errorf("resolve validator tool %q: %w", name, err)
-			}
-			item.Tools = append(item.Tools, resolvedValidatorTool{Name: name, CanonicalPath: identity.CanonicalPath, SHA256: identity.SHA256, Device: identity.Device, Inode: identity.Inode})
+	resolved := map[string][]resolvedValidatorSpec{}
+	for _, stage := range validatorStages(c) {
+		if len(stage.Specs) == 0 {
+			continue
 		}
-		for _, declared := range spec.Files {
-			abs := filepath.Join(rootAbs, filepath.FromSlash(declared))
-			rel, err := filepath.Rel(rootAbs, abs)
-			if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(os.PathSeparator)) {
-				return "", fmt.Errorf("validator file %q escapes workspace root", declared)
-			}
-			hash := hashFileContent(abs)
-			if strings.HasPrefix(hash, "unreadable:") {
-				return "", fmt.Errorf("validator file %q is unreadable", declared)
-			}
-			item.Files = append(item.Files, resolvedValidatorFile{Path: filepath.ToSlash(rel), SHA256: hash})
+		if len(stage.Specs) != len(stage.Validators) {
+			return "", fmt.Errorf("structured and legacy validators cannot be mixed in %s validators", stage.Stage)
 		}
-		resolved = append(resolved, item)
+		items := make([]resolvedValidatorSpec, 0, len(stage.Specs))
+		for _, spec := range stage.Specs {
+			item := resolvedValidatorSpec{Command: spec.Command}
+			for _, name := range spec.Tools {
+				identity, err := registry.Resolve(name, name)
+				if err != nil {
+					return "", fmt.Errorf("resolve %s validator tool %q: %w", stage.Stage, name, err)
+				}
+				item.Tools = append(item.Tools, resolvedValidatorTool{Name: name, CanonicalPath: identity.CanonicalPath, SHA256: identity.SHA256, Device: identity.Device, Inode: identity.Inode})
+			}
+			for _, declared := range spec.Files {
+				abs := filepath.Join(rootAbs, filepath.FromSlash(declared))
+				rel, err := filepath.Rel(rootAbs, abs)
+				if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(os.PathSeparator)) {
+					return "", fmt.Errorf("validator file %q escapes workspace root", declared)
+				}
+				hash := hashFileContent(abs)
+				if strings.HasPrefix(hash, "unreadable:") {
+					return "", fmt.Errorf("validator file %q is unreadable", declared)
+				}
+				item.Files = append(item.Files, resolvedValidatorFile{Path: filepath.ToSlash(rel), SHA256: hash})
+			}
+			items = append(items, item)
+		}
+		resolved[stage.Stage] = items
 	}
 	return hashJSON(resolved), nil
 }
 
-func validatorToolDirectories(c contracts.Contract, registry *toolregistry.Registry) ([][]string, error) {
-	if len(c.Success.ValidatorSpecs) == 0 {
+func validatorToolDirectoriesForStage(validators []string, specs []contracts.ValidatorSpec, registry *toolregistry.Registry) ([][]string, error) {
+	if len(specs) == 0 {
 		return nil, nil
 	}
 	if registry == nil {
 		return nil, fmt.Errorf("validator tool registry is not frozen")
 	}
-	if len(c.Success.ValidatorSpecs) != len(c.Success.Validators) {
+	if len(specs) != len(validators) {
 		return nil, fmt.Errorf("structured and legacy validators cannot be mixed")
 	}
-	out := make([][]string, len(c.Success.ValidatorSpecs))
-	for i, spec := range c.Success.ValidatorSpecs {
+	out := make([][]string, len(specs))
+	for i, spec := range specs {
 		seen := map[string]bool{}
 		for _, name := range spec.Tools {
 			identity, err := registry.Resolve(name, name)
@@ -373,8 +406,42 @@ func validatorToolDirectories(c contracts.Contract, registry *toolregistry.Regis
 	return out, nil
 }
 
+func validatorToolDirectories(c contracts.Contract, registry *toolregistry.Registry) (success [][]string, cleanup [][]string, err error) {
+	success, err = validatorToolDirectoriesForStage(c.Success.Validators, c.Success.ValidatorSpecs, registry)
+	if err != nil {
+		return nil, nil, err
+	}
+	if c.Cleanup != nil {
+		cleanup, err = validatorToolDirectoriesForStage(c.Cleanup.Validators, c.Cleanup.ValidatorSpecs, registry)
+		if err != nil {
+			return nil, nil, err
+		}
+	}
+	return success, cleanup, nil
+}
+
 func contractValidatorToolset(c contracts.Contract) map[string][]string {
 	return contractValidatorSet(c)
+}
+
+func resolvedAssayerParticipants(cfg config.Assay, envHash string) map[string]ExecutableIdentity {
+	parts := map[string]ExecutableIdentity{}
+	if strings.TrimSpace(cfg.Repo) == "" {
+		return parts
+	}
+	pythonID, err := toolregistry.ResolveTrusted("python3", cfg.Python)
+	pythonKnown := err == nil
+	pythonPath := strings.TrimSpace(cfg.Python)
+	if pythonKnown {
+		pythonPath = pythonID.CanonicalPath
+	}
+	repoHash := assayerRepoTreeHash(cfg.Repo)
+	parts["assayer"] = ExecutableIdentity{Role: "assayer", CanonicalPath: pythonPath, SHA256: repoHash, EnvironmentHash: envHash, Known: pythonKnown && !strings.HasPrefix(repoHash, "unreadable:")}
+	for _, item := range []struct{ role, rel string }{{"assayer_profile", "assayer/profiles.py"}, {"assayer_checks", "assayer/checks.py"}} {
+		hash := hashFileContent(filepath.Join(cfg.Repo, item.rel))
+		parts[item.role] = ExecutableIdentity{Role: item.role, CanonicalPath: filepath.Join(cfg.Repo, filepath.FromSlash(item.rel)), SHA256: hash, EnvironmentHash: envHash, Known: pythonKnown && !strings.HasPrefix(hash, "unreadable:")}
+	}
+	return parts
 }
 
 func governatorSelfSHA256() string {
@@ -390,17 +457,83 @@ func governatorSelfSHA256() string {
 	return hashFileContent(exe)
 }
 
+func assayerRepoTreeHash(repo string) string {
+	if strings.TrimSpace(repo) == "" {
+		return "none"
+	}
+	root, err := filepath.Abs(repo)
+	if err != nil {
+		return "unreadable:" + repo
+	}
+	var files []string
+	walkErr := filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		rel, err := filepath.Rel(root, path)
+		if err != nil {
+			return err
+		}
+		if rel == "." {
+			return nil
+		}
+		rel = filepath.ToSlash(rel)
+		if info.IsDir() {
+			if rel == ".git" || rel == "__pycache__" || rel == ".pytest_cache" || strings.HasPrefix(rel, ".git/") || strings.HasPrefix(rel, "__pycache__/") || strings.HasPrefix(rel, ".pytest_cache/") {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if strings.HasSuffix(rel, ".pyc") || strings.HasSuffix(rel, ".pyo") {
+			return nil
+		}
+		files = append(files, rel)
+		return nil
+	})
+	if walkErr != nil {
+		return "unreadable:" + root
+	}
+	sort.Strings(files)
+	items := make([]map[string]string, 0, len(files))
+	for _, rel := range files {
+		items = append(items, map[string]string{"path": rel, "sha256": hashFileContent(filepath.Join(root, filepath.FromSlash(rel)))})
+	}
+	return hashJSON(items)
+}
+
+func resolvedAssayerPython(cfg config.Assay) any {
+	out := map[string]any{"configured": strings.TrimSpace(cfg.Repo) != "", "requested": cfg.Python}
+	identity, err := toolregistry.ResolveTrusted("python3", cfg.Python)
+	if err != nil {
+		out["error"] = err.Error()
+		return out
+	}
+	out["canonical_path"] = identity.CanonicalPath
+	out["sha256"] = identity.SHA256
+	out["device"] = identity.Device
+	out["inode"] = identity.Inode
+	return out
+}
+
 // assayerInputs gathers the bridge config and the contract's assay declaration
 // so a changed Assayer profile or enforcement mode invalidates replay.
 func resolvedAssayerEnvironmentHash(cfg config.Config, c contracts.Contract) string {
+	env := assay.DescribeEnvironment(assay.Config{Repo: cfg.Assay.Repo, Python: cfg.Assay.Python})
 	files := map[string]string{}
-	for _, rel := range []string{"assayer/profiles.py", "assayer/checks.py", "assayer/registry.py", "pyproject.toml", "requirements.txt", "requirements.lock", "uv.lock", "poetry.lock", "PINNED_COMMIT", ".git/HEAD"} {
-		path := filepath.Join(cfg.Assay.Repo, rel)
+	for _, rel := range []string{"cli.py", "pyproject.toml", "requirements.txt", "requirements-lock.txt", "requirements.lock", "uv.lock", "poetry.lock", "schema.sql", "assayer/__init__.py", "assayer/checks.py", "assayer/evidence.py", "assayer/outbox.py", "assayer/profiles.py", "assayer/store.py"} {
 		if cfg.Assay.Repo != "" {
-			files[rel] = hashFileContent(path)
+			files[rel] = hashFileContent(filepath.Join(cfg.Assay.Repo, rel))
 		}
 	}
-	return hashJSON(map[string]any{"files": files, "python": cfg.Assay.Python, "bridge": cfg.Assay, "contract": c.Assay})
+	return hashJSON(map[string]any{
+		"repo_tree_hash":  assayerRepoTreeHash(cfg.Assay.Repo),
+		"assayer_commit":  env.AssayerCommit,
+		"python_identity": resolvedAssayerPython(cfg.Assay),
+		"environment":     env,
+		"selected_files":  files,
+		"bridge":          cfg.Assay,
+		"contract":        c.Assay,
+	})
 }
 
 func assayerInputs(cfg config.Config, c contracts.Contract) map[string]any {

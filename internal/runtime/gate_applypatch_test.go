@@ -31,9 +31,9 @@ func TestExtractApplyPatchPaths(t *testing.T) {
 	}
 }
 
-func TestExtractApplyPatchPathsEmpty(t *testing.T) {
-	if got := ExtractApplyPatchPaths("not a patch at all"); len(got) != 0 {
-		t.Fatalf("expected no paths, got %v", got)
+func TestParseApplyPatchPathsRejectsMalformedEnvelope(t *testing.T) {
+	if _, err := ParseApplyPatchPaths("not a patch at all"); err == nil {
+		t.Fatal("expected malformed apply_patch envelope to fail")
 	}
 }
 
@@ -75,7 +75,23 @@ func TestGateDecideApplyPatchAllowsScratchPath(t *testing.T) {
 	}
 }
 
-func TestGateDecideApplyPatchNoExtractablePathsAllows(t *testing.T) {
+func TestGateDecideApplyPatchMissingCommandDenies(t *testing.T) {
+	manifest := filepath.Join(t.TempDir(), "protected_paths.txt")
+	if err := os.WriteFile(manifest, []byte(""), 0600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("GOV_PROTECTED_PATHS", manifest)
+
+	d := GateDecideApplyPatch(t.TempDir(), "")
+	if d.Allow {
+		t.Fatalf("expected empty apply_patch command to deny, got %#v", d)
+	}
+	if d.Finding != "F2_APPLY_PATCH_PROTOCOL_ERROR" {
+		t.Fatalf("expected protocol-error finding, got %s", d.Finding)
+	}
+}
+
+func TestGateDecideApplyPatchMalformedEnvelopeDenies(t *testing.T) {
 	manifest := filepath.Join(t.TempDir(), "protected_paths.txt")
 	if err := os.WriteFile(manifest, []byte(""), 0600); err != nil {
 		t.Fatal(err)
@@ -83,10 +99,27 @@ func TestGateDecideApplyPatchNoExtractablePathsAllows(t *testing.T) {
 	t.Setenv("GOV_PROTECTED_PATHS", manifest)
 
 	d := GateDecideApplyPatch(t.TempDir(), "malformed patch body with no headers")
-	if !d.Allow {
-		t.Fatalf("expected malformed/empty patch envelope to default-allow, got %#v", d)
+	if d.Allow {
+		t.Fatalf("expected malformed apply_patch envelope to deny, got %#v", d)
 	}
-	if d.Finding != "F2_APPLY_PATCH" {
-		t.Fatalf("expected F2_APPLY_PATCH finding, got %s", d.Finding)
+	if d.Finding != "F2_APPLY_PATCH_PROTOCOL_ERROR" {
+		t.Fatalf("expected protocol-error finding, got %s", d.Finding)
+	}
+}
+
+func TestGateDecideApplyPatchUnknownDirectiveDenies(t *testing.T) {
+	manifest := filepath.Join(t.TempDir(), "protected_paths.txt")
+	if err := os.WriteFile(manifest, []byte(""), 0600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("GOV_PROTECTED_PATHS", manifest)
+
+	patch := "*** Begin Patch\n*** Rename File: scratch.go\n*** End Patch"
+	d := GateDecideApplyPatch(t.TempDir(), patch)
+	if d.Allow {
+		t.Fatalf("expected unknown apply_patch directive to deny, got %#v", d)
+	}
+	if d.Finding != "F2_APPLY_PATCH_PROTOCOL_ERROR" {
+		t.Fatalf("expected protocol-error finding, got %s", d.Finding)
 	}
 }

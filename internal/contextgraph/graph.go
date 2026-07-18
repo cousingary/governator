@@ -145,6 +145,8 @@ func scopedCommandOutput(ctx context.Context, status Status, args []string, dir 
 		Environment:      stageexec.FrozenEnvironment{Values: append([]string(nil), env.Values...), Hash: env.Hash},
 		NetworkPolicy:    stageexec.NetworkPolicyDenied,
 		CredentialPolicy: stageexec.CredentialPolicyNone,
+		OutputLimit:      2 << 20,
+		OutputCapture:    stageexec.CaptureRequiredComplete,
 		DescendantPolicy: stageexec.DescendantPolicy{RequireStrong: true},
 		EnforcementPlan:  plan,
 	})

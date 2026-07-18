@@ -10,6 +10,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -55,6 +56,17 @@ type DescendantPolicy struct {
 	RequireStrong bool `json:"require_strong"`
 }
 
+type OutputCaptureMode string
+
+const (
+	CaptureUnspecified      OutputCaptureMode = ""
+	CaptureNone             OutputCaptureMode = "none"
+	CaptureBounded          OutputCaptureMode = "bounded"
+	CaptureRequiredComplete OutputCaptureMode = "required_complete"
+)
+
+var ErrOutputLimitExceeded = errors.New("STAGE_OUTPUT_LIMIT_EXCEEDED")
+
 type EffectLedger struct {
 	ScopeMethod          string   `json:"scope_method,omitempty"`
 	WorkspaceFDScanClean bool     `json:"workspace_fd_scan_clean"`
@@ -82,6 +94,7 @@ type StageSpec struct {
 	CredentialPolicy CredentialPolicy
 	Timeout          time.Duration
 	OutputLimit      int64
+	OutputCapture    OutputCaptureMode
 	DescendantPolicy DescendantPolicy
 	EnforcementPlan  enforce.Plan
 	Stdin            io.Reader
@@ -105,6 +118,8 @@ type Executor struct{}
 
 func NewExecutor() Executor { return Executor{} }
 
+const waitAfterKillDeadline = 2 * time.Second
+
 func (Executor) Run(ctx context.Context, spec StageSpec) (StageResult, error) {
 	if strings.TrimSpace(spec.RunID) == "" {
 		return StageResult{}, fmt.Errorf("stage: missing run id")
@@ -120,6 +135,18 @@ func (Executor) Run(ctx context.Context, spec StageSpec) (StageResult, error) {
 	}
 	if spec.Environment.Hash == "" || spec.Environment.Hash != controllerenv.Hash(spec.Environment.Values) {
 		return StageResult{}, fmt.Errorf("stage: frozen environment hash mismatch")
+	}
+	captureMode := spec.OutputCapture
+	if captureMode == CaptureUnspecified {
+		captureMode = CaptureRequiredComplete
+	}
+	switch captureMode {
+	case CaptureNone, CaptureBounded, CaptureRequiredComplete:
+	default:
+		return StageResult{}, fmt.Errorf("stage: unknown output capture mode %q", captureMode)
+	}
+	if captureMode != CaptureNone && spec.OutputLimit <= 0 {
+		return StageResult{}, fmt.Errorf("stage: output limit required for capture mode %q", captureMode)
 	}
 	effectivePlan, err := spec.EnforcementPlan.WithExecutableAndReadRoots(spec.Executable.CanonicalPath, spec.ReadRoots...)
 	if err != nil {
@@ -178,26 +205,50 @@ func (Executor) Run(ctx context.Context, spec StageSpec) (StageResult, error) {
 	// backend writing to both stdout and stderr) that a bare bytes.Buffer
 	// here used to data-race on.
 	capture := &syncBuffer{}
-	stdout := io.Writer(capture)
-	stderr := io.Writer(capture)
+	stdout := io.Writer(io.Discard)
+	stderr := io.Writer(io.Discard)
 	if spec.Stdout != nil {
-		stdout = io.MultiWriter(spec.Stdout, capture)
+		stdout = spec.Stdout
 	}
 	if spec.Stderr != nil {
-		stderr = io.MultiWriter(spec.Stderr, capture)
+		stderr = spec.Stderr
 	}
-	lwOut := &limitWriter{w: stdout, remaining: spec.OutputLimit}
-	lwErr := &limitWriter{w: stderr, remaining: spec.OutputLimit}
+	if captureMode != CaptureNone {
+		if spec.Stdout != nil {
+			stdout = io.MultiWriter(spec.Stdout, capture)
+		} else {
+			stdout = capture
+		}
+		if spec.Stderr != nil {
+			stderr = io.MultiWriter(spec.Stderr, capture)
+		} else {
+			stderr = capture
+		}
+	}
+	var limitCancel context.CancelFunc
+	if captureMode == CaptureRequiredComplete {
+		ctx, limitCancel = context.WithCancel(ctx)
+		defer limitCancel()
+	}
+	limiter := newSharedLimitWriter(stdout, stderr, spec.OutputLimit, captureMode == CaptureRequiredComplete, limitCancel)
 	if spec.OutputLimit > 0 {
-		stdout = lwOut
-		stderr = lwErr
+		stdout = limiter.Stdout()
+		stderr = limiter.Stderr()
 	}
 	cmd.Stdout, cmd.Stderr = stdout, stderr
 	exit := 0
 	var runErr error
+	var proof containment.Proof
+	var extinctionErr error
+	extinguish := func() {
+		extCtx, cancel := context.WithTimeout(context.Background(), containment.DefaultExtinctionDeadline+time.Second)
+		defer cancel()
+		proof, extinctionErr = scope.Extinguish(extCtx, containment.DefaultExtinctionDeadline, spec.WorkingDirectory)
+	}
 	if err := cmd.Start(); err != nil {
 		exit = -1
 		runErr = err
+		extinguish()
 	} else {
 		if cmd.Process != nil {
 			scope.Started(cmd.Process.Pid)
@@ -214,16 +265,30 @@ func (Executor) Run(ctx context.Context, spec StageSpec) (StageResult, error) {
 					runErr = err
 				}
 			}
+			extinguish()
 		case <-ctx.Done():
 			exit = -1
-			runErr = ctx.Err()
+			if limiter.Exceeded() {
+				runErr = ErrOutputLimitExceeded
+			} else {
+				runErr = ctx.Err()
+			}
 			if cmd.Process != nil {
 				_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
 			}
-			<-done
+			extinguish()
+			select {
+			case err := <-done:
+				if err != nil && !errors.Is(runErr, ErrOutputLimitExceeded) && !errors.Is(runErr, context.DeadlineExceeded) && !errors.Is(runErr, context.Canceled) {
+					runErr = err
+				}
+			case <-time.After(waitAfterKillDeadline):
+				if extinctionErr == nil {
+					extinctionErr = fmt.Errorf("stage: command wait did not complete within %s after kill", waitAfterKillDeadline)
+				}
+			}
 		}
 	}
-	proof, extinctionErr := scope.Extinguish(context.Background(), containment.DefaultExtinctionDeadline, spec.WorkingDirectory)
 	res := StageResult{
 		ExitStatus:         exit,
 		ExecutableIdentity: spec.Executable,
@@ -233,7 +298,7 @@ func (Executor) Run(ctx context.Context, spec StageSpec) (StageResult, error) {
 			WorkspaceFDScanClean: proof.WorkspaceFDScanClean,
 			LandlockABI:          effectivePlan.LandlockABI, KernelReadEnvelope: append([]string(nil), effectivePlan.ReadRoots...),
 		},
-		OutputTruncated: spec.OutputLimit > 0 && (lwOut.truncated || lwErr.truncated),
+		OutputTruncated: limiter.Exceeded(),
 		DescendantsGone: extinctionErr == nil,
 		Output:          capture.String(),
 	}
@@ -264,26 +329,59 @@ func (s *syncBuffer) String() string {
 	return s.buf.String()
 }
 
-type limitWriter struct {
-	w         io.Writer
+type sharedLimitWriter struct {
+	mu        sync.Mutex
+	stdout    io.Writer
+	stderr    io.Writer
 	remaining int64
-	truncated bool
+	exceeded  bool
+	fail      bool
+	cancel    context.CancelFunc
 }
 
-func (l *limitWriter) Write(p []byte) (int, error) {
+type streamLimitWriter struct {
+	parent *sharedLimitWriter
+	w      io.Writer
+}
+
+func newSharedLimitWriter(stdout, stderr io.Writer, limit int64, fail bool, cancel context.CancelFunc) *sharedLimitWriter {
+	return &sharedLimitWriter{stdout: stdout, stderr: stderr, remaining: limit, fail: fail, cancel: cancel}
+}
+
+func (l *sharedLimitWriter) Stdout() io.Writer { return streamLimitWriter{parent: l, w: l.stdout} }
+func (l *sharedLimitWriter) Stderr() io.Writer { return streamLimitWriter{parent: l, w: l.stderr} }
+
+func (l *sharedLimitWriter) Exceeded() bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.exceeded
+}
+
+func (w streamLimitWriter) Write(p []byte) (int, error) {
 	orig := len(p)
-	if l.remaining <= 0 {
-		l.truncated = true
-		return orig, nil
+	w.parent.mu.Lock()
+	allowed := len(p)
+	if w.parent.remaining <= 0 {
+		allowed = 0
+	} else if int64(allowed) > w.parent.remaining {
+		allowed = int(w.parent.remaining)
 	}
-	if int64(len(p)) > l.remaining {
-		p = p[:l.remaining]
-		l.truncated = true
+	if allowed < len(p) {
+		w.parent.exceeded = true
+		if w.parent.cancel != nil {
+			w.parent.cancel()
+		}
 	}
-	n, err := l.w.Write(p)
-	l.remaining -= int64(n)
-	if err != nil {
-		return n, err
+	w.parent.remaining -= int64(allowed)
+	fail := w.parent.fail && w.parent.exceeded
+	w.parent.mu.Unlock()
+	if allowed > 0 {
+		if _, err := w.w.Write(p[:allowed]); err != nil {
+			return allowed, err
+		}
+	}
+	if fail {
+		return allowed, ErrOutputLimitExceeded
 	}
 	return orig, nil
 }

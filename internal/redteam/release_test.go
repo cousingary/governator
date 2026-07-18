@@ -80,6 +80,27 @@ func TestAttack25ReleaseBinaryCommitDiffersFromSourceAndClaims(t *testing.T) {
 	}
 }
 
+// TestAttack26DirtyReleaseBinaryReportsAContradictoryRelease identity check:
+// even when version/commit/claims hash all match, a release artifact that
+// self-reports dirty=true must fail the release gate.
+func TestAttack26DirtyReleaseBinaryReportsAContradictoryRelease(t *testing.T) {
+	commit := "2626262626262626262626262626262626262626"
+	dist, repoRoot, platform := buildReleaseFixtureDist(t, releaseFixtureOpts{
+		version:        "1.0.0-redteam26",
+		manifestCommit: commit,
+		mode:           0755,
+		artifactDirty:  true,
+	})
+
+	out, err := runReleaseVerify(t, dist, repoRoot, platform)
+	if err == nil {
+		t.Fatalf("release_verify.sh accepted an archived binary whose version --json reported dirty=true; output:\n%s", out)
+	}
+	if !strings.Contains(out, "dirty=true") {
+		t.Fatalf("expected release_verify.sh's claims-verify call to fail on dirty=true, got:\n%s", out)
+	}
+}
+
 // runReleaseVerify invokes the real scripts/release_verify.sh against a
 // synthetic dist directory, using the real cmd/gov binary (govBinary(t),
 // built from this repo's actual current source -- the same binary S8's
@@ -115,6 +136,7 @@ type releaseFixtureOpts struct {
 	// "version" and the artifact's own `version --json` report can be made
 	// to drift independently (Session 7 / TestV7Case32).
 	artifactVersion string
+	artifactDirty   bool
 	// manifestArtifactSHAOverride, when non-empty, replaces the manifest's
 	// recorded artifact_sha256 with an arbitrary value instead of the
 	// archive's real hash (Session 7 / TestV7Case36: an installed/local
@@ -160,7 +182,7 @@ func buildReleaseFixtureDist(t *testing.T, opts releaseFixtureOpts) (distDir, re
 	if artifactVersion == "" {
 		artifactVersion = opts.version
 	}
-	artifactBin := buildFakeArtifactBinary(t, artifactVersion, artifactCommit, claimsHash)
+	artifactBin := buildFakeArtifactBinary(t, artifactVersion, artifactCommit, claimsHash, opts.artifactDirty)
 	artifactSHA := fileSHA256Hex(t, artifactBin)
 	if opts.manifestArtifactSHAOverride != "" {
 		artifactSHA = opts.manifestArtifactSHAOverride
@@ -202,7 +224,7 @@ func buildReleaseFixtureDist(t *testing.T, opts releaseFixtureOpts) (distDir, re
 // real governator CLI) that answers `version --json` the way build-manifest
 // verification expects -- mirroring internal/claims/claims_test.go's build()
 // helper.
-func buildFakeArtifactBinary(t *testing.T, version, sourceCommit, claimsHash string) string {
+func buildFakeArtifactBinary(t *testing.T, version, sourceCommit, claimsHash string, dirty bool) string {
 	t.Helper()
 	modDir := t.TempDir()
 	if err := os.WriteFile(filepath.Join(modDir, "go.mod"), []byte("module example.com/fakegov\n\ngo 1.22\n"), 0644); err != nil {
@@ -222,7 +244,7 @@ var claimsHash = "unknown"
 
 func main() {
 	if len(os.Args) == 3 && os.Args[1] == "version" && os.Args[2] == "--json" {
-		_ = json.NewEncoder(os.Stdout).Encode(map[string]string{"version": version, "source_commit": sourceCommit, "claims_hash": claimsHash})
+		_ = json.NewEncoder(os.Stdout).Encode(map[string]any{"version": version, "source_commit": sourceCommit, "claims_hash": claimsHash, "dirty": ` + map[bool]string{true: "true", false: "false"}[dirty] + `})
 		return
 	}
 	fmt.Println("fakegov", version)

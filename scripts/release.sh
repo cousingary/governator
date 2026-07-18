@@ -163,7 +163,7 @@ run_tier redteam_race "$REDTEAM_RACE_LOG" REDTEAM_RACE_RESULT REDTEAM_RACE_SECON
 # EXPECTED_REDTEAM_SKIPS) validated skip *count*, not the exact identity or
 # reason of each skip — a wrong test skipping while the total stayed the
 # same still passed. internal/redteam/manifest.yaml is now the single
-# source of truth for the 38-case mandatory final attack corpus, and `gov
+# source of truth for the manifest-defined mandatory redteam corpus, and `gov
 # redteam-gate verify` checks exact test identity against it: every
 # required case present and passing, every skip individually authorized by
 # name via the manifest's allowed_skip predicate+reason. See
@@ -221,28 +221,99 @@ for entry in "${FUZZ_TARGETS[@]}"; do
     "$fn" "$pkg" "$fresult" "$((fend - fstart))" >>"$FUZZ_RESULTS_JSON"
 done
 
-# Assayer's own pytest matrix lives in a separate repo/checkout (not a
-# submodule of this one), honestly reported as SKIPPED with a reason when
-# that checkout isn't present on this machine, never silently omitted from
-# test-summary.json. P0-7 (Sol redteam v4 S8): "Assayer must be a blocking
-# release gate. SKIPPED is not a passing state for a release that ships
-# blocking Assayer behavior" — SKIPPED now blocks the release exactly like
-# FAIL does, below. This is a real operational requirement change: a release
-# built on a machine without ASSAYER_REPO checked out now refuses to ship,
-# where it previously shipped with an honestly-labeled but unenforced gap.
+# Assayer's own release evidence must be a REAL Python 3.10/3.11/3.12/3.13
+# matrix, not one host interpreter mislabeled as a matrix. Each interpreter's
+# record includes the exact command, exit code, timeout status, timestamps,
+# duration, and log hash. Missing interpreters or a missing Assayer checkout
+# are release-blocking FAIL states, not silently omitted or renamed PASS.
 ASSAYER_LOG="$OUT_DIR/test-assayer.log"
+ASSAYER_MATRIX_JSON="$OUT_DIR/assayer-matrix.json"
+: >"$ASSAYER_LOG"
 if [ -d "$ASSAYER_REPO" ]; then
-  if (cd "$ASSAYER_REPO" && python3 -m pytest -q) >"$ASSAYER_LOG" 2>&1; then
-    ASSAYER_RESULT=PASS
-  else
-    ASSAYER_RESULT=FAIL
-    cat "$ASSAYER_LOG" >&2
-  fi
-  ASSAYER_SUMMARY=$(tail -1 "$ASSAYER_LOG")
+  python3 - "$ASSAYER_MATRIX_JSON" <<'PY'
+import pathlib, sys
+pathlib.Path(sys.argv[1]).write_text("[]\n")
+PY
+  ASSAYER_RESULT=PASS
+  for ASSAYER_PY in 3.10 3.11 3.12 3.13; do
+    ASSAYER_BIN="python${ASSAYER_PY}"
+    ASSAYER_CASE_LOG="$OUT_DIR/test-assayer-py${ASSAYER_PY}.log"
+    ASSAYER_CASE_STARTED=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+    ASSAYER_CASE_START_EPOCH=$(date +%s)
+    ASSAYER_EXIT_CODE=0
+    ASSAYER_TIMEOUT=false
+    if command -v "$ASSAYER_BIN" >/dev/null 2>&1; then
+      if timeout 900s bash -lc "cd '$ASSAYER_REPO' && '$ASSAYER_BIN' -m pytest -q" >"$ASSAYER_CASE_LOG" 2>&1; then
+        ASSAYER_CASE_RESULT=PASS
+      else
+        ASSAYER_EXIT_CODE=$?
+        if [ "$ASSAYER_EXIT_CODE" -eq 124 ]; then
+          ASSAYER_TIMEOUT=true
+        fi
+        ASSAYER_CASE_RESULT=FAIL
+        ASSAYER_RESULT=FAIL
+        cat "$ASSAYER_CASE_LOG" >&2
+      fi
+    else
+      ASSAYER_CASE_RESULT=FAIL
+      ASSAYER_EXIT_CODE=127
+      ASSAYER_RESULT=FAIL
+      echo "${ASSAYER_BIN} not present on this machine" >"$ASSAYER_CASE_LOG"
+      cat "$ASSAYER_CASE_LOG" >&2
+    fi
+    ASSAYER_CASE_ENDED=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+    ASSAYER_CASE_END_EPOCH=$(date +%s)
+    ASSAYER_CASE_SUMMARY=$(tail -1 "$ASSAYER_CASE_LOG")
+    ASSAYER_CASE_LOG_SHA=$(sha256sum "$ASSAYER_CASE_LOG" | awk '{print $1}')
+    python3 - "$ASSAYER_MATRIX_JSON" "$ASSAYER_PY" "$ASSAYER_BIN" "$ASSAYER_CASE_RESULT" "$ASSAYER_EXIT_CODE" "$ASSAYER_TIMEOUT" "$ASSAYER_CASE_STARTED" "$ASSAYER_CASE_ENDED" "$((ASSAYER_CASE_END_EPOCH - ASSAYER_CASE_START_EPOCH))" "$ASSAYER_CASE_LOG_SHA" "$ASSAYER_CASE_SUMMARY" <<'PY'
+import json, pathlib, sys
+path = pathlib.Path(sys.argv[1])
+data = json.loads(path.read_text())
+data.append({
+    "python_version": sys.argv[2],
+    "python_executable": sys.argv[3],
+    "command": f"{sys.argv[3]} -m pytest -q",
+    "result": sys.argv[4],
+    "exit_code": int(sys.argv[5]),
+    "timeout": sys.argv[6] == "true",
+    "started_at": sys.argv[7],
+    "ended_at": sys.argv[8],
+    "duration_seconds": int(sys.argv[9]),
+    "log_sha256": sys.argv[10],
+    "summary": sys.argv[11].strip(),
+})
+path.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n")
+PY
+    printf '%s %s\n' "$ASSAYER_BIN" "$ASSAYER_CASE_SUMMARY" >>"$ASSAYER_LOG"
+  done
+  ASSAYER_SUMMARY=$(python3 - "$ASSAYER_MATRIX_JSON" <<'PY'
+import json, sys
+rows = json.loads(open(sys.argv[1]).read())
+print("; ".join(f"python{r['python_version']}={r['result']} ({r['summary']})" for r in rows))
+PY
+)
 else
-  ASSAYER_RESULT=SKIPPED
+  ASSAYER_RESULT=FAIL
   ASSAYER_SUMMARY="ASSAYER_REPO ${ASSAYER_REPO} not present on this machine"
   echo "$ASSAYER_SUMMARY" >"$ASSAYER_LOG"
+  python3 - "$ASSAYER_MATRIX_JSON" "$ASSAYER_SUMMARY" <<'PY'
+import json, pathlib, sys
+pathlib.Path(sys.argv[1]).write_text(json.dumps([
+    {
+        "python_version": "3.10-3.13",
+        "python_executable": "",
+        "command": "pythonX.Y -m pytest -q",
+        "result": "FAIL",
+        "exit_code": 127,
+        "timeout": False,
+        "started_at": "",
+        "ended_at": "",
+        "duration_seconds": 0,
+        "log_sha256": "",
+        "summary": sys.argv[2],
+    }
+], indent=2, sort_keys=True) + "\n")
+PY
 fi
 
 # Sol redteam v7 S8 (corpus case 37): a passing pytest matrix says nothing
@@ -434,7 +505,7 @@ python3 - "$TEST_SUMMARY" "$COMMIT" "$GO_VERSION" "$BUILD_TS" "$GO_SUM_HASH" \
   "$REDTEAM_RESULT" "$REDTEAM_SECONDS" "$REDTEAM_STARTED" "$REDTEAM_ENDED" "$REDTEAM_LOG_SHA" \
   "$REDTEAM_TESTS_DISCOVERED" "$REDTEAM_TESTS_RUN" "$REDTEAM_TESTS_SKIPPED" "$REDTEAM_TESTS_FAILED" "$REDTEAM_GATE_OK" "$REDTEAM_GATE_JSON" "$REDTEAM_MANIFEST" \
   "$REDTEAM_RACE_RESULT" "$REDTEAM_RACE_SECONDS" "$REDTEAM_RACE_STARTED" "$REDTEAM_RACE_ENDED" "$REDTEAM_RACE_LOG_SHA" \
-  "$FUZZ_RESULTS_JSON" "$ASSAYER_RESULT" "$ASSAYER_SUMMARY" "$ASSAYER_VERSION_TAG_RESULT" "$ASSAYER_VERSION_TAG_SUMMARY" <<'PYTESTSUMMARY'
+  "$FUZZ_RESULTS_JSON" "$ASSAYER_RESULT" "$ASSAYER_SUMMARY" "$ASSAYER_MATRIX_JSON" "$ASSAYER_VERSION_TAG_RESULT" "$ASSAYER_VERSION_TAG_SUMMARY" <<'PYTESTSUMMARY'
 import json, pathlib, sys
 
 (summary_path, commit, go_version, build_ts, go_sum_sha256,
@@ -445,7 +516,7 @@ import json, pathlib, sys
  redteam_result, redteam_seconds, redteam_started, redteam_ended, redteam_log_sha,
  redteam_tests_discovered, redteam_tests_run, redteam_tests_skipped, redteam_tests_failed, redteam_gate_ok, redteam_gate_json_path, redteam_manifest_path,
  redteam_race_result, redteam_race_seconds, redteam_race_started, redteam_race_ended, redteam_race_log_sha,
- fuzz_results_path, assayer_result, assayer_summary,
+ fuzz_results_path, assayer_result, assayer_summary, assayer_matrix_path,
  assayer_version_tag_result, assayer_version_tag_summary) = sys.argv[1:]
 
 redteam_gate = json.loads(pathlib.Path(redteam_gate_json_path).read_text())
@@ -492,7 +563,7 @@ data = {
             "tests_skipped": int(redteam_tests_skipped),
             "tests_failed": int(redteam_tests_failed),
             # Sol v7 S7 (HS4): identity-based, not count-based. manifest is
-            # internal/redteam/manifest.yaml (the 38-case single source of
+            # internal/redteam/manifest.yaml (the manifest-defined single source of
             # truth); gate is `gov redteam-gate verify`'s full structured
             # verdict -- exact missing/unexpected/failed/unexpected-skip test
             # names, not just totals.
@@ -511,6 +582,7 @@ data = {
         "assayer_matrix": {
             "result": assayer_result,
             "summary": assayer_summary.strip(),
+            "versions": json.loads(pathlib.Path(assayer_matrix_path).read_text()),
             # Sol v7 S8 (corpus case 37): a matching Git tag for Assayer's
             # own declared version, proving which commit "the shipped
             # Assayer" actually is -- see scripts/assayer_verify.sh.
@@ -534,7 +606,7 @@ if assayer_version_tag_result != "PASS":
 data["overall_result"] = overall
 pathlib.Path(summary_path).write_text(json.dumps(data, indent=2, sort_keys=True) + "\n")
 PYTESTSUMMARY
-rm -f "$FUZZ_RESULTS_JSON" "$UNIT_LOG" "$RACE_LOG" "$INTEGRATION_LOG" "$CORPUS_LOG" "$REDTEAM_LOG" "$REDTEAM_RACE_LOG" "$ASSAYER_LOG" "$ASSAYER_VERSION_TAG_LOG" "$OUT_DIR"/test-fuzz-*.log
+rm -f "$FUZZ_RESULTS_JSON" "$UNIT_LOG" "$RACE_LOG" "$INTEGRATION_LOG" "$CORPUS_LOG" "$REDTEAM_LOG" "$REDTEAM_RACE_LOG" "$ASSAYER_LOG" "$ASSAYER_VERSION_TAG_LOG" "$ASSAYER_MATRIX_JSON" "$OUT_DIR"/test-assayer-py*.log "$OUT_DIR"/test-fuzz-*.log
 
 # ---------------------------------------------------------------------------
 # Acceptance smoke test: extract the exact distributable archive for THIS
@@ -585,10 +657,16 @@ if [ -f "$HOST_ARCHIVE" ]; then
     REPORTED_VERSION=$(python3 -c "import json,sys; print(json.loads(sys.argv[1]).get('version',''))" "$VERSION_OUT" 2>/dev/null || echo "")
     REPORTED_COMMIT=$(python3 -c "import json,sys; print(json.loads(sys.argv[1]).get('source_commit',''))" "$VERSION_OUT" 2>/dev/null || echo "")
     REPORTED_CLAIMS=$(python3 -c "import json,sys; print(json.loads(sys.argv[1]).get('claims_hash',''))" "$VERSION_OUT" 2>/dev/null || echo "")
+    REPORTED_DIRTY=$(python3 -c "import json,sys; v=json.loads(sys.argv[1]); print(v.get('dirty', '__missing__'))" "$VERSION_OUT" 2>/dev/null || echo "__missing__")
     if [ "$REPORTED_VERSION" != "$VERSION" ] || [ "$REPORTED_COMMIT" != "$COMMIT" ] || [ "$REPORTED_CLAIMS" != "$CLAIMS_HASH" ]; then
       ACCEPT_OK=false
       VERSION_MATCH_OK=false
       echo "gov version --json ($REPORTED_VERSION/$REPORTED_COMMIT/$REPORTED_CLAIMS) does not match build-manifest.json ($VERSION/$COMMIT/$CLAIMS_HASH)" >>"$NOTES_FILE"
+    fi
+    if [ "$REPORTED_DIRTY" != "False" ] && [ "$REPORTED_DIRTY" != "false" ]; then
+      ACCEPT_OK=false
+      VERSION_MATCH_OK=false
+      echo "gov version --json reports dirty=$REPORTED_DIRTY; release artifacts must report dirty=false" >>"$NOTES_FILE"
     fi
   else
     ACCEPT_OK=false

@@ -352,7 +352,7 @@ var claimsHash = "unknown"
 
 func main() {
 	if len(os.Args) == 3 && os.Args[1] == "version" && os.Args[2] == "--json" {
-		_ = json.NewEncoder(os.Stdout).Encode(map[string]string{"version": version, "source_commit": sourceCommit, "claims_hash": claimsHash})
+		_ = json.NewEncoder(os.Stdout).Encode(map[string]any{"version": version, "source_commit": sourceCommit, "claims_hash": claimsHash, "dirty": false})
 		return
 	}
 	fmt.Println("gov", version)
@@ -366,17 +366,31 @@ func main() {
 		t.Fatal(err)
 	}
 
-	build := func(name, version string) string {
+	build := func(name, version string, dirty bool) string {
 		t.Helper()
 		out := filepath.Join(root, name)
-		cmd := exec.Command("go", "build", "-o", out, "-ldflags", "-X main.version="+version+" -X main.sourceCommit="+commit+" -X main.claimsHash="+claimsHash, "./cmd/gov")
+		source := filepath.Join(root, "cmd", "gov", "main.go")
+		orig, err := os.ReadFile(source)
+		if err != nil {
+			t.Fatalf("read main.go: %v", err)
+		}
+		repl := strings.Replace(string(orig), `"dirty": false`, `"dirty": `+map[bool]string{true: "true", false: "false"}[dirty], 1)
+		if err := os.WriteFile(source, []byte(repl), 0o644); err != nil {
+			t.Fatalf("write main.go: %v", err)
+		}
+		defer func() {
+			if err := os.WriteFile(source, orig, 0o644); err != nil {
+				t.Fatalf("restore main.go: %v", err)
+			}
+		}()
+		cmd := exec.Command("go", "build", "-buildvcs=false", "-o", out, "-ldflags", "-X main.version="+version+" -X main.sourceCommit="+commit+" -X main.claimsHash="+claimsHash, "./cmd/gov")
 		cmd.Dir = root
 		if data, err := cmd.CombinedOutput(); err != nil {
 			t.Fatalf("go build %s: %v\n%s", name, err, data)
 		}
 		return out
 	}
-	artifact := build("gov-good", "v1.4.1")
+	artifact := build("gov-good", "v1.4.1", false)
 	artifactHash, err := fileSHA256(artifact)
 	if err != nil {
 		t.Fatal(err)
@@ -391,11 +405,11 @@ func main() {
       "result": "PASS",
       "source_commit": "`+commit+`",
       "log_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-      "tests_discovered": 38,
-      "tests_run": 38,
+      "tests_discovered": 41,
+      "tests_run": 41,
       "tests_skipped": 0,
       "tests_failed": 0,
-      "identity_gate": {"ok": true, "discovered": 38, "run": 38, "skipped": 0, "failed": 0}
+      "identity_gate": {"ok": true, "discovered": 41, "run": 41, "skipped": 0, "failed": 0}
     }
   }
 }`)
@@ -433,7 +447,7 @@ func main() {
 		t.Fatalf("expected artifact-backed shipped claim, got %+v", r)
 	}
 
-	badArtifact := build("gov-rc1", "1.0.0-rc1")
+	badArtifact := build("gov-rc1", "1.0.0-rc1", false)
 	badHash, err := fileSHA256(badArtifact)
 	if err != nil {
 		t.Fatal(err)
@@ -454,6 +468,29 @@ func main() {
 	}
 	if r := results[0]; r.OK() || !containsSubstring(r.Problems, "artifact version 1.0.0-rc1") {
 		t.Fatalf("expected rc1 self-reporting binary to fail verification, got %+v", r)
+	}
+
+	dirtyArtifact := build("gov-dirty", "v1.4.1", true)
+	dirtyHash, err := fileSHA256(dirtyArtifact)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, err = os.ReadFile(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body = []byte(strings.ReplaceAll(string(body), filepath.ToSlash(badArtifact), filepath.ToSlash(dirtyArtifact)))
+	body = []byte(strings.ReplaceAll(string(body), badHash, dirtyHash))
+	if err := os.WriteFile(manifest, body, 0644); err != nil {
+		t.Fatal(err)
+	}
+	claim.BinaryBuildEvidence.ArtifactPath = dirtyArtifact
+	results, err = Verify(root, Document{Claims: []Claim{claim}})
+	if err != nil {
+		t.Fatalf("Verify dirty artifact: %v", err)
+	}
+	if r := results[0]; r.OK() || !containsSubstring(r.Problems, "dirty=true") {
+		t.Fatalf("expected dirty self-reporting binary to fail verification, got %+v", r)
 	}
 }
 
@@ -505,7 +542,7 @@ func TestVerifyRedteamSuiteRequiresIdentityGate(t *testing.T) {
 	suite := map[string]any{
 		"command":          "go test -v -tags redteam -count=1 ./...",
 		"result":           "PASS",
-		"tests_discovered": float64(38),
+		"tests_discovered": float64(41),
 		"tests_failed":     float64(0),
 	}
 	ok, problems := verifyRedteamSuite(suite, "")
@@ -524,7 +561,7 @@ func TestVerifyRedteamSuiteRejectsFailingIdentityGate(t *testing.T) {
 	suite := map[string]any{
 		"command":          "go test -v -tags redteam -count=1 ./...",
 		"result":           "PASS",
-		"tests_discovered": float64(38),
+		"tests_discovered": float64(41),
 		"tests_failed":     float64(0),
 		"identity_gate": map[string]any{
 			"ok":               false,

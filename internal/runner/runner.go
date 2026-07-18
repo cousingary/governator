@@ -96,7 +96,7 @@ type Runner interface {
 // Credentials.Roots itself at credential-mount time, independently of
 // whatever the rest of the run had already frozen. Ignored for mode "local"
 // (LocalWorktreeRunner never mounts credentials).
-func New(mode string, dockerCfg *contracts.DockerRunnerConfig, localCfg *contracts.LocalRunnerConfig, credentialRoots []string, controllerEnvironments ...controllerenv.Frozen) (Runner, error) {
+func New(mode string, dockerCfg *contracts.DockerRunnerConfig, localCfg *contracts.LocalRunnerConfig, credentialRoots []string, resolvedImage *ImageIdentity, controllerEnvironments ...controllerenv.Frozen) (Runner, error) {
 	frozen := controllerenv.Freeze()
 	if len(controllerEnvironments) > 0 {
 		frozen = controllerEnvironments[0]
@@ -118,7 +118,7 @@ func New(mode string, dockerCfg *contracts.DockerRunnerConfig, localCfg *contrac
 		if err := CheckDockerAvailable(frozen); err != nil {
 			return nil, fmt.Errorf("runner: docker requested but unavailable: %w", err)
 		}
-		return &DockerRunner{Config: *dockerCfg, CredentialRoots: credentialRoots, ControllerEnvironment: frozen}, nil
+		return &DockerRunner{Config: *dockerCfg, CredentialRoots: credentialRoots, ControllerEnvironment: frozen, ResolvedImage: resolvedImage}, nil
 	default:
 		return nil, fmt.Errorf("runner: unknown mode %q", mode)
 	}

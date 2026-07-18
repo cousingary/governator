@@ -2,8 +2,10 @@ package stage
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/cousingary/governator/internal/controllerenv"
 )
@@ -22,6 +24,8 @@ func TestExecutorUsesOnlyFrozenEnvironment(t *testing.T) {
 		RunID: "s3-test", StageID: "frozen-env", Executable: executable,
 		Arguments:        []string{"-c", `printf '%s|%s' "$PATH" "$HOME"`},
 		Environment:      FrozenEnvironment{Values: frozen.Values, Hash: frozen.Hash},
+		OutputLimit:      1 << 20,
+		OutputCapture:    CaptureRequiredComplete,
 		DescendantPolicy: DescendantPolicy{RequireStrong: false},
 	})
 	if err != nil {
@@ -47,5 +51,98 @@ func TestExecutorRejectsMissingOrMismatchedFrozenEnvironment(t *testing.T) {
 	base.Environment = FrozenEnvironment{Values: []string{"PATH=/trusted"}, Hash: "wrong"}
 	if _, err := NewExecutor().Run(context.Background(), base); err == nil || !strings.Contains(err.Error(), "hash mismatch") {
 		t.Fatalf("mismatched environment error = %v", err)
+	}
+}
+
+func TestExecutorRequiresOutputLimitForCapturedStages(t *testing.T) {
+	executable, err := HashExecutable("/bin/true")
+	if err != nil {
+		t.Fatal(err)
+	}
+	env := controllerenv.Base()
+	_, err = NewExecutor().Run(context.Background(), StageSpec{
+		RunID: "phase3", StageID: "no-limit", Executable: executable,
+		Environment: FrozenEnvironment{Values: env, Hash: controllerenv.Hash(env)},
+	})
+	if err == nil || !strings.Contains(err.Error(), "output limit required") {
+		t.Fatalf("missing output limit error = %v", err)
+	}
+}
+
+func TestExecutorUsesOneAggregateOutputBudget(t *testing.T) {
+	executable, err := HashExecutable("/bin/sh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	env := controllerenv.Base()
+	res, err := NewExecutor().Run(context.Background(), StageSpec{
+		RunID: "phase3", StageID: "aggregate-limit", Executable: executable,
+		Arguments:     []string{"-c", "printf 12345; printf 67890 >&2"},
+		Environment:   FrozenEnvironment{Values: env, Hash: controllerenv.Hash(env)},
+		OutputLimit:   7,
+		OutputCapture: CaptureBounded,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !res.OutputTruncated {
+		t.Fatal("aggregate cap did not report truncation")
+	}
+	if got := len(res.Output); got != 7 {
+		t.Fatalf("captured bytes = %d, want shared cap 7; output %q", got, res.Output)
+	}
+}
+
+func TestExecutorRequiredCompleteOutputLimitTerminatesStage(t *testing.T) {
+	executable, err := HashExecutable("/bin/sh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	env := controllerenv.Base()
+	start := time.Now()
+	res, err := NewExecutor().Run(context.Background(), StageSpec{
+		RunID: "phase3", StageID: "limit-kills", Executable: executable,
+		Arguments:     []string{"-c", "while :; do printf 0123456789; done"},
+		Environment:   FrozenEnvironment{Values: env, Hash: controllerenv.Hash(env)},
+		OutputLimit:   64,
+		OutputCapture: CaptureRequiredComplete,
+		Timeout:       5 * time.Second,
+	})
+	if !errors.Is(err, ErrOutputLimitExceeded) {
+		t.Fatalf("error = %v, want ErrOutputLimitExceeded", err)
+	}
+	if time.Since(start) > 4*time.Second {
+		t.Fatal("stage kept running after required-complete output cap")
+	}
+	if !res.OutputTruncated {
+		t.Fatal("limit kill did not report truncation")
+	}
+	if got := len(res.Output); got != 64 {
+		t.Fatalf("captured bytes = %d, want 64", got)
+	}
+}
+
+func TestExecutorCaptureNoneDoesNotRetainStreamedOutput(t *testing.T) {
+	executable, err := HashExecutable("/bin/sh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	env := controllerenv.Base()
+	var streamed strings.Builder
+	res, err := NewExecutor().Run(context.Background(), StageSpec{
+		RunID: "phase3", StageID: "capture-none", Executable: executable,
+		Arguments:     []string{"-c", "printf streamed"},
+		Environment:   FrozenEnvironment{Values: env, Hash: controllerenv.Hash(env)},
+		OutputCapture: CaptureNone,
+		Stdout:        &streamed,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if streamed.String() != "streamed" {
+		t.Fatalf("streamed output = %q", streamed.String())
+	}
+	if res.Output != "" {
+		t.Fatalf("capture-none retained output %q", res.Output)
 	}
 }

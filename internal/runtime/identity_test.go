@@ -547,3 +547,71 @@ func TestResolveValidatorToolsetRejectsEscapingFile(t *testing.T) {
 		t.Fatalf("expected workspace escape error, got %v", err)
 	}
 }
+
+func TestResolveValidatorToolsetBindsStructuredCleanupValidators(t *testing.T) {
+	root := t.TempDir()
+	path := filepath.Join(root, "cleanup.py")
+	if err := os.WriteFile(path, []byte("print('cleanup-a')\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	c := contracts.Contract{
+		Success: contracts.Success{Validators: []string{"true"}},
+		Cleanup: &contracts.Cleanup{
+			Validators:     []string{"python3 cleanup.py"},
+			ValidatorSpecs: []contracts.ValidatorSpec{{Command: "python3 cleanup.py", Files: []string{"cleanup.py"}}},
+		},
+	}
+	first, err := resolveValidatorToolset(c, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte("print('cleanup-b')\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	second, err := resolveValidatorToolset(c, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first == second {
+		t.Fatal("cleanup validator file byte change did not change resolved toolset hash")
+	}
+}
+
+func TestResolvedAssayerEnvironmentHashBindsCLIAndLockfile(t *testing.T) {
+	repo := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(repo, "assayer"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	for path, content := range map[string]string{
+		"cli.py":                "print('cli-v1')\n",
+		"pyproject.toml":        "[project]\nname='assayer'\nversion='1.1.0'\n",
+		"requirements-lock.txt": "package==1.0\n",
+		"assayer/__init__.py":   "",
+		"assayer/checks.py":     "CHECKS = {}\n",
+		"assayer/evidence.py":   "",
+		"assayer/outbox.py":     "",
+		"assayer/profiles.py":   "PROFILES = {}\n",
+		"assayer/store.py":      "",
+	} {
+		if err := os.WriteFile(filepath.Join(repo, filepath.FromSlash(path)), []byte(content), 0644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	cfg := config.BuiltIn()
+	cfg.Assay.Repo = repo
+	first := resolvedAssayerEnvironmentHash(cfg, contracts.Contract{})
+	if err := os.WriteFile(filepath.Join(repo, "cli.py"), []byte("print('cli-v2')\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	second := resolvedAssayerEnvironmentHash(cfg, contracts.Contract{})
+	if first == second {
+		t.Fatal("assayer cli.py byte change did not change assayer environment hash")
+	}
+	if err := os.WriteFile(filepath.Join(repo, "requirements-lock.txt"), []byte("package==2.0\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	third := resolvedAssayerEnvironmentHash(cfg, contracts.Contract{})
+	if second == third {
+		t.Fatal("assayer requirements-lock.txt change did not change assayer environment hash")
+	}
+}

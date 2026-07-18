@@ -613,6 +613,7 @@ func LaunchStaged(ctx context.Context, handle *BackendExecutionHandle, bin strin
 		Arguments:        args,
 		WorkingDirectory: workdir,
 		Environment:      stage.FrozenEnvironment{Values: envValues, Hash: controllerenv.Hash(envValues)},
+		OutputCapture:    stage.CaptureNone,
 		DescendantPolicy: stage.DescendantPolicy{RequireStrong: scope.IsStrong()},
 		EnforcementPlan:  plan,
 		CommandFactory:   factory,

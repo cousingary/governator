@@ -494,13 +494,13 @@ func verifyShipped(repoRoot string, c Claim, opts VerifyOptions) (bool, []string
 
 // minRedteamTestCount is a defense-in-depth floor, not the primary release
 // gate: even if the identity gate's manifest were somehow tampered down to
-// fewer entries, a redteam suite discovering fewer than the full 38-case
-// mandatory final attack corpus (agents/governator-sol-upgrade7-plan.md)
+// fewer entries, a redteam suite discovering fewer than the full 41-case
+// mandatory final attack corpus (including the currently enrolled v8 cases)
 // cannot be a real release. The identity check below (an exact,
 // name-by-name comparison against internal/redteam/manifest.yaml via `gov
 // redteam-gate verify`) is what actually replaces the old count-only gate
 // (Sol v7 S7, HS4) — see identity_gate below.
-const minRedteamTestCount = 38
+const minRedteamTestCount = 41
 
 // verifyClaimedRedteamCases checks that every redteam manifest case number a
 // claim declares (Claim.RedteamCases) is neither missing, name-drifted,
@@ -898,6 +898,14 @@ func verifyArtifactManifest(repoRoot, artifactPath, manifestPath string) (bool, 
 			ok = false
 			problems = append(problems, fmt.Sprintf("absent from shipped binary: artifact vcs revision %s does not match manifest source_commit %s", rev, manifest.SourceCommit))
 		}
+		if settings["vcs.modified"] == "true" {
+			ok = false
+			problems = append(problems, "absent from shipped binary: artifact build metadata reports vcs.modified=true")
+		}
+		if strings.Contains(strings.ToLower(strings.TrimSpace(bi.Main.Version)), "+dirty") {
+			ok = false
+			problems = append(problems, fmt.Sprintf("absent from shipped binary: artifact module version %q contains +dirty", bi.Main.Version))
+		}
 	}
 
 	self, err := runArtifactVersionJSON(artifactFull)
@@ -916,6 +924,13 @@ func verifyArtifactManifest(repoRoot, artifactPath, manifestPath string) (bool, 
 		if manifest.ClaimsHash != "" && self.ClaimsHash != manifest.ClaimsHash {
 			ok = false
 			problems = append(problems, fmt.Sprintf("absent from shipped binary: artifact claims_hash %s does not match manifest %s", self.ClaimsHash, manifest.ClaimsHash))
+		}
+		if self.Dirty == nil {
+			ok = false
+			problems = append(problems, "absent from shipped binary: artifact version JSON missing dirty field")
+		} else if *self.Dirty {
+			ok = false
+			problems = append(problems, "absent from shipped binary: artifact version JSON reports dirty=true")
 		}
 	}
 	return ok, problems
@@ -947,6 +962,7 @@ type artifactVersion struct {
 	BuildTimestamp         string `json:"build_timestamp"`
 	ClaimsHash             string `json:"claims_hash"`
 	AdapterProtocolVersion string `json:"adapter_protocol_version"`
+	Dirty                  *bool  `json:"dirty"`
 }
 
 func runArtifactVersionJSON(path string) (artifactVersion, error) {

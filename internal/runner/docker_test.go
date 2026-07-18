@@ -3,6 +3,7 @@ package runner
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -46,6 +47,20 @@ func secureRunnerTempDir(t *testing.T) string {
 // tag / env check" the plan calls for, applied as a runtime capability
 // check rather than a compile-time tag, so `go test ./...` still exercises
 // this file's syntax/compilation everywhere.
+func pinFakeDocker(t *testing.T, script string) string {
+	t.Helper()
+	registryFile := filepath.Join(t.TempDir(), "tools.yaml")
+	t.Setenv("GOV_TOOLREGISTRY_FILE", registryFile)
+	fakeDocker := filepath.Join(secureRunnerTempDir(t), "docker")
+	if err := os.WriteFile(fakeDocker, []byte(script), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := toolregistry.Enroll("docker", fakeDocker); err != nil {
+		t.Fatal(err)
+	}
+	return fakeDocker
+}
+
 func requireDocker(t *testing.T) {
 	t.Helper()
 	if err := CheckDockerAvailable(); err != nil {
@@ -226,6 +241,22 @@ func TestDockerRunArgsCanonicalizesMounts(t *testing.T) {
 // TestDockerRunArgsHardeningFlags pins Session 3b: each hardened control maps
 // to the expected docker flag, and absent controls produce no flag (so prior
 // job YAML stays byte-identical). No daemon required.
+func TestDockerRunArgsUsesResolvedImageID(t *testing.T) {
+	isolateConfig(t, "")
+	d := &DockerRunner{Config: contracts.DockerRunnerConfig{Image: "agent:latest"}, ResolvedImage: &ImageIdentity{ID: "sha256:" + strings.Repeat("a", 64)}}
+	args, err := d.runArgs(Workspace{Container: "c", Path: "/ws"}, "bin", nil)
+	if err != nil {
+		t.Fatalf("runArgs: %v", err)
+	}
+	joined := strings.Join(args, "\n")
+	if !strings.Contains(joined, d.ResolvedImage.ID) {
+		t.Fatalf("expected resolved image ID %q in runArgs:\n%s", d.ResolvedImage.ID, joined)
+	}
+	if strings.Contains(joined, d.Config.Image+"\n") || strings.HasSuffix(joined, d.Config.Image) {
+		t.Fatalf("runArgs should not pass mutable configured image %q once resolved:\n%s", d.Config.Image, joined)
+	}
+}
+
 func TestDockerRunArgsHardeningFlags(t *testing.T) {
 	isolateConfig(t, "")
 	d := &DockerRunner{Config: contracts.DockerRunnerConfig{
@@ -695,6 +726,59 @@ func dockerTestImageDigest(t *testing.T) string {
 // TestDockerObserveHardenedLiveMatchApproves is the positive end-to-end
 // control for Sol High 8/10: a container actually launched with every
 // hardened flag runArgs would emit passes Observe with no error.
+func TestDockerExecutorTimeoutRequiresProvenContainerExtinction(t *testing.T) {
+	stateDir := t.TempDir()
+	stateFile := filepath.Join(stateDir, "state")
+	if err := os.WriteFile(stateFile, []byte("running"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	pinFakeDocker(t, fmt.Sprintf(`#!/bin/sh
+set -eu
+state=$(cat %q)
+cmd=${1:-}
+shift || true
+case "$cmd" in
+  run)
+    sleep 30
+    ;;
+  inspect)
+    name=$1
+    shift
+    if [ "$state" = removed ]; then
+      echo "Error response from daemon: No such object: $name" >&2
+      exit 1
+    fi
+    printf '{"Image":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","State":{"Running":true,"Status":"running"}}'
+    ;;
+  stop)
+    echo 'permission denied' >&2
+    exit 1
+    ;;
+  rm)
+    echo 'daemon unavailable' >&2
+    exit 1
+    ;;
+  *)
+    echo 'unexpected command' >&2
+    exit 1
+    ;;
+esac
+`, stateFile))
+	d := &DockerRunner{Config: contracts.DockerRunnerConfig{Image: "agent:latest"}, ResolvedImage: &ImageIdentity{ID: "sha256:" + strings.Repeat("a", 64)}, ControllerEnvironment: controllerenv.Freeze()}
+	execFn := d.executor(Workspace{Container: "gov-timeout-test", Path: "/ws"})
+	var out bytes.Buffer
+	code, timedOut, descendantsGone, err := execFn(context.Background(), "bin", nil, "/ws", &out, 50*time.Millisecond)
+	if !timedOut || code != -1 {
+		t.Fatalf("expected timeout with code -1, got code=%d timedOut=%v err=%v", code, timedOut, err)
+	}
+	if descendantsGone {
+		t.Fatal("executor reported descendants gone even though fake docker inspect still reported the container running")
+	}
+	if err == nil || !strings.Contains(err.Error(), "docker extinction proof") {
+		t.Fatalf("expected extinction-proof error, got %v", err)
+	}
+}
+
 func TestDockerObserveHardenedLiveMatchApproves(t *testing.T) {
 	requireDocker(t)
 	digest := dockerTestImageDigest(t)
@@ -831,6 +915,26 @@ func TestResolveImageIdentityDetectsRetaggedMutableTag(t *testing.T) {
 // consulted, closes this). This test pins docker's path in the trusted-tool
 // registry, then prepends a different, hostile "docker" earlier on PATH,
 // and asserts resolveDocker() still returns the pinned path.
+func TestVerifyStartedContainerRejectsImageMismatch(t *testing.T) {
+	pinFakeDocker(t, "#!/bin/sh\nset -eu\nif [ \"${1:-}\" = inspect ]; then\n  printf '{\"Image\":\"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"State\":{\"Running\":true,\"Status\":\"running\"}}'\n  exit 0\nfi\nexit 1\n")
+	d := &DockerRunner{ResolvedImage: &ImageIdentity{ID: "sha256:" + strings.Repeat("a", 64)}, ControllerEnvironment: controllerenv.Freeze()}
+	err := d.verifyStartedContainer(context.Background(), Workspace{Container: "gov-image-mismatch"})
+	if err == nil || !strings.Contains(err.Error(), "runtime image mismatch") {
+		t.Fatalf("expected runtime image mismatch, got %v", err)
+	}
+}
+
+func TestContainerAbsentRecognizesDockerNotFoundPhrases(t *testing.T) {
+	for _, out := range []string{"Error: No such container: x", "Error response from daemon: No such object: x"} {
+		if !containerAbsent(out) {
+			t.Fatalf("containerAbsent(%q)=false, want true", out)
+		}
+	}
+	if containerAbsent("permission denied") {
+		t.Fatal("containerAbsent reported true for a real failure")
+	}
+}
+
 func TestResolveDockerHonorsRegistryPin(t *testing.T) {
 	registryFile := filepath.Join(t.TempDir(), "tools.yaml")
 	t.Setenv("GOV_TOOLREGISTRY_FILE", registryFile)

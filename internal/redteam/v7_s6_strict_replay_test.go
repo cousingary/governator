@@ -98,6 +98,11 @@ func strictReplayEnrollControllerTools(t *testing.T) {
 	if _, err := toolregistry.Enroll("test", testPath); err != nil {
 		t.Fatal(err)
 	}
+	if pythonPath, err := exec.LookPath("python3"); err == nil {
+		if _, err := toolregistry.Enroll("python3", pythonPath); err != nil {
+			t.Fatal(err)
+		}
+	}
 	// s6EnrollControllerTools only enrolls git/bash -- baseContract forbids
 	// network, which (per TestV6Case1) makes the externally enforced
 	// sandbox mandatory regardless of risk_class, and that sandbox's
@@ -125,6 +130,25 @@ func strictReplayContract(root string) contracts.Contract {
 		{Command: "test -f output/result.txt", Tools: []string{"test"}},
 	}
 	return c
+}
+
+func writeMinimalAssayerRepo(t *testing.T, repo string) {
+	t.Helper()
+	for rel, body := range map[string]string{
+		"PINNED_COMMIT":       "commit-v1\n",
+		"cli.py":              "print('assayer cli')\n",
+		"assayer/__init__.py": "__version__ = '0.0-test'\n",
+		"assayer/checks.py":   "CHECKS = ['v1']\n",
+		"assayer/profiles.py": "PROFILES = {'coding-output-v1': {'checks': ['v1']}}\n",
+	} {
+		path := filepath.Join(repo, filepath.FromSlash(rel))
+		if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte(body), 0644); err != nil {
+			t.Fatal(err)
+		}
+	}
 }
 
 // runStrictReplayTwiceUnchanged runs c through the real runtime engine
@@ -632,12 +656,14 @@ func TestV7Case25AssayerCommitChangeInvalidatesReplay(t *testing.T) {
 	strictReplayEnrollControllerTools(t)
 
 	assayRepo := t.TempDir()
-	if err := os.MkdirAll(filepath.Join(assayRepo, ".git"), 0755); err != nil {
-		t.Fatal(err)
-	}
-	headPath := filepath.Join(assayRepo, ".git", "HEAD")
-	if err := os.WriteFile(headPath, []byte("commit-v1"), 0644); err != nil {
-		t.Fatal(err)
+	writeMinimalAssayerRepo(t, assayRepo)
+	gitEnv := append(os.Environ(), "GIT_AUTHOR_NAME=test", "GIT_AUTHOR_EMAIL=test@example.com", "GIT_COMMITTER_NAME=test", "GIT_COMMITTER_EMAIL=test@example.com")
+	for _, args := range [][]string{{"init"}, {"add", "."}, {"commit", "-m", "v1"}} {
+		cmd := exec.Command("git", append([]string{"-C", assayRepo}, args...)...)
+		cmd.Env = gitEnv
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v: %s", args, err, out)
+		}
 	}
 	t.Setenv("GOV_ASSAY_REPO", assayRepo)
 
@@ -646,8 +672,10 @@ func TestV7Case25AssayerCommitChangeInvalidatesReplay(t *testing.T) {
 
 	runStrictReplayBaseline(t, home, bin, c)
 
-	if err := os.WriteFile(headPath, []byte("commit-v2-completely-different"), 0644); err != nil {
-		t.Fatal(err)
+	cmd := exec.Command("git", "-C", assayRepo, "commit", "--allow-empty", "-m", "v2")
+	cmd.Env = gitEnv
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("git commit --allow-empty: %v: %s", err, out)
 	}
 
 	r3 := runGoverned(t, home, bin, c)
@@ -670,13 +698,8 @@ func TestV7Case26AssayerProfileChangeInvalidatesReplay(t *testing.T) {
 	strictReplayEnrollControllerTools(t)
 
 	assayRepo := t.TempDir()
-	if err := os.MkdirAll(filepath.Join(assayRepo, "assayer"), 0755); err != nil {
-		t.Fatal(err)
-	}
+	writeMinimalAssayerRepo(t, assayRepo)
 	profilePath := filepath.Join(assayRepo, "assayer", "profiles.py")
-	if err := os.WriteFile(profilePath, []byte("PROFILES = {'coding-output-v1': {'checks': ['v1']}}\n"), 0644); err != nil {
-		t.Fatal(err)
-	}
 	t.Setenv("GOV_ASSAY_REPO", assayRepo)
 
 	c := strictReplayContract(root)

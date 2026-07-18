@@ -33,6 +33,8 @@ func runV7S3Stage(t *testing.T, workdir string, env controllerenv.Frozen, comman
 		Environment:      stageexec.FrozenEnvironment{Values: env.Values, Hash: env.Hash},
 		NetworkPolicy:    stageexec.NetworkPolicyDenied,
 		CredentialPolicy: stageexec.CredentialPolicyNone,
+		OutputLimit:      1 << 20,
+		OutputCapture:    stageexec.CaptureRequiredComplete,
 	})
 	if err != nil {
 		t.Fatal(err)
