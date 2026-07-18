@@ -265,10 +265,19 @@ func (Executor) Run(ctx context.Context, spec StageSpec) (StageResult, error) {
 	factory := spec.CommandFactory
 	if factory == nil && spec.ExecutableHandle != nil {
 		factory = func(c context.Context, s *containment.Scope, p enforce.Plan, b string, a []string, d string) (*exec.Cmd, error) {
-			return spec.ExecutableHandle.CommandWith(c, a, func(cc context.Context, sealed string, sealedArgs []string) *exec.Cmd {
-				if p.Active {
-					sealed, sealedArgs = p.Wrap(sealed, sealedArgs)
+			if p.Active {
+				sealed, err := spec.ExecutableHandle.SealedExecutablePath()
+				if err != nil {
+					return nil, err
 				}
+				extended, err := p.WithExecutableAndReadRoots(sealed, filepath.Dir(sealed))
+				if err != nil {
+					return nil, err
+				}
+				wb, wa := extended.Wrap(sealed, a)
+				return s.Command(c, wb, wa, d), nil
+			}
+			return spec.ExecutableHandle.CommandWith(c, a, func(cc context.Context, sealed string, sealedArgs []string) *exec.Cmd {
 				return s.Command(cc, sealed, sealedArgs, d)
 			})
 		}

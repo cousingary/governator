@@ -11,6 +11,7 @@ import (
 
 	"github.com/cousingary/governator/internal/controllerenv"
 	stageexec "github.com/cousingary/governator/internal/stage"
+	"github.com/cousingary/governator/internal/toolregistry"
 )
 
 func writeV7S3Probe(t *testing.T, dir, result string) {
@@ -23,18 +24,30 @@ func writeV7S3Probe(t *testing.T, dir, result string) {
 
 func runV7S3Stage(t *testing.T, workdir string, env controllerenv.Frozen, command string) string {
 	t.Helper()
-	executable, err := stageexec.HashExecutable("/bin/sh")
+	registryFile := filepath.Join(t.TempDir(), "tools.yaml")
+	t.Setenv("GOV_TOOLREGISTRY_FILE", registryFile)
+	if _, err := toolregistry.Enroll("bash", "/bin/sh"); err != nil {
+		t.Fatal(err)
+	}
+	registry, err := toolregistry.Load()
 	if err != nil {
 		t.Fatal(err)
 	}
+	handle, err := registry.ResolveHandle("bash", "/bin/sh", toolregistry.KindTrustedController)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer handle.Close()
 	result, err := stageexec.NewExecutor().Run(context.Background(), stageexec.StageSpec{
-		RunID: "v7-s3", StageID: "frozen-environment", Executable: executable,
-		Arguments: []string{"-c", command}, WorkingDirectory: workdir,
+		RunID:            "v7-s3",
+		StageID:          "frozen-environment",
+		Executable:       stageexec.ExecutableIdentity{CanonicalPath: handle.Identity.CanonicalPath, SHA256: handle.Identity.SHA256},
+		Arguments:        []string{"-c", command},
+		WorkingDirectory: workdir,
 		Environment:      stageexec.FrozenEnvironment{Values: env.Values, Hash: env.Hash},
-		NetworkPolicy:    stageexec.NetworkPolicyDenied,
-		CredentialPolicy: stageexec.CredentialPolicyNone,
 		OutputLimit:      1 << 20,
 		OutputCapture:    stageexec.CaptureRequiredComplete,
+		ExecutableHandle: handle,
 	})
 	if err != nil {
 		t.Fatal(err)

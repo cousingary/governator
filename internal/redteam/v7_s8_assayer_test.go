@@ -55,7 +55,7 @@ func buildAssayerRepoFixture(t *testing.T, version string) (repoDir string) {
 
 func runAssayerVerify(t *testing.T, repoDir string) (string, error) {
 	t.Helper()
-	cmd := exec.Command(assayerVerifyScript(t), "--assayer-repo", repoDir)
+	cmd := exec.Command("bash", assayerVerifyScript(t), "--assayer-repo", repoDir)
 	out, err := cmd.CombinedOutput()
 	return string(out), err
 }

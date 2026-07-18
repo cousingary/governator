@@ -378,7 +378,7 @@ fi
 # internal/redteam/v7_pending_cases_test.go's TestV7Case37.
 ASSAYER_VERSION_TAG_LOG="$OUT_DIR/test-assayer-version-tag.log"
 if [ -d "$ASSAYER_REPO" ]; then
-  if "$ROOT/scripts/assayer_verify.sh" --assayer-repo "$ASSAYER_REPO" >"$ASSAYER_VERSION_TAG_LOG" 2>&1; then
+  if bash "$ROOT/scripts/assayer_verify.sh" --assayer-repo "$ASSAYER_REPO" >"$ASSAYER_VERSION_TAG_LOG" 2>&1; then
     ASSAYER_VERSION_TAG_RESULT=PASS
   else
     ASSAYER_VERSION_TAG_RESULT=FAIL

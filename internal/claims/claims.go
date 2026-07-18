@@ -683,7 +683,7 @@ func verifyRedteamSuite(suite map[string]any, commit string) (bool, []string) {
 
 func verifyVersionTagProvenance(repoRoot, commit, version string, portable bool) (bool, []string) {
 	v := strings.TrimSpace(version)
-	if v == "" || strings.Contains(v, "candidate") || strings.Contains(v, "rc") || strings.Contains(v, "+") {
+	if v == "" || strings.Contains(v, "candidate") || strings.Contains(v, "+") {
 		return true, nil
 	}
 	tag := v

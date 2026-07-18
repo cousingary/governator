@@ -19,6 +19,7 @@ import (
 	"github.com/cousingary/governator/internal/controllerenv"
 	"github.com/cousingary/governator/internal/enforce"
 	stageexec "github.com/cousingary/governator/internal/stage"
+	"github.com/cousingary/governator/internal/toolregistry"
 )
 
 func TestV8Case3ValidatorNetworkDenyDoesNotInheritBackendAllow(t *testing.T) {
@@ -86,9 +87,13 @@ func TestV8Case6AssayerFailsClosedWithoutExternalSandbox(t *testing.T) {
 	enforce.ForceUnsupported = true
 	defer func() { enforce.ForceUnsupported = false }()
 
+	repo, err := filepath.Abs(filepath.Join("..", "assay", "testdata", "assayer_fixture"))
+	if err != nil {
+		t.Fatal(err)
+	}
 	dir := t.TempDir()
 	artifactPath, sha := assayerTestArtifact(t, dir, `{"ok":true}`)
-	cfg := assay.Config{Repo: dir, Timeout: time.Second}
+	cfg := assay.Config{Repo: repo, Timeout: time.Second}
 	v := assay.Evaluate(context.Background(), cfg, assayerTestRequest("v8-case6", sha), artifactPath)
 	if !v.HadError || !strings.Contains(v.Reason, "construct authority plan") {
 		t.Fatalf("verdict = %+v, want fail-closed sandbox error", v)
@@ -101,6 +106,11 @@ func TestV8Case7GraphProviderFailsClosedWithoutExternalSandbox(t *testing.T) {
 
 	root := fixtureRepo(t)
 	bin := buildFakeCodegraphBinary(t, "", "", "")
+	registryFile := filepath.Join(t.TempDir(), "tools.yaml")
+	t.Setenv("GOV_TOOLREGISTRY_FILE", registryFile)
+	if _, err := toolregistry.Enroll("codegraph", bin); err != nil {
+		t.Fatal(err)
+	}
 	status := contextgraph.Status{Mode: "auto", Provider: "codegraph", Bin: bin, Path: bin, Enabled: true}
 	_, err := contextgraph.Inspect(context.Background(), status, root)
 	if err == nil || !strings.Contains(err.Error(), "construct authority plan") {
@@ -109,21 +119,38 @@ func TestV8Case7GraphProviderFailsClosedWithoutExternalSandbox(t *testing.T) {
 }
 
 func TestV8Case8AuthorityRejectsContradictorySuppliedPlan(t *testing.T) {
-	executable, err := stageexec.HashExecutable("/bin/true")
+	registryFile := filepath.Join(t.TempDir(), "tools.yaml")
+	t.Setenv("GOV_TOOLREGISTRY_FILE", registryFile)
+	if _, err := toolregistry.Enroll("true", "/bin/true"); err != nil {
+		t.Fatal(err)
+	}
+	registry, err := toolregistry.Load()
 	if err != nil {
 		t.Fatal(err)
 	}
+	handle, err := registry.ResolveHandle("true", "/bin/true", toolregistry.KindTrustedController)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer handle.Close()
 	env := controllerenv.Base()
 	_, err = stageexec.NewExecutor().Run(context.Background(), stageexec.StageSpec{
 		RunID:            "v8-phase2",
 		StageID:          "authority-contradiction",
-		Executable:       executable,
+		Executable:       stageexec.ExecutableIdentity{CanonicalPath: handle.Identity.CanonicalPath, SHA256: handle.Identity.SHA256},
 		Environment:      stageexec.FrozenEnvironment{Values: env, Hash: controllerenv.Hash(env)},
 		OutputCapture:    stageexec.CaptureNone,
 		DescendantPolicy: stageexec.DescendantPolicy{RequireStrong: true},
 		Authority:        stageexec.StageAuthority{ReadRoots: []string{"."}, Network: stageexec.NetworkPolicyDenied, Credentials: stageexec.CredentialPolicyNone, RequireStrongScope: true},
 		EnforcementPlan:  enforce.Plan{Active: true, ReadOnly: true, AllowNetwork: true},
+		ExecutableHandle: handle,
 	})
+	if !enforce.Supported() {
+		if err == nil || !strings.Contains(err.Error(), "construct authority plan") {
+			t.Fatalf("error = %v, want fail-closed sandbox refusal on unsupported host", err)
+		}
+		return
+	}
 	if err == nil || !strings.Contains(err.Error(), "authority denies network but plan allows it") {
 		t.Fatalf("error = %v, want authority/plan contradiction", err)
 	}

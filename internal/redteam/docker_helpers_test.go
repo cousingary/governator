@@ -13,8 +13,10 @@ import (
 	"time"
 
 	"github.com/cousingary/governator/internal/contracts"
+	"github.com/cousingary/governator/internal/enforce"
 	"github.com/cousingary/governator/internal/runner"
 	govruntime "github.com/cousingary/governator/internal/runtime"
+	"github.com/cousingary/governator/internal/toolregistry"
 )
 
 // dockerFakeBackendScript is a governed-backend stand-in baked into the
@@ -101,6 +103,10 @@ func dockerContract(root, image string) contracts.Contract {
 	// confinement boundary), so clear it rather than leaving a
 	// local-runner-only field on a docker contract.
 	c.Local = nil
+	c.Success = contracts.Success{
+		RequiredFiles: []string{"output/result.txt"},
+		Validators:    []string{":"},
+	}
 	c.Runner = "docker"
 	c.Docker = &contracts.DockerRunnerConfig{
 		Image:   image,
@@ -136,6 +142,25 @@ func setUpDockerHostFallback(t *testing.T) {
 // an absolute host path -- callers must call setUpDockerHostFallback first.
 func runGovernedDocker(t *testing.T, home string, c contracts.Contract) govruntime.RunRecord {
 	t.Helper()
+	enrollRealControllerTools(t)
+	for _, tool := range []string{"docker"} {
+		path := "/usr/bin/" + tool
+		if _, err := os.Stat(path); err != nil {
+			looked, lookErr := exec.LookPath(tool)
+			if lookErr != nil {
+				t.Fatal(lookErr)
+			}
+			path = looked
+		}
+		if _, err := toolregistry.Enroll(tool, path); err != nil {
+			t.Fatal(err)
+		}
+	}
+	ownSelfExe := enforce.SelfExeOverride == ""
+	if ownSelfExe {
+		enforce.SelfExeOverride = govBinary(t)
+		defer func() { enforce.SelfExeOverride = "" }()
+	}
 	t.Setenv("GOV_HOME", home)
 	rec, err := govruntime.New().RunWithAutoRepair(context.Background(), c)
 	if err != nil {

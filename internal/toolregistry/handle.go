@@ -8,14 +8,16 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"runtime"
 	"syscall"
 )
 
 // Handle pins the verified-open executable object used by controller stages.
 type Handle struct {
-	Identity Identity
-	file     *os.File
+	Identity  Identity
+	file      *os.File
+	sealedDir string
 }
 
 func (r *Registry) ResolveHandle(name, requestedBin string, want Kind) (*Handle, error) {
@@ -91,3 +93,51 @@ func (h *Handle) CommandWith(ctx context.Context, args []string, build func(cont
 	cmd.ExtraFiles = []*os.File{h.file}
 	return cmd, nil
 }
+
+// SealedExecutablePath copies the verified-open controller tool into a
+// private immutable directory for wrapper-based launches that cannot rely on
+// /proc/self/fd/<n> surviving all the way to the final exec.
+func (h *Handle) SealedExecutablePath() (string, error) {
+	if h == nil || h.file == nil {
+		return "", fmt.Errorf("tool handle is closed")
+	}
+	if h.sealedDir != "" {
+		return filepath.Join(h.sealedDir, filepath.Base(h.Identity.CanonicalPath)), nil
+	}
+	dir, err := os.MkdirTemp("", "governator-tool-exec-*")
+	if err != nil {
+		return "", fmt.Errorf("create sealed tool dir: %w", err)
+	}
+	outPath := filepath.Join(dir, filepath.Base(h.Identity.CanonicalPath))
+	out, err := os.OpenFile(outPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0500)
+	if err != nil {
+		_ = os.RemoveAll(dir)
+		return "", fmt.Errorf("create sealed tool copy: %w", err)
+	}
+	if _, err := h.file.Seek(0, io.SeekStart); err != nil {
+		_ = out.Close()
+		_ = os.RemoveAll(dir)
+		return "", fmt.Errorf("rewind verified tool fd: %w", err)
+	}
+	_, copyErr := io.Copy(out, h.file)
+	closeErr := out.Close()
+	if copyErr != nil {
+		_ = os.RemoveAll(dir)
+		return "", fmt.Errorf("copy verified tool: %w", copyErr)
+	}
+	if closeErr != nil {
+		_ = os.RemoveAll(dir)
+		return "", fmt.Errorf("close sealed tool copy: %w", closeErr)
+	}
+	if err := os.Chmod(outPath, 0500); err != nil {
+		_ = os.RemoveAll(dir)
+		return "", fmt.Errorf("chmod sealed tool copy: %w", err)
+	}
+	if err := os.Chmod(dir, 0500); err != nil {
+		_ = os.RemoveAll(dir)
+		return "", fmt.Errorf("chmod sealed tool dir: %w", err)
+	}
+	h.sealedDir = dir
+	return outPath, nil
+}
+
