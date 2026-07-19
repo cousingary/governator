@@ -30,7 +30,10 @@ matcher (`Bash|Write|Edit|MultiEdit`), which also doesn't cover every tool.
 `codex-gov-wrap.sh` (the `codex` alias, `/home/lam/bin/codex-gov-wrap.sh`)
 keeps the gate active for every invocation EXCEPT when the user explicitly
 passes one of `--disable hooks`, `--disable=hooks`, `-c features.hooks=false`
-(or its quoted variants), or legacy `--yolo`. Benign flag-first invocations
+(or its quoted variants). `--yolo` is NOT a hook escape — it aliases
+`--dangerously-bypass-approvals-and-sandbox`, which removes approvals and
+the sandbox but leaves hooks (and therefore the gate) active. Benign
+flag-first invocations
 (`codex --model X`, `codex -s workspace-write`, `codex --reasoning-effort
 high`, ...) KEEP THE GATE ACTIVE — the wrapper does NOT inject
 `--disable hooks` for them. The earlier "any flag-first invocation runs
@@ -40,8 +43,9 @@ hook-disabling flags and only honors bypass when the user asked for it.
 The wrapper is now a pure pass-through (with ctxledger reporting); the
 global `~/.codex/hooks.json` is what actually enforces the gate, and it
 fires whenever Codex hasn't been told `--disable hooks`. Use `codex
---disable hooks` (or set `approval_policy = "never"` in config.toml for
-the session) when a real, deliberate escape hatch is needed.
+--disable hooks` when a real, deliberate escape hatch is needed
+(`approval_policy = "never"` is NOT an escape — it only removes user
+approval prompts; hooks still fire).
 
 The old non-interactive `gov run <job.yaml> --agent codex` job-contract path
 (worktree isolation, budget caps, mandatory fingerprint scan) is untouched
