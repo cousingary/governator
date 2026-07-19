@@ -1273,6 +1273,26 @@ claims:
         funcs:
           - TestV9Case26ValidatorToolDeclarationChangeChangesIdentity
 
+  - id: sol9-sovereign-git-bash-handles
+    title: "Sovereign Git plumbing and the internal runtime/runner Bash helpers execute through a held, verified toolregistry.Handle rather than a pathname exec.CommandContext re-resolved per command. gitplumb.NewSession resolves and opens the trusted-tool registry's verified git object exactly once and holds it for the Session's entire lifetime -- every plumbing command (hash-object, read-tree, update-index, write-tree, diff, commit-tree, update-ref, rev-parse) launches through that one descriptor. internal/runtime and internal/runner's shell() helpers launch bash through Handle.CommandWith's fd-argv mechanism (the same primitive enforce.Plan.Wrap uses for unshare/self-exec) instead of a bare pathname, and prepend a private immutable sealed copy of git (not a live, re-writable PATH directory) so bash's own PATH lookup for git cannot be redirected by a same-uid swap either. A same-uid replacement of the enrolled git or bash binary after resolution has no effect on what actually executes."
+    first_shipped_version: v1.0.2-rc3
+    claimed_maturity: tested
+    implementation:
+      - file: internal/gitplumb/gitplumb.go
+        symbols: [Session, openGitHandle, NewSession, runCmd, runCapture]
+      - file: internal/gitplumb/status.go
+        symbols: [StatusPorcelainV2]
+      - file: internal/runtime/runtime.go
+        symbols: [shell]
+      - file: internal/runner/runner.go
+        symbols: [shell]
+    tests:
+      - file: internal/redteam/v9_s5_sovereign_handle_launch_test.go
+        funcs:
+          - TestV9Case4EnrolledGitSwapAfterSessionOpenCannotChangeExecutedBytes
+          - TestV9Case5EnrolledBashSwapAfterHandleOpenCannotChangeExecutedBytes
+        build_tag: redteam
+
   - id: sol8-verify-empty-blocks-approval
     title: "A blocking-enforcement Assayer evaluation that resolves to no applicable checks (verdict no_applicable_checks) blocks approval by default -- verify(item, []) cannot silently pass just because nothing was found to check; only non-blocking (advisory/telemetry) enforcement tolerates it."
     first_shipped_version: v1.0.2-rc2

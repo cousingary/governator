@@ -1093,6 +1093,13 @@ func containsPlatformHash(v any, platform string) bool {
 	return false
 }
 
+// resolveGitPath (and gitOutput below, its only caller) is claims-tooling's
+// own offline reconciliation path -- verifying/regenerating claims.yaml
+// against repo history, never a live governed run's authority path. Its
+// exec.CommandContext(gitPath, ...) calls are out of Sol v9 P0-6's scope
+// (sovereign Git execution inside a governed transaction). Swept 2026-07-19
+// (rc3 Session 5); tracked for Session 8's exec.Command allowlist, not
+// fixed here.
 func resolveGitPath(portable bool) (string, error) {
 	if !portable {
 		gitPath, err := gitplumb.TrustedGitPath()

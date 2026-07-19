@@ -356,7 +356,11 @@ func runBehavioralProbes(ctx context.Context, agent agents.Agent, res agents.Res
 	// tool registry like every other git invocation, rather than a bare
 	// "git" argv0 -- failure here is already just a recorded note, not
 	// fatal to the probe, so an unresolvable/untrusted git degrades the
-	// same way any other init failure here does.
+	// same way any other init failure here does. This probe workspace init
+	// is diagnostic setup for an attestation probe, never a governed run's
+	// authority path, so it is out of Sol v9 P0-6's scope (sovereign Git
+	// execution). Swept 2026-07-19 (rc3 Session 5); tracked for Session 8's
+	// exec.Command allowlist, not fixed here.
 	if gitPath, gerr := gitplumb.TrustedGitPath(); gerr != nil {
 		out.notes = append(out.notes, "resolve trusted git for probe workspace: "+gerr.Error())
 	} else if err := func() error {

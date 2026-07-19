@@ -492,7 +492,10 @@ func PreflightSnapshotIfDelete(cmd string) {
 		// trusted-tool registry rather than a bare ambient argv0. This path
 		// is already non-blocking (a failure here only skips the recall
 		// snapshot, never the run itself), so an unresolvable/untrusted
-		// python3 degrades the same way any other failure here does.
+		// python3 degrades the same way any other failure here does. Out of
+		// Sol v9 P0-6's scope (sovereign Git/Bash execution) -- swept
+		// 2026-07-19 (rc3 Session 5), tracked for Session 8's exec.Command
+		// allowlist, not fixed here.
 		pythonIdentity, perr := toolregistry.ResolveTrusted("python3", "python3")
 		if perr != nil {
 			fmt.Fprintln(os.Stderr, "GOVERNATOR GATE — pre-delete snapshot skipped, python3 not trusted (non-blocking):", perr)

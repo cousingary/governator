@@ -466,3 +466,13 @@ cases:
     session: rc3-s4
     required: true
     status: implemented
+  - case: 83
+    name: TestV9Case4EnrolledGitSwapAfterSessionOpenCannotChangeExecutedBytes
+    session: rc3-s5
+    required: true
+    status: implemented
+  - case: 84
+    name: TestV9Case5EnrolledBashSwapAfterHandleOpenCannotChangeExecutedBytes
+    session: rc3-s5
+    required: true
+    status: implemented

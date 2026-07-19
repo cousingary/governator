@@ -596,44 +596,66 @@ func matchesAny(ps []string, n string) bool {
 }
 
 func shell(ctx context.Context, dir, command string) (int, string, error) {
-	// Sol report attack 10 / P0-5: every command this helper runs is a git
-	// invocation (or, in runner.go's copy, a plain cp — prepending is a
-	// no-op for it). bash resolves "git" via its own inherited PATH, so a
-	// hostile binary earlier on the calling process's PATH would otherwise
-	// silently redirect it. Prepending the trusted-tool registry's
-	// verified git directory makes bash's own lookup find that file first,
-	// regardless of what PATH otherwise contains. Fails closed: if git
-	// itself cannot be resolved and verified, no command this helper runs
-	// proceeds blind.
-	gitPath, gerr := gitplumb.TrustedGitPath()
+	registry, rerr := toolregistry.Load()
+	if rerr != nil {
+		return -1, "", fmt.Errorf("load trusted-tool registry: %w", rerr)
+	}
+	// Sol9 P0-6: every command this helper runs is a git invocation (or,
+	// in runner.go's copy, a plain cp — prepending is a no-op for it). The
+	// prior fix (Sol report attack 10 / P0-5) resolved git through the
+	// trusted-tool registry but only ever handed bash a live PATH-directory
+	// string to resolve "git" against at call time — a same-uid swap of
+	// the enrolled git binary after this resolution and before bash's own
+	// lookup would still run. Sealing the verified handle's exact bytes
+	// into a private, immutable, 0500 copy (the same primitive
+	// SealedExecutablePath gives structured validators for P0-5) and
+	// prepending THAT directory closes the window: bash's PATH lookup can
+	// only ever find the bytes verified here, never a path that could be
+	// replaced out from under it. The handle itself is no longer needed
+	// once the immutable copy exists.
+	gitHandle, gerr := registry.ResolveHandle("git", "git", toolregistry.KindTrustedController)
 	if gerr != nil {
-		return -1, "", gerr
+		return -1, "", fmt.Errorf("resolve trusted git handle: %w", gerr)
 	}
-	// Session 2 (post-v4 hardening plan item C): see runner.go's identical
-	// helper -- bash itself is the controller tool actually running this
-	// command string (including every deterministic validator/formatter/
-	// linter a job contract declares), so it needs the same
-	// registry-verified resolution git already got, not a bare argv0
-	// os/exec would resolve via ambient PATH.
-	bashIdentity, berr := toolregistry.ResolveTrusted("bash", "bash")
+	sealedGit, gerr := gitHandle.SealedExecutablePath()
+	_ = gitHandle.Close()
+	if gerr != nil {
+		return -1, "", fmt.Errorf("seal trusted git: %w", gerr)
+	}
+	// Session 2 (post-v4 hardening plan item C) / Sol9 P0-6: bash itself is
+	// the controller tool actually running this command string (including
+	// every deterministic validator/formatter/linter a job contract
+	// declares). It now launches from a held, verified descriptor
+	// (/proc/self/fd/<n>, via Handle.CommandWith — the same fd-argv
+	// mechanic enforce.Plan.Wrap uses for unshare/self-exec, Sol9
+	// P0-1/P0-2) instead of a pathname exec.CommandContext would have to
+	// re-resolve, so a same-uid swap of the enrolled bash binary between
+	// verification and this exec has no effect on what actually runs.
+	bashHandle, berr := registry.ResolveHandle("bash", "bash", toolregistry.KindTrustedController)
 	if berr != nil {
-		return -1, "", fmt.Errorf("resolve trusted bash: %w", berr)
+		return -1, "", fmt.Errorf("resolve trusted bash handle: %w", berr)
 	}
-	cmd := exec.CommandContext(ctx, bashIdentity.CanonicalPath, "--noprofile", "--norc", "-c", command)
-	if scope, ok := containment.ScopeFromContext(ctx); ok {
-		cmd = scope.Command(ctx, bashIdentity.CanonicalPath, []string{"--noprofile", "--norc", "-c", command}, dir)
-	} else {
-		cmd.Dir = dir
-		cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	defer bashHandle.Close()
+	build := func(c context.Context, bin string, a []string) *exec.Cmd {
+		if scope, ok := containment.ScopeFromContext(c); ok {
+			return scope.Command(c, bin, a, dir)
+		}
+		cc := exec.CommandContext(c, bin, a...)
+		cc.Dir = dir
+		cc.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+		return cc
+	}
+	cmd, err := bashHandle.CommandWith(ctx, []string{"--noprofile", "--norc", "-c", command}, build)
+	if err != nil {
+		return -1, "", err
 	}
 	frozen := controllerenv.Freeze()
-	pathValue := filepath.Dir(gitPath)
+	pathValue := filepath.Dir(sealedGit)
 	if basePath, ok := frozen.Lookup("PATH"); ok && basePath != "" {
 		pathValue += string(os.PathListSeparator) + basePath
 	}
 	cmd.Env = frozen.With(map[string]string{"PATH": pathValue}).Values
 	var out []byte
-	var err error
 	if scope, ok := containment.ScopeFromContext(ctx); ok {
 		var buf strings.Builder
 		cmd.Stdout = &buf

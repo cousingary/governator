@@ -31,6 +31,7 @@ import (
 	"syscall"
 
 	"github.com/cousingary/governator/internal/controllerenv"
+	"github.com/cousingary/governator/internal/toolregistry"
 )
 
 // Session is one isolated Git plumbing workspace: a temporary index file
@@ -53,13 +54,53 @@ type Session struct {
 	tmpDir        string
 	indexFile     string
 	emptyHooksDir string
+
+	// gitHandle is the one verified, open Git object this session's
+	// complete governed transaction executes through (Sol v9 P0-6):
+	// resolved and opened exactly once by NewSession, then reused by every
+	// runCmd call this Session makes for its entire lifetime, never
+	// re-resolved from a mutable path string per command. A same-uid
+	// replacement of the enrolled git binary after NewSession returns can
+	// no longer change what any of this session's operations actually
+	// execute. Released by Close.
+	gitHandle *toolregistry.Handle
+}
+
+// openGitHandle resolves and opens the trusted-tool registry's verified git
+// object. Callers that need it for more than one command (NewSession, which
+// threads the same handle through a Session's whole lifetime) must hold and
+// eventually Close it themselves; callers that need it for exactly one
+// command (StatusPorcelainV2, which has no Session) open, use, and close it
+// immediately.
+func openGitHandle() (*toolregistry.Handle, error) {
+	registry, err := toolregistry.Load()
+	if err != nil {
+		return nil, fmt.Errorf("gitplumb: load trusted-tool registry: %w", err)
+	}
+	handle, err := registry.ResolveHandle("git", "git", toolregistry.KindTrustedController)
+	if err != nil {
+		return nil, fmt.Errorf("gitplumb: resolve trusted git handle: %w", err)
+	}
+	return handle, nil
 }
 
 // NewSession resolves dir's common Git directory and creates the isolated
 // index file path and empty hooks directory this session's operations
-// will use. Nothing on disk is shared with any worktree's real index.
+// will use. Nothing on disk is shared with any worktree's real index. The
+// verified git handle opened here (Sol v9 P0-6) is held for the returned
+// Session's entire lifetime -- see gitHandle's doc comment.
 func NewSession(ctx context.Context, dir string) (*Session, error) {
-	out, err := runCapture(ctx, dir, nil, "rev-parse", "--git-common-dir")
+	handle, err := openGitHandle()
+	if err != nil {
+		return nil, err
+	}
+	ok := false
+	defer func() {
+		if !ok {
+			_ = handle.Close()
+		}
+	}()
+	out, err := runCapture(ctx, handle, dir, nil, "rev-parse", "--git-common-dir")
 	if err != nil {
 		return nil, fmt.Errorf("gitplumb: resolve git-common-dir: %w", err)
 	}
@@ -76,23 +117,35 @@ func NewSession(ctx context.Context, dir string) (*Session, error) {
 		_ = os.RemoveAll(tmpDir)
 		return nil, fmt.Errorf("gitplumb: create empty hooks dir: %w", err)
 	}
+	ok = true
 	return &Session{
 		GitDir:        gitDir,
 		WorkDir:       dir,
 		tmpDir:        tmpDir,
 		indexFile:     filepath.Join(tmpDir, "index"),
 		emptyHooksDir: emptyHooks,
+		gitHandle:     handle,
 	}, nil
 }
 
-// Close removes every temporary file this session created. The isolated
-// index and empty-hooks directory never held anything of value past the
-// operation they backed.
+// Close releases the session's held git handle and removes every temporary
+// file this session created. The isolated index and empty-hooks directory
+// never held anything of value past the operation they backed.
 func (s *Session) Close() error {
-	if s == nil || s.tmpDir == "" {
+	if s == nil {
 		return nil
 	}
-	return os.RemoveAll(s.tmpDir)
+	var err error
+	if s.gitHandle != nil {
+		err = s.gitHandle.Close()
+		s.gitHandle = nil
+	}
+	if s.tmpDir != "" {
+		if rerr := os.RemoveAll(s.tmpDir); rerr != nil && err == nil {
+			err = rerr
+		}
+	}
+	return err
 }
 
 // neutralEnv returns a copy of the current process environment with every
@@ -127,13 +180,19 @@ func neutralArgs(hooksDir string) []string {
 	}
 }
 
-func runCmd(ctx context.Context, dir string, extraEnv map[string]string, hooksDir string, args ...string) (*exec.Cmd, *bytes.Buffer, *bytes.Buffer, error) {
-	gitPath, err := TrustedGitPath()
-	if err != nil {
-		return nil, nil, nil, err
-	}
+// runCmd launches git through handle's already-verified, open descriptor
+// (Sol v9 P0-6) -- never TrustedGitPath()'s path string, which a second
+// exec.CommandContext call would have to re-resolve and which a same-uid
+// process could replace between verification and this exact invocation.
+// handle is owned by the caller (a Session for every operation across its
+// lifetime, or a single-command caller like StatusPorcelainV2); runCmd never
+// closes it.
+func runCmd(ctx context.Context, handle *toolregistry.Handle, dir string, extraEnv map[string]string, hooksDir string, args ...string) (*exec.Cmd, *bytes.Buffer, *bytes.Buffer, error) {
 	full := append(append([]string{}, neutralArgs(hooksDir)...), args...)
-	cmd := exec.CommandContext(ctx, gitPath, full...)
+	cmd, err := handle.Command(ctx, full...)
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("gitplumb: launch verified git handle: %w", err)
+	}
 	cmd.Dir = dir
 	cmd.Env = neutralEnv(extraEnv)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
@@ -143,17 +202,18 @@ func runCmd(ctx context.Context, dir string, extraEnv map[string]string, hooksDi
 	return cmd, &stdout, &stderr, nil
 }
 
-// runCapture runs a neutralized git command with no session-scoped hooks
-// dir override (an ephemeral one is created and discarded — used for
-// read-only bootstrap operations like resolving --git-common-dir, before a
-// Session exists).
-func runCapture(ctx context.Context, dir string, extraEnv map[string]string, args ...string) (string, error) {
+// runCapture runs a neutralized git command through handle with no
+// session-scoped hooks dir override (an ephemeral one is created and
+// discarded — used for read-only bootstrap operations like resolving
+// --git-common-dir, before a Session exists, and by StatusPorcelainV2's
+// standalone single-command callers).
+func runCapture(ctx context.Context, handle *toolregistry.Handle, dir string, extraEnv map[string]string, args ...string) (string, error) {
 	tmpHooks, err := os.MkdirTemp("", "gov-gitplumb-boot-")
 	if err != nil {
 		return "", err
 	}
 	defer os.RemoveAll(tmpHooks)
-	cmd, stdout, stderr, err := runCmd(ctx, dir, extraEnv, tmpHooks, args...)
+	cmd, stdout, stderr, err := runCmd(ctx, handle, dir, extraEnv, tmpHooks, args...)
 	if err != nil {
 		return "", err
 	}
@@ -182,7 +242,7 @@ func (s *Session) run(ctx context.Context, dir string, useIndex bool, args ...st
 	if useIndex {
 		extraEnv = map[string]string{"GIT_INDEX_FILE": s.indexFile}
 	}
-	cmd, stdout, stderr, err := runCmd(ctx, dir, extraEnv, s.emptyHooksDir, args...)
+	cmd, stdout, stderr, err := runCmd(ctx, s.gitHandle, dir, extraEnv, s.emptyHooksDir, args...)
 	if err != nil {
 		return "", err
 	}
@@ -312,7 +372,7 @@ func (s *Session) CommitTree(ctx context.Context, tree, parent, message string) 
 	if parent != "" {
 		args = append(args, "-p", parent)
 	}
-	cmd, stdout, stderr, err := runCmd(ctx, s.GitDir, nil, s.emptyHooksDir, args...)
+	cmd, stdout, stderr, err := runCmd(ctx, s.gitHandle, s.GitDir, nil, s.emptyHooksDir, args...)
 	if err != nil {
 		return "", err
 	}

@@ -33,7 +33,17 @@ type StatusEntry struct {
 // record fields ending in the new path, then the raw original path); every
 // other kind consumes exactly one.
 func StatusPorcelainV2(ctx context.Context, dir string) ([]StatusEntry, error) {
-	out, err := runCapture(ctx, dir, nil, "status", "--porcelain=v2", "-z")
+	// Sol v9 P0-6: this standalone call has no Session to reuse a held
+	// handle from, so it resolves, opens, uses, and closes its own -- the
+	// verified descriptor is exec'd directly (never a bare path string a
+	// second resolution could swap), and the fix doesn't require this
+	// one-shot caller to carry a Session it has no other use for.
+	handle, err := openGitHandle()
+	if err != nil {
+		return nil, err
+	}
+	defer handle.Close()
+	out, err := runCapture(ctx, handle, dir, nil, "status", "--porcelain=v2", "-z")
 	if err != nil {
 		return nil, err
 	}

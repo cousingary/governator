@@ -1,3 +1,10 @@
+// Package doctor implements `gov doctor`'s diagnostic checks. Its
+// exec.Command/exec.CommandContext calls (git/bash/python3/docker --version
+// and --help probes) are read-only capability checks run by an operator
+// invoking doctor directly -- never part of a governed run's execution
+// authority path, so they are out of Sol v9 P0-6's scope (sovereign Git/Bash
+// execution) and remain pathname-based. Swept 2026-07-19 (rc3 Session 5);
+// tracked for Session 8's exec.Command allowlist, not fixed here.
 package doctor
 
 import (

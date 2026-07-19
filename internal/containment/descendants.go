@@ -312,6 +312,18 @@ func ScopeFromContext(ctx context.Context) (*Scope, bool) {
 // every descendant it forks, however it detaches -- is born inside this
 // scope from the moment it starts. Callers still set Stdout/Stderr and call
 // Start themselves; Command only owns argv/SysProcAttr/Dir.
+// Command's ScopeSystemdUserScope/ScopePIDNamespace branches still launch
+// s.primitivePath (systemd-run / bwrap-style unshare equivalent) by pathname
+// -- the same TOCTOU shape Sol v9 P0-1/P0-2 fixed for enforce.Plan's unshare
+// wrapper (verified via the trusted-tool registry, then never held as an
+// open descriptor through to exec). Session 1's plan text called for "every
+// containment primitive (systemd-run, future helpers)" to get the same
+// fd-argv treatment, but the actual Session 1 commit only converted
+// unshare inside internal/enforce; this call site was not touched. Out of
+// Sol v9 P0-6's scope (sovereign Git/Bash execution), so not fixed in this
+// session -- flagged 2026-07-19 (rc3 Session 5) as a genuine outstanding
+// authority-bearing gap (not merely diagnostic tooling) for Session 8's
+// exec.Command allowlist / a follow-up hardening session.
 func (s *Scope) Command(ctx context.Context, bin string, args []string, dir string) *exec.Cmd {
 	var cmd *exec.Cmd
 	switch s.method {

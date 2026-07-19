@@ -43,10 +43,13 @@ func TestNoRawProcessLaunchOutsideStageExecutor(t *testing.T) {
 		// artifact (`gov version --json`) or runs read-only git plumbing to
 		// check claims against history. Not a governed runtime stage.
 		"internal/claims/claims.go": 4,
-		// git plumbing primitive (report §standing rule 4: "internal/gitplumb
-		// ... all already exist" — S1 threads existing primitives through
-		// the executor, it does not replace them).
-		"internal/gitplumb/gitplumb.go": 1,
+		// internal/gitplumb/gitplumb.go: fully migrated (rc3 Session 5, Sol9
+		// P0-6) — every git invocation now launches through a held, verified
+		// toolregistry.Handle (gitplumb.Session.gitHandle / openGitHandle),
+		// never a raw exec.Command(Context) against a pathname. Zero raw
+		// launch call sites remain in this file; entry removed per this
+		// test's own instruction that a completed migration's entry shrinks
+		// to nothing.
 		// `git init` for the attestation harness's own throwaway workspace
 		// setup, not a governed stage.
 		"internal/attest/attest.go": 1,

@@ -25,7 +25,6 @@ import (
 	"github.com/cousingary/governator/internal/contracts"
 	"github.com/cousingary/governator/internal/controllerenv"
 	"github.com/cousingary/governator/internal/enforce"
-	"github.com/cousingary/governator/internal/gitplumb"
 	"github.com/cousingary/governator/internal/toolregistry"
 )
 
@@ -136,37 +135,58 @@ func shell(ctx context.Context, dir, command string, environments ...controllere
 	if len(environments) > 0 {
 		frozen = environments[0]
 	}
-	// Sol report attack 10 / P0-5: see internal/runtime's identical helper
-	// for why this prepends the trusted-tool registry's verified git
-	// directory to the subprocess's PATH rather than trusting whatever the
-	// calling process's own PATH resolves "git" to.
-	gitPath, gerr := gitplumb.TrustedGitPath()
-	if gerr != nil {
-		return -1, "", gerr
-	}
-	// Session 2 (post-v4 hardening plan item C): bash itself is the
-	// controller tool actually running this command string (including
-	// every deterministic validator/formatter/linter a job contract
-	// declares) -- the PATH-prepend above only protects "git" once bash is
-	// already running, so bash's own resolution needs the same
-	// registry-verified treatment git already got, or a hostile bash
-	// earlier on this process's PATH would run with full Governator
-	// authority before the prepend ever mattered.
-	bashIdentity, berr := toolregistry.ResolveTrusted("bash", "bash")
-	if berr != nil {
-		return -1, "", fmt.Errorf("resolve trusted bash: %w", berr)
-	}
-	cmd := exec.CommandContext(ctx, bashIdentity.CanonicalPath, "--noprofile", "--norc", "-c", command)
-	cmd.Dir = dir
 	if err := frozen.Validate(); err != nil {
 		return -1, "", err
 	}
-	pathValue := filepath.Dir(gitPath)
+	registry, rerr := toolregistry.Load()
+	if rerr != nil {
+		return -1, "", fmt.Errorf("load trusted-tool registry: %w", rerr)
+	}
+	// Sol9 P0-6: see internal/runtime's identical helper for the full
+	// rationale. The prior fix (Sol report attack 10 / P0-5) prepended the
+	// trusted-tool registry's verified git directory to the subprocess's
+	// PATH, but that directory is a live, mutable path a same-uid process
+	// could still repopulate between resolution and bash's own lookup.
+	// Sealing the verified handle's bytes into a private immutable copy
+	// (the same primitive structured validators use, P0-5) and prepending
+	// that instead removes the window entirely.
+	gitHandle, gerr := registry.ResolveHandle("git", "git", toolregistry.KindTrustedController)
+	if gerr != nil {
+		return -1, "", fmt.Errorf("resolve trusted git handle: %w", gerr)
+	}
+	sealedGit, gerr := gitHandle.SealedExecutablePath()
+	_ = gitHandle.Close()
+	if gerr != nil {
+		return -1, "", fmt.Errorf("seal trusted git: %w", gerr)
+	}
+	// Session 2 (post-v4 hardening plan item C) / Sol9 P0-6: bash itself is
+	// the controller tool actually running this command string (including
+	// every deterministic validator/formatter/linter a job contract
+	// declares). It now launches from a held, verified descriptor
+	// (/proc/self/fd/<n>, via Handle.CommandWith -- the same fd-argv
+	// mechanic enforce.Plan.Wrap uses for unshare/self-exec, Sol9
+	// P0-1/P0-2) instead of a pathname exec.CommandContext would have to
+	// re-resolve.
+	bashHandle, berr := registry.ResolveHandle("bash", "bash", toolregistry.KindTrustedController)
+	if berr != nil {
+		return -1, "", fmt.Errorf("resolve trusted bash handle: %w", berr)
+	}
+	defer bashHandle.Close()
+	build := func(c context.Context, bin string, a []string) *exec.Cmd {
+		cc := exec.CommandContext(c, bin, a...)
+		cc.Dir = dir
+		cc.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+		return cc
+	}
+	cmd, err := bashHandle.CommandWith(ctx, []string{"--noprofile", "--norc", "-c", command}, build)
+	if err != nil {
+		return -1, "", err
+	}
+	pathValue := filepath.Dir(sealedGit)
 	if basePath, ok := frozen.Lookup("PATH"); ok && basePath != "" {
 		pathValue += string(os.PathListSeparator) + basePath
 	}
 	cmd.Env = frozen.With(map[string]string{"PATH": pathValue}).Values
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	out, err := cmd.CombinedOutput()
 	if ctx.Err() != nil && cmd.Process != nil {
 		_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
