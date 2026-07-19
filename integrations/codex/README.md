@@ -28,12 +28,20 @@ enforcement boundary — comparable in spirit to Claude Code's own PreToolUse
 matcher (`Bash|Write|Edit|MultiEdit`), which also doesn't cover every tool.
 
 `codex-gov-wrap.sh` (the `codex` alias, `/home/lam/bin/codex-gov-wrap.sh`)
-passes flag-first invocations (`codex --yolo`, `--model`, ...) through with
-Codex's own `--disable hooks` (equivalent to `-c features.hooks=false`) so a
-deliberate escape hatch stays a real, complete bypass — not just a
-wrapper-level illusion, since `~/.codex/hooks.json` is a global file Codex
-would otherwise apply to every invocation regardless of which wrapper called
-it. `codex-v` (`codex_wrap.sh`) does the same for its fully-vanilla path.
+keeps the gate active for every invocation EXCEPT when the user explicitly
+passes one of `--disable hooks`, `--disable=hooks`, `-c features.hooks=false`
+(or its quoted variants), or legacy `--yolo`. Benign flag-first invocations
+(`codex --model X`, `codex -s workspace-write`, `codex --reasoning-effort
+high`, ...) KEEP THE GATE ACTIVE — the wrapper does NOT inject
+`--disable hooks` for them. The earlier "any flag-first invocation runs
+vanilla" behavior was too aggressive and silently shed the gate for
+`codex --model ...` calls; the current wrapper scans all args for explicit
+hook-disabling flags and only honors bypass when the user asked for it.
+The wrapper is now a pure pass-through (with ctxledger reporting); the
+global `~/.codex/hooks.json` is what actually enforces the gate, and it
+fires whenever Codex hasn't been told `--disable hooks`. Use `codex
+--disable hooks` (or set `approval_policy = "never"` in config.toml for
+the session) when a real, deliberate escape hatch is needed.
 
 The old non-interactive `gov run <job.yaml> --agent codex` job-contract path
 (worktree isolation, budget caps, mandatory fingerprint scan) is untouched
