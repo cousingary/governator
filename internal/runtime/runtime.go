@@ -2876,7 +2876,7 @@ func (r *Runner) runOnce(ctx context.Context, c contracts.Contract) (RunRecord, 
 		return RunRecord{}, err
 	}
 	graphStatus := env.GraphStatus
-	preReplayGraph, err := contextgraph.CurrentWithStatus(ctx, root, graphStatus, env.Controller)
+	preReplayGraph, err := contextgraph.CurrentWithStatus(ctx, root, graphStatus, env.ToolRegistry, env.Controller)
 	if err != nil {
 		return RunRecord{}, err
 	}

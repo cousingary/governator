@@ -361,3 +361,33 @@ cases:
     session: rc3-s1
     required: true
     status: implemented
+  - case: 62
+    name: TestV9Case7GraphInitSucceedsUnderActiveLandlock
+    session: rc3-s2
+    required: true
+    status: implemented
+  - case: 63
+    name: TestV9Case8GraphSyncSucceedsUnderActiveLandlock
+    session: rc3-s2
+    required: true
+    status: implemented
+  - case: 64
+    name: TestV9Case9GraphProviderRotatedAfterFreezeCannotExecute
+    session: rc3-s2
+    required: true
+    status: implemented
+  - case: 65
+    name: TestV9Case10FrozenRegistryObjectImmuneToOnDiskRegistryChange
+    session: rc3-s2
+    required: true
+    status: implemented
+  - case: 66
+    name: TestV9Case11GraphProviderWriteOutsideCodegraphDenied
+    session: rc3-s2
+    required: true
+    status: implemented
+  - case: 67
+    name: TestV9Case12GraphReadOnlyOperationWriteDenied
+    session: rc3-s2
+    required: true
+    status: implemented

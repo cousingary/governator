@@ -1745,12 +1745,31 @@ func graphCmd(args []string) int {
 				return bad("graph: unknown option " + args[i])
 			}
 		}
-		snapshot, prepareErr := contextgraph.Prepare(context.Background(), project)
+		// Load the registry once and thread it through both Prepare and
+		// Query (Sol v9 P0-3: "Pass a frozen provider handle through:
+		// Resolve, Current, Prepare, Query") instead of Prepare and Query
+		// each reloading their own copy from disk.
+		registry, regErr := toolregistry.Load()
+		if regErr != nil {
+			fmt.Fprintln(os.Stderr, "graph:", regErr)
+			return 1
+		}
+		cfg, cfgErr := config.Load()
+		if cfgErr != nil {
+			fmt.Fprintln(os.Stderr, "graph:", cfgErr)
+			return 1
+		}
+		status, statusErr := contextgraph.ResolveConfigWithRegistry(cfg, registry)
+		if statusErr != nil {
+			fmt.Fprintln(os.Stderr, "graph:", statusErr)
+			return 1
+		}
+		snapshot, prepareErr := contextgraph.PrepareWithStatus(context.Background(), project, status, registry, controllerenv.Freeze())
 		if prepareErr != nil {
 			fmt.Fprintln(os.Stderr, "graph:", prepareErr)
 			return 1
 		}
-		output, queryErr := contextgraph.Query(context.Background(), snapshot, search, limit)
+		output, queryErr := contextgraph.QueryWithRegistry(context.Background(), snapshot, registry, search, limit)
 		if queryErr != nil {
 			fmt.Fprintln(os.Stderr, "graph:", queryErr)
 			return 1
