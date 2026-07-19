@@ -1293,6 +1293,27 @@ claims:
           - TestV9Case5EnrolledBashSwapAfterHandleOpenCannotChangeExecutedBytes
         build_tag: redteam
 
+  - id: sol9-docker-lifecycle-bounds
+    title: "DockerRunner's container-startup verification and CLI-lifecycle cleanup are bounded and honest. verifyStartedContainer no longer treats a container that never appears within the poll window as a verification pass: it returns a hard DOCKER_CONTAINER_NOT_OBSERVED error, and additionally requires the running/exited state to be known and (when the daemon reports one) the container's creation timestamp to not predate this launch. Each poll's docker inspect call runs under its own bounded per-call context so an unresponsive daemon can't block the poll past its own deadline. Once verification fails or the transaction times out, the executor now kills the docker CLI's whole process group (launched with SysProcAttr{Setpgid: true}) and waits for its exit only up to a short fixed deadline (DockerCLIShutdownDeadline, 5s) instead of blocking on an unbounded channel receive -- so a stuck CLI, or daemon-side stop/rm both failing, can no longer hang Governator for the remainder of the run's timeout budget. The container-observation poll itself runs for DockerContainerObservationDeadline (20s, not the original 2s) -- real Docker Desktop/WSL2 container creation was empirically observed to take upwards of 10s end to end, so a short deadline here would misreport genuinely-succeeding launches as DOCKER_CONTAINER_NOT_OBSERVED rather than making failures resolve any faster."
+    first_shipped_version: v1.0.2-rc3
+    claimed_maturity: tested
+    implementation:
+      - file: internal/runner/docker.go
+        symbols: [verifyStartedContainer, killProcessGroup, waitDockerCLIBounded, DockerCLIShutdownDeadline, DockerContainerObservationDeadline, dockerCreationClockSkew]
+    tests:
+      - file: internal/redteam/v9_s6_docker_lifecycle_test.go
+        funcs:
+          - TestV9Case28DockerContainerNeverAppearsHardFails
+          - TestV9Case29DockerCLIBlockedAfterContainerRemovalIsBounded
+          - TestV9Case30DockerDaemonInspectionHangIsBounded
+          - TestV9Case31DockerStopAndForceRemoveBothFailingStillReturns
+          - TestV9Case32WorkspaceMeasurementRefusedBeforeExtinctionProof
+        build_tag: redteam
+      - file: internal/runner/docker_test.go
+        funcs:
+          - TestDockerExecutorContainerNeverAppearsHardFails
+          - TestDockerExecutorAbandonsHungCLIAfterVerificationFailure
+
   - id: sol8-verify-empty-blocks-approval
     title: "A blocking-enforcement Assayer evaluation that resolves to no applicable checks (verdict no_applicable_checks) blocks approval by default -- verify(item, []) cannot silently pass just because nothing was found to check; only non-blocking (advisory/telemetry) enforcement tolerates it."
     first_shipped_version: v1.0.2-rc2

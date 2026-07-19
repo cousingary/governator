@@ -119,6 +119,17 @@ func TestNoRawProcessLaunchOutsideStageExecutor(t *testing.T) {
 		// (S1/S4/S6 gap-closure session, 2026-07-16): this was the last
 		// entry there, closing Category B.
 		"internal/agents/handle.go": 5,
+		// DockerRunner's executor (Sol9 P1-2, rc3 Session 6): the docker CLI
+		// invocation now launches through a CommandWith build callback (the
+		// same shape runner.go/runtime.go's shell() helpers use for bash)
+		// wrapping exec.CommandContext, so the CLI runs from a held,
+		// verified toolregistry.Handle descriptor rather than a bare
+		// pathname, with SysProcAttr{Setpgid: true} so a stuck CLI's whole
+		// process group can be killed on cleanup instead of only its
+		// top-level pid. DockerRunner is itself the containment boundary a
+		// governed stage's backend runs inside -- not a governed stage
+		// StageExecutor should wrap.
+		"internal/runner/docker.go": 1,
 	}
 
 	// Category B: known S1/S4/S6 migration gaps — real governed-stage

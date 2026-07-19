@@ -476,3 +476,28 @@ cases:
     session: rc3-s5
     required: true
     status: implemented
+  - case: 85
+    name: TestV9Case28DockerContainerNeverAppearsHardFails
+    session: rc3-s6
+    required: true
+    status: implemented
+  - case: 86
+    name: TestV9Case29DockerCLIBlockedAfterContainerRemovalIsBounded
+    session: rc3-s6
+    required: true
+    status: implemented
+  - case: 87
+    name: TestV9Case30DockerDaemonInspectionHangIsBounded
+    session: rc3-s6
+    required: true
+    status: implemented
+  - case: 88
+    name: TestV9Case31DockerStopAndForceRemoveBothFailingStillReturns
+    session: rc3-s6
+    required: true
+    status: implemented
+  - case: 89
+    name: TestV9Case32WorkspaceMeasurementRefusedBeforeExtinctionProof
+    session: rc3-s6
+    required: true
+    status: implemented

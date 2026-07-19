@@ -792,6 +792,119 @@ esac
 	}
 }
 
+// TestDockerExecutorContainerNeverAppearsHardFails is the direct regression
+// test for Sol9 P1-1: a container that never appears throughout the poll
+// window must be a hard DOCKER_CONTAINER_NOT_OBSERVED failure, never a
+// silent nil "verified" return.
+func TestDockerExecutorContainerNeverAppearsHardFails(t *testing.T) {
+	pinFakeDocker(t, `#!/bin/sh
+set -eu
+cmd=${1:-}
+shift || true
+case "$cmd" in
+  run)
+    sleep 0.2
+    ;;
+  inspect)
+    name=$1
+    echo "Error response from daemon: No such object: $name" >&2
+    exit 1
+    ;;
+  stop|rm)
+    exit 0
+    ;;
+  *)
+    echo 'unexpected command' >&2
+    exit 1
+    ;;
+esac
+`)
+	d := &DockerRunner{Config: contracts.DockerRunnerConfig{Image: "agent:latest"}, ResolvedImage: &ImageIdentity{ID: "sha256:" + strings.Repeat("a", 64)}, ControllerEnvironment: controllerenv.Freeze()}
+	execFn := d.executor(Workspace{Container: "gov-never-appears-test", Path: "/ws"})
+	var out bytes.Buffer
+	code, timedOut, _, err := execFn(context.Background(), "bin", nil, "/ws", &out, 10*time.Second)
+	if timedOut {
+		t.Fatal("expected a verification failure, not a transaction timeout")
+	}
+	if code != -1 {
+		t.Fatalf("expected code=-1, got %d", code)
+	}
+	if err == nil || !strings.Contains(err.Error(), "DOCKER_CONTAINER_NOT_OBSERVED") {
+		t.Fatalf("expected a DOCKER_CONTAINER_NOT_OBSERVED error, got %v", err)
+	}
+}
+
+// TestDockerExecutorAbandonsHungCLIAfterVerificationFailure is the direct
+// regression test for Sol9 P1-2: when verifyStartedContainer fails (the
+// container never appeared) and daemon-side stop/rm both fail, the executor
+// must still return -- by killing the docker CLI's process group and
+// bounding how long it waits for that kill to take effect -- rather than
+// blocking on `<-done` until the CLI happens to exit on its own. The fake
+// CLI's "run" case sleeps far longer than this test's overall timeout
+// budget; the test asserts the whole call returns quickly anyway.
+func TestDockerExecutorAbandonsHungCLIAfterVerificationFailure(t *testing.T) {
+	pinFakeDocker(t, `#!/bin/sh
+set -eu
+cmd=${1:-}
+shift || true
+case "$cmd" in
+  run)
+    sleep 300
+    ;;
+  inspect)
+    name=$1
+    echo "Error response from daemon: No such object: $name" >&2
+    exit 1
+    ;;
+  stop)
+    echo 'permission denied' >&2
+    exit 1
+    ;;
+  rm)
+    echo 'daemon unavailable' >&2
+    exit 1
+    ;;
+  *)
+    echo 'unexpected command' >&2
+    exit 1
+    ;;
+esac
+`)
+	d := &DockerRunner{Config: contracts.DockerRunnerConfig{Image: "agent:latest"}, ResolvedImage: &ImageIdentity{ID: "sha256:" + strings.Repeat("a", 64)}, ControllerEnvironment: controllerenv.Freeze()}
+	execFn := d.executor(Workspace{Container: "gov-hung-cli-test", Path: "/ws"})
+	var out bytes.Buffer
+	done := make(chan struct{})
+	var code int
+	var timedOut bool
+	var err error
+	go func() {
+		code, timedOut, _, err = execFn(context.Background(), "bin", nil, "/ws", &out, 10*time.Second)
+		close(done)
+	}()
+	// Margin has to clear the full worst-case path this test drives the
+	// executor through: verifyStartedContainer's fake CLI always reports the
+	// container absent, so its full observation deadline always elapses,
+	// followed by the CLI shutdown wait. Derived from the same exported
+	// deadlines the production code uses rather than a second hardcoded
+	// number (see internal/redteam/v9_s6_docker_lifecycle_test.go's
+	// dockerLifecycleBoundedRegressionMargin for the identical rationale).
+	margin := DockerContainerObservationDeadline + DockerCLIShutdownDeadline + 5*time.Second
+	select {
+	case <-done:
+	case <-time.After(margin):
+		t.Fatalf("executor did not return within %s -- the hung docker CLI was not bounded (Sol9 P1-2 regression)", margin)
+	}
+	if timedOut {
+		t.Fatal("expected a verification failure, not a transaction timeout")
+	}
+	if code != -1 {
+		t.Fatalf("expected code=-1, got %d", code)
+	}
+	if err == nil || !strings.Contains(err.Error(), "DOCKER_CONTAINER_NOT_OBSERVED") {
+		t.Fatalf("expected a DOCKER_CONTAINER_NOT_OBSERVED error, got %v", err)
+	}
+}
+
 func TestDockerObserveHardenedLiveMatchApproves(t *testing.T) {
 	requireDocker(t)
 	digest := dockerTestImageDigest(t)
@@ -935,7 +1048,7 @@ func TestResolveImageIdentityDetectsRetaggedMutableTag(t *testing.T) {
 func TestVerifyStartedContainerRejectsImageMismatch(t *testing.T) {
 	pinFakeDocker(t, "#!/bin/sh\nset -eu\nif [ \"${1:-}\" = inspect ]; then\n  printf '{\"Image\":\"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"State\":{\"Running\":true,\"Status\":\"running\"}}'\n  exit 0\nfi\nexit 1\n")
 	d := &DockerRunner{ResolvedImage: &ImageIdentity{ID: "sha256:" + strings.Repeat("a", 64)}, ControllerEnvironment: controllerenv.Freeze()}
-	err := d.verifyStartedContainer(context.Background(), Workspace{Container: "gov-image-mismatch"})
+	err := d.verifyStartedContainer(context.Background(), Workspace{Container: "gov-image-mismatch"}, time.Now())
 	if err == nil || !strings.Contains(err.Error(), "runtime image mismatch") {
 		t.Fatalf("expected runtime image mismatch, got %v", err)
 	}

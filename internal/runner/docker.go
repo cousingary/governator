@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/cousingary/governator/internal/agents"
@@ -246,7 +247,18 @@ func (d *DockerRunner) executor(ws Workspace) agents.Executor {
 			return 0, false, false, dberr
 		}
 		defer dockerHandle.Close()
-		cmd, cerr := dockerHandle.Command(runCtx, dockerArgs...)
+		// Sol9 P1-2: the docker CLI process launches with its own process
+		// group (Setpgid) so a same-uid kill signal issued after this
+		// package has already given up on it (below) reaches every process
+		// in the group, not only the CLI's own top-level pid -- the same
+		// mechanic internal/runner's and internal/runtime's shell() helpers
+		// use for bash.
+		build := func(c context.Context, bin string, a []string) *exec.Cmd {
+			cc := exec.CommandContext(c, bin, a...)
+			cc.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+			return cc
+		}
+		cmd, cerr := dockerHandle.CommandWith(runCtx, dockerArgs, build)
 		if cerr != nil {
 			return 0, false, false, cerr
 		}
@@ -254,6 +266,7 @@ func (d *DockerRunner) executor(ws Workspace) agents.Executor {
 		cmd.Env = append([]string(nil), env.Values...)
 		capped := &cappedWriter{w: out, remaining: d.Config.EffectiveOutputCapBytes()}
 		cmd.Stdout, cmd.Stderr = capped, capped
+		launchStart := time.Now()
 		if err := cmd.Start(); err != nil {
 			return 0, false, false, err
 		}
@@ -262,9 +275,10 @@ func (d *DockerRunner) executor(ws Workspace) agents.Executor {
 		var code int
 		var timedOut bool
 		var runErr error
-		if err := d.verifyStartedContainer(context.Background(), ws); err != nil {
-			runErr = errors.Join(err, d.forceStopAndRemove(context.Background(), ws))
-			<-done
+		if err := d.verifyStartedContainer(context.Background(), ws, launchStart); err != nil {
+			stopErr := d.forceStopAndRemove(context.Background(), ws)
+			killProcessGroup(cmd)
+			runErr = errors.Join(err, stopErr, waitDockerCLIBounded(done, DockerCLIShutdownDeadline))
 			code = -1
 		} else {
 			select {
@@ -279,8 +293,9 @@ func (d *DockerRunner) executor(ws Workspace) agents.Executor {
 			case <-runCtx.Done():
 				code = -1
 				timedOut = true
-				runErr = errors.Join(runCtx.Err(), d.forceStopAndRemove(context.Background(), ws))
-				<-done
+				stopErr := d.forceStopAndRemove(context.Background(), ws)
+				killProcessGroup(cmd)
+				runErr = errors.Join(runCtx.Err(), stopErr, waitDockerCLIBounded(done, DockerCLIShutdownDeadline))
 			}
 		}
 		// Record truncation accounting (Session 3a): loud, never silent. The
@@ -379,17 +394,68 @@ func (d *DockerRunner) runtimeImageRef() (string, error) {
 	return "", fmt.Errorf("docker runtime image is unresolved; refusing mutable configured reference %q", d.Config.Image)
 }
 
-func (d *DockerRunner) verifyStartedContainer(ctx context.Context, ws Workspace) error {
+// dockerCreationClockSkew tolerates minor variance between this process
+// recording launchStart and the daemon stamping the container's own Created
+// timestamp -- a genuine container from this launch always follows
+// launchStart, but by an amount that varies with daemon load, image pull
+// state, and host clock precision.
+const dockerCreationClockSkew = 3 * time.Second
+
+// DockerContainerObservationDeadline bounds how long verifyStartedContainer
+// polls before treating a container as genuinely never-appeared
+// (DOCKER_CONTAINER_NOT_OBSERVED). It must exceed real daemon-side container
+// creation latency, not just inspect-call latency: on a Docker
+// Desktop/WSL2 backend, `docker run` creating and starting even a trivial
+// container was empirically observed to take >10s end to end, while
+// `docker inspect` itself resolves in milliseconds once the container
+// exists. A short deadline here doesn't make failures happen faster, it
+// makes REAL, eventually-successful launches misreported as
+// DOCKER_CONTAINER_NOT_OBSERVED -- the same "absence looks like success (or
+// here, failure) when it isn't" class of bug Sol9 P1-1 flagged, just
+// inverted. 20s gives comfortable headroom above the observed ~10.5s while
+// staying well inside typical per-stage transaction budgets.
+const DockerContainerObservationDeadline = 20 * time.Second
+
+// verifyStartedContainer proves the transaction's container actually started
+// -- Sol9 P1-1's "absence counts as success" -- rather than merely polling
+// until a deadline and treating "still absent" as a clean pass. A successful
+// proof requires: the container exists; its running/exited state is known;
+// its image ID equals the resolved identity; and (when the daemon reports a
+// creation time) that time is not older than this launch, so a stale
+// container left behind under the same name cannot be mistaken for this
+// launch's own container. The name/ID match to "the transaction's
+// container" is structural: inspectContainer is queried by ws.Container
+// itself, and Docker enforces container-name uniqueness, so a hit can only
+// ever be this transaction's container or nothing.
+func (d *DockerRunner) verifyStartedContainer(ctx context.Context, ws Workspace, launchStart time.Time) error {
 	if d.ResolvedImage == nil || strings.TrimSpace(d.ResolvedImage.ID) == "" || ws.Container == "" {
 		return nil
 	}
 	env := d.controllerEnvironment()
-	deadline := time.Now().Add(2 * time.Second)
+	deadline := time.Now().Add(DockerContainerObservationDeadline)
 	for {
-		insp, absent, err := inspectContainer(ctx, ws.Container, env)
+		// Sol9 P1-2: bound each poll's inspect call so a daemon that never
+		// responds can't block this loop past its own deadline check --
+		// see waitDockerCLIBounded for the equivalent bound on the CLI's
+		// own shutdown wait.
+		inspectCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+		insp, absent, err := inspectContainer(inspectCtx, ws.Container, env)
+		cancel()
 		if err == nil {
 			if insp.Image != d.ResolvedImage.ID {
 				return fmt.Errorf("docker runtime image mismatch: resolved %s, running %s", d.ResolvedImage.ID, insp.Image)
+			}
+			if insp.State.Status == "" {
+				return fmt.Errorf("docker runtime state verification: container %s reported no running/exited state", ws.Container)
+			}
+			if !launchStart.IsZero() && insp.Created != "" {
+				created, perr := time.Parse(time.RFC3339Nano, insp.Created)
+				if perr != nil {
+					return fmt.Errorf("docker runtime verification: parse container %s creation time %q: %w", ws.Container, insp.Created, perr)
+				}
+				if created.Before(launchStart.Add(-dockerCreationClockSkew)) {
+					return fmt.Errorf("docker runtime verification: container %s was created at %s, before this launch started at %s -- a stale container reused the name instead of this launch's own container", ws.Container, created, launchStart)
+				}
 			}
 			return nil
 		}
@@ -397,7 +463,7 @@ func (d *DockerRunner) verifyStartedContainer(ctx context.Context, ws Workspace)
 			return fmt.Errorf("docker runtime image verification: %w", err)
 		}
 		if time.Now().After(deadline) {
-			return nil
+			return fmt.Errorf("DOCKER_CONTAINER_NOT_OBSERVED: container %s did not appear within %s", ws.Container, DockerContainerObservationDeadline)
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
@@ -420,6 +486,45 @@ func (d *DockerRunner) forceStopAndRemove(ctx context.Context, ws Workspace) err
 		return errors.Join(fmt.Errorf("docker stop %s: %w", ws.Container, stopErr), rmErr)
 	}
 	return fmt.Errorf("docker stop %s: %w (forced removal succeeded)", ws.Container, stopErr)
+}
+
+// DockerCLIShutdownDeadline bounds how long the executor waits for the
+// docker CLI's Wait to return once this package has already stopped/removed
+// the daemon-side container and sent the CLI's process group a kill signal
+// (Sol9 P1-2). The prior code blocked on `<-done` with no deadline
+// whatsoever, so a stuck CLI -- daemon socket wedged, stop/rm both failing
+// -- could hang Governator for however much of the run's timeout budget
+// remained, which could be very large.
+const DockerCLIShutdownDeadline = 5 * time.Second
+
+// killProcessGroup sends SIGKILL to a docker CLI invocation's whole process
+// group (Sol9 P1-2). The executor's cmd is built with
+// SysProcAttr{Setpgid: true} specifically so this reaches every process the
+// CLI may have spawned, not only its own top-level pid. Safe to call on a
+// cmd that never started or has already exited: Process is nil in the
+// former case, and killing an empty/already-reaped process group is a
+// harmless no-op (ESRCH), not an error worth surfacing.
+func killProcessGroup(cmd *exec.Cmd) {
+	if cmd == nil || cmd.Process == nil {
+		return
+	}
+	_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+}
+
+// waitDockerCLIBounded waits for the docker CLI's exit signal up to
+// deadline, returning a hard lifecycle error instead of blocking forever
+// when it never arrives -- the direct fix for Sol9 P1-2's unbounded
+// `<-done`. Called only after daemon-side cleanup and a process-group kill
+// have both already been attempted, so anything still outstanding past the
+// deadline is a genuine stuck-CLI lifecycle failure, not a process this
+// package simply hasn't gotten around to terminating yet.
+func waitDockerCLIBounded(done <-chan error, deadline time.Duration) error {
+	select {
+	case <-done:
+		return nil
+	case <-time.After(deadline):
+		return fmt.Errorf("docker CLI did not exit within %s after forced daemon cleanup and a process-group kill signal", deadline)
+	}
 }
 
 func (d *DockerRunner) proveContainerExtinction(ctx context.Context, ws Workspace) (bool, error) {
@@ -590,7 +695,10 @@ func authorizedCredentialDir(resolved string, allow []string) bool {
 // when no --pids-limit was set.
 type dockerInspect struct {
 	Image string `json:"Image"`
-	State struct {
+	// Created is the daemon-stamped RFC3339Nano creation timestamp -- Sol9
+	// P1-1's "creation timestamp belongs to this launch" proof element.
+	Created string `json:"Created"`
+	State   struct {
 		Running bool   `json:"Running"`
 		Status  string `json:"Status"`
 	} `json:"State"`
