@@ -1192,3 +1192,71 @@ claims:
         funcs:
           - TestV8Case22DarwinBuildRefusesApprovalOrMerge
         build_tag: redteam
+
+  - id: sol8-stage-output-limits
+    title: "Authority-bearing stage execution enforces a mandatory finite output cap for evidence-critical capture: an unbounded stream is terminated once it crosses the declared limit (STAGE_OUTPUT_LIMIT_EXCEEDED, truncation evidence recorded), and stdout/stderr share one aggregate cap rather than each independently receiving the nominal limit."
+    first_shipped_version: v1.0.2-rc2
+    claimed_maturity: tested
+    implementation:
+      - file: internal/stage/stage.go
+        symbols: [OutputCaptureMode, ErrOutputLimitExceeded, StageSpec, Run]
+    tests:
+      - file: internal/redteam/v8_phase3_stage_lifecycle_test.go
+        funcs:
+          - TestV8Case1BackendUnlimitedStdoutHitsStageOutputLimit
+          - TestV8Case2StdoutAndStderrShareAggregateStageOutputCap
+        build_tag: redteam
+
+  - id: sol8-stage-timeout-extinction
+    title: "Stage timeout handling never waits unbounded on the launched process: a deadline exceeded or kill signal terminates the stage promptly, cmd.Wait is bounded by waitAfterKillDeadline, and descendant extinction is proven before the caller proceeds -- an unkillable process cannot hang the governed run."
+    first_shipped_version: v1.0.2-rc2
+    claimed_maturity: tested
+    implementation:
+      - file: internal/stage/stage.go
+        symbols: [Run, waitAfterKillDeadline]
+    tests:
+      - file: internal/redteam/v8_phase3_stage_lifecycle_test.go
+        funcs:
+          - TestV8Case9StageWrapperTimeoutBoundsWaitAndExtinguishes
+        build_tag: redteam
+
+  - id: sol8-release-integrity-gates
+    title: "The release-blocking claims-verify gate refuses a shipped artifact whose own version --json reports dirty=true (source drifted from a clean tag); scripts/release_policy.py's signature command separately refuses an rc/production version with no accompanying asymmetric minisign signature. An rc/production release cannot ship an unproven or unsigned artifact. (release_policy.py is Python and is not symbol-resolved by this Go verifier; its behavior is asserted only through the redteam test below.)"
+    first_shipped_version: v1.0.2-rc2
+    claimed_maturity: tested
+    implementation:
+      - file: internal/claims/claims.go
+        symbols: [verifyArtifactManifest, runArtifactVersionJSON]
+    tests:
+      - file: internal/redteam/v8_session4_release_test.go
+        funcs:
+          - TestV8Case20DirtyReleaseArtifactRejected
+          - TestV8Case21UnsignedRCReleaseRejected
+        build_tag: redteam
+
+  - id: sol8-replay-identity-hardening
+    title: "Strict replay identity is invalidated whenever a trust-bearing participant actually changes: an Assayer branch advance (stable .git/HEAD notwithstanding) or a cleanup validator's declared tool being re-enrolled at a different verified path both disable replay of a prior approval rather than reusing a stale identity."
+    first_shipped_version: v1.0.2-rc2
+    claimed_maturity: tested
+    implementation:
+      - file: internal/runtime/identity.go
+        symbols: [resolvedAssayerParticipants, computeExecutionIdentity, validatorToolDirectories, validatorToolDirectoriesForStage]
+    tests:
+      - file: internal/redteam/v8_session5_reconciliation_test.go
+        funcs:
+          - TestV8Case14AssayerBranchAdvanceInvalidatesReplay
+          - TestV8Case16CleanupInterpreterSwapInvalidatesReplay
+        build_tag: redteam
+
+  - id: sol8-verify-empty-blocks-approval
+    title: "A blocking-enforcement Assayer evaluation that resolves to no applicable checks (verdict no_applicable_checks) blocks approval by default -- verify(item, []) cannot silently pass just because nothing was found to check; only non-blocking (advisory/telemetry) enforcement tolerates it."
+    first_shipped_version: v1.0.2-rc2
+    claimed_maturity: tested
+    implementation:
+      - file: internal/assay/assay.go
+        symbols: [VerdictNoApplicableChecks]
+    tests:
+      - file: internal/redteam/v8_session5_reconciliation_test.go
+        funcs:
+          - TestV8Case24NoApplicableChecksBlockApproval
+        build_tag: redteam
