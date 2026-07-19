@@ -346,3 +346,18 @@ cases:
     session: rc2-phase5
     required: true
     status: implemented
+  - case: 59
+    name: TestV9Case1ProductionSandboxHelperReachesGovernatorNotUnshare
+    session: rc3-s1
+    required: true
+    status: implemented
+  - case: 60
+    name: TestV9Case2EnrolledUnshareSwapAfterPlanResolutionCannotChangeExecutedBytes
+    session: rc3-s1
+    required: true
+    status: implemented
+  - case: 61
+    name: TestV9Case3GovernatorOnDiskSwapAfterProcessStartCannotChangeSandboxHelperIdentity
+    session: rc3-s1
+    required: true
+    status: implemented

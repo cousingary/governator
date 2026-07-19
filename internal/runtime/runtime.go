@@ -3055,6 +3055,12 @@ func (r *Runner) runOnce(ctx context.Context, c contracts.Contract) (RunRecord, 
 	if enforcePlanErr != nil {
 		return RunRecord{}, fmt.Errorf("external enforcement: %w", enforcePlanErr)
 	}
+	// Sol v9 P0-1/P0-2: enforcePlan may hold open descriptors (Governor's
+	// own self-exe, the verified unshare handle) it launches through
+	// instead of reopening by path -- release them once this run's launch
+	// (further below, still within this function) has started, mirroring
+	// handle.Close() just above for the backend's own resolved handle.
+	defer func() { _ = enforcePlan.Close() }()
 	if enforcePlan.Active && enforcePlan.ReadOnly {
 		// Sol v7 S9: a read-only-mode contract's own compiled prompt still
 		// instructs the backend to "write RESULT.json in the worktree" (every

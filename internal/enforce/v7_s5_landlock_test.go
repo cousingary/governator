@@ -59,7 +59,7 @@ func TestS5StageExecutableAddsELFClosureAndWrapEvidence(t *testing.T) {
 	if len(p.ReadRoots) < 3 {
 		t.Fatalf("missing executable/runtime/declared closure: %v", p.ReadRoots)
 	}
-	_, args := p.Wrap(shell, nil)
+	_, args, _ := p.Wrap(shell, nil)
 	joined := strings.Join(args, "\n")
 	for _, root := range p.ReadRoots {
 		if !strings.Contains(joined, "--read-root\n"+root) {

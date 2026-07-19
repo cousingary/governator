@@ -70,12 +70,56 @@ type Plan struct {
 	WriteDirs  []string
 	WriteFiles []string
 
+	// selfExe is the string-based launch path used only when selfExeFile is
+	// nil: the SelfExeOverride test seam (a real, distinct sealed-copy file,
+	// never process-relative) or a non-Linux os.Executable() result. Never
+	// populated on production Linux -- see selfExeFile.
 	selfExe string
-	// unsharePath is the trusted-tool registry's verified canonical path to
-	// unshare(1), resolved once at NewPlan time and bound into this Plan so
-	// Wrap never falls back to a bare "unshare" argv0 that os/exec would
-	// resolve via ambient PATH (Session 2, post-v4 hardening plan item C).
+	// selfExeFile is Governator's own running executable, opened in THIS
+	// process before any wrapper is composed (Sol v9 P0-1). /proc/self/exe
+	// unambiguously names Governator here; the defect was ever handing that
+	// PATH STRING to a second process (unshare) to resolve for itself, where
+	// "self" becomes unshare, not Governator. Wrap passes this descriptor
+	// through as /proc/self/fd/<n> instead, so no second resolution ever
+	// happens. nil on non-Linux or when SelfExeOverride is set, in which
+	// case selfExe (a real path) is used instead.
+	selfExeFile *os.File
+	// unsharePath is unshareHandle's canonical path, retained only as a
+	// string fallback for Plans built directly by tests (struct literals
+	// that never went through NewPlanForExecutable, so unshareHandle is
+	// nil). Every Plan NewPlanForExecutable actually constructs sets
+	// unshareHandle and launches through it.
 	unsharePath string
+	// unshareHandle is a sealed, open handle to the trusted-tool registry's
+	// verified unshare(1) object (Sol v9 P0-2). NewPlanForExecutable resolves
+	// and opens it once; Wrap launches through the held descriptor
+	// (/proc/self/fd/<n>), never by reopening unsharePath -- a same-uid
+	// replacement of the enrolled unshare binary after resolution can no
+	// longer change what actually execs.
+	unshareHandle *toolregistry.Handle
+}
+
+// Close releases any file descriptors this Plan holds open (the fd-backed
+// Governor self-exe and unshare handle Wrap launches through). Safe to call
+// on a zero/inactive Plan or one built from a test struct literal that never
+// opened either. Callers that obtained a Plan from NewPlan/NewPlanForExecutable
+// own it and must close it once the launch it was built for has started
+// (mirroring containment.Scope.Started's own primitiveHandle.Close()) --
+// holding these open any longer is pure fd leakage, since the child already
+// has its own independent descriptors after Start().
+func (p *Plan) Close() error {
+	var err error
+	if p.selfExeFile != nil {
+		err = p.selfExeFile.Close()
+		p.selfExeFile = nil
+	}
+	if p.unshareHandle != nil {
+		if cerr := p.unshareHandle.Close(); cerr != nil && err == nil {
+			err = cerr
+		}
+		p.unshareHandle = nil
+	}
+	return err
 }
 
 // SelfExeOverride is a test-only seam. NewPlan wraps a launch by re-executing
@@ -92,14 +136,48 @@ type Plan struct {
 // helper) and point this at it. Never set outside a test.
 var SelfExeOverride string
 
+// selfExePath is the string-based fallback used only for the
+// SelfExeOverride test seam and non-Linux hosts. It must never be called for
+// the production Linux path -- see openSelfExecutable, which that path uses
+// instead specifically because a string here would have to be re-resolved
+// by whatever process reads it next (the P0-1 defect: unshare resolving
+// "/proc/self/exe" for itself, not for Governator).
 func selfExePath() (string, error) {
 	if SelfExeOverride != "" {
 		return sealedExecutableCopy(SelfExeOverride, "governator-self-exec-*")
 	}
-	if runtime.GOOS == "linux" {
-		return "/proc/self/exe", nil
-	}
 	return os.Executable()
+}
+
+// openSelfExecutable opens Governator's own running executable in THIS
+// process, before any wrapper is composed (Sol v9 P0-1's required
+// correction). Opened here, "/proc/self/exe" is unambiguous: self is
+// Governator. The returned descriptor is what Wrap threads through the
+// launch chain as /proc/self/fd/<n> -- never a path string a wrapper
+// process would resolve for itself.
+func openSelfExecutable() (*os.File, error) {
+	f, err := os.Open("/proc/self/exe")
+	if err != nil {
+		return nil, fmt.Errorf("open running gov executable: %w", err)
+	}
+	ok := false
+	defer func() {
+		if !ok {
+			_ = f.Close()
+		}
+	}()
+	var magic [4]byte
+	if _, err := io.ReadFull(f, magic[:]); err != nil {
+		return nil, fmt.Errorf("read running gov executable magic: %w", err)
+	}
+	if magic != [4]byte{0x7f, 'E', 'L', 'F'} {
+		return nil, fmt.Errorf("running gov executable is not an ELF binary")
+	}
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		return nil, fmt.Errorf("rewind running gov executable: %w", err)
+	}
+	ok = true
+	return f, nil
 }
 
 func sealedExecutableCopy(src, pattern string) (string, error) {
@@ -198,19 +276,51 @@ func NewPlanForExecutable(active bool, workspace string, readOnly, allowNetwork,
 		}
 		return Plan{}, nil
 	}
-	self, err := selfExePath()
-	if err != nil {
-		return Plan{}, fmt.Errorf("enforce: resolve gov executable for sandbox wrapper: %w", err)
-	}
 	// Resolved again here (Supported() above already resolved it once to
 	// answer "does unshare exist and verify") rather than reusing that
 	// result: this is the trust decision that actually gets bound into the
 	// Plan and later executed by Wrap, so it gets its own fresh, fully
-	// fail-closed resolution rather than trusting an earlier boolean.
-	unshareIdentity, err := toolregistry.ResolveTrusted("unshare", "unshare")
+	// fail-closed resolution rather than trusting an earlier boolean. Held
+	// as an open handle (Sol v9 P0-2), not just a verified path string: the
+	// old code stored unshareIdentity.CanonicalPath and let Wrap reopen it
+	// by name, leaving a same-uid TOCTOU window between this resolution and
+	// the actual exec.
+	registry, err := toolregistry.Load()
 	if err != nil {
-		return Plan{}, fmt.Errorf("enforce: resolve trusted unshare: %w", err)
+		return Plan{}, fmt.Errorf("enforce: load trusted-tool registry: %w", err)
 	}
+	unshareHandle, err := registry.ResolveHandle("unshare", "unshare", toolregistry.KindTrustedController)
+	if err != nil {
+		return Plan{}, fmt.Errorf("enforce: resolve trusted unshare handle: %w", err)
+	}
+	closeOnErr := true
+	defer func() {
+		if closeOnErr {
+			_ = unshareHandle.Close()
+		}
+	}()
+
+	// selfExeFile (production Linux, SelfExeOverride unset) is the fd-backed
+	// fix for P0-1; selfExe (everything else) is the pre-existing
+	// string-based path, unchanged. See openSelfExecutable's doc comment.
+	var self string
+	var selfFile *os.File
+	if runtime.GOOS == "linux" && SelfExeOverride == "" {
+		selfFile, err = openSelfExecutable()
+	} else {
+		self, err = selfExePath()
+	}
+	if err != nil {
+		return Plan{}, fmt.Errorf("enforce: resolve gov executable for sandbox wrapper: %w", err)
+	}
+	if selfFile != nil {
+		defer func() {
+			if closeOnErr {
+				_ = selfFile.Close()
+			}
+		}()
+	}
+
 	readRoots, err := exactReadClosure(executable, declaredReadRoots)
 	if err != nil {
 		return Plan{}, fmt.Errorf("enforce: construct exact read closure: %w", err)
@@ -225,15 +335,18 @@ func NewPlanForExecutable(active bool, workspace string, readOnly, allowNetwork,
 			abs = a
 		}
 	}
+	closeOnErr = false
 	return Plan{
-		Active:       true,
-		Workspace:    abs,
-		ReadOnly:     readOnly,
-		AllowNetwork: allowNetwork,
-		ReadRoots:    readRoots,
-		LandlockABI:  abi,
-		selfExe:      self,
-		unsharePath:  unshareIdentity.CanonicalPath,
+		Active:        true,
+		Workspace:     abs,
+		ReadOnly:      readOnly,
+		AllowNetwork:  allowNetwork,
+		ReadRoots:     readRoots,
+		LandlockABI:   abi,
+		selfExe:       self,
+		selfExeFile:   selfFile,
+		unsharePath:   unshareHandle.Identity.CanonicalPath,
+		unshareHandle: unshareHandle,
 	}, nil
 }
 
@@ -250,11 +363,6 @@ func ExecutableReadClosure(executable string) ([]string, error) {
 	return exactReadClosure(executable, nil)
 }
 
-// Wrap rewrites bin/args so the process that actually starts is already
-// confined: Landlock is applied to it before it execs into bin (see
-// RunSandboxExec), and -- unless the run is permitted network access -- the
-// whole thing runs inside a network namespace with no configured route. A
-// no-op Plan (Active false) returns bin/args unchanged.
 func (p Plan) WithReadRoots(roots ...string) (Plan, error) {
 	return p.WithExecutableAndReadRoots("", roots...)
 }
@@ -287,11 +395,48 @@ func (p Plan) WithWriteRoots(dirs, files []string) Plan {
 	return p
 }
 
-func (p Plan) Wrap(bin string, args []string) (string, []string) {
+// Wrap rewrites bin/args so the process that actually starts is already
+// confined: Landlock is applied to it before it execs into bin (see
+// RunSandboxExec), and -- unless the run is permitted network access -- the
+// whole thing runs inside a network namespace with no configured route.
+//
+// Wrap's return values are (bin, args, extraFiles): the caller must build
+// its *exec.Cmd from bin/args as before AND set cmd.ExtraFiles = extraFiles
+// (appending, never replacing, if the caller's own scope wrapper already
+// populated some) before Start -- extraFiles holds the open descriptors
+// bin/args reference as /proc/self/fd/<n>, and Start dup's them into the
+// child at the deterministic fd numbers Wrap assigned. A no-op/inactive
+// Plan returns bin/args unchanged and a nil extraFiles.
+func (p Plan) Wrap(bin string, args []string) (string, []string, []*os.File) {
 	if !p.Active {
-		return bin, args
+		return bin, args, nil
 	}
-	inner := []string{p.selfExe, SandboxExecArg, "--workspace", p.Workspace}
+
+	// fdArg records f as the next descriptor Start must inherit and returns
+	// its deterministic /proc/self/fd/<n> argv form -- entry i of
+	// exec.Cmd.ExtraFiles always becomes fd 3+i in the child, so callers
+	// never need to guess a number: whichever order fdArg is called in here
+	// is the order extraFiles comes back in.
+	var extraFiles []*os.File
+	fdArg := func(f *os.File) string {
+		extraFiles = append(extraFiles, f)
+		return fmt.Sprintf("/proc/self/fd/%d", 2+len(extraFiles))
+	}
+
+	// selfArg is Governator's own re-exec target. selfExeFile (set by
+	// NewPlanForExecutable on production Linux) is threaded through as an
+	// inherited descriptor -- Sol v9 P0-1's required correction: a plain
+	// path string here would be re-resolved by whichever process reads it
+	// next, and after unshare that process is unshare itself, not
+	// Governator. selfExe (a real, distinct path -- SelfExeOverride's
+	// sealed test copy, or os.Executable() off Linux) is used unchanged
+	// when there is no descriptor to pass.
+	selfArg := p.selfExe
+	if p.selfExeFile != nil {
+		selfArg = fdArg(p.selfExeFile)
+	}
+
+	inner := []string{selfArg, SandboxExecArg, "--workspace", p.Workspace}
 	if p.ReadOnly {
 		inner = append(inner, "--readonly")
 	}
@@ -308,17 +453,25 @@ func (p Plan) Wrap(bin string, args []string) (string, []string) {
 	inner = append(inner, bin)
 	inner = append(inner, args...)
 	if p.AllowNetwork {
-		return inner[0], inner[1:]
+		return inner[0], inner[1:], extraFiles
 	}
 	// No configured route inside the namespace means every connect()/bind()
 	// past loopback fails at the kernel level -- this is not a policy the
 	// backend can be asked to honor, it structurally cannot reach anywhere.
-	// p.unsharePath (not a bare "unshare" argv0) so the process that
-	// actually launches is the exact binary NewPlan verified, never
-	// whatever a PATH substitution after that point would redirect a bare
-	// name to (Session 2, post-v4 hardening plan item C).
+	// The launch chain is: verified unshare object -> verified Governator
+	// object -> __sandbox_exec -> verified stage executable (Sol v9
+	// P0-1/P0-2). unshareHandle (set by NewPlanForExecutable) is threaded
+	// through the same fd-argv mechanism as selfExeFile above, never
+	// reopened by unsharePath's string -- a same-uid replacement of the
+	// enrolled unshare binary after resolution can no longer change what
+	// launches. unsharePath itself remains only for Plans built directly by
+	// tests as struct literals, which never populate unshareHandle.
+	unshareArg := p.unsharePath
+	if p.unshareHandle != nil {
+		unshareArg = fdArg(p.unshareHandle.File())
+	}
 	full := append([]string{"--net", "--map-root-user", "--"}, inner...)
-	return p.unsharePath, full
+	return unshareArg, full, extraFiles
 }
 
 type planContextKey struct{}

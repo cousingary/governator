@@ -31,7 +31,10 @@ func TestWrapUsesRegistryResolvedUnsharePath(t *testing.T) {
 		unsharePath:  pinnedUnshare,
 	}
 
-	bin, args := p.Wrap("some-backend", []string{"--flag"})
+	bin, args, extraFiles := p.Wrap("some-backend", []string{"--flag"})
+	if len(extraFiles) != 0 {
+		t.Fatalf("Wrap should not open any descriptors for a struct-literal Plan with no unshareHandle/selfExeFile, got %d", len(extraFiles))
+	}
 	if bin != pinnedUnshare {
 		t.Fatalf("Wrap returned bin=%q, want the registry-resolved path %q (a bare \"unshare\" would let ambient PATH redirect it)", bin, pinnedUnshare)
 	}
@@ -83,9 +86,12 @@ func TestNewPlanInactiveIsNoopWithoutHostSupport(t *testing.T) {
 		t.Fatalf("inactive NewPlan returned active plan: %+v", p)
 	}
 
-	bin, args := p.Wrap("backend", []string{"--arg"})
+	bin, args, extraFiles := p.Wrap("backend", []string{"--arg"})
 	if bin != "backend" || len(args) != 1 || args[0] != "--arg" {
 		t.Fatalf("inactive Wrap changed launch: bin=%q args=%v", bin, args)
+	}
+	if extraFiles != nil {
+		t.Fatalf("inactive Wrap should return no extra files, got %v", extraFiles)
 	}
 }
 
@@ -100,7 +106,10 @@ func TestWrapBuildsSandboxExecAndReadOnlyArgs(t *testing.T) {
 		unsharePath:  "/trusted/unshare",
 	}
 
-	bin, args := p.Wrap("backend", []string{"--arg", "value"})
+	bin, args, extraFiles := p.Wrap("backend", []string{"--arg", "value"})
+	if len(extraFiles) != 0 {
+		t.Fatalf("Wrap should not open any descriptors for a struct-literal Plan with no unshareHandle/selfExeFile, got %d", len(extraFiles))
+	}
 	if bin != "/trusted/gov" {
 		t.Fatalf("network-allowed Wrap should exec trusted gov wrapper directly, got %q", bin)
 	}

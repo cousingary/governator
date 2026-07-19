@@ -207,6 +207,11 @@ func (Executor) Run(ctx context.Context, spec StageSpec) (StageResult, error) {
 			if cerr != nil {
 				return StageResult{}, fmt.Errorf("stage: construct authority plan: %w", cerr)
 			}
+			// Sol v9 P0-1/P0-2: compiledPlan may hold open descriptors (see
+			// enforce.Plan.Close's doc comment) -- release them once this
+			// stage's launch (below, still within this Run call) has
+			// started.
+			defer func() { _ = compiledPlan.Close() }()
 			if effectivePlan.Active {
 				if authority.Network == NetworkPolicyDenied && effectivePlan.AllowNetwork {
 					return StageResult{}, fmt.Errorf("stage: authority denies network but plan allows it")
@@ -274,8 +279,10 @@ func (Executor) Run(ctx context.Context, spec StageSpec) (StageResult, error) {
 				if err != nil {
 					return nil, err
 				}
-				wb, wa := extended.Wrap(sealed, a)
-				return s.Command(c, wb, wa, d), nil
+				wb, wa, wf := extended.Wrap(sealed, a)
+				cmd := s.Command(c, wb, wa, d)
+				cmd.ExtraFiles = append(cmd.ExtraFiles, wf...)
+				return cmd, nil
 			}
 			return spec.ExecutableHandle.CommandWith(c, a, func(cc context.Context, sealed string, sealedArgs []string) *exec.Cmd {
 				return s.Command(cc, sealed, sealedArgs, d)
@@ -287,10 +294,13 @@ func (Executor) Run(ctx context.Context, spec StageSpec) (StageResult, error) {
 		// resolved path (validators, graph provider, Assayer's own
 		// non-backend stages), so the wrap is applied directly to it here.
 		factory = func(c context.Context, s *containment.Scope, p enforce.Plan, b string, a []string, d string) (*exec.Cmd, error) {
+			var wrapFiles []*os.File
 			if p.Active {
-				b, a = p.Wrap(b, a)
+				b, a, wrapFiles = p.Wrap(b, a)
 			}
-			return s.Command(c, b, a, d), nil
+			cmd := s.Command(c, b, a, d)
+			cmd.ExtraFiles = append(cmd.ExtraFiles, wrapFiles...)
+			return cmd, nil
 		}
 	}
 	cmd, err := factory(ctx, scope, effectivePlan, bin, args, spec.WorkingDirectory)

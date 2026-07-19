@@ -81,6 +81,21 @@ func (h *Handle) Command(ctx context.Context, args ...string) (*exec.Cmd, error)
 	return nil, fmt.Errorf("sealed controller-tool launch is unsupported on %s", runtime.GOOS)
 }
 
+// File returns the handle's held, already-verified file descriptor for a
+// caller that must compose it into a launch chain with more than one
+// descriptor-backed executable of its own (see enforce.Plan.Wrap, which
+// chains a verified unshare object ahead of a verified Governator self-exec
+// -- CommandWith only threads a single descriptor through one build
+// callback, not two independent ones into the same exec.Cmd.ExtraFiles).
+// The handle retains ownership: the caller must not close the returned
+// file directly, only Handle.Close, and must not use it after Close.
+func (h *Handle) File() *os.File {
+	if h == nil {
+		return nil
+	}
+	return h.file
+}
+
 // CommandWith composes fd-backed launch with a caller-owned scope/wrapper.
 func (h *Handle) CommandWith(ctx context.Context, args []string, build func(context.Context, string, []string) *exec.Cmd) (*exec.Cmd, error) {
 	if h == nil || h.file == nil {

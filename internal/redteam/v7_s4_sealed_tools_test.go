@@ -82,6 +82,16 @@ func TestV7Case13BashReplacementCannotChangeExecutedBytes(t *testing.T)   { v7S4
 func TestV7Case14GitReplacementCannotChangeExecutedBytes(t *testing.T)    { v7S4ToolSwap(t, "git") }
 func TestV7Case15PythonReplacementCannotChangeExecutedBytes(t *testing.T) { v7S4ToolSwap(t, "python3") }
 
+// TestV7Case16GovernatorSelfIdentityUsesRunningObject originally also
+// asserted enforce.go's source literally contained `return "/proc/self/exe",
+// nil` -- Sol v9 P0-1 found that literal to be the defect, not evidence
+// against it: handing that path STRING through unshare re-resolves "self" as
+// unshare, not Governator (see enforce.openSelfExecutable and the production
+// integration test in internal/redteam/v9_s1_wrapper_composition_test.go,
+// which exercises the fixed behavior end to end). A source-inspection
+// assertion that a known-hostile line still exists is a regression lock, not
+// a regression test, so it is removed here; this test keeps only the
+// identity.go check, which was never the defective line.
 func TestV7Case16GovernatorSelfIdentityUsesRunningObject(t *testing.T) {
 	root, err := filepath.Abs(filepath.Join("..", ".."))
 	if err != nil {
@@ -91,14 +101,7 @@ func TestV7Case16GovernatorSelfIdentityUsesRunningObject(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	enforcement, err := os.ReadFile(filepath.Join(root, "internal", "enforce", "enforce.go"))
-	if err != nil {
-		t.Fatal(err)
-	}
 	if !strings.Contains(string(identity), `hashFileContent("/proc/self/exe")`) {
 		t.Fatal("self identity reopens a mutable executable pathname")
-	}
-	if !strings.Contains(string(enforcement), `return "/proc/self/exe", nil`) {
-		t.Fatal("sandbox-helper re-exec does not use the running executable object")
 	}
 }

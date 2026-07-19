@@ -602,8 +602,10 @@ func LaunchStaged(ctx context.Context, handle *BackendExecutionHandle, bin strin
 			p = extended
 		}
 		return LaunchCommand(c, handle, b, a, func(cc context.Context, launchBin string, launchArgs []string) *exec.Cmd {
-			wb, wa := p.Wrap(launchBin, launchArgs)
-			return s.Command(cc, wb, wa, d)
+			wb, wa, wf := p.Wrap(launchBin, launchArgs)
+			cmd := s.Command(cc, wb, wa, d)
+			cmd.ExtraFiles = append(cmd.ExtraFiles, wf...)
+			return cmd
 		})
 	}
 	res, runErr := stage.NewExecutor().Run(ctx, stage.StageSpec{
