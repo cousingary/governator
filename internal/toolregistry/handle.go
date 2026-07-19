@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"syscall"
 )
 
@@ -123,35 +124,71 @@ func (h *Handle) SealedExecutablePath() (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("create sealed tool dir: %w", err)
 	}
-	outPath := filepath.Join(dir, filepath.Base(h.Identity.CanonicalPath))
-	out, err := os.OpenFile(outPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0500)
+	outPath, err := h.sealInto(dir)
 	if err != nil {
 		_ = os.RemoveAll(dir)
-		return "", fmt.Errorf("create sealed tool copy: %w", err)
-	}
-	if _, err := h.file.Seek(0, io.SeekStart); err != nil {
-		_ = out.Close()
-		_ = os.RemoveAll(dir)
-		return "", fmt.Errorf("rewind verified tool fd: %w", err)
-	}
-	_, copyErr := io.Copy(out, h.file)
-	closeErr := out.Close()
-	if copyErr != nil {
-		_ = os.RemoveAll(dir)
-		return "", fmt.Errorf("copy verified tool: %w", copyErr)
-	}
-	if closeErr != nil {
-		_ = os.RemoveAll(dir)
-		return "", fmt.Errorf("close sealed tool copy: %w", closeErr)
-	}
-	if err := os.Chmod(outPath, 0500); err != nil {
-		_ = os.RemoveAll(dir)
-		return "", fmt.Errorf("chmod sealed tool copy: %w", err)
+		return "", err
 	}
 	if err := os.Chmod(dir, 0500); err != nil {
 		_ = os.RemoveAll(dir)
 		return "", fmt.Errorf("chmod sealed tool dir: %w", err)
 	}
 	h.sealedDir = dir
+	return outPath, nil
+}
+
+// SealedExecutablePathIn copies the verified-open controller tool into the
+// caller-supplied directory dir, returning the path to the sealed copy
+// inside it. Used to populate a per-stage shared executable directory for
+// structured validator toolsets (Sol9 P0-5): the directory becomes the
+// validator's sole PATH entry, with one sealed object per declared tool,
+// so declaring "go" can never expose python3/perl/curl/ssh/git/sh through
+// PATH the way filepath.Dir(canonical) + ambient PATH did before. The
+// caller owns dir and is responsible for removing it; this Handle retains
+// no reference to it (a later SealedExecutablePath call still creates the
+// handle's own private dir, unchanged). The sealed copy is created with
+// O_CREAT|O_EXCL so a name collision inside dir -- two declared tools
+// resolving to the same basename -- is rejected rather than silently
+// overwriting one with the other.
+func (h *Handle) SealedExecutablePathIn(dir string) (string, error) {
+	if h == nil || h.file == nil {
+		return "", fmt.Errorf("tool handle is closed")
+	}
+	if strings.TrimSpace(dir) == "" {
+		return "", fmt.Errorf("sealed tool directory is empty")
+	}
+	return h.sealInto(dir)
+}
+
+// sealInto is the shared copy-verified-bytes-into-path primitive both
+// SealedExecutablePath (private dir per handle) and SealedExecutablePathIn
+// (shared caller dir for a structured validator toolset) drive. The
+// caller owns the directory's lifecycle (creation, chmod, removal);
+// sealInto only writes one exclusive file inside it.
+func (h *Handle) sealInto(dir string) (string, error) {
+	outPath := filepath.Join(dir, filepath.Base(h.Identity.CanonicalPath))
+	out, err := os.OpenFile(outPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0500)
+	if err != nil {
+		return "", fmt.Errorf("create sealed tool copy: %w", err)
+	}
+	if _, err := h.file.Seek(0, io.SeekStart); err != nil {
+		_ = out.Close()
+		_ = os.Remove(outPath)
+		return "", fmt.Errorf("rewind verified tool fd: %w", err)
+	}
+	_, copyErr := io.Copy(out, h.file)
+	closeErr := out.Close()
+	if copyErr != nil {
+		_ = os.Remove(outPath)
+		return "", fmt.Errorf("copy verified tool: %w", copyErr)
+	}
+	if closeErr != nil {
+		_ = os.Remove(outPath)
+		return "", fmt.Errorf("close sealed tool copy: %w", closeErr)
+	}
+	if err := os.Chmod(outPath, 0500); err != nil {
+		_ = os.Remove(outPath)
+		return "", fmt.Errorf("chmod sealed tool copy: %w", err)
+	}
 	return outPath, nil
 }

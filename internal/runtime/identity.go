@@ -17,6 +17,7 @@ import (
 	"github.com/cousingary/governator/internal/assay"
 	"github.com/cousingary/governator/internal/config"
 	"github.com/cousingary/governator/internal/contracts"
+	"github.com/cousingary/governator/internal/enforce"
 	"github.com/cousingary/governator/internal/prompts"
 	"github.com/cousingary/governator/internal/runner"
 	"github.com/cousingary/governator/internal/toolregistry"
@@ -378,46 +379,160 @@ func resolveValidatorToolset(c contracts.Contract, root string, registries ...*t
 	return hashJSON(resolved), nil
 }
 
-func validatorToolDirectoriesForStage(validators []string, specs []contracts.ValidatorSpec, registry *toolregistry.Registry) ([][]string, error) {
-	if len(specs) == 0 {
+// sealedValidatorTools is a per-validator private executable directory
+// populated with sealed (verified-bytes) copies of exactly the tools the
+// spec declares -- nothing else. That directory becomes the validator's
+// sole PATH entry (no ambient base PATH), so declaring "go" can no longer
+// expose python3/perl/curl/ssh/git/sh through PATH the way
+// filepath.Dir(canonical) + ambient PATH let it before (Sol9 P0-5).
+//
+// ReadRoots carries each sealed tool's ELF runtime closure (dynamic
+// loader + shared libraries) so the Landlock read policy the structured
+// validator runs under can actually permit the kernel exec of a declared
+// dynamically-linked tool -- without it, the sealed binary's first
+// mmap of /lib64/ld-linux-x86-64.so.2 would be denied and the validator
+// would fail before its declared tool ever ran.
+//
+// Identities mirrors what resolveValidatorToolset already folded into
+// the replay identity hash; sealedValidatorToolsets returns it here so
+// the call site has a single source of truth for the validator's
+// declared-tool set, never a re-resolve inside validator execution.
+type sealedValidatorTools struct {
+	Path       string
+	ReadRoots  []string
+	Identities []resolvedValidatorTool
+}
+
+// sealedToolsForSpec materializes one private executable directory for a
+// single validator spec, sealing each declared tool into it and gathering
+// the closure read roots each sealed tool needs to actually exec under
+// Landlock. Returns nil (no error) for a spec declaring no tools -- the
+// caller keeps the legacy ambient-PATH behavior in that case (already
+// marked validator_tools=Known:false in the identity, so strict replay
+// never depends on it). A spec whose declared tool cannot be resolved,
+// sealed, or whose ELF closure cannot be computed is a hard error: the
+// pre-fix behavior silently widened PATH to whatever dir held the tool,
+// which is exactly what P0-5 closes, so fail closed here rather than
+// fall back to ambient.
+func sealedToolsForSpec(spec contracts.ValidatorSpec, stage string, idx int, registry *toolregistry.Registry) (*sealedValidatorTools, error) {
+	if len(spec.Tools) == 0 {
 		return nil, nil
 	}
 	if registry == nil {
 		return nil, fmt.Errorf("validator tool registry is not frozen")
 	}
-	if len(specs) != len(validators) {
-		return nil, fmt.Errorf("structured and legacy validators cannot be mixed")
+	dir, err := os.MkdirTemp("", fmt.Sprintf("gov-validator-%s-%d-", stage, idx))
+	if err != nil {
+		return nil, fmt.Errorf("create sealed validator tool dir: %w", err)
 	}
-	out := make([][]string, len(specs))
-	for i, spec := range specs {
-		seen := map[string]bool{}
-		for _, name := range spec.Tools {
-			identity, err := registry.Resolve(name, name)
-			if err != nil {
-				return nil, fmt.Errorf("resolve validator tool %q: %w", name, err)
-			}
-			dir := filepath.Dir(identity.CanonicalPath)
-			if !seen[dir] {
-				out[i] = append(out[i], dir)
-				seen[dir] = true
-			}
+	constructed := false
+	defer func() {
+		if !constructed {
+			_ = os.RemoveAll(dir)
+		}
+	}()
+	var identities []resolvedValidatorTool
+	var readRoots []string
+	seen := map[string]bool{}
+	for _, name := range spec.Tools {
+		handle, err := registry.ResolveHandle(name, name, toolregistry.KindTrustedController)
+		if err != nil {
+			return nil, fmt.Errorf("resolve %s validator tool %q: %w", stage, name, err)
+		}
+		// SealedExecutablePathIn copies the verified-bytes fd's contents
+		// into the shared dir; once it returns, the handle's own fd is
+		// no longer needed and we can close it. The sealed copy stands
+		// alone -- bash finds the tool by name through PATH=dir, never
+		// via /proc/self/fd/<n>, so the handle's fd is not part of the
+		// validator's launch chain.
+		if _, err := handle.SealedExecutablePathIn(dir); err != nil {
+			_ = handle.Close()
+			return nil, fmt.Errorf("seal %s validator tool %q: %w", stage, name, err)
+		}
+		base := filepath.Base(handle.Identity.CanonicalPath)
+		if seen[base] {
+			_ = handle.Close()
+			return nil, fmt.Errorf("%s validator tool %q collides on basename %q with an earlier declared tool in the sealed directory", stage, name, base)
+		}
+		seen[base] = true
+		identities = append(identities, resolvedValidatorTool{
+			Name:          name,
+			CanonicalPath: handle.Identity.CanonicalPath,
+			SHA256:        handle.Identity.SHA256,
+			Device:        handle.Identity.Device,
+			Inode:         handle.Identity.Inode,
+		})
+		closure, cerr := enforce.ExecutableReadClosure(handle.Identity.CanonicalPath)
+		if cerr != nil {
+			_ = handle.Close()
+			return nil, fmt.Errorf("resolve %s validator tool %q runtime closure: %w", stage, name, cerr)
+		}
+		readRoots = append(readRoots, closure...)
+		if err := handle.Close(); err != nil {
+			return nil, fmt.Errorf("close sealed %s validator tool %q handle: %w", stage, name, err)
 		}
 	}
-	return out, nil
+	if err := os.Chmod(dir, 0500); err != nil {
+		return nil, fmt.Errorf("chmod sealed validator tool dir: %w", err)
+	}
+	constructed = true
+	return &sealedValidatorTools{Path: dir, ReadRoots: readRoots, Identities: identities}, nil
 }
 
-func validatorToolDirectories(c contracts.Contract, registry *toolregistry.Registry) (success [][]string, cleanup [][]string, err error) {
-	success, err = validatorToolDirectoriesForStage(c.Success.Validators, c.Success.ValidatorSpecs, registry)
-	if err != nil {
-		return nil, nil, err
-	}
-	if c.Cleanup != nil {
-		cleanup, err = validatorToolDirectoriesForStage(c.Cleanup.Validators, c.Cleanup.ValidatorSpecs, registry)
-		if err != nil {
-			return nil, nil, err
+// sealedValidatorToolsets materializes one private executable directory
+// per validator spec across the success and cleanup stages. The returned
+// remove function deletes every directory it created and the caller MUST
+// defer it once the transaction's validators have finished running --
+// the sealed dirs are private to the run, never part of replay identity
+// (which is over the verified tool identities, not the sealed copies).
+//
+// A spec with no declared Tools contributes a nil entry, preserving the
+// legacy ambient-PATH behavior for that one validator (already marked
+// validator_tools=Known:false in the identity). Structured validators
+// snap to enforcement: PATH is exactly their sealed dir, no ambient base
+// PATH, no auto-added git directory -- declaring git explicitly when
+// needed, exactly as P0-5 requires.
+func sealedValidatorToolsets(c contracts.Contract, registry *toolregistry.Registry) (success, cleanup []*sealedValidatorTools, remove func(), err error) {
+	var dirs []string
+	remove = func() {
+		for _, d := range dirs {
+			_ = os.RemoveAll(d)
 		}
 	}
-	return success, cleanup, nil
+	defer func() {
+		if err != nil {
+			remove()
+		}
+	}()
+	if len(c.Success.ValidatorSpecs) > 0 {
+		success = make([]*sealedValidatorTools, len(c.Success.ValidatorSpecs))
+		for i, spec := range c.Success.ValidatorSpecs {
+			st, serr := sealedToolsForSpec(spec, "success", i, registry)
+			if serr != nil {
+				err = serr
+				return
+			}
+			success[i] = st
+			if st != nil {
+				dirs = append(dirs, st.Path)
+			}
+		}
+	}
+	if c.Cleanup != nil && len(c.Cleanup.ValidatorSpecs) > 0 {
+		cleanup = make([]*sealedValidatorTools, len(c.Cleanup.ValidatorSpecs))
+		for i, spec := range c.Cleanup.ValidatorSpecs {
+			st, serr := sealedToolsForSpec(spec, "cleanup", i, registry)
+			if serr != nil {
+				err = serr
+				return
+			}
+			cleanup[i] = st
+			if st != nil {
+				dirs = append(dirs, st.Path)
+			}
+		}
+	}
+	return success, cleanup, remove, nil
 }
 
 func contractValidatorToolset(c contracts.Contract) map[string][]string {

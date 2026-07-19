@@ -673,6 +673,17 @@ func shell(ctx context.Context, dir, command string) (int, string, error) {
 // just runID+"-"+stage -- reused across every validator in one run, which
 // StageExecutor's runID+stageID+nonce naming fixes) and none of the
 // filesystem/network/credential envelope a governed backend gets.
+//
+// trustedToolDirs drives the structured-validator PATH policy (Sol9
+// P0-5). When non-empty, the entries are private per-validator sealed
+// directories populated with verified-bytes copies of exactly the tools
+// the validator declared -- PATH is set to those directories ALONE,
+// with no ambient base PATH and no auto-added git directory, so a
+// validator declaring only "go" can no longer resolve python3/perl/curl/
+// ssh/git/sh the way filepath.Dir(canonical) + base PATH let it before.
+// When empty (legacy string validators, already marked
+// validator_tools=Known:false in the identity), the pre-fix ambient
+// behavior is preserved: PATH = gitDir + frozen base PATH.
 func shellStage(ctx context.Context, runID, stageName, dir, command string, authority stageexec.StageAuthority, frozen ControllerEnvironment, trustedToolDirs []string, registry *toolregistry.Registry) (int, string, error, error) {
 	if registry == nil {
 		return -1, "", fmt.Errorf("controller tool registry is not frozen"), nil
@@ -691,16 +702,33 @@ func shellStage(ctx context.Context, runID, stageName, dir, command string, auth
 	if err := frozen.Validate(); err != nil {
 		return -1, "", err, nil
 	}
-	pathParts := []string{filepath.Dir(gitIdentity.CanonicalPath)}
-	pathParts = append(pathParts, trustedToolDirs...)
-	if basePath, ok := frozen.Lookup("PATH"); ok && basePath != "" {
-		pathParts = append(pathParts, basePath)
+	structured := len(trustedToolDirs) > 0
+	var pathValue string
+	if structured {
+		// P0-5: structured validators get PATH = sealed dirs only. No
+		// ambient base PATH, no auto-added git directory. A validator
+		// that needs git must declare it explicitly.
+		pathValue = strings.Join(trustedToolDirs, string(os.PathListSeparator))
+	} else {
+		pathParts := []string{filepath.Dir(gitIdentity.CanonicalPath)}
+		if basePath, ok := frozen.Lookup("PATH"); ok && basePath != "" {
+			pathParts = append(pathParts, basePath)
+		}
+		pathValue = strings.Join(pathParts, string(os.PathListSeparator))
 	}
-	pathValue := strings.Join(pathParts, string(os.PathListSeparator))
 	stageEnv := frozen.With(map[string]string{"PATH": pathValue})
 	readRoots := append([]string(nil), authority.ReadRoots...)
-	readRoots = append(readRoots, filepath.Dir(gitIdentity.CanonicalPath))
-	readRoots = append(readRoots, trustedToolDirs...)
+	if structured {
+		// P0-5: sealed dirs (and their tool ELF closures, already merged
+		// into authority.ReadRoots by the caller) are the only additional
+		// read roots. The git directory is NOT added -- a structured
+		// validator that wants git must declare it, at which point its
+		// sealed copy + closure land in trustedToolDirs/ReadRoots like
+		// any other declared tool.
+		readRoots = append(readRoots, trustedToolDirs...)
+	} else {
+		readRoots = append(readRoots, filepath.Dir(gitIdentity.CanonicalPath))
+	}
 	authority.ReadRoots = readRoots
 	res, err := stageexec.NewExecutor().Run(ctx, stageexec.StageSpec{
 		RunID:            runID,
@@ -2872,10 +2900,16 @@ func (r *Runner) runOnce(ctx context.Context, c contracts.Contract) (RunRecord, 
 	if err != nil {
 		return RunRecord{}, err
 	}
-	successValidatorToolDirs, cleanupValidatorToolDirs, err := validatorToolDirectories(c, env.ToolRegistry)
+	// Sol9 P0-5: materialize per-validator private executable directories
+	// populated with sealed copies of exactly the tools each spec
+	// declares, plus the ELF runtime closure read roots each sealed tool
+	// needs to actually exec under Landlock. removeSealedValidatorDirs
+	// cleans them up when the transaction's validators have finished.
+	successValidatorSealed, cleanupValidatorSealed, removeSealedValidatorDirs, err := sealedValidatorToolsets(c, env.ToolRegistry)
 	if err != nil {
 		return RunRecord{}, err
 	}
+	defer removeSealedValidatorDirs()
 	graphStatus := env.GraphStatus
 	preReplayGraph, err := contextgraph.CurrentWithStatus(ctx, root, graphStatus, env.ToolRegistry, env.Controller)
 	if err != nil {
@@ -3496,15 +3530,25 @@ func (r *Runner) runOnce(ctx context.Context, c contracts.Contract) (RunRecord, 
 			violations = append(violations, deadlineErr.Error())
 			break
 		}
+		// Sol9 P0-5: a structured validator (one whose spec declared
+		// tools, materialized into a sealed dir above) runs with PATH =
+		// that sealed dir alone -- no ambient base PATH, no auto-added
+		// git directory. A legacy/structured-no-tools validator (nil
+		// entry here) keeps the pre-fix ambient behavior, exactly as
+		// shellStage's structured flag below decides.
 		var toolDirs []string
-		if validatorIndex < len(successValidatorToolDirs) {
-			toolDirs = successValidatorToolDirs[validatorIndex]
+		var sealedReadRoots []string
+		if validatorIndex < len(successValidatorSealed) && successValidatorSealed[validatorIndex] != nil {
+			sealed := successValidatorSealed[validatorIndex]
+			toolDirs = []string{sealed.Path}
+			sealedReadRoots = sealed.ReadRoots
 		}
 		var validatorSpec *contracts.ValidatorSpec
 		if validatorIndex < len(c.Success.ValidatorSpecs) {
 			validatorSpec = &c.Success.ValidatorSpecs[validatorIndex]
 		}
 		authority := validatorAuthority(work, validatorSpec, false, requireStrongDescendants)
+		authority.ReadRoots = append(authority.ReadRoots, sealedReadRoots...)
 		code, out, e, extinctionErr := shellStage(vctx, id, "success-validator", work, v, authority, env.Controller, toolDirs, env.ToolRegistry)
 		cancel()
 		if extinctionErr != nil {
@@ -3542,15 +3586,23 @@ func (r *Runner) runOnce(ctx context.Context, c contracts.Contract) (RunRecord, 
 				}
 				break
 			}
+			// Sol9 P0-5: same structured-validator PATH policy as the
+			// success loop above. A structured cleanup validator runs
+			// with PATH = its sealed dir alone; legacy cleanup
+			// validators keep the ambient behavior.
 			var toolDirs []string
-			if i < len(cleanupValidatorToolDirs) {
-				toolDirs = cleanupValidatorToolDirs[i]
+			var sealedReadRoots []string
+			if i < len(cleanupValidatorSealed) && cleanupValidatorSealed[i] != nil {
+				sealed := cleanupValidatorSealed[i]
+				toolDirs = []string{sealed.Path}
+				sealedReadRoots = sealed.ReadRoots
 			}
 			var validatorSpec *contracts.ValidatorSpec
 			if i < len(c.Cleanup.ValidatorSpecs) {
 				validatorSpec = &c.Cleanup.ValidatorSpecs[i]
 			}
 			authority := validatorAuthority(work, validatorSpec, true, requireStrongDescendants)
+			authority.ReadRoots = append(authority.ReadRoots, sealedReadRoots...)
 			code, out, e, extinctionErr := shellStage(vctx, id, "cleanup-validator", work, v, authority, env.Controller, toolDirs, env.ToolRegistry)
 			cancel()
 			// Sol redteam v7 S1 cleanup-specific fail-open defect: Required

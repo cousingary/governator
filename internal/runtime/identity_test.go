@@ -698,3 +698,52 @@ func TestV9Case18VenvDirectoryDoesNotChangeAssayerEnvironmentHash(t *testing.T) 
 		t.Fatalf("removing .venv/assayer.egg-info changed the assayer environment hash: before=%s after=%s", before, afterRemove)
 	}
 }
+
+// TestV9Case26ValidatorToolDeclarationChangeChangesIdentity is Sol9 P0-5
+// report case 26: the validator toolset identity hash binds the declared
+// Tools list (per-tool canonical_path/sha256/device/inode, per
+// resolveValidatorToolset's resolvedValidatorSpec record), so a spec
+// that adds or removes a declared tool mints a different identity and
+// never silently replays a prior approval. This is the
+// identity-binding counterpart to the execution-confinement cases in
+// internal/redteam/v9_s4_validator_tool_confinement_test.go: P0-5
+// requires BOTH that undeclared tools cannot execute AND that a changed
+// declaration invalidates replay. Lives here next to TestV9Case17/18
+// because it is a property of the identity-hash function, not of
+// sandboxed execution.
+func TestV9Case26ValidatorToolDeclarationChangeChangesIdentity(t *testing.T) {
+	registryFile := filepath.Join(t.TempDir(), "tools.yaml")
+	t.Setenv("GOV_TOOLREGISTRY_FILE", registryFile)
+	for _, name := range []string{"true", "cat"} {
+		path, err := exec.LookPath(name)
+		if err != nil {
+			t.Skipf("conditional: declared tool %q is unavailable on this host (%v) -- case needs both true and cat to enroll", name, err)
+		}
+		if canonical, cerr := filepath.EvalSymlinks(path); cerr == nil {
+			path = canonical
+		}
+		if _, err := toolregistry.Enroll(name, path); err != nil {
+			t.Fatalf("enroll declared validator tool %q: %v", name, err)
+		}
+	}
+	root := t.TempDir()
+	declaredTrue := contracts.Contract{Success: contracts.Success{
+		Validators:     []string{"true"},
+		ValidatorSpecs: []contracts.ValidatorSpec{{Command: "true", Tools: []string{"true"}}},
+	}}
+	declaredTrueAndCat := contracts.Contract{Success: contracts.Success{
+		Validators:     []string{"true"},
+		ValidatorSpecs: []contracts.ValidatorSpec{{Command: "true", Tools: []string{"true", "cat"}}},
+	}}
+	hashTrue, err := resolveValidatorToolset(declaredTrue, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hashTrueAndCat, err := resolveValidatorToolset(declaredTrueAndCat, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if hashTrue == hashTrueAndCat {
+		t.Fatal("adding a declared tool did not change the validator toolset identity hash -- a swapped Tools declaration would silently replay a prior approval")
+	}
+}

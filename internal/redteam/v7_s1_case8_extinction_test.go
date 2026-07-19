@@ -22,6 +22,7 @@ package redteam
 
 import (
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -29,6 +30,7 @@ import (
 
 	"github.com/cousingary/governator/internal/contracts"
 	"github.com/cousingary/governator/internal/enforce"
+	"github.com/cousingary/governator/internal/toolregistry"
 )
 
 // TestV7Case8CleanupValidatorDetachedDescendantExtinctionFailureBlocksApproval:
@@ -57,6 +59,29 @@ func TestV7Case8CleanupValidatorDetachedDescendantExtinctionFailureBlocksApprova
 
 	enforce.SelfExeOverride = govBinary(t)
 	defer func() { enforce.SelfExeOverride = "" }()
+
+	// Sol9 P0-4 compatibility: structured cleanup validators now run under
+	// the sealed-tool-PATH policy (rc3 Session 4), so every name in
+	// ValidatorSpec.Tools has to be registry-enrolled before the run's
+	// sealedValidatorToolsets can resolve + seal it. Pre-fix, the
+	// ambient base PATH made /usr/bin/dd etc. reachable without ever
+	// enrolling -- exactly the defect P0-5 closes. Enroll the exact
+	// paths the validator command actually invokes (dd, setsid, sleep,
+	// sh) so a hangfuse-capable host reaches the descendant-spawn step
+	// this test exists to exercise, instead of failing earlier at
+	// sealedValidatorToolsets's "resolve cleanup validator tool" check.
+	for _, tool := range []string{"dd", "setsid", "sleep", "sh"} {
+		path, err := exec.LookPath(tool)
+		if err != nil {
+			t.Fatalf("look up case 8 declared tool %q: %v", tool, err)
+		}
+		if canonical, cerr := filepath.EvalSymlinks(path); cerr == nil {
+			path = canonical
+		}
+		if _, err := toolregistry.Enroll(tool, path); err != nil {
+			t.Fatalf("enroll case 8 declared tool %q: %v", tool, err)
+		}
+	}
 
 	mntParent := t.TempDir()
 	mnt := filepath.Join(mntParent, "case8-hang")

@@ -1240,13 +1240,38 @@ claims:
     claimed_maturity: tested
     implementation:
       - file: internal/runtime/identity.go
-        symbols: [resolvedAssayerParticipants, computeExecutionIdentity, validatorToolDirectories, validatorToolDirectoriesForStage]
+        symbols: [resolvedAssayerParticipants, computeExecutionIdentity, resolveValidatorToolset]
     tests:
       - file: internal/redteam/v8_session5_reconciliation_test.go
         funcs:
           - TestV8Case14AssayerBranchAdvanceInvalidatesReplay
           - TestV8Case16CleanupInterpreterSwapInvalidatesReplay
         build_tag: redteam
+
+  - id: sol9-validator-tool-confinement
+    title: "A structured validator's declared Tools list constrains validator EXECUTION, not just validator identity: the validator runs with PATH set to a per-stage sealed directory populated with verified-bytes copies of exactly the declared tools (one entry per name, no ambient base PATH, no auto-added git directory), so declaring one tool in /usr/bin can no longer expose python3/perl/curl/ssh/git/sh the way filepath.Dir(canonical) + base PATH let it before. A declared tool swapped after identity calculation fails closed at sealedValidatorToolsets's pre-execution re-resolve, never executing replacement bytes."
+    first_shipped_version: v1.0.2-rc3
+    claimed_maturity: tested
+    implementation:
+      - file: internal/toolregistry/handle.go
+        symbols: [SealedExecutablePathIn]
+      - file: internal/runtime/identity.go
+        symbols: [sealedValidatorToolsets, sealedToolsForSpec, sealedValidatorTools]
+      - file: internal/runtime/runtime.go
+        symbols: [shellStage]
+    tests:
+      - file: internal/redteam/v9_s4_validator_tool_confinement_test.go
+        funcs:
+          - TestV9Case21DeclaredGoInvokingPython3IsDenied
+          - TestV9Case22DeclaredUsrBinToolInvokingAnotherIsDenied
+          - TestV9Case23DeclaredToolSwappedAfterIdentityCalcFailsClosed
+          - TestV9Case24UndeclaredGitIsDenied
+          - TestV9Case25UndeclaredScriptIsDenied
+          - TestV9Case27StructuredValidatorPathContainsOnlyDeclaredTools
+        build_tag: redteam
+      - file: internal/runtime/identity_test.go
+        funcs:
+          - TestV9Case26ValidatorToolDeclarationChangeChangesIdentity
 
   - id: sol8-verify-empty-blocks-approval
     title: "A blocking-enforcement Assayer evaluation that resolves to no applicable checks (verdict no_applicable_checks) blocks approval by default -- verify(item, []) cannot silently pass just because nothing was found to check; only non-blocking (advisory/telemetry) enforcement tolerates it."

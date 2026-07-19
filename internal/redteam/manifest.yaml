@@ -431,3 +431,38 @@ cases:
     session: rc3-s3
     required: true
     status: implemented
+  - case: 76
+    name: TestV9Case21DeclaredGoInvokingPython3IsDenied
+    session: rc3-s4
+    required: true
+    status: implemented
+  - case: 77
+    name: TestV9Case22DeclaredUsrBinToolInvokingAnotherIsDenied
+    session: rc3-s4
+    required: true
+    status: implemented
+  - case: 78
+    name: TestV9Case23DeclaredToolSwappedAfterIdentityCalcFailsClosed
+    session: rc3-s4
+    required: true
+    status: implemented
+  - case: 79
+    name: TestV9Case24UndeclaredGitIsDenied
+    session: rc3-s4
+    required: true
+    status: implemented
+  - case: 80
+    name: TestV9Case25UndeclaredScriptIsDenied
+    session: rc3-s4
+    required: true
+    status: implemented
+  - case: 81
+    name: TestV9Case26ValidatorToolDeclarationChangeChangesIdentity
+    session: rc3-s4
+    required: true
+    status: implemented
+  - case: 82
+    name: TestV9Case27StructuredValidatorPathContainsOnlyDeclaredTools
+    session: rc3-s4
+    required: true
+    status: implemented
