@@ -21,7 +21,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
-	"path/filepath"
 	"strings"
 	"time"
 
@@ -189,7 +188,15 @@ func (c Config) Configured() bool {
 // return; every failure mode this function can hit is itself a meaningful,
 // recordable outcome (an ERROR verdict), not a Go-level exceptional
 // condition the caller should be propagating past the ledger.
-func Evaluate(ctx context.Context, cfg Config, req Request, artifactPath string) Verdict {
+//
+// snap is the caller's frozen Snapshot (BuildSnapshot), built once per
+// governed transaction before replay identity was calculated. Evaluate
+// executes exactly snap.CLIPath through snap.Python with PYTHONPATH pinned
+// to snap.Dir -- it never reloads the tool registry, never re-resolves
+// python, and never reads from cfg.Repo (the live, mutable checkout) at
+// all (Sol9 P0-4). cfg.Repo is used elsewhere in this package only for
+// best-effort metadata (DescribeEnvironment).
+func Evaluate(ctx context.Context, cfg Config, req Request, artifactPath string, snap *Snapshot) Verdict {
 	before, err := sha256File(artifactPath)
 	if err != nil {
 		return errorVerdict(fmt.Sprintf("assay: read artifact for pre-check: %s", err))
@@ -216,50 +223,37 @@ func Evaluate(ctx context.Context, cfg Config, req Request, artifactPath string)
 	runCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	python := strings.TrimSpace(cfg.Python)
-	if python == "" {
-		python = "python3"
+	if snap == nil {
+		return errorVerdict("assay: no execution snapshot provided (internal error: BuildSnapshot must run once per transaction before Evaluate)")
 	}
-	// Session 3: resolve the interpreter as a sealed executable handle and
-	// run a sealed copy of cli.py so neither the interpreter nor the script
-	// is re-opened from a mutable pathname at launch time.
-	registry, rerr := toolregistry.Load()
-	if rerr != nil {
-		return errorVerdict(fmt.Sprintf("assay: load trusted-tool registry: %s", rerr))
-	}
-	pythonHandle, perr := registry.ResolveHandle("python3", python, toolregistry.KindTrustedController)
-	if perr != nil {
-		return errorVerdict(fmt.Sprintf("assay: resolve trusted python3 handle: %s", perr))
-	}
-	defer pythonHandle.Close()
-	pythonIdentity := pythonHandle.Identity
-	cliPath, cleanupCLI, cerr := stage.SealReadonlyCopy(filepath.Join(cfg.Repo, "cli.py"))
-	if cerr != nil {
-		return errorVerdict(fmt.Sprintf("assay: seal cli.py: %s", cerr))
-	}
-	defer cleanupCLI()
+	pythonIdentity := snap.Python.Identity
 
-	// Sol redteam v7 S1 / v8 S2: this subprocess now declares authority and
-	// lets stage.Executor compile the only acceptable enforcement plan from
-	// it. `evaluate` reads its artifact content from stdin and writes only its
+	// Sol redteam v7 S1 / v8 S2: this subprocess declares authority and lets
+	// stage.Executor compile the only acceptable enforcement plan from it.
+	// `evaluate` reads its artifact content from stdin and writes only its
 	// verdict to stdout, so it needs no write access and no network. A host
 	// that cannot provide the requested external sandbox now fails closed.
+	//
+	// Sol9 P0-4: PYTHONPATH and ReadRoots point exclusively at the frozen
+	// snapshot directory -- never cfg.Repo, the live mutable checkout -- so
+	// the interpreter can only ever import the exact bytes replay identity
+	// was calculated over.
 	envValues := controllerenv.Base()
-	envValues = append(envValues, "PYTHONPATH="+cfg.Repo)
+	envValues = append(envValues, "PYTHONPATH="+snap.Dir)
 	authority := stage.StageAuthority{
-		ReadRoots:          []string{cfg.Repo, filepath.Dir(cliPath)},
+		ReadRoots:          []string{snap.Dir},
 		Network:            stage.NetworkPolicyDenied,
 		Credentials:        stage.CredentialPolicyNone,
 		RequireStrongScope: true,
 	}
-	authority.ReadRoots = append(authority.ReadRoots, pythonStdlibReadRoots(runCtx, pythonHandle)...)
+	authority.ReadRoots = append(authority.ReadRoots, pythonStdlibReadRoots(runCtx, snap.Python)...)
 	var stdout, stderr bytes.Buffer
 	stageRes, runErr := stage.NewExecutor().Run(runCtx, stage.StageSpec{
 		RunID:            firstNonEmpty(req.RunID, "assay"),
 		StageID:          "assay-evaluate",
 		Executable:       stage.ExecutableIdentity{CanonicalPath: pythonIdentity.CanonicalPath, SHA256: pythonIdentity.SHA256},
-		Arguments:        []string{cliPath, "evaluate", "--profile", req.CheckProfile},
-		WorkingDirectory: cfg.Repo,
+		Arguments:        []string{snap.CLIPath, "evaluate", "--profile", req.CheckProfile},
+		WorkingDirectory: snap.Dir,
 		Environment:      stage.FrozenEnvironment{Values: envValues, Hash: controllerenv.Hash(envValues)},
 		ReadRoots:        nil,
 		NetworkPolicy:    authority.Network,
@@ -272,7 +266,7 @@ func Evaluate(ctx context.Context, cfg Config, req Request, artifactPath string)
 		Stdin:            bytes.NewReader(payload),
 		Stdout:           &stdout,
 		Stderr:           &stderr,
-		ExecutableHandle: pythonHandle,
+		ExecutableHandle: snap.Python,
 	})
 	if runCtx.Err() == context.DeadlineExceeded {
 		return errorVerdict(fmt.Sprintf("assay: subprocess timed out after %s", timeout))

@@ -479,12 +479,29 @@ func assayerRepoTreeHash(repo string) string {
 		}
 		rel = filepath.ToSlash(rel)
 		if info.IsDir() {
-			if rel == ".git" || rel == "__pycache__" || rel == ".pytest_cache" || strings.HasPrefix(rel, ".git/") || strings.HasPrefix(rel, "__pycache__/") || strings.HasPrefix(rel, ".pytest_cache/") {
+			// Sol9 P0-4 work item 3: exclude local/regenerable byproducts a
+			// dev checkout accumulates but that carry no executable
+			// distribution content of their own -- a venv reinstall or an
+			// egg-info regen must not churn this identity. Matched by base
+			// name (not full rel path) so a nested occurrence -- e.g.
+			// assayer/__pycache__ -- is excluded exactly like a top-level
+			// one, unlike the previous rel-prefix check. Mirrors assayer's
+			// own .gitignore (__pycache__, *.egg-info) plus .venv, which
+			// isn't gitignored there but is exactly the same kind of noise.
+			name := info.Name()
+			if name == ".git" || name == "__pycache__" || name == ".pytest_cache" || name == ".venv" || strings.HasSuffix(name, ".egg-info") {
 				return filepath.SkipDir
 			}
 			return nil
 		}
 		if strings.HasSuffix(rel, ".pyc") || strings.HasSuffix(rel, ".pyo") {
+			return nil
+		}
+		// uv.lock is gitignored in the Assayer repo (a regenerable local
+		// byproduct, unlike the checked-in requirements-lock.txt) and
+		// .env holds operator secrets that must never influence -- let
+		// alone leak a fingerprint of -- this identity.
+		if rel == "uv.lock" || rel == ".env" {
 			return nil
 		}
 		files = append(files, rel)
@@ -517,7 +534,13 @@ func resolvedAssayerPython(cfg config.Assay) any {
 
 // assayerInputs gathers the bridge config and the contract's assay declaration
 // so a changed Assayer profile or enforcement mode invalidates replay.
-func resolvedAssayerEnvironmentHash(cfg config.Config, c contracts.Contract) string {
+//
+// snap is the *assay.Snapshot BuildSnapshot already produced for this
+// transaction (nil when assay isn't configured). Its TreeHash/python
+// identity/dirty flag are folded in here so replay identity binds to
+// exactly the bytes Evaluate will execute (Sol9 P0-4), not just a
+// broader, noisier fingerprint of the live checkout at large.
+func resolvedAssayerEnvironmentHash(cfg config.Config, c contracts.Contract, snap *assay.Snapshot) string {
 	env := assay.DescribeEnvironment(assay.Config{Repo: cfg.Assay.Repo, Python: cfg.Assay.Python})
 	files := map[string]string{}
 	for _, rel := range []string{"cli.py", "pyproject.toml", "requirements.txt", "requirements-lock.txt", "requirements.lock", "uv.lock", "poetry.lock", "schema.sql", "assayer/__init__.py", "assayer/checks.py", "assayer/evidence.py", "assayer/outbox.py", "assayer/profiles.py", "assayer/store.py"} {
@@ -525,14 +548,22 @@ func resolvedAssayerEnvironmentHash(cfg config.Config, c contracts.Contract) str
 			files[rel] = hashFileContent(filepath.Join(cfg.Assay.Repo, rel))
 		}
 	}
+	snapshotIdentity := map[string]any{}
+	if snap != nil {
+		snapshotIdentity["tree_hash"] = snap.TreeHash
+		snapshotIdentity["python_sha256"] = snap.Python.Identity.SHA256
+		snapshotIdentity["python_canonical_path"] = snap.Python.Identity.CanonicalPath
+		snapshotIdentity["dirty"] = snap.Dirty
+	}
 	return hashJSON(map[string]any{
-		"repo_tree_hash":  assayerRepoTreeHash(cfg.Assay.Repo),
-		"assayer_commit":  env.AssayerCommit,
-		"python_identity": resolvedAssayerPython(cfg.Assay),
-		"environment":     env,
-		"selected_files":  files,
-		"bridge":          cfg.Assay,
-		"contract":        c.Assay,
+		"repo_tree_hash":    assayerRepoTreeHash(cfg.Assay.Repo),
+		"snapshot_identity": snapshotIdentity,
+		"assayer_commit":    env.AssayerCommit,
+		"python_identity":   resolvedAssayerPython(cfg.Assay),
+		"environment":       env,
+		"selected_files":    files,
+		"bridge":            cfg.Assay,
+		"contract":          c.Assay,
 	})
 }
 

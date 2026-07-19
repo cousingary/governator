@@ -80,7 +80,7 @@ func assayDeclaresBlocking(a *contracts.Assay) bool {
 // artifact"): every entry in artifactRecords is now resolved and evaluated
 // independently — a contract producing several artifacts under a blocking
 // assay blocks on ANY failing artifact, not just the first.
-func runAssayStep(ctx context.Context, db *sql.DB, cfg config.Config, c contracts.Contract, runID, contractHash, backend string, artifactRecords []observability.ArtifactRecord, violations *[]string) {
+func runAssayStep(ctx context.Context, db *sql.DB, cfg config.Config, c contracts.Contract, runID, contractHash, backend string, artifactRecords []observability.ArtifactRecord, violations *[]string, snap *assay.Snapshot) {
 	created := time.Now().UTC().Format(time.RFC3339Nano)
 	assayCfg := assay.Config{
 		Repo:    cfg.Assay.Repo,
@@ -203,7 +203,7 @@ func runAssayStep(ctx context.Context, db *sql.DB, cfg config.Config, c contract
 		}
 
 		start := time.Now()
-		verdict := assay.Evaluate(ctx, assayCfg, req, artifact.Path)
+		verdict := assay.Evaluate(ctx, assayCfg, req, artifact.Path, snap)
 		duration := time.Since(start)
 
 		record(artifact.Name, artifact.SHA256, resolution.Profile, verdict.Verdict, verdict.PolicyVersion, verdict, duration.Milliseconds())

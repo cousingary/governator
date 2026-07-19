@@ -391,3 +391,43 @@ cases:
     session: rc3-s2
     required: true
     status: implemented
+  - case: 68
+    name: TestV9Case13ChecksPyMutationAfterSnapshotHasNoEffect
+    session: rc3-s3
+    required: true
+    status: implemented
+  - case: 69
+    name: TestV9Case14ProfilesPyMutationAfterSnapshotHasNoEffect
+    session: rc3-s3
+    required: true
+    status: implemented
+  - case: 70
+    name: TestV9Case15PythonRegistryRotationAfterSnapshotHasNoEffect
+    session: rc3-s3
+    required: true
+    status: implemented
+  - case: 71
+    name: TestV9Case16SnapshotReadRootsExcludeLiveRepoUnderRealLandlock
+    session: rc3-s3
+    required: true
+    status: implemented
+  - case: 72
+    name: TestV9Case17DependencyLockChangeChangesAssayerEnvironmentHash
+    session: rc3-s3
+    required: true
+    status: implemented
+  - case: 73
+    name: TestV9Case18VenvDirectoryDoesNotChangeAssayerEnvironmentHash
+    session: rc3-s3
+    required: true
+    status: implemented
+  - case: 74
+    name: TestV9Case19DirtyAssayerCheckoutDisablesStrictReplay
+    session: rc3-s3
+    required: true
+    status: implemented
+  - case: 75
+    name: TestV9Case20FreshSnapshotAfterMutationReflectsNewBytes
+    session: rc3-s3
+    required: true
+    status: implemented

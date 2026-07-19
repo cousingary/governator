@@ -24,6 +24,7 @@ import (
 	"time"
 
 	"github.com/cousingary/governator/internal/agents"
+	"github.com/cousingary/governator/internal/assay"
 	"github.com/cousingary/governator/internal/attest"
 	"github.com/cousingary/governator/internal/breaker"
 	"github.com/cousingary/governator/internal/config"
@@ -2894,7 +2895,35 @@ func (r *Runner) runOnce(ctx context.Context, c contracts.Contract) (RunRecord, 
 	graphSnapshotHash := hashJSON(preReplayGraph)
 	identity := computeExecutionIdentity(cfg, c, agent, handle.PathResolution, handle.Identity, dockerImage, agents.EnvPolicyHash(handle.AllowedEnv), head, hash, promptVersion, capabilityAttestID, policyBundle, compiledPromptHash, consumedArtifactsHash(consumedIdentities), contextgraph.ProviderIdentityHash(graphStatus), graphSnapshotHash, env.Controller.Hash, validatorToolsetHash)
 	identity.ProtectedManifestHash = hashJSON(env.ProtectedPatterns)
-	identity.AssayerEnvironmentHash = resolvedAssayerEnvironmentHash(cfg, c)
+	// Sol9 P0-4: build the Assayer execution snapshot HERE, before replay
+	// identity is calculated, and thread the one returned *assay.Snapshot
+	// through to runAssayStep below -- Evaluate must never rebuild its own
+	// or reload the registry/re-resolve python for itself. A configured but
+	// unbuildable snapshot is a hard failure, not a silent skip: assay was
+	// declared and Governator cannot honestly bind replay identity to code
+	// it never actually copied.
+	//
+	// Gated on c.Assay != nil, not just cfg.Assay.Repo: runAssayStep itself
+	// is only ever invoked below when this specific contract declares an
+	// assay block (see the `c.Assay != nil` guard at its call site) --
+	// building a snapshot whenever the operator's bridge config merely
+	// names a repo, regardless of whether this run's contract uses assay
+	// at all, would both waste the copy and turn an unrelated contract's
+	// run into a hard failure over an assay misconfiguration it never
+	// touches.
+	var assaySnapshot *assay.Snapshot
+	if c.Assay != nil && strings.TrimSpace(cfg.Assay.Repo) != "" {
+		assaySnapshot, err = assay.BuildSnapshot(env.ToolRegistry, assay.Config{
+			Repo:    cfg.Assay.Repo,
+			Python:  cfg.Assay.Python,
+			Timeout: time.Duration(cfg.Assay.TimeoutSeconds) * time.Second,
+		})
+		if err != nil {
+			return RunRecord{}, fmt.Errorf("assay: build execution snapshot: %w", err)
+		}
+		defer assaySnapshot.Close()
+	}
+	identity.AssayerEnvironmentHash = resolvedAssayerEnvironmentHash(cfg, c, assaySnapshot)
 	identity.AssayerProfileHash = identity.AssayerEnvironmentHash
 	backendToolIdentity := toolregistry.Identity{Name: resolved.Agent, Kind: toolregistry.KindGovernedBackend, CanonicalPath: handle.CanonicalPath, SHA256: handle.SHA256, OwnerUID: handle.OwnerUID, OwnerGID: handle.OwnerGID, Mode: handle.Mode}
 	assayerParticipantHash := ""
@@ -2926,6 +2955,14 @@ func (r *Runner) runOnce(ctx context.Context, c contracts.Contract) (RunRecord, 
 	if perr := validateParticipants(identity.Participants); perr != nil {
 		identity.StrictReplayEligible = false
 		identity.StrictReplayDisabledReason = perr.Error()
+	}
+	// Sol9 P0-4 work item 4: a snapshot built from a dirty (uncommitted
+	// changes) Assayer checkout cannot be reproduced against a specific
+	// commit by a later audit, so strict replay must be disabled for this
+	// transaction even though the snapshot itself executed correctly.
+	if assaySnapshot != nil && assaySnapshot.Dirty {
+		identity.StrictReplayEligible = false
+		identity.StrictReplayDisabledReason = assaySnapshot.DirtyReason
 	}
 	transaction := newTransactionSnapshot(hash, env.ConfigHash, env.ProtectedPatterns, graphSnapshotHash, compiledPromptForIdentity, env.Controller.Hash, identity.CredentialIdentityHash, identity.Participants, consumedIdentities)
 	if priorID, perr := replayMatch(db, func() string {
@@ -3589,7 +3626,7 @@ func (r *Runner) runOnce(ctx context.Context, c contracts.Contract) (RunRecord, 
 		if err := lifecycle.Record(db, id, lifecycle.Assaying, "", lifecycle.Now()); err != nil {
 			return rec, err
 		}
-		runAssayStep(ctx, db, cfg, c, id, hash, rec.Agent, artifactRecords, &violations)
+		runAssayStep(ctx, db, cfg, c, id, hash, rec.Agent, artifactRecords, &violations, assaySnapshot)
 	}
 	if len(violations) == 0 {
 		finalAfterAssay, finalViolations := finalValidationMeasurement(ctx, r.Home, root, work, id, git, c, env.ProtectedPatterns, workBefore, liveBefore, protectedBefore, gitControlBefore)

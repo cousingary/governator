@@ -247,7 +247,17 @@ print(json.dumps({"verdict":"pass","failed_checks":[],"had_error":False}))
 	path, sha := assayerTestArtifact(t, artifactDir, "real artifact content, long enough")
 	req := assayerTestRequest("case11", sha)
 
-	_ = assay.Evaluate(context.Background(), assay.Config{Repo: stubDir, Python: "python3"}, req, path)
+	registry, rerr := toolregistry.Load()
+	if rerr != nil {
+		t.Fatal(rerr)
+	}
+	snap, serr := assay.BuildSnapshot(registry, assay.Config{Repo: stubDir, Python: "python3"})
+	if serr != nil {
+		t.Fatalf("build assayer execution snapshot: %v", serr)
+	}
+	defer snap.Close()
+
+	_ = assay.Evaluate(context.Background(), assay.Config{Repo: stubDir, Python: "python3"}, req, path, snap)
 
 	if _, err := os.Stat(hostEscape); err == nil {
 		t.Fatalf("Assayer subprocess wrote outside its declared repo: %s", hostEscape)
@@ -284,7 +294,17 @@ print(json.dumps({"verdict":"pass","failed_checks":[],"had_error":False}))
 	path, sha := assayerTestArtifact(t, artifactDir, "real artifact content, long enough")
 	req := assayerTestRequest("case12", sha)
 
-	_ = assay.Evaluate(context.Background(), assay.Config{Repo: stubDir, Python: "python3"}, req, path)
+	registry, rerr := toolregistry.Load()
+	if rerr != nil {
+		t.Fatal(rerr)
+	}
+	snap, serr := assay.BuildSnapshot(registry, assay.Config{Repo: stubDir, Python: "python3"})
+	if serr != nil {
+		t.Fatalf("build assayer execution snapshot: %v", serr)
+	}
+	defer snap.Close()
+
+	_ = assay.Evaluate(context.Background(), assay.Config{Repo: stubDir, Python: "python3"}, req, path, snap)
 
 	if atomic.LoadInt32(&received) > 0 {
 		t.Fatalf("Assayer subprocess reached the network (server received %d request(s))", atomic.LoadInt32(&received))

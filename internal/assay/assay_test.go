@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/cousingary/governator/internal/enforce"
+	"github.com/cousingary/governator/internal/toolregistry"
 )
 
 // TestMain forces enforce.Supported() false for this package's whole test
@@ -56,6 +57,25 @@ func writeArtifact(t *testing.T, dir, content string) (path, sha string) {
 	return path, hex.EncodeToString(sum[:])
 }
 
+// buildTestSnapshot builds a real *Snapshot from repo (a fixture/stub
+// Assayer checkout) via the real trusted-tool registry, matching how a
+// caller must build one exactly once before Evaluate. Registered for
+// cleanup so the private snapshot directory and held python handle don't
+// leak across tests.
+func buildTestSnapshot(t *testing.T, repo string) *Snapshot {
+	t.Helper()
+	registry, err := toolregistry.Load()
+	if err != nil {
+		t.Fatalf("load trusted-tool registry: %v", err)
+	}
+	snap, err := BuildSnapshot(registry, Config{Repo: repo, Python: "python3"})
+	if err != nil {
+		t.Fatalf("build assayer execution snapshot for %s: %v", repo, err)
+	}
+	t.Cleanup(snap.Close)
+	return snap
+}
+
 func baseRequest(sha string) Request {
 	payload, _ := json.Marshal(map[string]any{
 		"content": "This is a sufficiently long piece of real generated content for the check.",
@@ -74,7 +94,9 @@ func TestEvaluateShaMismatchBeforeEvaluationIsError(t *testing.T) {
 	req := baseRequest(sha)
 	req.ArtifactSHA256 = "0000000000000000000000000000000000000000000000000000000000000000"
 
-	v := Evaluate(context.Background(), Config{Repo: dir, Python: "python3"}, req, path)
+	// No snapshot needed: the sha256 pre-check must fail before Evaluate
+	// ever looks at snap, so passing nil here also proves that ordering.
+	v := Evaluate(context.Background(), Config{Repo: dir, Python: "python3"}, req, path, nil)
 	if v.Verdict != VerdictError {
 		t.Fatalf("expected error verdict, got %+v", v)
 	}
@@ -113,7 +135,7 @@ print(json.dumps({"verdict":"pass","failed_checks":[],"had_error":False,"trace_i
 		_ = os.WriteFile(path, []byte("mutated content"), 0o644)
 	}()
 
-	v := Evaluate(context.Background(), Config{Repo: stubDir, Python: "python3"}, req, path)
+	v := Evaluate(context.Background(), Config{Repo: stubDir, Python: "python3"}, req, path, buildTestSnapshot(t, stubDir))
 	if v.Verdict != VerdictError {
 		t.Fatalf("expected error verdict, got %+v", v)
 	}
@@ -134,7 +156,7 @@ func TestEvaluateNonzeroExitIsError(t *testing.T) {
 	path, sha := writeArtifact(t, dir, "content")
 	req := baseRequest(sha)
 
-	v := Evaluate(context.Background(), Config{Repo: stubDir, Python: "python3"}, req, path)
+	v := Evaluate(context.Background(), Config{Repo: stubDir, Python: "python3"}, req, path, buildTestSnapshot(t, stubDir))
 	if v.Verdict != VerdictError || !v.HadError {
 		t.Fatalf("expected error verdict, got %+v", v)
 	}
@@ -156,7 +178,7 @@ func TestEvaluateTimeout(t *testing.T) {
 	req := baseRequest(sha)
 
 	start := time.Now()
-	v := Evaluate(context.Background(), Config{Repo: stubDir, Python: "python3", Timeout: 150 * time.Millisecond}, req, path)
+	v := Evaluate(context.Background(), Config{Repo: stubDir, Python: "python3", Timeout: 150 * time.Millisecond}, req, path, buildTestSnapshot(t, stubDir))
 	elapsed := time.Since(start)
 	if v.Verdict != VerdictError || !strings.Contains(v.Reason, "timed out") {
 		t.Fatalf("expected timeout error verdict, got %+v", v)
@@ -178,7 +200,7 @@ func TestEvaluateUnparseableStdoutIsError(t *testing.T) {
 	path, sha := writeArtifact(t, dir, "content")
 	req := baseRequest(sha)
 
-	v := Evaluate(context.Background(), Config{Repo: stubDir, Python: "python3"}, req, path)
+	v := Evaluate(context.Background(), Config{Repo: stubDir, Python: "python3"}, req, path, buildTestSnapshot(t, stubDir))
 	if v.Verdict != VerdictError || !v.HadError {
 		t.Fatalf("expected error verdict, got %+v", v)
 	}
@@ -314,7 +336,8 @@ func TestSol3ArtifactDeclaredPathReachesRealAssayerFilePathCheck(t *testing.T) {
 		CheckProfile:         "coding-output-v2",
 	}
 
-	v := Evaluate(context.Background(), Config{Repo: repo, Python: "python3"}, req, path)
+	snap := buildTestSnapshot(t, repo)
+	v := Evaluate(context.Background(), Config{Repo: repo, Python: "python3"}, req, path, snap)
 	if v.Verdict != VerdictPass {
 		t.Fatalf("expected pass verdict keying off artifact_declared_path against the real assayer CLI, got %+v", v)
 	}
@@ -324,7 +347,7 @@ func TestSol3ArtifactDeclaredPathReachesRealAssayerFilePathCheck(t *testing.T) {
 	// the real CLI is actually checking the field, not ignoring it.
 	mismatched := req
 	mismatched.ArtifactDeclaredPath = "result.js"
-	badV := Evaluate(context.Background(), Config{Repo: repo, Python: "python3"}, mismatched, path)
+	badV := Evaluate(context.Background(), Config{Repo: repo, Python: "python3"}, mismatched, path, snap)
 	if badV.Verdict != VerdictFail {
 		t.Fatalf("expected fail verdict for a declared-path/language mismatch, got %+v", badV)
 	}

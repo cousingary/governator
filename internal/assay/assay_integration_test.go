@@ -66,7 +66,8 @@ func TestEvaluateAgainstRealCLIPassAndFail(t *testing.T) {
 	req := baseRequest(sha)
 	req.Payload = json.RawMessage(`{"content":"This is a real, sufficiently long piece of generated content."}`)
 
-	v := Evaluate(context.Background(), Config{Repo: repo, Python: "python3"}, req, path)
+	snap := buildTestSnapshot(t, repo)
+	v := Evaluate(context.Background(), Config{Repo: repo, Python: "python3"}, req, path, snap)
 	if v.Verdict != VerdictPass {
 		t.Fatalf("expected pass verdict against real assayer CLI, got %+v", v)
 	}
@@ -89,7 +90,7 @@ func TestEvaluateAgainstRealCLIPassAndFail(t *testing.T) {
 	badReq := baseRequest(badSHA)
 	badReq.Payload = json.RawMessage(`{}`)
 
-	badV := Evaluate(context.Background(), Config{Repo: repo, Python: "python3"}, badReq, badPath)
+	badV := Evaluate(context.Background(), Config{Repo: repo, Python: "python3"}, badReq, badPath, snap)
 	if badV.Verdict != VerdictFail {
 		t.Fatalf("expected fail verdict for missing required field, got %+v", badV)
 	}

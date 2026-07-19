@@ -94,7 +94,16 @@ func TestV8Case6AssayerFailsClosedWithoutExternalSandbox(t *testing.T) {
 	dir := t.TempDir()
 	artifactPath, sha := assayerTestArtifact(t, dir, `{"ok":true}`)
 	cfg := assay.Config{Repo: repo, Timeout: time.Second}
-	v := assay.Evaluate(context.Background(), cfg, assayerTestRequest("v8-case6", sha), artifactPath)
+	registry, rerr := toolregistry.Load()
+	if rerr != nil {
+		t.Fatal(rerr)
+	}
+	snap, serr := assay.BuildSnapshot(registry, cfg)
+	if serr != nil {
+		t.Fatalf("build assayer execution snapshot: %v", serr)
+	}
+	defer snap.Close()
+	v := assay.Evaluate(context.Background(), cfg, assayerTestRequest("v8-case6", sha), artifactPath, snap)
 	if !v.HadError || !strings.Contains(v.Reason, "construct authority plan") {
 		t.Fatalf("verdict = %+v, want fail-closed sandbox error", v)
 	}

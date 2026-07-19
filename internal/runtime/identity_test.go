@@ -609,11 +609,11 @@ func TestResolvedAssayerEnvironmentHashBindsCLI(t *testing.T) {
 	repo := writeAssayerIdentityFixture(t)
 	cfg := config.BuiltIn()
 	cfg.Assay.Repo = repo
-	first := resolvedAssayerEnvironmentHash(cfg, contracts.Contract{})
+	first := resolvedAssayerEnvironmentHash(cfg, contracts.Contract{}, nil)
 	if err := os.WriteFile(filepath.Join(repo, "cli.py"), []byte("print('cli-v2')\n"), 0644); err != nil {
 		t.Fatal(err)
 	}
-	second := resolvedAssayerEnvironmentHash(cfg, contracts.Contract{})
+	second := resolvedAssayerEnvironmentHash(cfg, contracts.Contract{}, nil)
 	if first == second {
 		t.Fatal("assayer cli.py byte change did not change assayer environment hash")
 	}
@@ -623,12 +623,78 @@ func TestResolvedAssayerEnvironmentHashBindsLockfile(t *testing.T) {
 	repo := writeAssayerIdentityFixture(t)
 	cfg := config.BuiltIn()
 	cfg.Assay.Repo = repo
-	first := resolvedAssayerEnvironmentHash(cfg, contracts.Contract{})
+	first := resolvedAssayerEnvironmentHash(cfg, contracts.Contract{}, nil)
 	if err := os.WriteFile(filepath.Join(repo, "requirements-lock.txt"), []byte("package==2.0\n"), 0644); err != nil {
 		t.Fatal(err)
 	}
-	second := resolvedAssayerEnvironmentHash(cfg, contracts.Contract{})
+	second := resolvedAssayerEnvironmentHash(cfg, contracts.Contract{}, nil)
 	if first == second {
 		t.Fatal("assayer requirements-lock.txt change did not change assayer environment hash")
+	}
+}
+
+// TestV9Case17DependencyLockChangeChangesAssayerEnvironmentHash is Sol9 P0-4
+// report case 17: "dependency changed without source change -> identity
+// changes". requirements-lock.txt is a dependency *declaration*, not
+// executable source (no .py file in the fixture changes here at all) --
+// TestResolvedAssayerEnvironmentHashBindsLockfile right above already proves
+// the mechanism; this is the corpus-enrolled name for that same property so
+// the redteam gate tracks it by identity, matching case 17 in
+// agents/governator-sol-upgrade9.md and the rc3 plan's Session 3 list.
+func TestV9Case17DependencyLockChangeChangesAssayerEnvironmentHash(t *testing.T) {
+	repo := writeAssayerIdentityFixture(t)
+	cfg := config.BuiltIn()
+	cfg.Assay.Repo = repo
+	before := resolvedAssayerEnvironmentHash(cfg, contracts.Contract{}, nil)
+	if err := os.WriteFile(filepath.Join(repo, "requirements-lock.txt"), []byte("package==9.9.9\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	after := resolvedAssayerEnvironmentHash(cfg, contracts.Contract{}, nil)
+	if before == after {
+		t.Fatal("changing a dependency lock file without touching any .py source did not change the assayer environment hash")
+	}
+}
+
+// TestV9Case18VenvDirectoryDoesNotChangeAssayerEnvironmentHash is Sol9 P0-4
+// report case 18 / work item 3: assayerRepoTreeHash previously walked
+// .venv/*.egg-info wholesale, so a plain `pip install`/venv reinstall in a
+// dev checkout churned this identity with zero executable-distribution
+// change. Adding (and then removing) a populated .venv tree must leave the
+// hash completely unchanged.
+func TestV9Case18VenvDirectoryDoesNotChangeAssayerEnvironmentHash(t *testing.T) {
+	repo := writeAssayerIdentityFixture(t)
+	cfg := config.BuiltIn()
+	cfg.Assay.Repo = repo
+	before := resolvedAssayerEnvironmentHash(cfg, contracts.Contract{}, nil)
+
+	venvDir := filepath.Join(repo, ".venv", "lib", "python3.12", "site-packages", "supabase")
+	if err := os.MkdirAll(venvDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(venvDir, "__init__.py"), []byte("# vendored\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	eggInfo := filepath.Join(repo, "assayer.egg-info")
+	if err := os.MkdirAll(eggInfo, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(eggInfo, "PKG-INFO"), []byte("Name: assayer\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	afterAdd := resolvedAssayerEnvironmentHash(cfg, contracts.Contract{}, nil)
+	if before != afterAdd {
+		t.Fatalf("adding .venv/assayer.egg-info changed the assayer environment hash: before=%s after=%s", before, afterAdd)
+	}
+
+	if err := os.RemoveAll(filepath.Join(repo, ".venv")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.RemoveAll(eggInfo); err != nil {
+		t.Fatal(err)
+	}
+	afterRemove := resolvedAssayerEnvironmentHash(cfg, contracts.Contract{}, nil)
+	if before != afterRemove {
+		t.Fatalf("removing .venv/assayer.egg-info changed the assayer environment hash: before=%s after=%s", before, afterRemove)
 	}
 }
