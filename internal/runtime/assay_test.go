@@ -289,6 +289,12 @@ func TestAssayNotConfiguredSkipsAndRecordsSkipped(t *testing.T) {
 	writeArtifactSchema(t, root)
 	home := t.TempDir()
 	t.Setenv("GOV_HOME", home)
+	// Isolate from the host's real ~/.governator/config.yaml: GOV_HOME does
+	// not redirect config file lookup (config.Path() uses $HOME), so an
+	// operator config with assay.repo set would otherwise leak in and make
+	// this "not configured" case actually configured. Same isolation
+	// pattern used by batch_test.go / plan_test.go.
+	t.Setenv("GOV_CONFIG", filepath.Join(t.TempDir(), "missing-config.yaml"))
 	t.Setenv("GOV_ASSAY_REPO", "") // explicit: unconfigured
 	bin := writeFakeBackend(t, `mkdir -p output .governator/artifacts
 printf 'ok\n' > output/result.txt
@@ -334,6 +340,10 @@ func TestAssayBlockingUnconfiguredQuarantines(t *testing.T) {
 	writeArtifactSchema(t, root)
 	home := t.TempDir()
 	t.Setenv("GOV_HOME", home)
+	// See TestAssayNotConfiguredSkipsAndRecordsSkipped: isolate from the
+	// host's real config so this "unconfigured blocking" case is genuinely
+	// unconfigured, not inheriting an operator assay.repo.
+	t.Setenv("GOV_CONFIG", filepath.Join(t.TempDir(), "missing-config.yaml"))
 	t.Setenv("GOV_ASSAY_REPO", "") // explicit: unconfigured
 	bin := writeFakeBackend(t, `mkdir -p output .governator/artifacts
 printf 'ok\n' > output/result.txt
