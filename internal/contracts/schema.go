@@ -257,12 +257,25 @@ type DockerRunnerConfig struct {
 	// non-empty list (fail-closed): the docker runner has no mechanism to
 	// enforce it, and an unenforced allowlist reading as a restriction is
 	// worse than no field at all. Use network: deny (default), or network:
-	// allow with deny_metadata_and_local_net: true.
+	// allow with sinkhole_metadata_hostnames: true.
 	EgressAllowlist []string `yaml:"egress_allowlist,omitempty" json:"egress_allowlist,omitempty"`
-	// DenyMetadataAndLocalNet sinkholes cloud-metadata endpoints when network
-	// is allowed (--add-host redirection to loopback). The safe default remains
-	// network: deny; this narrows the allow opt-in.
-	DenyMetadataAndLocalNet bool `yaml:"deny_metadata_and_local_net,omitempty" json:"deny_metadata_and_local_net,omitempty"`
+	// SinkholeMetadataHostnames sinkholes cloud-metadata hostnames when
+	// network is allowed (--add-host redirection to loopback). Named for
+	// exactly what it does (Sol9 P2-1, renamed from the prior
+	// deny_metadata_and_local_net -- that name implied it denied local
+	// networks, which it never did): it rewrites a fixed set of known
+	// metadata hostnames only. It does NOT block raw-IP access (e.g.
+	// 169.254.169.254), RFC1918 networks, host gateways, local Docker
+	// services, or IPv6 link-local metadata endpoints. The only real network
+	// isolation modes remain network: deny and network: allow; this field
+	// narrows the allow opt-in, it does not provide local-network isolation.
+	SinkholeMetadataHostnames bool `yaml:"sinkhole_metadata_hostnames,omitempty" json:"sinkhole_metadata_hostnames,omitempty"`
+	// DenyMetadataAndLocalNetDeprecated is the pre-rc3 field name
+	// (deny_metadata_and_local_net), accepted for one release so existing
+	// contracts keep parsing under decoder.KnownFields(true). Parse folds it
+	// into SinkholeMetadataHostnames and prints a deprecation warning; never
+	// read this field directly.
+	DenyMetadataAndLocalNetDeprecated bool `yaml:"deny_metadata_and_local_net,omitempty" json:"deny_metadata_and_local_net,omitempty"`
 	// RequireCompleteTranscript makes output truncation a blocking violation:
 	// a run whose transcript was capped is quarantined rather than approved on
 	// an incomplete evidence trail. Defaults false (truncation is recorded but
@@ -1489,9 +1502,9 @@ func validateRunner(c Contract, add func(string, string)) {
 	// the contract READS as restricted while the container has full egress.
 	// Until a real enforcement mechanism exists, declaring it is an error:
 	// use network: deny (the default), or an explicit network: allow with
-	// deny_metadata_and_local_net: true for the enforceable narrowing.
+	// sinkhole_metadata_hostnames: true for the enforceable narrowing.
 	if len(c.Docker.EgressAllowlist) > 0 {
-		add("docker.egress_allowlist", "declared but not enforceable by the docker runner in this build; remove it and use network: deny, or network: allow with deny_metadata_and_local_net: true (fail-closed: an unenforced allowlist must not read as a restriction)")
+		add("docker.egress_allowlist", "declared but not enforceable by the docker runner in this build; remove it and use network: deny, or network: allow with sinkhole_metadata_hostnames: true (fail-closed: an unenforced allowlist must not read as a restriction)")
 	}
 }
 

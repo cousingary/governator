@@ -204,8 +204,8 @@ type truncationStats struct {
 }
 
 // metadataSinkholeHosts are the cloud-metadata endpoints redirected to
-// loopback via docker --add-host when DenyMetadataAndLocalNet is set under a
-// network: allow config. Raw-IP access (e.g. dialling 169.254.169.254
+// loopback via docker --add-host when SinkholeMetadataHostnames is set under
+// a network: allow config. Raw-IP access (e.g. dialling 169.254.169.254
 // directly) is not blocked by /etc/hosts; the safe default remains network:
 // deny. These entries cover name-based lookups, which is all the CLI can do.
 var metadataSinkholeHosts = []string{
@@ -254,7 +254,7 @@ func (d *DockerRunner) executor(ws Workspace) agents.Executor {
 		// mechanic internal/runner's and internal/runtime's shell() helpers
 		// use for bash.
 		build := func(c context.Context, bin string, a []string) *exec.Cmd {
-			cc := exec.CommandContext(c, bin, a...)
+			cc := exec.CommandContext(c, bin, a...) // govratchet:exec-allow(production_launch_factory) -- bin is dockerHandle's verified/sealed path, substituted by the caller
 			cc.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 			return cc
 		}
@@ -368,7 +368,7 @@ func (d *DockerRunner) runArgs(ws Workspace, bin string, args []string) ([]strin
 	// additionally sinkhole cloud-metadata endpoints when configured.
 	if d.Config.EffectiveNetwork() != "allow" {
 		out = append(out, "--network", "none")
-	} else if d.Config.DenyMetadataAndLocalNet {
+	} else if d.Config.SinkholeMetadataHostnames {
 		for _, host := range metadataSinkholeHosts {
 			out = append(out, "--add-host", host+":127.0.0.1")
 		}

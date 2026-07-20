@@ -2,7 +2,9 @@ package contracts
 
 import (
 	"fmt"
+	"io"
 	"math"
+	"os"
 	"strings"
 	"testing"
 )
@@ -88,6 +90,43 @@ func TestReadOnlyModeRejectsWrites(t *testing.T) {
 	_, err := Parse([]byte(input))
 	if err == nil || !strings.Contains(err.Error(), "allowed.write") {
 		t.Fatalf("expected allowed.write error, got %v", err)
+	}
+}
+
+// TestParseAcceptsDeprecatedDenyMetadataAndLocalNetKey is the Sol9 P2-1
+// backward-compat check: decoder.KnownFields(true) means an unrecognized
+// YAML key is a hard decode error, so the pre-rc3 field name
+// deny_metadata_and_local_net must still parse for one release -- folded
+// into the renamed SinkholeMetadataHostnames field, with a deprecation
+// warning on stderr rather than a silent rename.
+func TestParseAcceptsDeprecatedDenyMetadataAndLocalNetKey(t *testing.T) {
+	input := strings.Replace(validContract, "on_violation: quarantine\n", `on_violation: quarantine
+runner: docker
+docker:
+  image: "img@sha256:`+strings.Repeat("a", 64)+`"
+  network: allow
+  deny_metadata_and_local_net: true
+`, 1)
+
+	origStderr := os.Stderr
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	os.Stderr = w
+	contract, parseErr := Parse([]byte(input))
+	os.Stderr = origStderr
+	w.Close()
+	captured, _ := io.ReadAll(r)
+
+	if parseErr != nil {
+		t.Fatalf("Parse(deprecated key) error = %v", parseErr)
+	}
+	if contract.Docker == nil || !contract.Docker.SinkholeMetadataHostnames {
+		t.Fatalf("expected deny_metadata_and_local_net to fold into SinkholeMetadataHostnames, got %+v", contract.Docker)
+	}
+	if !strings.Contains(string(captured), "deprecated") || !strings.Contains(string(captured), "sinkhole_metadata_hostnames") {
+		t.Fatalf("expected a deprecation warning naming the new field on stderr, got %q", captured)
 	}
 }
 

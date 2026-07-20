@@ -74,7 +74,7 @@ func (h *Handle) Command(ctx context.Context, args ...string) (*exec.Cmd, error)
 		return nil, fmt.Errorf("tool handle is closed")
 	}
 	if runtime.GOOS == "linux" {
-		cmd := exec.CommandContext(ctx, "/proc/self/fd/3", args...)
+		cmd := exec.CommandContext(ctx, "/proc/self/fd/3", args...) // govratchet:exec-allow(production_launch_factory) -- this is the fd-based launch primitive itself
 		cmd.ExtraFiles = []*os.File{h.file}
 		return cmd, nil
 	}

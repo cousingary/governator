@@ -67,14 +67,20 @@ printf '{"type":"result","total_cost_usd":0.25}\n'
 	if enf.DeclaredNetworkPolicy != "deny" || enf.EnforcedNetworkPolicy != "deny" {
 		t.Fatalf("expected declared/enforced deny network policy, got declared=%q enforced=%q", enf.DeclaredNetworkPolicy, enf.EnforcedNetworkPolicy)
 	}
-	if enf.ObservedNetworkAttempts != -1 {
-		t.Fatalf("expected unobserved network-attempt counter (-1) until kernel egress accounting lands, got %d", enf.ObservedNetworkAttempts)
+	if enf.NetworkAttemptObservation != "unavailable" {
+		t.Fatalf("expected network_attempt_observation=unavailable until kernel egress accounting lands, got %q", enf.NetworkAttemptObservation)
+	}
+	if enf.NetworkDenialMechanism != "isolated_namespace" {
+		t.Fatalf("expected network_denial_mechanism=isolated_namespace for a network-denied local run, got %q", enf.NetworkDenialMechanism)
 	}
 	if len(enf.ActualWriteSet) == 0 {
 		t.Fatal("expected actual_write_set evidence after completion")
 	}
-	if enf.CredentialExposure != "none" {
-		t.Fatalf("expected no credential exposure for local run, got %q", enf.CredentialExposure)
+	if enf.DeclaredCredentialPolicy != "none" {
+		t.Fatalf("expected no declared credential policy for local run, got %q", enf.DeclaredCredentialPolicy)
+	}
+	if enf.ObservedCredentialAccess != "unavailable" {
+		t.Fatalf("expected observed_credential_access=unavailable (no interposition to observe it), got %q", enf.ObservedCredentialAccess)
 	}
 	if enf.OutputConsequence != "complete" {
 		t.Fatalf("expected complete output consequence, got %q", enf.OutputConsequence)

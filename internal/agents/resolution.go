@@ -139,7 +139,7 @@ func probeVersion(ctx context.Context, path string) (string, bool) {
 		return "", false
 	}
 	defer os.RemoveAll(scratch)
-	cmd := exec.CommandContext(probeCtx, path, "--version")
+	cmd := exec.CommandContext(probeCtx, path, "--version") // govratchet:exec-allow(diagnostic_only)
 	cmd.Env = controllerenv.Base()
 	cmd.Dir = scratch
 	out, err := cmd.CombinedOutput()

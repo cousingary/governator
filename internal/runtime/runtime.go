@@ -641,7 +641,7 @@ func shell(ctx context.Context, dir, command string) (int, string, error) {
 		if scope, ok := containment.ScopeFromContext(c); ok {
 			return scope.Command(c, bin, a, dir)
 		}
-		cc := exec.CommandContext(c, bin, a...)
+		cc := exec.CommandContext(c, bin, a...) // govratchet:exec-allow(production_launch_factory) -- bin is bashHandle's verified/sealed path, substituted by the caller
 		cc.Dir = dir
 		cc.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 		return cc
@@ -1014,6 +1014,31 @@ func requiresCompleteTranscript(c contracts.Contract) bool {
 		return true
 	}
 	return c.Assay != nil && assayDeclaresBlocking(c.Assay)
+}
+
+// declaredCredentialPolicy is the declared-authority tier of the effect
+// ledger's credential evidence (Sol9 P1-5): it reflects only what the
+// contract asked for, never anything observed about actual credential
+// access, which Governator's local/Docker containment has no interposition
+// to witness (see ObservedCredentialAccess = "unavailable" at every call
+// site).
+func declaredCredentialPolicy(c contracts.Contract) string {
+	if c.Docker != nil && len(c.Docker.CredentialMounts) > 0 {
+		return "declared"
+	}
+	return "none"
+}
+
+// networkDenialMechanism names the applied-enforcement mechanism behind a
+// deny verdict (Sol9 P1-5) -- Governator's only real local network denial
+// today is process isolation via a network namespace, never a kernel-level
+// per-attempt observation, so this stays constant across every deny case
+// rather than implying finer-grained enforcement exists.
+func networkDenialMechanism(planActive, allowNetwork bool) string {
+	if planActive && !allowNetwork {
+		return "isolated_namespace"
+	}
+	return ""
 }
 
 const workspaceCleanupTimeout = 2 * time.Minute
@@ -3305,19 +3330,21 @@ func (r *Runner) runOnce(ctx context.Context, c contracts.Contract) (RunRecord, 
 			enforcedNetwork = "allow"
 		}
 		enfRec := observability.EnforcementRecord{
-			RunID:                   id,
-			Method:                  method,
-			NetworkNamespaced:       !enforcePlan.AllowNetwork,
-			ProcessesObservedPeak:   descProof.ProcessesObservedPeak,
-			LandlockABI:             enforcePlan.LandlockABI,
-			KernelReadEnvelope:      append([]string(nil), enforcePlan.ReadRoots...),
-			DeclaredNetworkPolicy:   enforcedNetwork,
-			EnforcedNetworkPolicy:   enforcedNetwork,
-			ObservedNetworkAttempts: -1,
-			DeclaredWriteRoots:      append(append([]string(nil), enforcePlan.WriteDirs...), enforcePlan.WriteFiles...),
-			CredentialExposure:      "unobserved",
-			OutputConsequence:       "unobserved",
-			Created:                 time.Now().UTC().Format(time.RFC3339Nano),
+			RunID:                     id,
+			Method:                    method,
+			NetworkNamespaced:         !enforcePlan.AllowNetwork,
+			ProcessesObservedPeak:     descProof.ProcessesObservedPeak,
+			LandlockABI:               enforcePlan.LandlockABI,
+			KernelReadEnvelope:        append([]string(nil), enforcePlan.ReadRoots...),
+			DeclaredNetworkPolicy:     enforcedNetwork,
+			EnforcedNetworkPolicy:     enforcedNetwork,
+			NetworkAttemptObservation: "unavailable",
+			NetworkDenialMechanism:    networkDenialMechanism(enforcePlan.Active, enforcePlan.AllowNetwork),
+			DeclaredWriteRoots:        append(append([]string(nil), enforcePlan.WriteDirs...), enforcePlan.WriteFiles...),
+			DeclaredCredentialPolicy:  declaredCredentialPolicy(c),
+			ObservedCredentialAccess:  "unavailable",
+			OutputConsequence:         "unobserved",
+			Created:                   time.Now().UTC().Format(time.RFC3339Nano),
 		}
 		if err := observability.RecordEnforcement(db, enfRec); err != nil {
 			payload, _ := json.Marshal(enfRec)
@@ -3995,10 +4022,6 @@ func (r *Runner) runOnce(ctx context.Context, c contracts.Contract) (RunRecord, 
 		for _, file := range files {
 			actualWriteSet = append(actualWriteSet, file.Path)
 		}
-		credentialExposure := "none"
-		if c.Docker != nil && len(c.Docker.CredentialMounts) > 0 {
-			credentialExposure = "declared"
-		}
 		outputConsequence := "complete"
 		if obs.OutputTruncated {
 			if requiresCompleteTranscript(c) {
@@ -4008,20 +4031,22 @@ func (r *Runner) runOnce(ctx context.Context, c contracts.Contract) (RunRecord, 
 			}
 		}
 		enfRec := observability.EnforcementRecord{
-			RunID:                   id,
-			Method:                  method,
-			NetworkNamespaced:       !enforcePlan.AllowNetwork,
-			ProcessesObservedPeak:   descProof.ProcessesObservedPeak,
-			LandlockABI:             enforcePlan.LandlockABI,
-			KernelReadEnvelope:      append([]string(nil), enforcePlan.ReadRoots...),
-			DeclaredNetworkPolicy:   enforcedNetwork,
-			EnforcedNetworkPolicy:   enforcedNetwork,
-			ObservedNetworkAttempts: -1,
-			DeclaredWriteRoots:      append(append([]string(nil), enforcePlan.WriteDirs...), enforcePlan.WriteFiles...),
-			ActualWriteSet:          actualWriteSet,
-			CredentialExposure:      credentialExposure,
-			OutputConsequence:       outputConsequence,
-			Created:                 time.Now().UTC().Format(time.RFC3339Nano),
+			RunID:                     id,
+			Method:                    method,
+			NetworkNamespaced:         !enforcePlan.AllowNetwork,
+			ProcessesObservedPeak:     descProof.ProcessesObservedPeak,
+			LandlockABI:               enforcePlan.LandlockABI,
+			KernelReadEnvelope:        append([]string(nil), enforcePlan.ReadRoots...),
+			DeclaredNetworkPolicy:     enforcedNetwork,
+			EnforcedNetworkPolicy:     enforcedNetwork,
+			NetworkAttemptObservation: "unavailable",
+			NetworkDenialMechanism:    networkDenialMechanism(enforcePlan.Active, enforcePlan.AllowNetwork),
+			DeclaredWriteRoots:        append(append([]string(nil), enforcePlan.WriteDirs...), enforcePlan.WriteFiles...),
+			ActualWriteSet:            actualWriteSet,
+			DeclaredCredentialPolicy:  declaredCredentialPolicy(c),
+			ObservedCredentialAccess:  "unavailable",
+			OutputConsequence:         outputConsequence,
+			Created:                   time.Now().UTC().Format(time.RFC3339Nano),
 		}
 		if err := observability.RecordEnforcement(db, enfRec); err != nil {
 			payload, _ := json.Marshal(enfRec)

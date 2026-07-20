@@ -334,11 +334,11 @@ func (s *Scope) Command(ctx context.Context, bin string, args []string, dir stri
 			"--",
 			bin,
 		}, args...)
-		cmd = exec.CommandContext(ctx, s.primitivePath, full...)
+		cmd = exec.CommandContext(ctx, s.primitivePath, full...) // govratchet:exec-allow(known_gap_pending_hardening) -- systemd-run launched by pathname, see comment above
 		cmd.Env = controllerenv.Base()
 		cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	case ScopeCgroupDirect:
-		cmd = exec.CommandContext(ctx, bin, args...)
+		cmd = exec.CommandContext(ctx, bin, args...) // govratchet:exec-allow(production_launch_factory) -- bin is already the caller's verified/sealed path
 		cmd.SysProcAttr = cgroupDirectSysProcAttr(s.cgroupFile.Fd())
 	case ScopePIDNamespace:
 		full := []string{
@@ -350,11 +350,11 @@ func (s *Scope) Command(ctx context.Context, bin string, args []string, dir stri
 			bin,
 		}
 		full = append(full, args...)
-		cmd = exec.CommandContext(ctx, s.primitivePath, full...)
+		cmd = exec.CommandContext(ctx, s.primitivePath, full...) // govratchet:exec-allow(known_gap_pending_hardening) -- unshare-equivalent launched by pathname, see comment above
 		cmd.Env = controllerenv.Base()
 		cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	default: // scopeDegraded
-		cmd = exec.CommandContext(ctx, bin, args...)
+		cmd = exec.CommandContext(ctx, bin, args...) // govratchet:exec-allow(production_launch_factory) -- bin is already the caller's verified/sealed path
 		cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	}
 	cmd.Dir = dir

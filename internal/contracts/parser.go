@@ -51,6 +51,17 @@ func Parse(data []byte) (*Contract, error) {
 		return nil, fmt.Errorf("decode contract: %w", err)
 	}
 
+	// Sol9 P2-1: docker.deny_metadata_and_local_net was renamed to
+	// docker.sinkhole_metadata_hostnames (the old name implied it denied
+	// local networks; it only ever rewrote metadata hostnames). Accept the
+	// old key for one release rather than a hard decode failure --
+	// decoder.KnownFields(true) means an unrecognized key would otherwise
+	// reject the whole contract.
+	if contract.Docker != nil && contract.Docker.DenyMetadataAndLocalNetDeprecated {
+		fmt.Fprintln(os.Stderr, "WARNING: docker.deny_metadata_and_local_net is deprecated, use docker.sinkhole_metadata_hostnames instead (same behavior: it only rewrites known metadata hostnames, it does not deny local networks)")
+		contract.Docker.SinkholeMetadataHostnames = true
+	}
+
 	if err := contract.Validate(); err != nil {
 		return nil, err
 	}

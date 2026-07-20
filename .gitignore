@@ -13,3 +13,9 @@ RESULT.json
 output/
 .governator/
 .governator-canary
+# Sol9 P2-2: contamination the audit found inside a manually-tarred bundle --
+# stray scratch/debug files and the context-graph runtime db, none of which
+# scripts/audit_bundle.sh's git-archive-based source/ tier can ever include
+# once they're also excluded from tracking here.
+.tmp_debug_*
+.codegraph/

@@ -11,7 +11,9 @@
 # in one empty staging directory, and emits the complete file set the audit
 # requires: gov_<version>_<platform>.tar.gz (one per platform), checksums.txt,
 # build-manifest.json, sbom.json, claims.yaml, test-summary.json,
-# acceptance-summary.json, signature.
+# acceptance-summary.json, checksums.txt.hmac (only when
+# GOV_RELEASE_HMAC_KEY is set -- Sol9 P2-2 renamed this from the ambiguous
+# "signature" and stopped writing an "UNSIGNED" placeholder when absent).
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
@@ -111,6 +113,14 @@ print(m.group(1) if m else "")' "$ARCHITECTURE_DOC")
       exit 1
       ;;
   esac
+  # Sol9 P2-3: a Source-HEAD match doesn't catch a stale *narrative* inside
+  # the doc (the audit found an accurate Status header sitting next to a
+  # Remediation-history section that still described an older release as
+  # current). Check that separately.
+  if ! python3 "$ROOT/scripts/check_architecture_doc.py" "$ARCHITECTURE_DOC"; then
+    echo "release: refusing to release with a stale architecture doc narrative (see above)" >&2
+    exit 1
+  fi
 fi
 
 BUILD_TS=$(date -u +%Y-%m-%dT%H:%M:%SZ)
@@ -897,33 +907,31 @@ CHECKSUMS="$OUT_DIR/checksums.txt"
 (cd "$OUT_DIR" && sha256sum -- *.tar.gz build-manifest.json architecture-build-metadata.json sbom.json claims.yaml test-summary.json acceptance-summary.json claims-verify-report.txt gov >"$(basename "$CHECKSUMS")")
 
 # ---------------------------------------------------------------------------
-# signature — HMAC-SHA256 over checksums.txt, keyed by an operator-supplied
-# secret. Never fabricated: an unsigned release says so in plain text rather
-# than shipping a signature file that isn't one.
+# checksums.txt.hmac — HMAC-SHA256 over checksums.txt, keyed by an
+# operator-supplied secret. Sol9 P2-2: this file used to be named plain
+# "signature" and was ALWAYS written, including the literal text "UNSIGNED:
+# set GOV_RELEASE_HMAC_KEY..." when no key was configured -- sitting right
+# next to a real checksums.txt.minisig, a file named exactly "signature"
+# saying "UNSIGNED" reads as "this release is unsigned" even when the
+# asymmetric signature below is present and real. Renamed to name what it
+# actually is, and omitted entirely (not written as a placeholder) when no
+# HMAC key is configured -- its absence is the honest signal, not a fabricated
+# file.
 #
-# P0-7 (Sol redteam v4 S8): docs/security.md flagged this as the release's
-# real gap — "HMAC with a shared secret is not publicly verifiable." An HMAC
-# key that signs is also a key that can forge; anyone who can verify a
-# release can also mint a fake one. When GOV_RELEASE_MINISIGN_KEY (path to
-# an UNENCRYPTED minisign secret key — `minisign -G -W`, no interactive
+# P0-7 (Sol redteam v4 S8): docs/security.md flagged the underlying gap —
+# "HMAC with a shared secret is not publicly verifiable." An HMAC key that
+# signs is also a key that can forge; anyone who can verify a release can
+# also mint a fake one. When GOV_RELEASE_MINISIGN_KEY (path to an
+# UNENCRYPTED minisign secret key — `minisign -G -W`, no interactive
 # password prompt to automate around) and the `minisign` binary are both
 # available, this additionally produces checksums.txt.minisig: an Ed25519
 # signature verifiable by anyone holding only the corresponding *public*
 # key, with no shared secret in the loop. This augments, not replaces, the
-# HMAC signature above (existing tooling/docs keep working); when minisign
-# isn't configured, no .minisig file is written — never a fabricated one.
+# HMAC file above (existing tooling/docs keep working); when minisign isn't
+# configured, no .minisig file is written — never a fabricated one.
 # ---------------------------------------------------------------------------
-SIGNATURE="$OUT_DIR/signature"
-if [ -n "${GOV_RELEASE_HMAC_KEY:-}" ]; then
-  python3 -c "
-import hmac, hashlib, os, sys
-key = os.environ['GOV_RELEASE_HMAC_KEY'].encode()
-data = open(sys.argv[1], 'rb').read()
-print('hmac-sha256:' + hmac.new(key, data, hashlib.sha256).hexdigest())
-" "$CHECKSUMS" >"$SIGNATURE"
-else
-  echo "UNSIGNED: set GOV_RELEASE_HMAC_KEY to sign checksums.txt for this release" >"$SIGNATURE"
-fi
+HMAC_SIGNATURE="$OUT_DIR/checksums.txt.hmac"
+python3 "$ROOT/scripts/release_hmac_sign.py" --checksums "$CHECKSUMS" --out "$HMAC_SIGNATURE"
 
 MINISIG="$OUT_DIR/checksums.txt.minisig"
 if [ -n "${GOV_RELEASE_MINISIGN_KEY:-}" ] && command -v minisign >/dev/null 2>&1; then

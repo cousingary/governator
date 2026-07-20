@@ -531,3 +531,33 @@ cases:
     session: rc3-s7
     required: true
     status: implemented
+  - case: 96
+    name: TestV9Case38BundleWithStaleBinaryRejected
+    session: rc3-s8
+    required: true
+    status: implemented
+  - case: 97
+    name: TestV9Case39BundleWithVenvOrCacheRejected
+    session: rc3-s8
+    required: true
+    status: implemented
+  - case: 98
+    name: TestV9Case40StaleArchitectureFinalSectionRejected
+    session: rc3-s8
+    required: true
+    status: implemented
+  - case: 99
+    name: TestV9Case41HMACPlaceholderNeverWrittenWithoutAKey
+    session: rc3-s8
+    required: true
+    status: implemented
+  - case: 100
+    name: TestV9Case42MissingPubkeyFingerprintRejected
+    session: rc3-s8
+    required: true
+    status: implemented
+  - case: 101
+    name: TestV9Case43ClaimsDivergenceWithoutProvenanceRejected
+    session: rc3-s8
+    required: true
+    status: implemented

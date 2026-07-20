@@ -6,7 +6,9 @@ name: Release
 # for why .goreleaser.yml was retired) so a local run and a CI run produce
 # byte-for-byte the same file set: gov_<version>_<platform>.tar.gz per
 # platform, checksums.txt, build-manifest.json, sbom.json, claims.yaml,
-# test-summary.json, acceptance-summary.json, signature.
+# test-summary.json, acceptance-summary.json, checksums.txt.hmac (only when
+# GOV_RELEASE_HMAC_KEY is configured; Sol9 P2-2 renamed this from the
+# ambiguous "signature").
 #
 # This workflow is inert until a git remote and a `v*` tag exist (docs/
 # publishing.md step 2/5) — it is committed now so the CI proof mechanism is
@@ -85,7 +87,7 @@ jobs:
             dist/test-summary.json
             dist/acceptance-summary.json
             dist/claims-verify-report.txt
-            dist/signature
+            dist/checksums.txt.hmac
           if-no-files-found: warn
 
       - name: Create GitHub release (draft)
@@ -103,4 +105,4 @@ jobs:
             dist/test-summary.json
             dist/acceptance-summary.json
             dist/claims-verify-report.txt
-            dist/signature
+            dist/checksums.txt.hmac

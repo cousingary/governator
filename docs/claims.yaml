@@ -1161,17 +1161,17 @@ claims:
           - TestV8Case8AuthorityRejectsContradictorySuppliedPlan
         build_tag: redteam
 
-  - id: sol8-effect-ledger-reconciliation
-    title: "The enforcement ledger reconciles declared authority with what Governator actually proved: declared vs enforced network policy, an observed-network-attempt counter, declared write roots vs actual write set, credential exposure, peak process count, kernel read envelope, Landlock ABI, and output consequence are recorded per run in enforcement_events and surfaced from stage/runtime execution evidence."
-    first_shipped_version: v1.0.2-rc2
+  - id: sol9-effect-ledger-evidence-classes
+    title: "The enforcement ledger (per-run enforcement_events and the per-stage EffectLedger) separates three distinct evidence classes rather than mixing their vocabulary: declared authority (DeclaredNetworkPolicy, DeclaredWriteRoots, DeclaredCredentialPolicy -- what was asked for), applied enforcement (EnforcedNetworkPolicy, NetworkDenialMechanism, KernelReadEnvelope, LandlockABI -- what the containment mechanism was configured to enforce), and observed effects (ActualWriteSet, ProcessesObservedPeak, ObservedCredentialAccess, OutputConsequence, NetworkAttemptObservation -- what was actually witnessed). ActualWriteSet is a real before/after reconciliation of the declared write roots (snapshotWriteRoots/reconcileWriteSet), not the declared roots restated as observed. Network-attempt accounting is not implemented: NetworkAttemptObservation records the literal string \"unavailable\" rather than a sentinel -1 that could be mistaken for a real (empty) observation, and claims about network denial say \"kernel-enforced denial\" (NetworkDenialMechanism=\"isolated_namespace\") rather than implying observed attempts."
+    first_shipped_version: v1.0.2-rc3
     claimed_maturity: tested
     implementation:
       - file: internal/observability/enforcement.go
         symbols: [EnforcementRecord, RecordEnforcement, EnforcementForRun]
       - file: internal/stage/stage.go
-        symbols: [EffectLedger, Run]
+        symbols: [EffectLedger, Run, snapshotWriteRoots, reconcileWriteSet, networkDenialMechanism]
       - file: internal/runtime/runtime.go
-        symbols: [runOnce]
+        symbols: [runOnce, declaredCredentialPolicy, networkDenialMechanism]
     tests:
       - file: internal/observability/enforcement_s5_test.go
         funcs:
@@ -1179,6 +1179,11 @@ claims:
       - file: internal/runtime/sol5_enforcement_ledger_test.go
         funcs:
           - TestSol5EnforcementLedgerRecordsExternalObservation
+      - file: internal/stage/effect_ledger_test.go
+        funcs:
+          - TestReconcileWriteSetDetectsNewAndChangedFiles
+          - TestReconcileWriteSetCoversDeclaredFiles
+          - TestReconcileWriteSetEmptyWhenNothingChanges
 
   - id: sol8-darwin-non-approving
     title: "Darwin builds are feature-limited/non-approving: the runtime refuses approval or merge on darwin even when a backend otherwise produced valid output, so a Darwin artifact can be distributed only as an explicitly non-approving build."
@@ -1326,3 +1331,53 @@ claims:
         funcs:
           - TestV8Case24NoApplicableChecksBlockApproval
         build_tag: redteam
+
+  - id: sol9-network-hostname-sinkhole-rename
+    title: "docker.deny_metadata_and_local_net (which only ever rewrote a fixed set of metadata hostnames via --add-host, never denied local networks) is renamed to docker.sinkhole_metadata_hostnames -- a name that matches its actual behavior. The old key is still accepted for one release: internal/contracts.Parse folds it into SinkholeMetadataHostnames and prints a deprecation warning to stderr, so existing contracts keep parsing under decoder.KnownFields(true) rather than a hard decode failure. The only real network isolation modes remain network: deny and network: allow."
+    first_shipped_version: v1.0.2-rc3
+    claimed_maturity: tested
+    implementation:
+      - file: internal/contracts/schema.go
+        symbols: [DockerRunnerConfig]
+      - file: internal/contracts/parser.go
+        symbols: [Parse]
+      - file: internal/runner/docker.go
+        symbols: [DockerRunner]
+    tests:
+      - file: internal/contracts/parser_test.go
+        funcs:
+          - TestParseAcceptsDeprecatedDenyMetadataAndLocalNetKey
+      - file: internal/runner/docker_test.go
+        funcs:
+          - TestDockerRunnerNetworkAllowOptIn
+
+  - id: sol9-audit-bundle-hygiene
+    title: "scripts/audit_bundle.sh is the single, canonical audit/source bundle generator, replacing whatever ad hoc directory tar previously produced the audit archive (found by the audit to contain a partial .venv, Python/pytest caches, .codegraph/, a stray .tmp_debug_docker.go, egg-info, and a stale rc1-dirty bin/gov sitting next to the real dist/gov). source/ is built exclusively from `git archive` -- it can only ever emit committed, tracked bytes at a given ref, so every one of those categories is structurally impossible to include, not merely git-ignored-and-hoped-not-there -- and a post-build contamination scan asserts none of the named patterns exist anywhere in the finished bundle regardless. Output structure is source/ dist/ architecture/ evidence/. scripts/check_architecture_doc.py rejects a bundle whose architecture doc's Remediation-history section still names an older release as current even though its Status header is accurate. evidence/CLAIMS_PROVENANCE.txt always records whether source/docs/claims.yaml (current) and dist/claims.yaml (frozen into an earlier release build) diverge -- evidence/ never carries a third, unlabeled claims.yaml copy. scripts/release_hmac_sign.py (factored out of scripts/release.sh) never writes an 'UNSIGNED' placeholder for checksums.txt.hmac; absence of the file is the signal when no GOV_RELEASE_HMAC_KEY is configured. scripts/check_release_docs.py asserts the release docs actually document minisign verification and where the public-key fingerprint is published (out-of-band, never embedded in the repo)."
+    first_shipped_version: v1.0.2-rc3
+    claimed_maturity: tested
+    implementation:
+      - file: internal/redteam/v9_s8_bundle_claims_test.go
+        symbols: [TestV9Case38BundleWithStaleBinaryRejected, TestV9Case39BundleWithVenvOrCacheRejected, TestV9Case40StaleArchitectureFinalSectionRejected, TestV9Case41HMACPlaceholderNeverWrittenWithoutAKey, TestV9Case42MissingPubkeyFingerprintRejected, TestV9Case43ClaimsDivergenceWithoutProvenanceRejected]
+    tests:
+      - file: internal/redteam/v9_s8_bundle_claims_test.go
+        funcs:
+          - TestV9Case38BundleWithStaleBinaryRejected
+          - TestV9Case39BundleWithVenvOrCacheRejected
+          - TestV9Case40StaleArchitectureFinalSectionRejected
+          - TestV9Case41HMACPlaceholderNeverWrittenWithoutAKey
+          - TestV9Case42MissingPubkeyFingerprintRejected
+          - TestV9Case43ClaimsDivergenceWithoutProvenanceRejected
+        build_tag: redteam
+
+  - id: sol9-exec-command-ratchet
+    title: "A CI ratchet (internal/govlint, plain go test ./... tier -- not gated behind a build tag) statically parses every non-test .go file under internal/ and cmd/ and fails if any raw exec.Command/exec.CommandContext call site lacks a same-line //govratchet:exec-allow(<class>) justification comment, or cites a class outside the fixed allowlist (production_launch_factory, diagnostic_only, release_tooling, legacy_bridge, known_gap_pending_hardening). Every current call site is marked; the known_gap_pending_hardening class narrowly grandfathers the genuine unresolved gap Session 5 found (containment/descendants.go's systemd-run/unshare containment primitives are still launched by pathname, not the fd-verified mechanism Session 1 built for internal/enforce) rather than silently endorsing it as fixed. Adding a new unmarked call site, or reusing an unrecognized class, fails the build."
+    first_shipped_version: v1.0.2-rc3
+    claimed_maturity: tested
+    implementation:
+      - file: internal/govlint/exec_command_ratchet_test.go
+        symbols: [TestExecCommandRatchet, allowedExecCommandClasses]
+    tests:
+      - file: internal/govlint/exec_command_ratchet_test.go
+        funcs:
+          - TestExecCommandRatchet
+          - TestExecCommandRatchetDetectsUnmarkedAndInvalidSites

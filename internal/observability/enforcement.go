@@ -7,25 +7,40 @@ import (
 )
 
 // EnforcementRecord is the kernel containment evidence for one governed
-// launch. KernelReadEnvelope is the exact pre-resolved set admitted by
-// Landlock; the additional declared-vs-applied fields make the ledger say
-// what was actually proven rather than leaving unenforced/unobserved gaps
-// implicit.
+// launch, split into three distinct evidence classes so no field's name
+// implies stronger proof than the implementation gives it (Sol9 P1-5: the
+// prior single-tier field set let "declared" and "observed" values share
+// vocabulary, and ObservedNetworkAttempts carried a permanent sentinel -1
+// that read as a real, if empty, observation instead of "not implemented"):
+//
+//   - declared authority: what the caller asked for (DeclaredNetworkPolicy,
+//     DeclaredWriteRoots, DeclaredCredentialPolicy).
+//   - applied enforcement: what the containment mechanism was actually
+//     configured to enforce (EnforcedNetworkPolicy, NetworkDenialMechanism,
+//     KernelReadEnvelope, LandlockABI).
+//   - observed effects: what was actually witnessed after the fact
+//     (ActualWriteSet, ProcessesObservedPeak, ObservedCredentialAccess,
+//     OutputConsequence, NetworkAttemptObservation). A field in this class
+//     that cannot yet be measured must say so explicitly (e.g.
+//     NetworkAttemptObservation = "unavailable") rather than encode
+//     "not implemented" as a value indistinguishable from a real zero.
 type EnforcementRecord struct {
-	RunID                   string
-	Method                  string
-	NetworkNamespaced       bool
-	ProcessesObservedPeak   int
-	LandlockABI             int
-	KernelReadEnvelope      []string
-	DeclaredNetworkPolicy   string
-	EnforcedNetworkPolicy   string
-	ObservedNetworkAttempts int
-	DeclaredWriteRoots      []string
-	ActualWriteSet          []string
-	CredentialExposure      string
-	OutputConsequence       string
-	Created                 string
+	RunID                     string
+	Method                    string
+	NetworkNamespaced         bool
+	ProcessesObservedPeak     int
+	LandlockABI               int
+	KernelReadEnvelope        []string
+	DeclaredNetworkPolicy     string
+	EnforcedNetworkPolicy     string
+	NetworkAttemptObservation string
+	NetworkDenialMechanism    string
+	DeclaredWriteRoots        []string
+	ActualWriteSet            []string
+	DeclaredCredentialPolicy  string
+	ObservedCredentialAccess  string
+	OutputConsequence         string
+	Created                   string
 }
 
 func ensureEnforcementSchema(db *sql.DB) error {
@@ -38,10 +53,12 @@ landlock_abi INTEGER NOT NULL DEFAULT 0,
 kernel_read_envelope TEXT NOT NULL DEFAULT '[]',
 declared_network_policy TEXT NOT NULL DEFAULT '',
 enforced_network_policy TEXT NOT NULL DEFAULT '',
-observed_network_attempts INTEGER NOT NULL DEFAULT -1,
+network_attempt_observation TEXT NOT NULL DEFAULT '',
+network_denial_mechanism TEXT NOT NULL DEFAULT '',
 declared_write_roots TEXT NOT NULL DEFAULT '[]',
 actual_write_set TEXT NOT NULL DEFAULT '[]',
-credential_exposure TEXT NOT NULL DEFAULT '',
+declared_credential_policy TEXT NOT NULL DEFAULT '',
+observed_credential_access TEXT NOT NULL DEFAULT '',
 output_consequence TEXT NOT NULL DEFAULT '',
 created TEXT NOT NULL);`); err != nil {
 		return err
@@ -77,10 +94,18 @@ created TEXT NOT NULL);`); err != nil {
 	for _, stmt := range []string{
 		`ALTER TABLE enforcement_events ADD COLUMN declared_network_policy TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE enforcement_events ADD COLUMN enforced_network_policy TEXT NOT NULL DEFAULT ''`,
-		`ALTER TABLE enforcement_events ADD COLUMN observed_network_attempts INTEGER NOT NULL DEFAULT -1`,
+		// Sol9 P1-5: observed_network_attempts (INTEGER, sentinel -1 forever)
+		// replaced by two honest string fields -- rc2 ledgers keep the old
+		// column as an unread vestige rather than attempting a destructive
+		// SQLite column drop/rename mid-migration.
+		`ALTER TABLE enforcement_events ADD COLUMN network_attempt_observation TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE enforcement_events ADD COLUMN network_denial_mechanism TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE enforcement_events ADD COLUMN declared_write_roots TEXT NOT NULL DEFAULT '[]'`,
 		`ALTER TABLE enforcement_events ADD COLUMN actual_write_set TEXT NOT NULL DEFAULT '[]'`,
-		`ALTER TABLE enforcement_events ADD COLUMN credential_exposure TEXT NOT NULL DEFAULT ''`,
+		// credential_exposure (mixed declared/observed semantics depending on
+		// call site) split into its two evidence classes.
+		`ALTER TABLE enforcement_events ADD COLUMN declared_credential_policy TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE enforcement_events ADD COLUMN observed_credential_access TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE enforcement_events ADD COLUMN output_consequence TEXT NOT NULL DEFAULT ''`,
 	} {
 		field := strings.Fields(stmt)[5]
@@ -110,9 +135,9 @@ func RecordEnforcement(db *sql.DB, r EnforcementRecord) error {
 	if err != nil {
 		return err
 	}
-	_, err = db.Exec(`INSERT INTO enforcement_events(run_id,method,network_namespaced,processes_observed_peak,landlock_abi,kernel_read_envelope,declared_network_policy,enforced_network_policy,observed_network_attempts,declared_write_roots,actual_write_set,credential_exposure,output_consequence,created) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-ON CONFLICT(run_id) DO UPDATE SET method=excluded.method,network_namespaced=excluded.network_namespaced,processes_observed_peak=excluded.processes_observed_peak,landlock_abi=excluded.landlock_abi,kernel_read_envelope=excluded.kernel_read_envelope,declared_network_policy=excluded.declared_network_policy,enforced_network_policy=excluded.enforced_network_policy,observed_network_attempts=excluded.observed_network_attempts,declared_write_roots=excluded.declared_write_roots,actual_write_set=excluded.actual_write_set,credential_exposure=excluded.credential_exposure,output_consequence=excluded.output_consequence,created=excluded.created`,
-		r.RunID, r.Method, boolInt(r.NetworkNamespaced), r.ProcessesObservedPeak, r.LandlockABI, string(envelope), r.DeclaredNetworkPolicy, r.EnforcedNetworkPolicy, r.ObservedNetworkAttempts, string(declaredWrites), string(actualWrites), r.CredentialExposure, r.OutputConsequence, r.Created)
+	_, err = db.Exec(`INSERT INTO enforcement_events(run_id,method,network_namespaced,processes_observed_peak,landlock_abi,kernel_read_envelope,declared_network_policy,enforced_network_policy,network_attempt_observation,network_denial_mechanism,declared_write_roots,actual_write_set,declared_credential_policy,observed_credential_access,output_consequence,created) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+ON CONFLICT(run_id) DO UPDATE SET method=excluded.method,network_namespaced=excluded.network_namespaced,processes_observed_peak=excluded.processes_observed_peak,landlock_abi=excluded.landlock_abi,kernel_read_envelope=excluded.kernel_read_envelope,declared_network_policy=excluded.declared_network_policy,enforced_network_policy=excluded.enforced_network_policy,network_attempt_observation=excluded.network_attempt_observation,network_denial_mechanism=excluded.network_denial_mechanism,declared_write_roots=excluded.declared_write_roots,actual_write_set=excluded.actual_write_set,declared_credential_policy=excluded.declared_credential_policy,observed_credential_access=excluded.observed_credential_access,output_consequence=excluded.output_consequence,created=excluded.created`,
+		r.RunID, r.Method, boolInt(r.NetworkNamespaced), r.ProcessesObservedPeak, r.LandlockABI, string(envelope), r.DeclaredNetworkPolicy, r.EnforcedNetworkPolicy, r.NetworkAttemptObservation, r.NetworkDenialMechanism, string(declaredWrites), string(actualWrites), r.DeclaredCredentialPolicy, r.ObservedCredentialAccess, r.OutputConsequence, r.Created)
 	return err
 }
 
@@ -123,8 +148,8 @@ func EnforcementForRun(db *sql.DB, runID string) (EnforcementRecord, bool, error
 	var r EnforcementRecord
 	var networkNamespaced int
 	var envelope, declaredWrites, actualWrites string
-	err := db.QueryRow(`SELECT run_id,method,network_namespaced,processes_observed_peak,landlock_abi,kernel_read_envelope,declared_network_policy,enforced_network_policy,observed_network_attempts,declared_write_roots,actual_write_set,credential_exposure,output_consequence,created FROM enforcement_events WHERE run_id=?`, runID).
-		Scan(&r.RunID, &r.Method, &networkNamespaced, &r.ProcessesObservedPeak, &r.LandlockABI, &envelope, &r.DeclaredNetworkPolicy, &r.EnforcedNetworkPolicy, &r.ObservedNetworkAttempts, &declaredWrites, &actualWrites, &r.CredentialExposure, &r.OutputConsequence, &r.Created)
+	err := db.QueryRow(`SELECT run_id,method,network_namespaced,processes_observed_peak,landlock_abi,kernel_read_envelope,declared_network_policy,enforced_network_policy,network_attempt_observation,network_denial_mechanism,declared_write_roots,actual_write_set,declared_credential_policy,observed_credential_access,output_consequence,created FROM enforcement_events WHERE run_id=?`, runID).
+		Scan(&r.RunID, &r.Method, &networkNamespaced, &r.ProcessesObservedPeak, &r.LandlockABI, &envelope, &r.DeclaredNetworkPolicy, &r.EnforcedNetworkPolicy, &r.NetworkAttemptObservation, &r.NetworkDenialMechanism, &declaredWrites, &actualWrites, &r.DeclaredCredentialPolicy, &r.ObservedCredentialAccess, &r.OutputConsequence, &r.Created)
 	if err == sql.ErrNoRows {
 		return EnforcementRecord{}, false, nil
 	}

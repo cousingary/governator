@@ -977,7 +977,7 @@ type artifactVersion struct {
 func runArtifactVersionJSON(path string) (artifactVersion, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), probeTimeout)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, path, "version", "--json")
+	cmd := exec.CommandContext(ctx, path, "version", "--json") // govratchet:exec-allow(release_tooling)
 	var out, stderr bytes.Buffer
 	cmd.Stdout = &out
 	cmd.Stderr = &stderr
@@ -1125,7 +1125,7 @@ func gitOutput(repoRoot string, portable bool, args ...string) ([]byte, error) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), probeTimeout)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, gitPath, append([]string{"-C", repoRoot}, args...)...)
+	cmd := exec.CommandContext(ctx, gitPath, append([]string{"-C", repoRoot}, args...)...) // govratchet:exec-allow(release_tooling)
 	var out, stderr bytes.Buffer
 	cmd.Stdout = &out
 	cmd.Stderr = &stderr
@@ -1146,7 +1146,7 @@ func gitCheck(repoRoot string, portable bool, args ...string) error {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), probeTimeout)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, gitPath, append([]string{"-C", repoRoot}, args...)...)
+	cmd := exec.CommandContext(ctx, gitPath, append([]string{"-C", repoRoot}, args...)...) // govratchet:exec-allow(release_tooling)
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
@@ -1169,7 +1169,7 @@ func gitShow(repoRoot string, portable bool, commit, path string) ([]byte, error
 	// Historical file paths are always repo-relative with forward slashes,
 	// regardless of host OS path separators.
 	ref := commit + ":" + filepath.ToSlash(path)
-	cmd := exec.CommandContext(ctx, gitPath, "-C", repoRoot, "show", ref)
+	cmd := exec.CommandContext(ctx, gitPath, "-C", repoRoot, "show", ref) // govratchet:exec-allow(release_tooling)
 	var out, stderr bytes.Buffer
 	cmd.Stdout = &out
 	cmd.Stderr = &stderr

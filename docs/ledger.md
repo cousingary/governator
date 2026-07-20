@@ -110,6 +110,16 @@ A contract that sets `repair.auto: true` opts into automatic repair: `gov run` (
 
 When graph integration is active, every run records the CodeGraph provider version, SHA-256 database fingerprint, file/node/edge counts, and database size. Runtime indexes live only in the disposable worktree and are not merged into source. The fingerprint identifies the exact context database presented to the agent; it is evidence, not a substitute for source verification.
 
+## Effect ledger evidence classes
+
+`enforcement_events` (one row per run, `internal/observability/enforcement.go`) and the per-stage `EffectLedger` (`internal/stage/stage.go`, embedded in helper-stage results) separate three evidence classes rather than mixing their vocabulary:
+
+- **Declared authority** — what was asked for: `DeclaredNetworkPolicy`, `DeclaredWriteRoots`, `DeclaredCredentialPolicy`.
+- **Applied enforcement** — what the containment mechanism was actually configured to enforce: `EnforcedNetworkPolicy`, `NetworkDenialMechanism`, `KernelReadEnvelope`, `LandlockABI`.
+- **Observed effects** — what was actually witnessed after the fact: `ActualWriteSet`, `ProcessesObservedPeak`, `ObservedCredentialAccess`, `OutputConsequence`, `NetworkAttemptObservation`.
+
+`ActualWriteSet` is a real before/after reconciliation of the declared write roots (stage-level: snapshot immediately before launch, diff against the same roots after the scope is extinguished), not the declared roots restated as if observed. Network-attempt accounting is not implemented on this host: `NetworkAttemptObservation` is the literal string `"unavailable"` — never a sentinel integer that could read as a real (empty) observation — and network denial is described as kernel-enforced (`NetworkDenialMechanism = "isolated_namespace"`), never as kernel-observed attempts, unless attempt accounting is genuinely implemented.
+
 ## Usage and cost caveats
 
 `gov usage summary` aggregates measured tokens, cache activity, tool calls, and transcript bytes; `gov usage RUN_ID` reports one run. Token totals are parsed from Claude, Codex, GLM, OpenCode, and Pi transcript shapes. Runs without reported usage store zero plus `usage_unavailable`; zero must not be interpreted as measured usage.

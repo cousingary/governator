@@ -174,7 +174,7 @@ func shell(ctx context.Context, dir, command string, environments ...controllere
 	}
 	defer bashHandle.Close()
 	build := func(c context.Context, bin string, a []string) *exec.Cmd {
-		cc := exec.CommandContext(c, bin, a...)
+		cc := exec.CommandContext(c, bin, a...) // govratchet:exec-allow(production_launch_factory) -- bin is bashHandle's verified/sealed path, substituted by the caller
 		cc.Dir = dir
 		cc.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 		return cc

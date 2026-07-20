@@ -13,9 +13,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"syscall"
@@ -79,19 +81,31 @@ const (
 
 var ErrOutputLimitExceeded = errors.New("STAGE_OUTPUT_LIMIT_EXCEEDED")
 
+// EffectLedger mirrors observability.EnforcementRecord's three-evidence-class
+// split (Sol9 P1-5) at the per-stage granularity: declared authority
+// (DeclaredNetworkPolicy, DeclaredWriteRoots, DeclaredCredentialPolicy),
+// applied enforcement (EnforcedNetworkPolicy, NetworkDenialMechanism,
+// KernelReadEnvelope, LandlockABI), and observed effects (ActualWriteSet,
+// PeakProcessCount, ObservedCredentialAccess, OutputConsequence,
+// NetworkAttemptObservation). ActualWriteSet is populated by snapshotting
+// every declared write root immediately before launch and reconciling
+// against the same roots after the scope is extinguished -- a real
+// before/after diff, not the declared roots restated as if observed.
 type EffectLedger struct {
-	ScopeMethod             string   `json:"scope_method,omitempty"`
-	WorkspaceFDScanClean    bool     `json:"workspace_fd_scan_clean"`
-	LandlockABI             int      `json:"landlock_abi,omitempty"`
-	KernelReadEnvelope      []string `json:"kernel_read_envelope,omitempty"`
-	DeclaredNetworkPolicy   string   `json:"declared_network_policy,omitempty"`
-	EnforcedNetworkPolicy   string   `json:"enforced_network_policy,omitempty"`
-	ObservedNetworkAttempts int      `json:"observed_network_attempts,omitempty"`
-	DeclaredWriteRoots      []string `json:"declared_write_roots,omitempty"`
-	ActualWriteSet          []string `json:"actual_write_set,omitempty"`
-	CredentialExposure      string   `json:"credential_exposure,omitempty"`
-	PeakProcessCount        int      `json:"peak_process_count,omitempty"`
-	OutputConsequence       string   `json:"output_consequence,omitempty"`
+	ScopeMethod               string   `json:"scope_method,omitempty"`
+	WorkspaceFDScanClean      bool     `json:"workspace_fd_scan_clean"`
+	LandlockABI               int      `json:"landlock_abi,omitempty"`
+	KernelReadEnvelope        []string `json:"kernel_read_envelope,omitempty"`
+	DeclaredNetworkPolicy     string   `json:"declared_network_policy,omitempty"`
+	EnforcedNetworkPolicy     string   `json:"enforced_network_policy,omitempty"`
+	NetworkAttemptObservation string   `json:"network_attempt_observation,omitempty"`
+	NetworkDenialMechanism    string   `json:"network_denial_mechanism,omitempty"`
+	DeclaredWriteRoots        []string `json:"declared_write_roots,omitempty"`
+	ActualWriteSet            []string `json:"actual_write_set,omitempty"`
+	DeclaredCredentialPolicy  string   `json:"declared_credential_policy,omitempty"`
+	ObservedCredentialAccess  string   `json:"observed_credential_access,omitempty"`
+	PeakProcessCount          int      `json:"peak_process_count,omitempty"`
+	OutputConsequence         string   `json:"output_consequence,omitempty"`
 }
 
 // CommandFactory lets callers with already-sealed launch logic build the exact
@@ -261,6 +275,10 @@ func (Executor) Run(ctx context.Context, spec StageSpec) (StageResult, error) {
 		ctx, cancel = context.WithTimeout(ctx, spec.Timeout)
 		defer cancel()
 	}
+	// Sol9 P1-5: snapshot every declared write root before launch so
+	// ActualWriteSet below is a real before/after reconciliation rather than
+	// the declared roots restated as if they were observed.
+	writeSnapshotBefore := snapshotWriteRoots(effectivePlan.WriteDirs, effectivePlan.WriteFiles)
 	scope, err := containment.NewScope(spec.RunID+"-"+spec.StageID+"-"+nonce(), spec.DescendantPolicy.RequireStrong)
 	if err != nil {
 		return StageResult{}, err
@@ -441,11 +459,12 @@ func (Executor) Run(ctx context.Context, spec StageSpec) (StageResult, error) {
 	}
 	declaredWrites := append([]string(nil), effectivePlan.WriteDirs...)
 	declaredWrites = append(declaredWrites, effectivePlan.WriteFiles...)
-	credentialExposure := "unobserved"
+	actualWriteSet := reconcileWriteSet(writeSnapshotBefore, effectivePlan.WriteDirs, effectivePlan.WriteFiles)
+	declaredCredentialPolicy := "unspecified"
 	if authority.Credentials == CredentialPolicyNone || spec.CredentialPolicy == CredentialPolicyNone {
-		credentialExposure = string(CredentialPolicyNone)
+		declaredCredentialPolicy = string(CredentialPolicyNone)
 	} else if authority.Credentials == CredentialPolicyDeclared || spec.CredentialPolicy == CredentialPolicyDeclared {
-		credentialExposure = string(CredentialPolicyDeclared)
+		declaredCredentialPolicy = string(CredentialPolicyDeclared)
 	}
 	outputConsequence := "complete"
 	if limiter.Exceeded() {
@@ -460,17 +479,20 @@ func (Executor) Run(ctx context.Context, spec StageSpec) (StageResult, error) {
 		ExecutableIdentity: spec.Executable,
 		EnvironmentHash:    spec.Environment.Hash,
 		ObservedEffects: EffectLedger{
-			ScopeMethod:             string(proof.Method),
-			WorkspaceFDScanClean:    proof.WorkspaceFDScanClean,
-			LandlockABI:             effectivePlan.LandlockABI,
-			KernelReadEnvelope:      append([]string(nil), effectivePlan.ReadRoots...),
-			DeclaredNetworkPolicy:   declaredNetwork,
-			EnforcedNetworkPolicy:   enforcedNetwork,
-			ObservedNetworkAttempts: -1,
-			DeclaredWriteRoots:      declaredWrites,
-			CredentialExposure:      credentialExposure,
-			PeakProcessCount:        proof.ProcessesObservedPeak,
-			OutputConsequence:       outputConsequence,
+			ScopeMethod:               string(proof.Method),
+			WorkspaceFDScanClean:      proof.WorkspaceFDScanClean,
+			LandlockABI:               effectivePlan.LandlockABI,
+			KernelReadEnvelope:        append([]string(nil), effectivePlan.ReadRoots...),
+			DeclaredNetworkPolicy:     declaredNetwork,
+			EnforcedNetworkPolicy:     enforcedNetwork,
+			NetworkAttemptObservation: "unavailable",
+			NetworkDenialMechanism:    networkDenialMechanism(effectivePlan.Active, effectivePlan.AllowNetwork),
+			DeclaredWriteRoots:        declaredWrites,
+			ActualWriteSet:            actualWriteSet,
+			DeclaredCredentialPolicy:  declaredCredentialPolicy,
+			ObservedCredentialAccess:  "unavailable",
+			PeakProcessCount:          proof.ProcessesObservedPeak,
+			OutputConsequence:         outputConsequence,
 		},
 		OutputTruncated: limiter.Exceeded(),
 		DescendantsGone: extinctionErr == nil,
@@ -480,6 +502,73 @@ func (Executor) Run(ctx context.Context, spec StageSpec) (StageResult, error) {
 		return res, extinctionErr
 	}
 	return res, runErr
+}
+
+// networkDenialMechanism names the applied-enforcement mechanism behind a
+// network-deny verdict (Sol9 P1-5). Governator's only real local network
+// denial is process isolation via a network namespace, never a per-attempt
+// kernel observation, so this stays constant across every deny case rather
+// than implying finer-grained enforcement exists.
+func networkDenialMechanism(planActive, allowNetwork bool) string {
+	if planActive && !allowNetwork {
+		return "isolated_namespace"
+	}
+	return ""
+}
+
+// writeRootStat is one file's size+mtime fingerprint within a snapshotted
+// write root, cheap enough to take twice per stage run without hashing
+// tree contents.
+type writeRootStat struct {
+	size  int64
+	mtime int64
+}
+
+// snapshotWriteRoots walks every declared write directory and stats every
+// declared write file, returning a fingerprint per path found. Missing
+// roots (e.g. a directory a validator's `init` step is about to create) are
+// silently skipped rather than treated as an error -- their absence before
+// and presence after is exactly what reconcileWriteSet needs to detect a
+// write.
+func snapshotWriteRoots(dirs, files []string) map[string]writeRootStat {
+	snap := map[string]writeRootStat{}
+	for _, d := range dirs {
+		_ = filepath.WalkDir(d, func(path string, entry fs.DirEntry, err error) error {
+			if err != nil || entry.IsDir() {
+				return nil
+			}
+			info, ierr := entry.Info()
+			if ierr != nil {
+				return nil
+			}
+			snap[path] = writeRootStat{size: info.Size(), mtime: info.ModTime().UnixNano()}
+			return nil
+		})
+	}
+	for _, f := range files {
+		if info, err := os.Stat(f); err == nil && !info.IsDir() {
+			snap[f] = writeRootStat{size: info.Size(), mtime: info.ModTime().UnixNano()}
+		}
+	}
+	return snap
+}
+
+// reconcileWriteSet is the Sol9 P1-5 observed-effects reconciliation: it
+// re-snapshots the same declared write roots after the stage has run and
+// extinguished, and reports every path that is new or whose size/mtime
+// fingerprint changed since before. Unlike the roots themselves (a declared
+// fact), this is an actual before/after diff -- the closest evidence
+// available without kernel-level write interposition.
+func reconcileWriteSet(before map[string]writeRootStat, dirs, files []string) []string {
+	after := snapshotWriteRoots(dirs, files)
+	changed := make([]string, 0, len(after))
+	for path, stat := range after {
+		if prev, existed := before[path]; !existed || prev != stat {
+			changed = append(changed, path)
+		}
+	}
+	sort.Strings(changed)
+	return changed
 }
 
 // syncBuffer is a mutex-guarded bytes.Buffer: os/exec copies a Cmd's Stdout

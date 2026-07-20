@@ -434,11 +434,11 @@ func (h *BackendExecutionHandle) probeVersion(ctx context.Context) (string, bool
 	defer os.RemoveAll(scratch)
 	var cmd *exec.Cmd
 	if path, extra, ok := h.fdLaunchArgs(); ok {
-		cmd = exec.CommandContext(probeCtx, path, "--version")
+		cmd = exec.CommandContext(probeCtx, path, "--version") // govratchet:exec-allow(diagnostic_only)
 		cmd.Env = controllerenv.Base()
 		cmd.ExtraFiles = extra
 	} else {
-		cmd = exec.CommandContext(probeCtx, h.CanonicalPath, "--version")
+		cmd = exec.CommandContext(probeCtx, h.CanonicalPath, "--version") // govratchet:exec-allow(diagnostic_only)
 		cmd.Env = controllerenv.Base()
 	}
 	cmd.Dir = scratch
@@ -536,7 +536,7 @@ func LaunchCommand(ctx context.Context, handle *BackendExecutionHandle, bin stri
 		if scopeCmd != nil {
 			return scopeCmd(ctx, bin, args), nil
 		}
-		return exec.CommandContext(ctx, bin, args...), nil
+		return exec.CommandContext(ctx, bin, args...), nil // govratchet:exec-allow(production_launch_factory) -- no handle means no governed-run verification context (test/non-governed caller)
 	}
 	if err := handle.VerifyUnchanged(); err != nil {
 		return nil, err
@@ -549,7 +549,7 @@ func LaunchCommand(ctx context.Context, handle *BackendExecutionHandle, bin stri
 		return scopeCmd(ctx, sealed, args), nil
 	}
 	if path, extra, ok := handle.fdLaunchArgs(); ok {
-		cmd := exec.CommandContext(ctx, path, args...)
+		cmd := exec.CommandContext(ctx, path, args...) // govratchet:exec-allow(production_launch_factory) -- path is the verified fd pseudo-path, not an attacker-controlled pathname
 		cmd.ExtraFiles = extra
 		// argv[0] stays the configured bin name (cosmetic only -- execve
 		// resolves cmd.Path, the fd, regardless of argv[0]) so a backend
@@ -557,7 +557,7 @@ func LaunchCommand(ctx context.Context, handle *BackendExecutionHandle, bin stri
 		cmd.Args[0] = bin
 		return cmd, nil
 	}
-	return exec.CommandContext(ctx, bin, args...), nil
+	return exec.CommandContext(ctx, bin, args...), nil // govratchet:exec-allow(production_launch_factory) -- post-VerifyUnchanged fallback when fd-launch is unavailable
 }
 
 // LaunchStaged runs a governed backend command through internal/stage.

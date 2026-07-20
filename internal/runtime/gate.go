@@ -502,7 +502,7 @@ func PreflightSnapshotIfDelete(cmd string) {
 			return
 		}
 		if err := func() error {
-			cmd := exec.CommandContext(ctx, pythonIdentity.CanonicalPath, script, "snapshot", "pre-delete")
+			cmd := exec.CommandContext(ctx, pythonIdentity.CanonicalPath, script, "snapshot", "pre-delete") // govratchet:exec-allow(legacy_bridge)
 			cmd.Env = controllerenv.Base()
 			return cmd.Run()
 		}(); err != nil {

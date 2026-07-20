@@ -364,7 +364,7 @@ func runBehavioralProbes(ctx context.Context, agent agents.Agent, res agents.Res
 	if gitPath, gerr := gitplumb.TrustedGitPath(); gerr != nil {
 		out.notes = append(out.notes, "resolve trusted git for probe workspace: "+gerr.Error())
 	} else if err := func() error {
-		cmd := exec.CommandContext(ctx, gitPath, "init", "-q", workspace)
+		cmd := exec.CommandContext(ctx, gitPath, "init", "-q", workspace) // govratchet:exec-allow(diagnostic_only)
 		cmd.Env = controllerenv.Base()
 		return cmd.Run()
 	}(); err != nil {

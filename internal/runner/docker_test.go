@@ -273,16 +273,16 @@ func TestDockerRunArgsUsesResolvedImageID(t *testing.T) {
 func TestDockerRunArgsHardeningFlags(t *testing.T) {
 	isolateConfig(t, "")
 	d := &DockerRunner{Config: contracts.DockerRunnerConfig{
-		Image:                   "img@sha256:" + strings.Repeat("a", 64),
-		User:                    "65532:65532",
-		ReadOnlyRootfs:          true,
-		CapDropAll:              true,
-		NoNewPrivileges:         true,
-		SeccompProfile:          "/etc/docker/seccomp.json",
-		AppArmorProfile:         "governator",
-		Tmpfs:                   []string{"/tmp", "/run"},
-		Network:                 "allow",
-		DenyMetadataAndLocalNet: true,
+		Image:                     "img@sha256:" + strings.Repeat("a", 64),
+		User:                      "65532:65532",
+		ReadOnlyRootfs:            true,
+		CapDropAll:                true,
+		NoNewPrivileges:           true,
+		SeccompProfile:            "/etc/docker/seccomp.json",
+		AppArmorProfile:           "governator",
+		Tmpfs:                     []string{"/tmp", "/run"},
+		Network:                   "allow",
+		SinkholeMetadataHostnames: true,
 	}, ResolvedImage: fakeResolvedImage()}
 	args, err := d.runArgs(Workspace{Container: "c", Path: "/ws"}, "bin", nil)
 	if err != nil {

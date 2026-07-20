@@ -115,7 +115,7 @@ func checkGit() Check {
 		return check
 	}
 	path := identity.CanonicalPath
-	output, err := exec.Command(path, "--version").Output()
+	output, err := exec.Command(path, "--version").Output() // govratchet:exec-allow(diagnostic_only)
 	if err != nil {
 		check.Status, check.Detail = StatusFail, err.Error()
 		return check
@@ -125,7 +125,7 @@ func checkGit() Check {
 		check.Status, check.Detail = StatusFail, fmt.Sprintf("need git >=2.30; got %s", strings.TrimSpace(string(output)))
 		return check
 	}
-	help, _ := exec.Command(path, "worktree", "-h").CombinedOutput()
+	help, _ := exec.Command(path, "worktree", "-h").CombinedOutput() // govratchet:exec-allow(diagnostic_only)
 	if !bytes.Contains(help, []byte("git worktree")) || !bytes.Contains(help, []byte("add")) {
 		check.Status, check.Detail = StatusFail, "git worktree support was not detected"
 		return check
@@ -158,7 +158,7 @@ func checkTrustedTool(name string, required bool, versionArgs ...string) Check {
 		check.Status, check.Detail = status, "untrusted: "+err.Error()
 		return check
 	}
-	output, verr := exec.Command(identity.CanonicalPath, versionArgs...).CombinedOutput()
+	output, verr := exec.Command(identity.CanonicalPath, versionArgs...).CombinedOutput() // govratchet:exec-allow(diagnostic_only)
 	if verr != nil {
 		check.Status, check.Detail = StatusOK, fmt.Sprintf("trusted at %s but %s failed: %v", identity.CanonicalPath, strings.Join(versionArgs, " "), verr)
 		return check
@@ -210,7 +210,7 @@ func checkRTK() Check {
 		check.Status, check.Detail = StatusWarn, status.Bin+" not found in PATH; token optimization inactive"
 		return check
 	}
-	output, versionErr := exec.Command(status.Path, "--version").CombinedOutput()
+	output, versionErr := exec.Command(status.Path, "--version").CombinedOutput() // govratchet:exec-allow(diagnostic_only)
 	if versionErr != nil {
 		check.Status = StatusWarn
 		if check.Required {
@@ -426,8 +426,8 @@ func checkCodexFlags() Check {
 		check.Status, check.Detail = StatusWarn, "codex not found in PATH (adapter unavailable)"
 		return check
 	}
-	rootOutput, _ := exec.Command(path, "--help").CombinedOutput()
-	execOutput, _ := exec.Command(path, "exec", "--help").CombinedOutput()
+	rootOutput, _ := exec.Command(path, "--help").CombinedOutput()         // govratchet:exec-allow(diagnostic_only)
+	execOutput, _ := exec.Command(path, "exec", "--help").CombinedOutput() // govratchet:exec-allow(diagnostic_only)
 	var missing []string
 	if !bytes.Contains(rootOutput, []byte("--ask-for-approval")) {
 		missing = append(missing, "root:--ask-for-approval")
@@ -463,7 +463,7 @@ func checkBackendFlags(name, defaultBin string, helpArgs, requiredFlags []string
 		return check
 	}
 	args := backendHelpArgs(helpArgs)
-	output, _ := exec.Command(path, args...).CombinedOutput()
+	output, _ := exec.Command(path, args...).CombinedOutput() // govratchet:exec-allow(diagnostic_only)
 	body := string(output)
 	var missing []string
 	for _, flag := range requiredFlags {
