@@ -622,6 +622,7 @@ func shell(ctx context.Context, dir, command string) (int, string, error) {
 	if gerr != nil {
 		return -1, "", fmt.Errorf("seal trusted git: %w", gerr)
 	}
+	defer sealedGit.Close()
 	// Session 2 (post-v4 hardening plan item C) / Sol9 P0-6: bash itself is
 	// the controller tool actually running this command string (including
 	// every deterministic validator/formatter/linter a job contract
@@ -650,11 +651,18 @@ func shell(ctx context.Context, dir, command string) (int, string, error) {
 		return -1, "", err
 	}
 	frozen := controllerenv.Freeze()
-	pathValue := filepath.Dir(sealedGit)
+	pathValue := filepath.Dir(sealedGit.Path)
 	if basePath, ok := frozen.Lookup("PATH"); ok && basePath != "" {
 		pathValue += string(os.PathListSeparator) + basePath
 	}
 	cmd.Env = frozen.With(map[string]string{"PATH": pathValue}).Values
+	// Sol9 P1-4: re-verify the sealed git copy immediately before it can be
+	// found through PATH below -- a private read-only copy is not
+	// kernel-immutable, so this is the last point Governator can catch a
+	// same-UID tamper before launch.
+	if verr := sealedGit.Verify(); verr != nil {
+		return -1, "", fmt.Errorf("verify sealed git before launch: %w", verr)
+	}
 	var out []byte
 	if scope, ok := containment.ScopeFromContext(ctx); ok {
 		var buf strings.Builder
@@ -3564,6 +3572,22 @@ func (r *Runner) runOnce(ctx context.Context, c contracts.Contract) (RunRecord, 
 			sealed := successValidatorSealed[validatorIndex]
 			toolDirs = []string{sealed.Path}
 			sealedReadRoots = sealed.ReadRoots
+			// Sol9 P1-4: re-verify every sealed tool copy immediately
+			// before the validator process that will find them through
+			// PATH=sealed.Path starts -- a private read-only copy is not
+			// kernel-immutable, so this is the last point Governator can
+			// catch a same-UID tamper before launch.
+			verifyFailed := false
+			for _, cp := range sealed.Copies {
+				if verr := cp.Verify(); verr != nil {
+					violations = append(violations, "verify sealed validator tool before launch: "+verr.Error())
+					verifyFailed = true
+				}
+			}
+			if verifyFailed {
+				cancel()
+				break
+			}
 		}
 		var validatorSpec *contracts.ValidatorSpec
 		if validatorIndex < len(c.Success.ValidatorSpecs) {
@@ -3618,6 +3642,23 @@ func (r *Runner) runOnce(ctx context.Context, c contracts.Contract) (RunRecord, 
 				sealed := cleanupValidatorSealed[i]
 				toolDirs = []string{sealed.Path}
 				sealedReadRoots = sealed.ReadRoots
+				// Sol9 P1-4: same immediately-before-launch re-verification
+				// as the success loop above. Unconditional regardless of
+				// c.Cleanup.Required, matching the extinction-failure
+				// posture below -- a same-UID tamper of a sealed tool is a
+				// security event, never merely "the lint pass had a bad
+				// day."
+				verifyFailed := false
+				for _, cp := range sealed.Copies {
+					if verr := cp.Verify(); verr != nil {
+						violations = append(violations, "verify sealed cleanup validator tool before launch: "+verr.Error())
+						verifyFailed = true
+					}
+				}
+				if verifyFailed {
+					cancel()
+					break
+				}
 			}
 			var validatorSpec *contracts.ValidatorSpec
 			if i < len(c.Cleanup.ValidatorSpecs) {

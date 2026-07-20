@@ -16,6 +16,7 @@ import (
 // for the cross-repo Assayer attacks (13/14/16 in assayer_test.go).
 const runtimePackageDir = "../runtime"
 const observabilityPackageDir = "../observability"
+const pathsafePackageDir = "../pathsafe"
 
 func assertRuntimeTestFileContains(t *testing.T, relPath string, markers ...string) {
 	t.Helper()
@@ -25,6 +26,11 @@ func assertRuntimeTestFileContains(t *testing.T, relPath string, markers ...stri
 func assertObservabilityTestFileContains(t *testing.T, relPath string, markers ...string) {
 	t.Helper()
 	assertPackageFileContains(t, observabilityPackageDir, relPath, markers...)
+}
+
+func assertPathsafeTestFileContains(t *testing.T, relPath string, markers ...string) {
+	t.Helper()
+	assertPackageFileContains(t, pathsafePackageDir, relPath, markers...)
 }
 
 func assertPackageFileContains(t *testing.T, packageDir, relPath string, markers ...string) {

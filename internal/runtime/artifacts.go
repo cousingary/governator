@@ -17,6 +17,7 @@ import (
 
 	"github.com/cousingary/governator/internal/contracts"
 	"github.com/cousingary/governator/internal/observability"
+	"github.com/cousingary/governator/internal/pathsafe"
 )
 
 type stagedArtifact struct {
@@ -240,7 +241,7 @@ func safeWorkspaceRel(raw string) (string, error) {
 // separate "check" step for a race to land between.
 
 func readRegularBeneath(baseDir, relPath string) ([]byte, os.FileInfo, error) {
-	f, err := openBeneath(baseDir, relPath, os.O_RDONLY, 0)
+	f, err := pathsafe.OpenBeneath(baseDir, relPath, os.O_RDONLY, 0)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -260,7 +261,7 @@ func readRegularBeneath(baseDir, relPath string) ([]byte, os.FileInfo, error) {
 }
 
 func writeNewBeneath(baseDir, relPath string, data []byte, perm os.FileMode) error {
-	f, err := openBeneath(baseDir, relPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, perm)
+	f, err := pathsafe.OpenBeneath(baseDir, relPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, perm)
 	if err != nil {
 		return err
 	}
@@ -298,7 +299,7 @@ func writeOverwriteBeneath(baseDir, relPath string, data []byte, perm os.FileMod
 	} else if !os.IsNotExist(err) {
 		return err
 	}
-	f, err := openBeneath(baseDir, relPath, flags, openMode)
+	f, err := pathsafe.OpenBeneath(baseDir, relPath, flags, openMode)
 	if err != nil {
 		return err
 	}

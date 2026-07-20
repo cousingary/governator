@@ -401,6 +401,11 @@ type sealedValidatorTools struct {
 	Path       string
 	ReadRoots  []string
 	Identities []resolvedValidatorTool
+	// Copies is every per-tool SealedCopy this directory was populated
+	// with (Sol9 P1-4). The caller MUST call Verify on each immediately
+	// before the validator process that will find them through PATH=Path
+	// starts, and Close once that process has finished.
+	Copies []*toolregistry.SealedCopy
 }
 
 // sealedToolsForSpec materializes one private executable directory for a
@@ -426,8 +431,12 @@ func sealedToolsForSpec(spec contracts.ValidatorSpec, stage string, idx int, reg
 		return nil, fmt.Errorf("create sealed validator tool dir: %w", err)
 	}
 	constructed := false
+	var copies []*toolregistry.SealedCopy
 	defer func() {
 		if !constructed {
+			for _, cp := range copies {
+				_ = cp.Close()
+			}
 			_ = os.RemoveAll(dir)
 		}
 	}()
@@ -441,14 +450,19 @@ func sealedToolsForSpec(spec contracts.ValidatorSpec, stage string, idx int, reg
 		}
 		// SealedExecutablePathIn copies the verified-bytes fd's contents
 		// into the shared dir; once it returns, the handle's own fd is
-		// no longer needed and we can close it. The sealed copy stands
+		// no longer needed and we can close it. The private copy stands
 		// alone -- bash finds the tool by name through PATH=dir, never
 		// via /proc/self/fd/<n>, so the handle's fd is not part of the
-		// validator's launch chain.
-		if _, err := handle.SealedExecutablePathIn(dir); err != nil {
+		// validator's launch chain. The returned SealedCopy (Sol9 P1-4)
+		// is kept so its Verify can be called immediately before the
+		// validator process starts, catching a same-UID tamper of the
+		// published copy between now and then.
+		sealedCopy, err := handle.SealedExecutablePathIn(dir)
+		if err != nil {
 			_ = handle.Close()
 			return nil, fmt.Errorf("seal %s validator tool %q: %w", stage, name, err)
 		}
+		copies = append(copies, sealedCopy)
 		base := filepath.Base(handle.Identity.CanonicalPath)
 		if seen[base] {
 			_ = handle.Close()
@@ -476,7 +490,7 @@ func sealedToolsForSpec(spec contracts.ValidatorSpec, stage string, idx int, reg
 		return nil, fmt.Errorf("chmod sealed validator tool dir: %w", err)
 	}
 	constructed = true
-	return &sealedValidatorTools{Path: dir, ReadRoots: readRoots, Identities: identities}, nil
+	return &sealedValidatorTools{Path: dir, ReadRoots: readRoots, Identities: identities, Copies: copies}, nil
 }
 
 // sealedValidatorToolsets materializes one private executable directory
@@ -494,7 +508,11 @@ func sealedToolsForSpec(spec contracts.ValidatorSpec, stage string, idx int, reg
 // needed, exactly as P0-5 requires.
 func sealedValidatorToolsets(c contracts.Contract, registry *toolregistry.Registry) (success, cleanup []*sealedValidatorTools, remove func(), err error) {
 	var dirs []string
+	var copies []*toolregistry.SealedCopy
 	remove = func() {
+		for _, cp := range copies {
+			_ = cp.Close()
+		}
 		for _, d := range dirs {
 			_ = os.RemoveAll(d)
 		}
@@ -515,6 +533,7 @@ func sealedValidatorToolsets(c contracts.Contract, registry *toolregistry.Regist
 			success[i] = st
 			if st != nil {
 				dirs = append(dirs, st.Path)
+				copies = append(copies, st.Copies...)
 			}
 		}
 	}
@@ -529,6 +548,7 @@ func sealedValidatorToolsets(c contracts.Contract, registry *toolregistry.Regist
 			cleanup[i] = st
 			if st != nil {
 				dirs = append(dirs, st.Path)
+				copies = append(copies, st.Copies...)
 			}
 		}
 	}

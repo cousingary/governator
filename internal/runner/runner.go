@@ -159,6 +159,7 @@ func shell(ctx context.Context, dir, command string, environments ...controllere
 	if gerr != nil {
 		return -1, "", fmt.Errorf("seal trusted git: %w", gerr)
 	}
+	defer sealedGit.Close()
 	// Session 2 (post-v4 hardening plan item C) / Sol9 P0-6: bash itself is
 	// the controller tool actually running this command string (including
 	// every deterministic validator/formatter/linter a job contract
@@ -182,11 +183,18 @@ func shell(ctx context.Context, dir, command string, environments ...controllere
 	if err != nil {
 		return -1, "", err
 	}
-	pathValue := filepath.Dir(sealedGit)
+	pathValue := filepath.Dir(sealedGit.Path)
 	if basePath, ok := frozen.Lookup("PATH"); ok && basePath != "" {
 		pathValue += string(os.PathListSeparator) + basePath
 	}
 	cmd.Env = frozen.With(map[string]string{"PATH": pathValue}).Values
+	// Sol9 P1-4: re-verify the sealed git copy immediately before it can be
+	// found through PATH below -- a private read-only copy is not
+	// kernel-immutable, so this is the last point Governator can catch a
+	// same-UID tamper before launch.
+	if verr := sealedGit.Verify(); verr != nil {
+		return -1, "", fmt.Errorf("verify sealed git before launch: %w", verr)
+	}
 	out, err := cmd.CombinedOutput()
 	if ctx.Err() != nil && cmd.Process != nil {
 		_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)

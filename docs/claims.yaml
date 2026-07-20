@@ -677,8 +677,8 @@ claims:
     implementation:
       - file: internal/runtime/artifacts.go
         symbols: [collectProducedArtifacts, readRegularBeneath, writeNewBeneath, writeOverwriteBeneath]
-      - file: internal/runtime/openbeneath.go
-        symbols: [openBeneath]
+      - file: internal/pathsafe/openbeneath.go
+        symbols: [OpenBeneath]
       - file: internal/containment/containment.go
         symbols: [LocalEffectfulTieringEnforced, Effectful, RequiresHostContainment, EnforcePolicy]
     tests:
@@ -995,8 +995,8 @@ claims:
         symbols: [loadPolicyBundle, evaluatePolicyGate]
       - file: internal/observability/policy_checkpoints.go
         symbols: [ConsumePolicyOverrideReservations]
-      - file: internal/runtime/openbeneath.go
-        symbols: [openBeneath]
+      - file: internal/pathsafe/openbeneath.go
+        symbols: [OpenBeneath]
       - file: internal/runtime/artifacts.go
         symbols: [readRegularBeneath, writeNewBeneath, writeOverwriteBeneath]
       - file: internal/spend/reservation.go

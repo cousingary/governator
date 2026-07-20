@@ -12,6 +12,8 @@ import (
 
 	"github.com/landlock-lsm/go-landlock/landlock"
 	llsyscall "github.com/landlock-lsm/go-landlock/landlock/syscall"
+
+	"github.com/cousingary/governator/internal/pathsafe"
 )
 
 // RequiredLandlockABI is the minimum ABI that enforces the complete filesystem
@@ -187,49 +189,97 @@ func elfRuntimeFiles(path string) ([]string, error) {
 	return out, nil
 }
 
+// resolveRealDir opens path as a directory with O_DIRECTORY|O_NOFOLLOW (so
+// a symlinked final component is refused outright) and returns the
+// kernel-resolved real path via /proc/self/fd, plus the held descriptor.
+// The caller owns closing the descriptor. This is Sol9 P1-3 step 1
+// ("resolve the real workspace"): the returned path is guaranteed free of
+// symlink components at the instant it was resolved, and the returned
+// descriptor lets subsequent lookups beneath it (pathsafe.OpenBeneathFd)
+// reuse the same already-verified directory instead of reopening a pathname
+// string that could have been swapped in the meantime.
+func resolveRealDir(path string) (*os.File, string, error) {
+	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_DIRECTORY|syscall.O_NOFOLLOW|syscall.O_CLOEXEC, 0)
+	if err != nil {
+		return nil, "", fmt.Errorf("open %q: %w", path, err)
+	}
+	real, err := pathsafe.RealPath(f)
+	if err != nil {
+		_ = f.Close()
+		return nil, "", err
+	}
+	return f, real, nil
+}
+
 // writeCarveOuts resolves the declared extra write-dir/write-file paths
 // (Sol v7 S9: read-only-mode jobs still need to land Produces artifacts and
 // RESULT.json) into RWDirs/RWFiles rules, refusing anything that would
 // escape the workspace it's meant to carve an exception into -- a caller
 // error here must never silently grant write access outside the workspace,
 // which would defeat the whole point of an otherwise read-only Plan.
-func writeCarveOuts(workspace string, writeDirs, writeFiles []string) ([]landlock.Rule, error) {
+//
+// Sol9 P1-3: the prior implementation validated lexical containment
+// (filepath.Abs/Rel) and then inspected the declared path with os.Stat,
+// which follows symlinks. A declared path lexically inside the workspace
+// could be -- or gain a parent that becomes -- a symlink resolving outside
+// the workspace, passing the lexical check while escaping in practice.
+// Every write root is now resolved beneath the held workspace descriptor
+// via pathsafe.OpenBeneathFd (openat2 RESOLVE_BENEATH|RESOLVE_NO_SYMLINKS|
+// RESOLVE_NO_MAGICLINKS), which validates every path component -- not just
+// the final one -- as one atomic kernel operation and refuses any symlink
+// anywhere in it. The Landlock rule is built from the kernel-resolved real
+// path that open call actually produced, never the caller-declared string.
+func writeCarveOuts(workspaceFile *os.File, realWorkspace string, writeDirs, writeFiles []string) ([]landlock.Rule, error) {
 	var rules []landlock.Rule
-	within := func(kind, path string) error {
-		if workspace == "" {
-			return fmt.Errorf("%s %q declared with no workspace to scope it to", kind, path)
-		}
-		absWorkspace, err := filepath.Abs(workspace)
+	if len(writeDirs) == 0 && len(writeFiles) == 0 {
+		return rules, nil
+	}
+	if workspaceFile == nil || realWorkspace == "" {
+		return nil, fmt.Errorf("write-dir/write-file declared with no workspace to scope it to")
+	}
+	resolve := func(kind, declared string, wantDir bool) (string, error) {
+		absPath, err := filepath.Abs(declared)
 		if err != nil {
-			return err
+			return "", fmt.Errorf("resolve %s %q: %w", kind, declared, err)
 		}
-		absPath, err := filepath.Abs(path)
-		if err != nil {
-			return fmt.Errorf("resolve %s %q: %w", kind, path, err)
-		}
-		rel, err := filepath.Rel(absWorkspace, absPath)
+		rel, err := filepath.Rel(realWorkspace, absPath)
 		if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
-			return fmt.Errorf("%s %q escapes workspace %q", kind, path, absWorkspace)
+			return "", fmt.Errorf("%s %q escapes workspace %q", kind, declared, realWorkspace)
 		}
-		return nil
+		f, err := pathsafe.OpenBeneathFd(workspaceFile, filepath.ToSlash(rel), os.O_RDONLY, 0)
+		if err != nil {
+			return "", fmt.Errorf("%s %q must exist beneath workspace %q with no symlink components (pre-create it before launch): %w", kind, declared, realWorkspace, err)
+		}
+		defer f.Close()
+		info, err := f.Stat()
+		if err != nil {
+			return "", fmt.Errorf("stat resolved %s %q: %w", kind, declared, err)
+		}
+		if wantDir && !info.IsDir() {
+			return "", fmt.Errorf("%s %q must already exist as a directory (pre-create it before launch)", kind, declared)
+		}
+		if !wantDir && (info.IsDir() || !info.Mode().IsRegular()) {
+			return "", fmt.Errorf("%s %q must already exist as a regular file (pre-create it before launch)", kind, declared)
+		}
+		real, err := pathsafe.RealPath(f)
+		if err != nil {
+			return "", fmt.Errorf("resolve real path of %s %q: %w", kind, declared, err)
+		}
+		return real, nil
 	}
 	for _, dir := range writeDirs {
-		if err := within("write-dir", dir); err != nil {
+		real, err := resolve("write-dir", dir, true)
+		if err != nil {
 			return nil, err
 		}
-		if info, err := os.Stat(dir); err != nil || !info.IsDir() {
-			return nil, fmt.Errorf("write-dir %q must already exist as a directory (pre-create it before launch): %v", dir, err)
-		}
-		rules = append(rules, landlock.RWDirs(dir))
+		rules = append(rules, landlock.RWDirs(real))
 	}
 	for _, file := range writeFiles {
-		if err := within("write-file", file); err != nil {
+		real, err := resolve("write-file", file, false)
+		if err != nil {
 			return nil, err
 		}
-		if info, err := os.Stat(file); err != nil || info.IsDir() {
-			return nil, fmt.Errorf("write-file %q must already exist as a regular file (pre-create it before launch): %v", file, err)
-		}
-		rules = append(rules, landlock.RWFiles(file))
+		rules = append(rules, landlock.RWFiles(real))
 	}
 	return rules, nil
 }
@@ -269,15 +319,29 @@ func applyLandlockRuleset(workspace string, readOnly bool, execPath string, decl
 	// additional writable/readable root beyond the declared closure above,"
 	// not "grant rights to the empty path" (RunSandboxExec's own flag check
 	// enforces the analogous non-readOnly requirement below).
+	//
+	// The workspace is resolved through a held O_DIRECTORY|O_NOFOLLOW
+	// descriptor exactly once (Sol9 P1-3) and the resulting kernel-resolved
+	// real path/descriptor pair is what both the workspace rule itself and
+	// every write carve-out below are built from -- never the caller-passed
+	// pathname string a second time.
+	var workspaceFile *os.File
+	realWorkspace := ""
 	if workspace != "" {
+		var err error
+		workspaceFile, realWorkspace, err = resolveRealDir(workspace)
+		if err != nil {
+			return fmt.Errorf("resolve workspace %q: %w", workspace, err)
+		}
+		defer workspaceFile.Close()
 		if readOnly {
-			rules = append(rules, landlock.RODirs(workspace))
+			rules = append(rules, landlock.RODirs(realWorkspace))
 		} else {
-			rules = append(rules, landlock.RWDirs(workspace))
+			rules = append(rules, landlock.RWDirs(realWorkspace))
 		}
 	}
 	if len(writeDirs) > 0 || len(writeFiles) > 0 {
-		carveOuts, err := writeCarveOuts(workspace, writeDirs, writeFiles)
+		carveOuts, err := writeCarveOuts(workspaceFile, realWorkspace, writeDirs, writeFiles)
 		if err != nil {
 			return err
 		}

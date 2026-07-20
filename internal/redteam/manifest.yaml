@@ -501,3 +501,33 @@ cases:
     session: rc3-s6
     required: true
     status: implemented
+  - case: 90
+    name: TestV9Case33WriteRootSymlinkOutsideWorkspaceRefused
+    session: rc3-s7
+    required: true
+    status: implemented
+  - case: 91
+    name: TestV9Case34ParentDirectoryBecomesSymlinkRefused
+    session: rc3-s7
+    required: true
+    status: implemented
+  - case: 92
+    name: TestV9Case35WorkspaceReachedViaSymlinkRefused
+    session: rc3-s7
+    required: true
+    status: implemented
+  - case: 93
+    name: TestV9Case36PathExchangedAfterEarlierValidationRefused
+    session: rc3-s7
+    required: true
+    status: implemented
+  - case: 94
+    name: TestV9Case37WriteFileTargetReplacedByDirectoryOrSymlinkRefused
+    session: rc3-s7
+    required: true
+    status: implemented
+  - case: 95
+    name: TestV9Case6SameUIDMutationOfSealedToolCopyDetectedOrIneffective
+    session: rc3-s7
+    required: true
+    status: implemented

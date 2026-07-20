@@ -4,6 +4,8 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/cousingary/governator/internal/pathsafe"
 )
 
 // TestOpenBeneathRefusesParentComponentSymlink is Sol P1-7's regression test
@@ -26,10 +28,10 @@ func TestOpenBeneathRefusesParentComponentSymlink(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	f, err := openBeneath(base, "staged/escaped.txt", os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
+	f, err := pathsafe.OpenBeneath(base, "staged/escaped.txt", os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
 	if err == nil {
 		f.Close()
-		t.Fatal("expected openBeneath to refuse a path through a symlinked parent component")
+		t.Fatal("expected OpenBeneath to refuse a path through a symlinked parent component")
 	}
 
 	if _, statErr := os.Stat(filepath.Join(escapeTarget, "escaped.txt")); !os.IsNotExist(statErr) {
