@@ -128,6 +128,14 @@ CLAIMS_HASH=$(sha256sum docs/claims.yaml | awk '{print $1}')
 ADAPTER_PROTOCOL_VERSION=${ADAPTER_PROTOCOL_VERSION:-adapter-protocol-v1}
 GO_VERSION=$(go version | awk '{print $3}')
 FUZZ_SECONDS=${FUZZ_SECONDS:-15}
+# Attempt 1/2 of the rc3 cut (2026-07-20) both failed on host contention, not
+# code defects: with Docker fully quiet, the default go test concurrency
+# (package-level -p and within-package -parallel both default to GOMAXPROCS,
+# 8 on this host) still pushed SQLite writers and timing-budget tests past
+# their margins (SQLITE_BUSY, wall-clock budget tests missing their window by
+# 4x). Capping both knobs trades wall-clock time for headroom; tune via env
+# if a future host has more room.
+GO_TEST_PARALLELISM=${GO_TEST_PARALLELISM:-2}
 # Sol3 P1.8 (S12) confirmed session's own machine can build all four
 # platforms with CGO_ENABLED=0 (modernc.org/sqlite is pure Go, no cgo
 # toolchain needed for cross-compilation).
@@ -194,16 +202,16 @@ run_tier() {
 GO_SUM_HASH=$(sha256sum go.sum | awk '{print $1}')
 
 UNIT_LOG="$OUT_DIR/test-unit.log"
-run_tier unit "$UNIT_LOG" UNIT_RESULT UNIT_SECONDS UNIT_STARTED UNIT_ENDED UNIT_LOG_SHA go test -count=1 ./...
+run_tier unit "$UNIT_LOG" UNIT_RESULT UNIT_SECONDS UNIT_STARTED UNIT_ENDED UNIT_LOG_SHA go test -p "$GO_TEST_PARALLELISM" -parallel "$GO_TEST_PARALLELISM" -count=1 ./...
 
 RACE_LOG="$OUT_DIR/test-race.log"
-run_tier race "$RACE_LOG" RACE_RESULT RACE_SECONDS RACE_STARTED RACE_ENDED RACE_LOG_SHA go test -race -timeout=30m -count=1 ./...
+run_tier race "$RACE_LOG" RACE_RESULT RACE_SECONDS RACE_STARTED RACE_ENDED RACE_LOG_SHA go test -race -timeout=30m -p "$GO_TEST_PARALLELISM" -parallel "$GO_TEST_PARALLELISM" -count=1 ./...
 
 INTEGRATION_LOG="$OUT_DIR/test-integration.log"
-run_tier integration "$INTEGRATION_LOG" INTEGRATION_RESULT INTEGRATION_SECONDS INTEGRATION_STARTED INTEGRATION_ENDED INTEGRATION_LOG_SHA go test -tags integration -count=1 ./internal/assay/...
+run_tier integration "$INTEGRATION_LOG" INTEGRATION_RESULT INTEGRATION_SECONDS INTEGRATION_STARTED INTEGRATION_ENDED INTEGRATION_LOG_SHA go test -tags integration -p "$GO_TEST_PARALLELISM" -parallel "$GO_TEST_PARALLELISM" -count=1 ./internal/assay/...
 
 CORPUS_LOG="$OUT_DIR/test-corpus.log"
-run_tier black_box_corpus "$CORPUS_LOG" CORPUS_RESULT CORPUS_SECONDS CORPUS_STARTED CORPUS_ENDED CORPUS_LOG_SHA go test -run 'Sol3' -v -count=1 ./...
+run_tier black_box_corpus "$CORPUS_LOG" CORPUS_RESULT CORPUS_SECONDS CORPUS_STARTED CORPUS_ENDED CORPUS_LOG_SHA go test -run 'Sol3' -v -p "$GO_TEST_PARALLELISM" -parallel "$GO_TEST_PARALLELISM" -count=1 ./...
 CORPUS_TESTS_RUN=$(grep -c '^--- PASS\|^--- FAIL' "$CORPUS_LOG" || true)
 CORPUS_TESTS_FAILED=$(grep -c '^--- FAIL' "$CORPUS_LOG" || true)
 
@@ -218,10 +226,10 @@ CORPUS_TESTS_FAILED=$(grep -c '^--- FAIL' "$CORPUS_LOG" || true)
 # fields (discovered/run/skipped/failed counts as first-class release
 # evidence, and rejection of any *unexpected* skip) land in S8, not here.
 REDTEAM_LOG="$OUT_DIR/test-redteam.log"
-run_tier redteam "$REDTEAM_LOG" REDTEAM_RESULT REDTEAM_SECONDS REDTEAM_STARTED REDTEAM_ENDED REDTEAM_LOG_SHA go test -v -timeout=30m -tags redteam -count=1 ./...
+run_tier redteam "$REDTEAM_LOG" REDTEAM_RESULT REDTEAM_SECONDS REDTEAM_STARTED REDTEAM_ENDED REDTEAM_LOG_SHA go test -v -timeout=30m -tags redteam -p "$GO_TEST_PARALLELISM" -parallel "$GO_TEST_PARALLELISM" -count=1 ./...
 
 REDTEAM_RACE_LOG="$OUT_DIR/test-redteam-race.log"
-run_tier redteam_race "$REDTEAM_RACE_LOG" REDTEAM_RACE_RESULT REDTEAM_RACE_SECONDS REDTEAM_RACE_STARTED REDTEAM_RACE_ENDED REDTEAM_RACE_LOG_SHA go test -v -race -timeout=30m -tags redteam -count=1 ./...
+run_tier redteam_race "$REDTEAM_RACE_LOG" REDTEAM_RACE_RESULT REDTEAM_RACE_SECONDS REDTEAM_RACE_STARTED REDTEAM_RACE_ENDED REDTEAM_RACE_LOG_SHA go test -v -race -timeout=30m -tags redteam -p "$GO_TEST_PARALLELISM" -parallel "$GO_TEST_PARALLELISM" -count=1 ./...
 
 # Sol redteam v7 S7 (HS4): the old count-based gate (MIN_REDTEAM_TESTS /
 # EXPECTED_REDTEAM_SKIPS) validated skip *count*, not the exact identity or
@@ -582,7 +590,7 @@ python3 - "$TEST_SUMMARY" "$COMMIT" "$GO_VERSION" "$BUILD_TS" "$GO_SUM_HASH" \
   "$REDTEAM_RESULT" "$REDTEAM_SECONDS" "$REDTEAM_STARTED" "$REDTEAM_ENDED" "$REDTEAM_LOG_SHA" \
   "$REDTEAM_TESTS_DISCOVERED" "$REDTEAM_TESTS_RUN" "$REDTEAM_TESTS_SKIPPED" "$REDTEAM_TESTS_FAILED" "$REDTEAM_GATE_OK" "$REDTEAM_GATE_JSON" "$REDTEAM_MANIFEST" \
   "$REDTEAM_RACE_RESULT" "$REDTEAM_RACE_SECONDS" "$REDTEAM_RACE_STARTED" "$REDTEAM_RACE_ENDED" "$REDTEAM_RACE_LOG_SHA" \
-  "$FUZZ_RESULTS_JSON" "$ASSAYER_RESULT" "$ASSAYER_SUMMARY" "$ASSAYER_MATRIX_JSON" "$ASSAYER_VERSION_TAG_RESULT" "$ASSAYER_VERSION_TAG_SUMMARY" <<'PYTESTSUMMARY'
+  "$FUZZ_RESULTS_JSON" "$ASSAYER_RESULT" "$ASSAYER_SUMMARY" "$ASSAYER_MATRIX_JSON" "$ASSAYER_VERSION_TAG_RESULT" "$ASSAYER_VERSION_TAG_SUMMARY" "$GO_TEST_PARALLELISM" <<'PYTESTSUMMARY'
 import json, pathlib, sys
 
 (summary_path, commit, go_version, build_ts, go_sum_sha256,
@@ -594,7 +602,9 @@ import json, pathlib, sys
  redteam_tests_discovered, redteam_tests_run, redteam_tests_skipped, redteam_tests_failed, redteam_gate_ok, redteam_gate_json_path, redteam_manifest_path,
  redteam_race_result, redteam_race_seconds, redteam_race_started, redteam_race_ended, redteam_race_log_sha,
  fuzz_results_path, assayer_result, assayer_summary, assayer_matrix_path,
- assayer_version_tag_result, assayer_version_tag_summary) = sys.argv[1:]
+ assayer_version_tag_result, assayer_version_tag_summary, go_test_parallelism) = sys.argv[1:]
+
+par = f"-p {go_test_parallelism} -parallel {go_test_parallelism}"
 
 redteam_gate = json.loads(pathlib.Path(redteam_gate_json_path).read_text())
 
@@ -614,11 +624,11 @@ data = {
         "python": __import__("sys").version.split()[0],
     },
     "suites": {
-        "unit": {"command": "go test -count=1 ./...", "result": unit_result, "duration_seconds": int(unit_seconds), "started_at": unit_started, "ended_at": unit_ended, "log_sha256": unit_log_sha},
-        "race": {"command": "go test -race -count=1 ./...", "result": race_result, "duration_seconds": int(race_seconds), "started_at": race_started, "ended_at": race_ended, "log_sha256": race_log_sha},
-        "integration": {"command": "go test -tags integration -count=1 ./internal/assay/...", "result": integration_result, "duration_seconds": int(integration_seconds), "started_at": integration_started, "ended_at": integration_ended, "log_sha256": integration_log_sha},
+        "unit": {"command": f"go test {par} -count=1 ./...", "result": unit_result, "duration_seconds": int(unit_seconds), "started_at": unit_started, "ended_at": unit_ended, "log_sha256": unit_log_sha},
+        "race": {"command": f"go test -race {par} -count=1 ./...", "result": race_result, "duration_seconds": int(race_seconds), "started_at": race_started, "ended_at": race_ended, "log_sha256": race_log_sha},
+        "integration": {"command": f"go test -tags integration {par} -count=1 ./internal/assay/...", "result": integration_result, "duration_seconds": int(integration_seconds), "started_at": integration_started, "ended_at": integration_ended, "log_sha256": integration_log_sha},
         "black_box_corpus": {
-            "command": "go test -run Sol3 -v -count=1 ./...",
+            "command": f"go test -run Sol3 -v {par} -count=1 ./...",
             "result": corpus_result,
             "duration_seconds": int(corpus_seconds),
             "started_at": corpus_started,
@@ -628,7 +638,7 @@ data = {
             "tests_failed": int(corpus_tests_failed),
         },
         "redteam": {
-            "command": "go test -v -tags redteam -count=1 ./...",
+            "command": f"go test -v -tags redteam {par} -count=1 ./...",
             "result": redteam_result,
             "source_commit": commit,
             "duration_seconds": int(redteam_seconds),
@@ -648,7 +658,7 @@ data = {
             "identity_gate": {**redteam_gate, "ok": redteam_gate_ok == "true"},
         },
         "redteam_race": {
-            "command": "go test -v -race -tags redteam -count=1 ./...",
+            "command": f"go test -v -race -tags redteam {par} -count=1 ./...",
             "result": redteam_race_result,
             "duration_seconds": int(redteam_race_seconds),
             "started_at": redteam_race_started,
