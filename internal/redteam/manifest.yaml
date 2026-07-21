@@ -669,3 +669,13 @@ cases:
     session: rc4-s3
     required: true
     status: implemented
+  - case: 122
+    name: TestV10Case21SameUIDChmodAndInPlaceOverwriteOfChecksPyDetectedBeforeVerdict
+    session: rc4-s4
+    required: true
+    status: implemented
+  - case: 123
+    name: TestV10Case22SameUIDRenameOverReplacementOfCliPyDetectedBeforeVerdict
+    session: rc4-s4
+    required: true
+    status: implemented

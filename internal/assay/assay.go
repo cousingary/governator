@@ -226,6 +226,16 @@ func Evaluate(ctx context.Context, cfg Config, req Request, artifactPath string,
 	if snap == nil {
 		return errorVerdict("assay: no execution snapshot provided (internal error: BuildSnapshot must run once per transaction before Evaluate)")
 	}
+	// Sol10 P0-4: snap.Dir is a private read-only COPY, never a kernel-
+	// immutable one (see Snapshot's doc comment) -- a same-UID process
+	// elsewhere on the host can chmod it back open and replace a file at any
+	// point since BuildSnapshot ran. Verify immediately before launch is the
+	// last point this side can catch that before importing the tampered
+	// bytes; skipping it would attribute whatever Python actually imports to
+	// the pre-tamper TreeHash already in replay identity.
+	if verr := snap.Verify(); verr != nil {
+		return errorVerdict(fmt.Sprintf("assay: %s", verr))
+	}
 	pythonIdentity := snap.Python.Identity
 
 	// Sol redteam v7 S1 / v8 S2: this subprocess declares authority and lets
@@ -282,6 +292,17 @@ func Evaluate(ctx context.Context, cfg Config, req Request, artifactPath string,
 	}
 	if stageRes.ExitStatus != 0 {
 		return errorVerdict(fmt.Sprintf("assay: subprocess exit: exit status %d; stderr: %s", stageRes.ExitStatus, strings.TrimSpace(stderr.String())))
+	}
+
+	// Sol10 P0-4: re-verify immediately after evaluation, before trusting
+	// anything the subprocess printed -- a same-UID mutation that lands
+	// during the launch (Landlock's read-only ruleset binds the launched
+	// python process itself, never a separate process on the host) must
+	// still invalidate the verdict it produced, exactly like the artifact
+	// sha256 post-check below catches a TOCTOU mutation of the artifact
+	// itself.
+	if verr := snap.Verify(); verr != nil {
+		return errorVerdict(fmt.Sprintf("assay: %s", verr))
 	}
 
 	var v Verdict
