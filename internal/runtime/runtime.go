@@ -3064,7 +3064,7 @@ func (r *Runner) runOnce(ctx context.Context, c contracts.Contract) (RunRecord, 
 		assayerParticipantHash = identity.AssayerEnvironmentHash
 	}
 	identity.Participants = resolvedParticipants(env.ToolRegistry, backendToolIdentity, graphStatus, env.Controller.Hash, validatorToolsetHash, assayerParticipantHash)
-	for role, part := range resolvedAssayerParticipants(cfg.Assay, env.Controller.Hash) {
+	for role, part := range resolvedAssayerParticipants(cfg.Assay, env.Controller.Hash, assaySnapshot) {
 		identity.Participants[role] = part
 	}
 	if dockerImage != nil {

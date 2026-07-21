@@ -28,6 +28,57 @@ import (
 // token.
 const AssayerSnapshotMutated = "ASSAYER_SNAPSHOT_MUTATED"
 
+// SnapshotProtocolVersion identifies the shape of SnapshotIdentity below --
+// bump only when that field set changes, mirroring
+// ArtifactProtocolVersion/BridgePolicyVersion's existing versioning
+// convention elsewhere in this package.
+const SnapshotProtocolVersion = "gov-assay-snapshot-identity-v1"
+
+// SnapshotIdentity is Sol10 P0-6's fix: the ONE and ONLY source of Assayer
+// transaction identity. Every field here is resolved once, inside
+// BuildSnapshot, from data already gathered while building this same
+// Snapshot -- never re-read from cfg.Repo, never re-resolved against the
+// trusted-tool registry, afterward. Before this type existed,
+// internal/runtime's resolvedAssayerEnvironmentHash/resolvedAssayerParticipants
+// combined a caller's frozen *Snapshot with several LIVE reads performed
+// after that Snapshot was already built (a live repo tree walk, a freshly
+// resolved python3, assay.DescribeEnvironment) -- so the ledgered identity
+// described a hybrid of the snapshot actually executed plus whatever the
+// live checkout/registry happened to be at the moment identity was
+// computed, not the identity of any single executable transaction. A
+// caller that wants Assayer transaction identity now reads this struct and
+// nothing else.
+type SnapshotIdentity struct {
+	// PackageHash is TreeHash: a sha256 over exactly the file set copied
+	// into Dir (path+content), sorted by path.
+	PackageHash string
+	// PythonIdentity is the verified python3 handle's registry identity,
+	// captured once at resolve time -- never re-resolved.
+	PythonIdentity toolregistry.Identity
+	// RuntimeHash/DependencyHash/LockHash are
+	// Runtime.RuntimeHash/DependencyHash/LockHash -- see RuntimeManifest's
+	// doc comment. LockHash is the declared dependency lock's own hash
+	// (requirements-lock.txt), distinct from DependencyHash (the *installed*
+	// bytes): binding it here means a lockfile edit with no corresponding
+	// change to what's actually installed still mints a different identity.
+	RuntimeHash    string
+	DependencyHash string
+	LockHash       string
+	// ProfileHash is assayer/profiles.py's content hash at copy time, taken
+	// directly from the bytes actually copied into Dir -- never a separate
+	// live read of cfg.Repo.
+	ProfileHash string
+	// ProtocolVersion is SnapshotProtocolVersion at build time.
+	ProtocolVersion string
+	// GitCommit is cfg.Repo's commit (or PINNED_COMMIT fixture marker),
+	// resolved once here, at snapshot-build time -- a later live
+	// git-rev-parse against the (possibly since-changed) checkout never
+	// factors into an already-built transaction's identity.
+	GitCommit string
+	// Dirty mirrors Snapshot.Dirty.
+	Dirty bool
+}
+
 // Snapshot is a private, read-only copy of the executable Assayer
 // distribution -- cli.py plus the assayer/ package -- built once per
 // governed transaction, before that transaction's replay identity is
@@ -66,9 +117,9 @@ type Snapshot struct {
 	// CLIPath is Dir/cli.py -- the only entry point ever executed.
 	CLIPath string
 	// TreeHash is a sha256 over exactly the file set copied into Dir
-	// (path+content), sorted by path. This is the execution identity, as
-	// opposed to internal/runtime's broader (and noisier) whole-checkout
-	// assayerRepoTreeHash.
+	// (path+content), sorted by path. This is the execution identity --
+	// also exposed as Identity.PackageHash, the copy every replay-identity
+	// caller should read (see SnapshotIdentity's doc comment).
 	TreeHash string
 	// Python is the verified, held python3 handle resolved once for this
 	// snapshot. Evaluate must launch through this handle, never re-resolve
@@ -86,6 +137,10 @@ type Snapshot struct {
 	// so strict replay must be disabled for a transaction built from one.
 	Dirty       bool
 	DirtyReason string
+
+	// Identity is Sol10 P0-6's SnapshotIdentity -- the sole source of
+	// Assayer transaction identity. See that type's doc comment.
+	Identity SnapshotIdentity
 
 	// files is the retained-descriptor manifest Verify walks: one entry per
 	// file copied into Dir, opened read-only immediately after it was
@@ -401,15 +456,41 @@ func BuildSnapshot(registry *toolregistry.Registry, cfg Config) (*Snapshot, erro
 
 	dirty, dirtyReason := snapshotDirty(registry, cfg.Repo)
 
+	// Sol10 P0-6: resolved once, here, from data this call already has in
+	// hand -- profileHash from the bytes just copied (never a separate live
+	// read), gitCommit from one probe at build time (never re-read by a
+	// later identity calculation against the possibly-since-changed live
+	// checkout).
+	treeHash := hex.EncodeToString(treeSum[:])
+	profileHash := ""
+	for _, cf := range copied {
+		if cf.rel == "assayer/profiles.py" {
+			profileHash = cf.sha
+			break
+		}
+	}
+	identity := SnapshotIdentity{
+		PackageHash:     treeHash,
+		PythonIdentity:  pythonHandle.Identity,
+		RuntimeHash:     runtimeManifest.RuntimeHash,
+		DependencyHash:  runtimeManifest.DependencyHash,
+		LockHash:        runtimeManifest.LockHash,
+		ProfileHash:     profileHash,
+		ProtocolVersion: SnapshotProtocolVersion,
+		GitCommit:       assayerCommit(cfg.Repo),
+		Dirty:           dirty,
+	}
+
 	ok = true
 	return &Snapshot{
 		Dir:         dir,
 		CLIPath:     filepath.Join(dir, "cli.py"),
-		TreeHash:    hex.EncodeToString(treeSum[:]),
+		TreeHash:    treeHash,
 		Python:      pythonHandle,
 		Runtime:     runtimeManifest,
 		Dirty:       dirty,
 		DirtyReason: dirtyReason,
+		Identity:    identity,
 		files:       files,
 	}, nil
 }

@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/cousingary/governator/internal/agents"
+	"github.com/cousingary/governator/internal/assay"
 	"github.com/cousingary/governator/internal/config"
 	"github.com/cousingary/governator/internal/containment"
 	"github.com/cousingary/governator/internal/contracts"
@@ -606,15 +607,37 @@ func writeAssayerIdentityFixture(t *testing.T) string {
 	return repo
 }
 
+// buildIdentityTestSnapshot builds a real *assay.Snapshot against repo's
+// CURRENT bytes and registers it for cleanup. Sol10 P0-6 made
+// resolvedAssayerEnvironmentHash/resolvedAssayerParticipants derive solely
+// from a snapshot's frozen SnapshotIdentity, never from a live re-read of
+// cfg.Repo -- so proving a repo edit changes the environment hash now means
+// building a FRESH snapshot after the edit (a new transaction observing new
+// bytes), not re-calling the hash function with the same snapshot (or nil)
+// against a since-mutated live checkout.
+func buildIdentityTestSnapshot(t *testing.T, repo string) *assay.Snapshot {
+	t.Helper()
+	registry, err := toolregistry.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	snap, err := assay.BuildSnapshot(registry, assay.Config{Repo: repo, Python: "python3"})
+	if err != nil {
+		t.Fatalf("build snapshot: %v", err)
+	}
+	t.Cleanup(snap.Close)
+	return snap
+}
+
 func TestResolvedAssayerEnvironmentHashBindsCLI(t *testing.T) {
 	repo := writeAssayerIdentityFixture(t)
 	cfg := config.BuiltIn()
 	cfg.Assay.Repo = repo
-	first := resolvedAssayerEnvironmentHash(cfg, contracts.Contract{}, nil)
+	first := resolvedAssayerEnvironmentHash(cfg, contracts.Contract{}, buildIdentityTestSnapshot(t, repo))
 	if err := os.WriteFile(filepath.Join(repo, "cli.py"), []byte("print('cli-v2')\n"), 0644); err != nil {
 		t.Fatal(err)
 	}
-	second := resolvedAssayerEnvironmentHash(cfg, contracts.Contract{}, nil)
+	second := resolvedAssayerEnvironmentHash(cfg, contracts.Contract{}, buildIdentityTestSnapshot(t, repo))
 	if first == second {
 		t.Fatal("assayer cli.py byte change did not change assayer environment hash")
 	}
@@ -624,11 +647,11 @@ func TestResolvedAssayerEnvironmentHashBindsLockfile(t *testing.T) {
 	repo := writeAssayerIdentityFixture(t)
 	cfg := config.BuiltIn()
 	cfg.Assay.Repo = repo
-	first := resolvedAssayerEnvironmentHash(cfg, contracts.Contract{}, nil)
+	first := resolvedAssayerEnvironmentHash(cfg, contracts.Contract{}, buildIdentityTestSnapshot(t, repo))
 	if err := os.WriteFile(filepath.Join(repo, "requirements-lock.txt"), []byte("package==2.0\n"), 0644); err != nil {
 		t.Fatal(err)
 	}
-	second := resolvedAssayerEnvironmentHash(cfg, contracts.Contract{}, nil)
+	second := resolvedAssayerEnvironmentHash(cfg, contracts.Contract{}, buildIdentityTestSnapshot(t, repo))
 	if first == second {
 		t.Fatal("assayer requirements-lock.txt change did not change assayer environment hash")
 	}
@@ -646,11 +669,11 @@ func TestV9Case17DependencyLockChangeChangesAssayerEnvironmentHash(t *testing.T)
 	repo := writeAssayerIdentityFixture(t)
 	cfg := config.BuiltIn()
 	cfg.Assay.Repo = repo
-	before := resolvedAssayerEnvironmentHash(cfg, contracts.Contract{}, nil)
+	before := resolvedAssayerEnvironmentHash(cfg, contracts.Contract{}, buildIdentityTestSnapshot(t, repo))
 	if err := os.WriteFile(filepath.Join(repo, "requirements-lock.txt"), []byte("package==9.9.9\n"), 0644); err != nil {
 		t.Fatal(err)
 	}
-	after := resolvedAssayerEnvironmentHash(cfg, contracts.Contract{}, nil)
+	after := resolvedAssayerEnvironmentHash(cfg, contracts.Contract{}, buildIdentityTestSnapshot(t, repo))
 	if before == after {
 		t.Fatal("changing a dependency lock file without touching any .py source did not change the assayer environment hash")
 	}
@@ -660,13 +683,17 @@ func TestV9Case17DependencyLockChangeChangesAssayerEnvironmentHash(t *testing.T)
 // report case 18 / work item 3: assayerRepoTreeHash previously walked
 // .venv/*.egg-info wholesale, so a plain `pip install`/venv reinstall in a
 // dev checkout churned this identity with zero executable-distribution
-// change. Adding (and then removing) a populated .venv tree must leave the
-// hash completely unchanged.
+// change. Sol10 P0-6 replaced that live whole-repo walk with the frozen
+// Snapshot's own tree hash (PackageHash): BuildSnapshot only ever copies
+// cli.py plus assayer/**.py, so it structurally never touches a top-level
+// .venv or *.egg-info directory in the first place -- adding (and then
+// removing) a populated .venv tree must leave a freshly built snapshot's
+// environment hash completely unchanged.
 func TestV9Case18VenvDirectoryDoesNotChangeAssayerEnvironmentHash(t *testing.T) {
 	repo := writeAssayerIdentityFixture(t)
 	cfg := config.BuiltIn()
 	cfg.Assay.Repo = repo
-	before := resolvedAssayerEnvironmentHash(cfg, contracts.Contract{}, nil)
+	before := resolvedAssayerEnvironmentHash(cfg, contracts.Contract{}, buildIdentityTestSnapshot(t, repo))
 
 	venvDir := filepath.Join(repo, ".venv", "lib", "python3.12", "site-packages", "supabase")
 	if err := os.MkdirAll(venvDir, 0755); err != nil {
@@ -683,7 +710,7 @@ func TestV9Case18VenvDirectoryDoesNotChangeAssayerEnvironmentHash(t *testing.T) 
 		t.Fatal(err)
 	}
 
-	afterAdd := resolvedAssayerEnvironmentHash(cfg, contracts.Contract{}, nil)
+	afterAdd := resolvedAssayerEnvironmentHash(cfg, contracts.Contract{}, buildIdentityTestSnapshot(t, repo))
 	if before != afterAdd {
 		t.Fatalf("adding .venv/assayer.egg-info changed the assayer environment hash: before=%s after=%s", before, afterAdd)
 	}
@@ -694,7 +721,7 @@ func TestV9Case18VenvDirectoryDoesNotChangeAssayerEnvironmentHash(t *testing.T) 
 	if err := os.RemoveAll(eggInfo); err != nil {
 		t.Fatal(err)
 	}
-	afterRemove := resolvedAssayerEnvironmentHash(cfg, contracts.Contract{}, nil)
+	afterRemove := resolvedAssayerEnvironmentHash(cfg, contracts.Contract{}, buildIdentityTestSnapshot(t, repo))
 	if before != afterRemove {
 		t.Fatalf("removing .venv/assayer.egg-info changed the assayer environment hash: before=%s after=%s", before, afterRemove)
 	}

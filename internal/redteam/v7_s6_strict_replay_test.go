@@ -642,10 +642,17 @@ func TestV7Case29ModelVisibleCanaryChangeInvalidatesReplay(t *testing.T) {
 	}
 }
 
-// TestV7Case25AssayerCommitChangeInvalidatesReplay proves
-// internal/runtime/identity.go's resolvedAssayerEnvironmentHash (called
-// unconditionally in runOnce) hashes the Assayer checkout's .git/HEAD
-// content, so a new commit at GOV_ASSAY_REPO invalidates replay.
+// TestV7Case25AssayerCommitChangeInvalidatesReplay proves a new commit at
+// GOV_ASSAY_REPO invalidates replay for a contract that actually declares
+// an assay block. Sol10 P0-6 narrowed resolvedAssayerEnvironmentHash to
+// derive solely from the frozen *assay.Snapshot built for THIS
+// transaction (internal/assay/snapshot.go's SnapshotIdentity.GitCommit,
+// resolved once per BuildSnapshot call) -- and runtime.go only builds that
+// snapshot when the contract itself declares c.Assay (Session 6's fix:
+// binding identity to the bridge-level repo regardless of whether this
+// contract even uses assay was exactly the "hybrid identity" over-breadth
+// the report flagged). So this contract must set c.Assay, or no snapshot
+// is ever built and there is nothing for a commit change to invalidate.
 func TestV7Case25AssayerCommitChangeInvalidatesReplay(t *testing.T) {
 	strictReplayConfig(t)
 	root := fixtureRepo(t)
@@ -668,6 +675,12 @@ func TestV7Case25AssayerCommitChangeInvalidatesReplay(t *testing.T) {
 	t.Setenv("GOV_ASSAY_REPO", assayRepo)
 
 	c := strictReplayContract(root)
+	// advisory: writeMinimalAssayerRepo's cli.py doesn't implement a real
+	// `evaluate` subcommand, so Evaluate will return a VerdictError -- fine
+	// under advisory (assay.Blocks only blocks under "blocking"
+	// enforcement), and this case cares only about identity binding the
+	// snapshot, not about a real passing verdict.
+	c.Assay = &contracts.Assay{Profile: "coding-output-v1", Enforcement: "advisory"}
 	bin := fakeBackend(t, standardBackendBody(""))
 
 	runStrictReplayBaseline(t, home, bin, c)
@@ -685,9 +698,10 @@ func TestV7Case25AssayerCommitChangeInvalidatesReplay(t *testing.T) {
 }
 
 // TestV7Case26AssayerProfileChangeInvalidatesReplay is Case 25's sibling:
-// resolvedAssayerEnvironmentHash also hashes assayer/profiles.py's content
-// directly, so a changed profile definition invalidates replay even though
-// GOV_ASSAY_REPO's path and .git/HEAD are unchanged.
+// the frozen snapshot's ProfileHash (assayer/profiles.py's content at copy
+// time) also invalidates replay when it changes, even though GOV_ASSAY_REPO's
+// path and .git/HEAD are unchanged. Like Case 25, c.Assay must be declared
+// so BuildSnapshot actually runs for this transaction (Sol10 P0-6).
 func TestV7Case26AssayerProfileChangeInvalidatesReplay(t *testing.T) {
 	strictReplayConfig(t)
 	root := fixtureRepo(t)
@@ -703,6 +717,7 @@ func TestV7Case26AssayerProfileChangeInvalidatesReplay(t *testing.T) {
 	t.Setenv("GOV_ASSAY_REPO", assayRepo)
 
 	c := strictReplayContract(root)
+	c.Assay = &contracts.Assay{Profile: "coding-output-v1", Enforcement: "advisory"}
 	bin := fakeBackend(t, standardBackendBody(""))
 
 	runStrictReplayBaseline(t, home, bin, c)

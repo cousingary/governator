@@ -10,7 +10,6 @@ import (
 	"path/filepath"
 	"runtime"
 	"runtime/debug"
-	"sort"
 	"strings"
 
 	"github.com/cousingary/governator/internal/agents"
@@ -602,23 +601,46 @@ func contractValidatorToolset(c contracts.Contract) map[string][]string {
 	return contractValidatorSet(c)
 }
 
-func resolvedAssayerParticipants(cfg config.Assay, envHash string) map[string]ExecutableIdentity {
+// resolvedAssayerParticipants reports the "assayer"/"assayer_profile"/
+// "assayer_checks" participant identities from snap alone (Sol10 P0-6):
+// before this fix these three roles were built by re-resolving python3 and
+// re-walking/re-hashing the live Assayer checkout on every call, so a
+// concurrent edit or a python3 registry rotation occurring AFTER snap was
+// already built silently changed the identity ledgered for a transaction
+// whose execution had already been pinned to that frozen Snapshot. snap is
+// the same *assay.Snapshot BuildSnapshot already produced for this
+// transaction (nil when assay isn't configured, or when this specific
+// contract doesn't declare an assay block); once built, nothing here
+// rereads cfg.Repo, reloads the trusted-tool registry, or re-resolves
+// python.
+func resolvedAssayerParticipants(cfg config.Assay, envHash string, snap *assay.Snapshot) map[string]ExecutableIdentity {
 	parts := map[string]ExecutableIdentity{}
 	if strings.TrimSpace(cfg.Repo) == "" {
 		return parts
 	}
-	pythonID, err := toolregistry.ResolveTrusted("python3", cfg.Python)
-	pythonKnown := err == nil
-	pythonPath := strings.TrimSpace(cfg.Python)
-	if pythonKnown {
-		pythonPath = pythonID.CanonicalPath
+	if snap == nil {
+		// Bridge is configured but no snapshot was built for this
+		// transaction (this contract doesn't use assay this run) -- there
+		// is no executed snapshot to bind identity to, so these roles
+		// report NotApplicable rather than falling back to a live
+		// re-resolve.
+		for _, role := range []string{"assayer", "assayer_profile", "assayer_checks"} {
+			parts[role] = ExecutableIdentity{Role: role, EnvironmentHash: envHash, Known: true, NotApplicable: true}
+		}
+		return parts
 	}
-	repoHash := assayerRepoTreeHash(cfg.Repo)
-	parts["assayer"] = ExecutableIdentity{Role: "assayer", CanonicalPath: pythonPath, SHA256: repoHash, EnvironmentHash: envHash, Known: pythonKnown && !strings.HasPrefix(repoHash, "unreadable:")}
-	for _, item := range []struct{ role, rel string }{{"assayer_profile", "assayer/profiles.py"}, {"assayer_checks", "assayer/checks.py"}} {
-		hash := hashFileContent(filepath.Join(cfg.Repo, item.rel))
-		parts[item.role] = ExecutableIdentity{Role: item.role, CanonicalPath: filepath.Join(cfg.Repo, filepath.FromSlash(item.rel)), SHA256: hash, EnvironmentHash: envHash, Known: pythonKnown && !strings.HasPrefix(hash, "unreadable:")}
+	pythonID := snap.Identity.PythonIdentity
+	parts["assayer"] = ExecutableIdentity{
+		Role: "assayer", CanonicalPath: pythonID.CanonicalPath, SHA256: snap.Identity.PackageHash,
+		Device: pythonID.Device, Inode: pythonID.Inode, EnvironmentHash: envHash,
+		Known: pythonID.SHA256 != "" && snap.Identity.PackageHash != "",
 	}
+	parts["assayer_profile"] = ExecutableIdentity{Role: "assayer_profile", SHA256: snap.Identity.ProfileHash, EnvironmentHash: envHash, Known: snap.Identity.ProfileHash != ""}
+	// assayer_checks: checks.py's bytes are part of the same copied tree
+	// PackageHash already covers (BuildSnapshot copies every .py file under
+	// assayer/), so this role shares that hash rather than needing its own
+	// separately-retained field.
+	parts["assayer_checks"] = ExecutableIdentity{Role: "assayer_checks", SHA256: snap.Identity.PackageHash, EnvironmentHash: envHash, Known: snap.Identity.PackageHash != ""}
 	return parts
 }
 
@@ -635,111 +657,31 @@ func governatorSelfSHA256() string {
 	return hashFileContent(exe)
 }
 
-func assayerRepoTreeHash(repo string) string {
-	if strings.TrimSpace(repo) == "" {
-		return "none"
-	}
-	root, err := filepath.Abs(repo)
-	if err != nil {
-		return "unreadable:" + repo
-	}
-	var files []string
-	walkErr := filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
-		if err != nil {
-			return err
-		}
-		rel, err := filepath.Rel(root, path)
-		if err != nil {
-			return err
-		}
-		if rel == "." {
-			return nil
-		}
-		rel = filepath.ToSlash(rel)
-		if info.IsDir() {
-			// Sol9 P0-4 work item 3: exclude local/regenerable byproducts a
-			// dev checkout accumulates but that carry no executable
-			// distribution content of their own -- a venv reinstall or an
-			// egg-info regen must not churn this identity. Matched by base
-			// name (not full rel path) so a nested occurrence -- e.g.
-			// assayer/__pycache__ -- is excluded exactly like a top-level
-			// one, unlike the previous rel-prefix check. Mirrors assayer's
-			// own .gitignore (__pycache__, *.egg-info) plus .venv, which
-			// isn't gitignored there but is exactly the same kind of noise.
-			name := info.Name()
-			if name == ".git" || name == "__pycache__" || name == ".pytest_cache" || name == ".venv" || strings.HasSuffix(name, ".egg-info") {
-				return filepath.SkipDir
-			}
-			return nil
-		}
-		if strings.HasSuffix(rel, ".pyc") || strings.HasSuffix(rel, ".pyo") {
-			return nil
-		}
-		// uv.lock is gitignored in the Assayer repo (a regenerable local
-		// byproduct, unlike the checked-in requirements-lock.txt) and
-		// .env holds operator secrets that must never influence -- let
-		// alone leak a fingerprint of -- this identity.
-		if rel == "uv.lock" || rel == ".env" {
-			return nil
-		}
-		files = append(files, rel)
-		return nil
-	})
-	if walkErr != nil {
-		return "unreadable:" + root
-	}
-	sort.Strings(files)
-	items := make([]map[string]string, 0, len(files))
-	for _, rel := range files {
-		items = append(items, map[string]string{"path": rel, "sha256": hashFileContent(filepath.Join(root, filepath.FromSlash(rel)))})
-	}
-	return hashJSON(items)
-}
-
-func resolvedAssayerPython(cfg config.Assay) any {
-	out := map[string]any{"configured": strings.TrimSpace(cfg.Repo) != "", "requested": cfg.Python}
-	identity, err := toolregistry.ResolveTrusted("python3", cfg.Python)
-	if err != nil {
-		out["error"] = err.Error()
-		return out
-	}
-	out["canonical_path"] = identity.CanonicalPath
-	out["sha256"] = identity.SHA256
-	out["device"] = identity.Device
-	out["inode"] = identity.Inode
-	return out
-}
-
-// assayerInputs gathers the bridge config and the contract's assay declaration
-// so a changed Assayer profile or enforcement mode invalidates replay.
+// resolvedAssayerEnvironmentHash is Sol10 P0-6's fix: the sole source of
+// Assayer transaction identity. Everything it hashes comes either from snap
+// (the frozen *assay.Snapshot BuildSnapshot already produced for this
+// transaction, before replay identity was calculated) or from cfg/c (this
+// transaction's own declared bridge/contract configuration -- values
+// already fixed as function arguments, never re-read from disk here).
 //
-// snap is the *assay.Snapshot BuildSnapshot already produced for this
-// transaction (nil when assay isn't configured). Its TreeHash/python
-// identity/dirty flag are folded in here so replay identity binds to
-// exactly the bytes Evaluate will execute (Sol9 P0-4), not just a
-// broader, noisier fingerprint of the live checkout at large.
+// Before this fix this function ALSO re-walked the live Assayer repo tree
+// (assayerRepoTreeHash), re-resolved python3 (resolvedAssayerPython), and
+// called assay.DescribeEnvironment/hashed a hand-picked file list -- all
+// live state read AFTER snap was built -- so the ledgered identity
+// described a hybrid of the frozen snapshot actually executed plus
+// whatever the live checkout/registry happened to be at the moment this
+// function ran, not the identity of any single executable transaction
+// (Sol10 P0-6). snap is nil when assay isn't configured, or when this
+// specific contract doesn't declare an assay block; there is then no
+// snapshot to bind to and the hash reduces to the declared
+// (non-)configuration alone.
 func resolvedAssayerEnvironmentHash(cfg config.Config, c contracts.Contract, snap *assay.Snapshot) string {
-	env := assay.DescribeEnvironment(assay.Config{Repo: cfg.Assay.Repo, Python: cfg.Assay.Python})
-	files := map[string]string{}
-	for _, rel := range []string{"cli.py", "pyproject.toml", "requirements.txt", "requirements-lock.txt", "requirements.lock", "uv.lock", "poetry.lock", "schema.sql", "assayer/__init__.py", "assayer/checks.py", "assayer/evidence.py", "assayer/outbox.py", "assayer/profiles.py", "assayer/store.py"} {
-		if cfg.Assay.Repo != "" {
-			files[rel] = hashFileContent(filepath.Join(cfg.Assay.Repo, rel))
-		}
-	}
-	snapshotIdentity := map[string]any{}
+	var snapshotIdentity any = "no-snapshot-this-transaction"
 	if snap != nil {
-		snapshotIdentity["tree_hash"] = snap.TreeHash
-		snapshotIdentity["python_sha256"] = snap.Python.Identity.SHA256
-		snapshotIdentity["python_canonical_path"] = snap.Python.Identity.CanonicalPath
-		snapshotIdentity["dirty"] = snap.Dirty
+		snapshotIdentity = snap.Identity
 	}
 	return hashJSON(map[string]any{
-		"repo_tree_hash":    assayerRepoTreeHash(cfg.Assay.Repo),
 		"snapshot_identity": snapshotIdentity,
-		"assayer_commit":    env.AssayerCommit,
-		"python_identity":   resolvedAssayerPython(cfg.Assay),
-		"environment":       env,
-		"selected_files":    files,
 		"bridge":            cfg.Assay,
 		"contract":          c.Assay,
 	})
