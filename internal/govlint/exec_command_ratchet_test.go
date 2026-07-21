@@ -23,11 +23,18 @@ import (
 // exec.CommandContext call site the ratchet accepts -- it is not meant to
 // grow casually.
 var allowedExecCommandClasses = map[string]string{
-	"production_launch_factory":   "the verified-handle/sealed-descriptor launch mechanism itself (internal/agents.LaunchCommand, internal/toolregistry.Handle.Command, and the CommandFactory closures that receive an already-verified bin from a Handle) -- expected to contain the terminal raw exec call",
-	"diagnostic_only":             "gov doctor / --version / --help probes: sandboxed to a disposable scratch dir, never part of a governed run's authority path",
-	"release_tooling":             "claims/release verification against an already-built artifact or repo history -- offline reconciliation, not a live governed run",
-	"legacy_bridge":               "a best-effort, non-blocking side channel to the legacy Python harness whose failure never affects the governed run's outcome",
-	"known_gap_pending_hardening": "a genuine authority-bearing pathname exec that Session 5 (rc3) found and explicitly did NOT fix -- narrowly grandfathered so the ratchet doesn't block unrelated work, not endorsed as correct; see the comment at each such site and docs/claims.yaml",
+	"production_launch_factory": "the verified-handle/sealed-descriptor launch mechanism itself (internal/agents.LaunchCommand, internal/toolregistry.Handle.Command, and the CommandFactory closures that receive an already-verified bin from a Handle) -- expected to contain the terminal raw exec call",
+	"diagnostic_only":           "gov doctor / --version / --help probes: sandboxed to a disposable scratch dir, never part of a governed run's authority path",
+	"release_tooling":           "claims/release verification against an already-built artifact or repo history -- offline reconciliation, not a live governed run",
+	"legacy_bridge":             "a best-effort, non-blocking side channel to the legacy Python harness whose failure never affects the governed run's outcome",
+	// known_gap_pending_hardening was removed (rc4 Session 2, Sol10 P0-2):
+	// the class existed solely to grandfather containment/descendants.go's
+	// systemd-run/unshare pathname-exec sites, which now launch through a
+	// held toolregistry.Handle descriptor (production_launch_factory) like
+	// every other verified-handle launch. Do not re-add this class as a
+	// shortcut for a new gap -- fix the gap, or add a new, specifically
+	// justified class and update docs/claims.yaml's sol9-exec-command-ratchet
+	// claim to describe it.
 }
 
 // TestExecCommandRatchet is the Sol9 P2-3 CI ratchet: every raw
@@ -40,14 +47,19 @@ var allowedExecCommandClasses = map[string]string{
 // verified-handle/sealed-descriptor launch path Sessions 1-7 built.
 //
 // This is a ratchet, not a ban: every site marked as of Sol9 Session 8 stays
-// green, including the containment/descendants.go known_gap_pending_hardening
-// sites Session 5 flagged as genuinely unresolved (systemd-run/unshare still
-// launched by pathname). Adding a NEW raw exec.Command/exec.CommandContext
-// call site without a marker -- or citing a class not in
-// allowedExecCommandClasses -- fails this test. Report attack surface: Sol9
-// P2-3 ("architecture claims exceed current implementation" / "a CI ratchet
-// should reject new raw execution sites and maintain an explicit allowlist
-// for the remaining ones").
+// green. The containment/descendants.go known_gap_pending_hardening sites
+// Sol9 Session 5 flagged as genuinely unresolved (systemd-run/unshare
+// launched by pathname) were closed in rc4 Session 2 (Sol10 P0-2) -- both
+// now launch through a held toolregistry.Handle descriptor, marked
+// production_launch_factory like every other verified-handle launch, and the
+// known_gap_pending_hardening class itself was removed from
+// allowedExecCommandClasses above (citing it is now itself a ratchet
+// violation). Adding a NEW raw exec.Command/exec.CommandContext call site
+// without a marker -- or citing a class not in allowedExecCommandClasses --
+// fails this test. Report attack surface: Sol9 P2-3 ("architecture claims
+// exceed current implementation" / "a CI ratchet should reject new raw
+// execution sites and maintain an explicit allowlist for the remaining
+// ones").
 func TestExecCommandRatchet(t *testing.T) {
 	_, thisFile, _, ok := runtime.Caller(0)
 	if !ok {

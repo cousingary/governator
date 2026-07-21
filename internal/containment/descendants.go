@@ -105,6 +105,108 @@ type Proof struct {
 	ProcessesObservedPeak int `json:"processes_observed_peak"`
 }
 
+// ContainmentEnvironment is the frozen set of descendant-owning containment
+// primitives a whole run's replay identity is evaluated against (rc4 Session
+// 2, Sol10 P0-2). Before this type existed, NewScope called
+// toolregistry.Load() and ResolveHandle fresh on every invocation -- once for
+// the run-level Scope, again for every stage's own Scope (internal/stage.
+// Executor.Run) -- so the trusted-tool registry could be reloaded, and in
+// principle observe different enrolled state, after the run's environment and
+// replay identity were already frozen (buildRunEnvironment, called exactly
+// once at the top of runOnce). ResolveEnvironment now does that resolution
+// exactly once, from the SAME frozen registry every other trust decision in
+// the run uses, and every NewScope call for the run's whole lifetime --
+// backend and every stage -- is handed this one value rather than resolving
+// its own.
+//
+// SystemdRun/Unshare are nil when that primitive is not enrolled/resolvable
+// on this host; NewScope's existing fallback chain treats a nil handle
+// exactly like the old resolution failure it replaces.
+type ContainmentEnvironment struct {
+	SystemdRun *toolregistry.Handle
+	Unshare    *toolregistry.Handle
+	Cgroup     CgroupCapabilities
+}
+
+// CgroupCapabilities is a descriptive snapshot of this process's cgroup v2
+// direct-management capability, folded into ContainmentEnvironmentHash
+// (internal/runtime/identity.go) so a host's cgroup capability is part of
+// the run's replay identity like everything else ContainmentEnvironment
+// describes. Unlike SystemdRun/Unshare, newDirectCgroupScope does NOT
+// consume this to decide whether to attempt cgroup-direct: cgroup-direct
+// launches the caller's own already-verified bin directly (never a
+// "primitive binary" needing registry trust the way systemd-run/unshare do,
+// see Command's ScopeCgroupDirect branch), so it carries none of P0-2's
+// TOCTOU concern, and several legitimate callers (internal/assay.Evaluate,
+// notably) construct a Scope via a bare context.Context that was never
+// threaded through containment.WithEnvironment -- requiring a resolved
+// CgroupCapabilities there would wrongly disable the strongest containment
+// method available on hosts with a perfectly usable cgroup v2 hierarchy.
+// newDirectCgroupScope always probes live, exactly as it did before this
+// type existed.
+type CgroupCapabilities struct {
+	Available bool
+	SelfPath  string
+}
+
+// ResolveEnvironment resolves every containment primitive's held handle
+// exactly once from registry -- the caller's already-frozen trusted-tool
+// registry (internal/runtime.RunEnvironment.ToolRegistry), never a fresh
+// toolregistry.Load(). A primitive that is not enrolled or fails
+// registry-verification simply resolves to a nil handle; it is not a hard
+// error here, mirroring NewScope's pre-existing "try the next weaker
+// primitive" fallback discipline for the whole run rather than per attempt.
+func ResolveEnvironment(registry *toolregistry.Registry) (ContainmentEnvironment, error) {
+	if registry == nil {
+		return ContainmentEnvironment{}, fmt.Errorf("containment: tool registry is not frozen")
+	}
+	var env ContainmentEnvironment
+	if h, err := registry.ResolveHandle("systemd-run", "systemd-run", toolregistry.KindTrustedController); err == nil {
+		env.SystemdRun = h
+	}
+	if h, err := registry.ResolveHandle("unshare", "unshare", toolregistry.KindTrustedController); err == nil {
+		env.Unshare = h
+	}
+	env.Cgroup = probeCgroupCapabilities()
+	return env, nil
+}
+
+// probeCgroupCapabilities resolves this process's own cgroup v2 path once.
+// Availability is not guaranteed by this probe alone (newDirectCgroupScope
+// still must create and write to a real subdirectory to know for certain --
+// a parent cgroup can be readable but not writable), so Available only
+// records whether a cgroup v2 path could be resolved at all; a false here
+// lets newDirectCgroupScope skip the attempt entirely instead of failing a
+// mkdir on every stage.
+func probeCgroupCapabilities() CgroupCapabilities {
+	self, err := cgroupPathForPID(os.Getpid())
+	if err != nil {
+		return CgroupCapabilities{}
+	}
+	return CgroupCapabilities{Available: true, SelfPath: self}
+}
+
+// Close releases every handle this environment holds. The caller that
+// resolved the environment (ResolveEnvironment, called exactly once before
+// replay) owns this and must call it exactly once, after every Scope built
+// from this environment across the run's entire lifetime -- backend and
+// every stage -- has finished. Individual Scopes never close these handles;
+// they only borrow them for the duration of one launch (see Scope.Command).
+func (e ContainmentEnvironment) Close() error {
+	var err error
+	if e.SystemdRun != nil {
+		if cerr := e.SystemdRun.Close(); cerr != nil {
+			err = cerr
+		}
+	}
+	if e.Unshare != nil {
+		if cerr := e.Unshare.Close(); cerr != nil && err == nil {
+			err = cerr
+		}
+	}
+	return err
+}
+
 // Scope owns the entire descendant tree spawned by one governed subprocess
 // launch. Exactly one is constructed per run, before the backend is started,
 // and threaded through to the launch site via WithScope/ScopeFromContext so
@@ -115,13 +217,17 @@ type Scope struct {
 	method   ScopeMethod
 	runID    string
 	unitName string // ScopeSystemdUserScope only
-	// primitiveHandle pins the verified-open primitive binary (systemd-run for
-	// ScopeSystemdUserScope, unshare for ScopePIDNamespace) so scope launch
-	// itself never re-opens a mutable pathname. primitivePath is retained only
-	// as a defensive fallback when a test constructs a Scope directly without a
-	// real handle.
+	// primitiveHandle is the verified-open primitive binary (systemd-run for
+	// ScopeSystemdUserScope, unshare for ScopePIDNamespace) this Scope
+	// launches through -- Command builds every argv0 for these two methods as
+	// the handle's own /proc/self/fd/<n> pseudo-path (rc4 Session 2, Sol10
+	// P0-2), never a canonical pathname a same-uid process could replace
+	// between resolution and exec. Scope BORROWS this handle from the run's
+	// ContainmentEnvironment (see ResolveEnvironment) -- it never closes it;
+	// the environment is shared across every stage's own Scope for the run's
+	// whole lifetime, and only the environment's own Close, called once after
+	// the run finishes, releases it.
 	primitiveHandle *toolregistry.Handle
-	primitivePath   string
 
 	mu         sync.Mutex
 	pid        int // outer-namespace pid of the launched wrapper/process
@@ -130,6 +236,13 @@ type Scope struct {
 	resolveErr error
 
 	cgroupFile *os.File // ScopeCgroupDirect only; keeps the dir fd alive for CLONE_INTO_CGROUP
+
+	// sealedPrimitive is the private, verified-bytes copy of primitiveHandle
+	// Command seals for ScopeSystemdUserScope/ScopePIDNamespace (rc4 Session
+	// 2, Sol10 P0-2) -- see Command's doc comment for why a sealed copy, not
+	// an fd-argv launch, is what actually gets exec'd. Owned by this Scope;
+	// Extinguish closes it once the launched process has fully finished.
+	sealedPrimitive *toolregistry.SealedCopy
 }
 
 // NewScope selects the strongest descendant-owning primitive available on
@@ -137,17 +250,24 @@ type Scope struct {
 // scope, then a directly managed cgroup v2 subtree, then a PID namespace.
 // requireStrong callers refuse outright when none qualifies rather than
 // silently falling back to a bare process group.
-func NewScope(runID string, requireStrong bool) (*Scope, error) {
+//
+// env is the run's frozen ContainmentEnvironment (rc4 Session 2, Sol10
+// P0-2), resolved exactly once via ResolveEnvironment before replay --
+// NewScope never loads or resolves the trusted-tool registry itself. Every
+// call for one run (the run-level Scope and every stage's own Scope) must be
+// handed the SAME env value, so the primitive actually launched can never
+// diverge from the one the run's replay identity was computed against.
+func NewScope(runID string, requireStrong bool, env ContainmentEnvironment) (*Scope, error) {
 	if os.Getenv("GOV_CONTAINMENT_FORCE_DEGRADED") == "1" {
 		return &Scope{method: scopeDegraded, runID: runID}, nil
 	}
-	if s, err := newSystemdUserScope(runID); err == nil {
+	if s, err := newSystemdUserScope(runID, env.SystemdRun); err == nil {
 		return s, nil
 	}
 	if s, err := newDirectCgroupScope(runID); err == nil {
 		return s, nil
 	}
-	if s, err := newPIDNamespaceScope(runID); err == nil {
+	if s, err := newPIDNamespaceScope(runID, env.Unshare); err == nil {
 		return s, nil
 	}
 	if requireStrong {
@@ -177,14 +297,18 @@ func (s *Scope) RunID() string { return s.runID }
 // copy of the run's requireStrong policy decision threaded through.
 func (s *Scope) IsStrong() bool { return s.method != scopeDegraded }
 
-func newSystemdUserScope(runID string) (*Scope, error) {
-	registry, err := toolregistry.Load()
-	if err != nil {
-		return nil, fmt.Errorf("containment: load trusted-tool registry: %w", err)
-	}
-	handle, err := registry.ResolveHandle("systemd-run", "systemd-run", toolregistry.KindTrustedController)
-	if err != nil {
-		return nil, fmt.Errorf("containment: resolve trusted systemd-run handle: %w", err)
+// newSystemdUserScope probes whether this host's live systemd --user manager
+// can actually accept a transient scope right now, and if so returns a Scope
+// that launches through handle -- the run's frozen, held systemd-run
+// descriptor (ContainmentEnvironment.SystemdRun), never a fresh registry
+// resolution. handle is BORROWED: this function never closes it, on success
+// or on any of the error returns below -- ownership stays with whoever
+// resolved the ContainmentEnvironment, so a probe failure here (this
+// particular attempt only) never costs the run its one held descriptor for
+// every other stage still to come.
+func newSystemdUserScope(runID string, handle *toolregistry.Handle) (*Scope, error) {
+	if handle == nil {
+		return nil, fmt.Errorf("containment: systemd-run is not enrolled/resolvable in this run's frozen containment environment")
 	}
 	if _, err := os.Stat("/run/systemd/system"); err != nil {
 		return nil, fmt.Errorf("containment: systemd is not PID 1 (no /run/systemd/system): %w", err)
@@ -212,12 +336,10 @@ func newSystemdUserScope(runID string) (*Scope, error) {
 	// itself were succeeding.
 	probe, err := handle.Command(probeCtx, "--user", "--scope", "--quiet", "--collect", "--unit="+probeUnit, "--", "/bin/true")
 	if err != nil {
-		_ = handle.Close()
 		return nil, fmt.Errorf("containment: systemd user scope probe: %w", err)
 	}
 	probe.Env = controllerenv.Base()
 	if out, err := probe.CombinedOutput(); err != nil {
-		_ = handle.Close()
 		return nil, fmt.Errorf("containment: systemd user scope probe failed: %w: %s", err, strings.TrimSpace(string(out)))
 	}
 	return &Scope{
@@ -225,7 +347,6 @@ func newSystemdUserScope(runID string) (*Scope, error) {
 		runID:           runID,
 		unitName:        "governator-" + sanitizeName(runID) + "-" + nonce(),
 		primitiveHandle: handle,
-		primitivePath:   handle.Identity.CanonicalPath,
 	}, nil
 }
 
@@ -243,6 +364,10 @@ func nonce() string {
 	return hex.EncodeToString(b[:])
 }
 
+// newDirectCgroupScope always probes this process's own cgroup v2 path
+// live -- see CgroupCapabilities' doc comment for why it does not consume
+// the run's (possibly entirely absent) ContainmentEnvironment the way
+// newSystemdUserScope/newPIDNamespaceScope do.
 func newDirectCgroupScope(runID string) (*Scope, error) {
 	self, err := cgroupPathForPID(os.Getpid())
 	if err != nil {
@@ -269,16 +394,14 @@ func newDirectCgroupScope(runID string) (*Scope, error) {
 	}, nil
 }
 
-func newPIDNamespaceScope(runID string) (*Scope, error) {
-	registry, err := toolregistry.Load()
-	if err != nil {
-		return nil, fmt.Errorf("containment: load trusted-tool registry: %w", err)
+// newPIDNamespaceScope returns a Scope that launches through handle -- the
+// run's frozen, held unshare descriptor (ContainmentEnvironment.Unshare).
+// handle is BORROWED, exactly as newSystemdUserScope's is: never closed here.
+func newPIDNamespaceScope(runID string, handle *toolregistry.Handle) (*Scope, error) {
+	if handle == nil {
+		return nil, fmt.Errorf("containment: unshare is not enrolled/resolvable in this run's frozen containment environment")
 	}
-	handle, err := registry.ResolveHandle("unshare", "unshare", toolregistry.KindTrustedController)
-	if err != nil {
-		return nil, fmt.Errorf("containment: resolve trusted unshare handle: %w", err)
-	}
-	return &Scope{method: ScopePIDNamespace, runID: runID, primitiveHandle: handle, primitivePath: handle.Identity.CanonicalPath}, nil
+	return &Scope{method: ScopePIDNamespace, runID: runID, primitiveHandle: handle}, nil
 }
 
 func sanitizeName(runID string) string {
@@ -298,6 +421,29 @@ func WithScope(ctx context.Context, s *Scope) context.Context {
 	return context.WithValue(ctx, scopeContextKey{}, s)
 }
 
+type environmentContextKey struct{}
+
+// WithEnvironment attaches the run's frozen ContainmentEnvironment to ctx
+// (rc4 Session 2, Sol10 P0-2), mirroring WithScope, so every NewScope call
+// site for the run's whole lifetime -- the run-level Scope (constructed
+// where WithEnvironment is called) and every stage's own Scope
+// (internal/stage.Executor.Run, several packages and call layers away) --
+// retrieves the SAME resolved handles via EnvironmentFromContext rather than
+// each independently resolving the trusted-tool registry.
+func WithEnvironment(ctx context.Context, env ContainmentEnvironment) context.Context {
+	return context.WithValue(ctx, environmentContextKey{}, env)
+}
+
+// EnvironmentFromContext retrieves a ContainmentEnvironment attached by
+// WithEnvironment. ok is false only for a launch that never went through a
+// governed runtime.Runner (doctor probes, direct package tests); NewScope
+// treats the resulting zero value exactly like every primitive being
+// unresolvable, falling back through its normal chain.
+func EnvironmentFromContext(ctx context.Context) (ContainmentEnvironment, bool) {
+	env, ok := ctx.Value(environmentContextKey{}).(ContainmentEnvironment)
+	return env, ok
+}
+
 // ScopeFromContext retrieves a Scope attached by WithScope. Callers must
 // treat "not found" as "no containment for this launch" -- every caller in
 // this codebase falls back to the pre-S2 process-group behavior when this
@@ -312,18 +458,51 @@ func ScopeFromContext(ctx context.Context) (*Scope, bool) {
 // every descendant it forks, however it detaches -- is born inside this
 // scope from the moment it starts. Callers still set Stdout/Stderr and call
 // Start themselves; Command only owns argv/SysProcAttr/Dir.
-// Command's ScopeSystemdUserScope/ScopePIDNamespace branches still launch
-// s.primitivePath (systemd-run / bwrap-style unshare equivalent) by pathname
-// -- the same TOCTOU shape Sol v9 P0-1/P0-2 fixed for enforce.Plan's unshare
-// wrapper (verified via the trusted-tool registry, then never held as an
-// open descriptor through to exec). Session 1's plan text called for "every
-// containment primitive (systemd-run, future helpers)" to get the same
-// fd-argv treatment, but the actual Session 1 commit only converted
-// unshare inside internal/enforce; this call site was not touched. Out of
-// Sol v9 P0-6's scope (sovereign Git/Bash execution), so not fixed in this
-// session -- flagged 2026-07-19 (rc3 Session 5) as a genuine outstanding
-// authority-bearing gap (not merely diagnostic tooling) for Session 8's
-// exec.Command allowlist / a follow-up hardening session.
+//
+// rc4 Session 2 (Sol10 P0-2): the ScopeSystemdUserScope/ScopePIDNamespace
+// branches used to exec s.primitivePath -- a canonical pathname re-resolved
+// at every launch, the same TOCTOU shape Sol v9 P0-1/P0-2 already closed for
+// enforce.Plan's unshare wrapper. A same-uid process could replace the file
+// at that path between NewScope's verification and this exec, and the
+// replacement -- not the verified binary -- would become the thing
+// responsible for establishing containment.
+//
+// An earlier version of this fix launched through s.primitiveHandle's own
+// /proc/self/fd/<n> descriptor directly (mirroring toolregistry.Handle.
+// Command). That broke every caller that composes a Scope's launch with
+// enforce.Plan.Wrap's OWN independent fd-argv numbering (agents.LaunchStaged,
+// internal/stage's default CommandFactory, and toolregistry.Handle.
+// CommandWith's build callback all do, for backend/validator/bash launches
+// under an active enforce.Plan) -- both layers independently assumed they
+// would own ExtraFiles[0]/fd 3, so whichever layer's files got merged in
+// second silently landed at the wrong descriptor (or, for CommandWith's
+// build callback, got overwritten outright), and the argv string baked in
+// by the other layer no longer pointed at what it meant to. Composing two
+// independently fd-numbering launch mechanisms correctly would need every
+// composition call site to thread a shared fd allocator through -- real
+// production_launch_factory work belongs together, not scattered piecemeal
+// under a fix for a single primitive.
+//
+// So instead, both branches launch through a SEALED PRIVATE COPY: a fresh,
+// 0500, same-uid-only-readable copy of s.primitiveHandle's own verified
+// bytes (SealedExecutablePath, sealed FROM the already-open, already-hashed
+// descriptor -- never by re-reading the enrolled path), re-verified
+// (Verify) immediately before this launch to catch a same-uid tamper of the
+// COPY itself between sealing and exec. This is one of the plan's own
+// explicitly acceptable alternatives to fd-argv launch ("a verified private
+// immutable copy"), it uses an ordinary real pathname so it composes with
+// enforce.Plan.Wrap/Handle.CommandWith exactly like every other
+// already-verified bin these callers pass through Scope.Command, and it
+// needs no signature change here. The copy is owned by this Scope
+// (s.sealedPrimitive) and closed by Extinguish, once the launched process
+// has fully finished with it.
+//
+// Sealing or verifying can fail (disk full, /tmp unwritable, or Verify
+// genuinely catching a live same-uid tamper of the copy) -- Command has no
+// error return, so a failure here produces a cmd that will simply fail at
+// Start() with a descriptive, un-executable path, exactly the fail-closed
+// outcome every caller's existing cmd.Start() error check already handles;
+// it never falls back to a mutable pathname.
 func (s *Scope) Command(ctx context.Context, bin string, args []string, dir string) *exec.Cmd {
 	var cmd *exec.Cmd
 	switch s.method {
@@ -334,7 +513,8 @@ func (s *Scope) Command(ctx context.Context, bin string, args []string, dir stri
 			"--",
 			bin,
 		}, args...)
-		cmd = exec.CommandContext(ctx, s.primitivePath, full...) // govratchet:exec-allow(known_gap_pending_hardening) -- systemd-run launched by pathname, see comment above
+		primitive := s.sealPrimitive()
+		cmd = exec.CommandContext(ctx, primitive, full...) // govratchet:exec-allow(production_launch_factory) -- primitive is a freshly sealed, re-verified private copy of s.primitiveHandle's held bytes, never the mutable enrolled path
 		cmd.Env = controllerenv.Base()
 		cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	case ScopeCgroupDirect:
@@ -350,7 +530,8 @@ func (s *Scope) Command(ctx context.Context, bin string, args []string, dir stri
 			bin,
 		}
 		full = append(full, args...)
-		cmd = exec.CommandContext(ctx, s.primitivePath, full...) // govratchet:exec-allow(known_gap_pending_hardening) -- unshare-equivalent launched by pathname, see comment above
+		primitive := s.sealPrimitive()
+		cmd = exec.CommandContext(ctx, primitive, full...) // govratchet:exec-allow(production_launch_factory) -- primitive is a freshly sealed, re-verified private copy of s.primitiveHandle's held bytes, never the mutable enrolled path
 		cmd.Env = controllerenv.Base()
 		cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	default: // scopeDegraded
@@ -361,20 +542,49 @@ func (s *Scope) Command(ctx context.Context, bin string, args []string, dir stri
 	return cmd
 }
 
+// sealPrimitive seals s.primitiveHandle's held, verified bytes into a fresh
+// private copy, re-verifies that copy immediately, and returns its path --
+// see Command's doc comment. On any failure it returns a fixed,
+// guaranteed-nonexistent path so the resulting exec.Cmd fails closed at
+// Start() rather than falling back to a mutable pathname; s.sealedPrimitive
+// is left nil in that case, so Extinguish has nothing to close.
+func (s *Scope) sealPrimitive() string {
+	const failClosedPath = "/nonexistent/governator-sealed-primitive-unavailable"
+	if s.primitiveHandle == nil {
+		return failClosedPath
+	}
+	sealed, err := s.primitiveHandle.SealedExecutablePath()
+	if err != nil {
+		return failClosedPath
+	}
+	if err := sealed.Verify(); err != nil {
+		_ = sealed.Close()
+		return failClosedPath
+	}
+	s.sealedPrimitive = sealed
+	return sealed.Path
+}
+
 // Started must be called with the outer-namespace PID immediately after a
 // successful Start() on the *exec.Cmd Command produced. It resolves the
 // exact cgroup path (systemd assigns it asynchronously via its own IPC to
 // the manager, so this polls briefly) or the PID-namespace's init PID, so
 // Extinguish has something concrete to act on.
+//
+// rc4 Session 2 (Sol10 P0-2): this used to close s.primitiveHandle here, on
+// the reasoning that Start() had already dup'd the descriptor into the
+// child so the parent's copy was no longer needed. That was correct when
+// each Scope owned a freshly, independently resolved handle -- it is wrong
+// now that primitiveHandle is BORROWED from the run's shared
+// ContainmentEnvironment (every stage's own Scope launches through the same
+// held descriptor across the run's whole lifetime); closing it here would
+// close it out from under every later stage still to launch. Ownership of
+// closing belongs solely to whoever resolved the ContainmentEnvironment
+// (ResolveEnvironment's caller), once, after the run finishes.
 func (s *Scope) Started(pid int) {
 	s.mu.Lock()
 	s.pid = pid
-	h := s.primitiveHandle
-	s.primitiveHandle = nil
 	s.mu.Unlock()
-	if h != nil {
-		_ = h.Close()
-	}
 	switch s.method {
 	case ScopeSystemdUserScope:
 		s.resolveCgroupFromPID(pid)
@@ -439,13 +649,20 @@ func (s *Scope) Extinguish(ctx context.Context, deadline time.Duration, workspac
 	if deadline <= 0 {
 		deadline = DefaultExtinctionDeadline
 	}
+	// rc4 Session 2 (Sol10 P0-2): this used to close s.primitiveHandle in a
+	// deferred cleanup here. Wrong for the same reason Started's doc comment
+	// gives -- the handle is borrowed from the run's shared
+	// ContainmentEnvironment, not owned by this Scope. s.sealedPrimitive
+	// (Command's private sealed copy, see its doc comment), by contrast, IS
+	// owned by this Scope -- close it once the launched process this
+	// Extinguish call confirms dead can no longer need it.
 	defer func() {
 		s.mu.Lock()
-		h := s.primitiveHandle
-		s.primitiveHandle = nil
+		sealed := s.sealedPrimitive
+		s.sealedPrimitive = nil
 		s.mu.Unlock()
-		if h != nil {
-			_ = h.Close()
+		if sealed != nil {
+			_ = sealed.Close()
 		}
 	}()
 	start := time.Now()

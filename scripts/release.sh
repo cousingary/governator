@@ -246,6 +246,7 @@ import json, os, platform
 print(json.dumps({
     'linux': platform.system().lower() == 'linux',
     'has_systemd_user': os.environ.get('GOV_REDTEAM_HAS_SYSTEMD_USER', '') == '1',
+    'no_systemd_user': os.environ.get('GOV_REDTEAM_HAS_SYSTEMD_USER', '') != '1',
     'has_second_uid': os.environ.get('GOV_REDTEAM_HAS_SECOND_UID', '') == '1',
     'has_kernel_landlock_full_abi': os.environ.get('GOV_REDTEAM_HAS_LANDLOCK_FULL_ABI', '') == '1',
 }))

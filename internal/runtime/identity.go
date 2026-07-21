@@ -16,12 +16,40 @@ import (
 	"github.com/cousingary/governator/internal/agents"
 	"github.com/cousingary/governator/internal/assay"
 	"github.com/cousingary/governator/internal/config"
+	"github.com/cousingary/governator/internal/containment"
 	"github.com/cousingary/governator/internal/contracts"
 	"github.com/cousingary/governator/internal/enforce"
 	"github.com/cousingary/governator/internal/prompts"
 	"github.com/cousingary/governator/internal/runner"
 	"github.com/cousingary/governator/internal/toolregistry"
 )
+
+// containmentEnvironmentHash binds the exact identity of every
+// descendant-containment primitive a run's frozen ContainmentEnvironment
+// resolved into ExecutionIdentity (rc4 Session 2, Sol10 P0-2) -- see
+// ExecutionIdentity.ContainmentEnvironmentHash's doc comment. A primitive
+// that failed to resolve (nil handle) hashes as "enrolled: false" rather
+// than being omitted, so "not enrolled" and "enrolled to something" are
+// always distinguishable identities.
+func containmentEnvironmentHash(env containment.ContainmentEnvironment) string {
+	describe := func(h *toolregistry.Handle) map[string]any {
+		if h == nil {
+			return map[string]any{"enrolled": false}
+		}
+		return map[string]any{
+			"enrolled":       true,
+			"canonical_path": h.Identity.CanonicalPath,
+			"sha256":         h.Identity.SHA256,
+			"device":         h.Identity.Device,
+			"inode":          h.Identity.Inode,
+		}
+	}
+	return hashJSON(map[string]any{
+		"systemd_run": describe(env.SystemdRun),
+		"unshare":     describe(env.Unshare),
+		"cgroup":      env.Cgroup,
+	})
+}
 
 // ExecutionIdentity captures every trust-bearing input that must remain
 // identical for a prior APPROVED run to be safely replayed. Per Sol's Critical
@@ -50,20 +78,33 @@ type ExecutionIdentity struct {
 	ValidatorToolsetHash      string
 	ControllerToolsetHash     string
 	ControllerEnvironmentHash string
-	AssayerEnvironmentHash    string
-	ConsumedArtifactsHash     string
-	GraphProviderHash         string
-	GraphSnapshotHash         string
-	GovernatorSelfSHA256      string
-	AssayerProfileHash        string
-	BackendAdapter            string
-	BackendAdapterVersion     string
-	BackendBinaryPath         string
-	BackendBinarySHA256       string
-	ModelID                   string
-	CapabilityAttestID        string
-	RunnerConfigHash          string
-	GovernatorVersion         string
+	// ContainmentEnvironmentHash (rc4 Session 2, Sol10 P0-2) binds the exact
+	// identity (SHA256/canonical path/device/inode) of every
+	// descendant-containment primitive (systemd-run, unshare) this run's
+	// frozen ContainmentEnvironment resolved, plus its cgroup v2 capability
+	// probe -- see containmentEnvironmentHash. Computed once, from the same
+	// RunEnvironment.Containment every containment.NewScope call for this
+	// run is handed, before any stage launches; a same-uid replacement of an
+	// enrolled primitive after this hash was computed has no effect on
+	// execution (Scope.Command launches through the held descriptor, never a
+	// re-resolved pathname), but a genuinely DIFFERENT enrolled primitive
+	// between runs still mints a different identity, exactly like every
+	// other trust-bearing input here.
+	ContainmentEnvironmentHash string
+	AssayerEnvironmentHash     string
+	ConsumedArtifactsHash      string
+	GraphProviderHash          string
+	GraphSnapshotHash          string
+	GovernatorSelfSHA256       string
+	AssayerProfileHash         string
+	BackendAdapter             string
+	BackendAdapterVersion      string
+	BackendBinaryPath          string
+	BackendBinarySHA256        string
+	ModelID                    string
+	CapabilityAttestID         string
+	RunnerConfigHash           string
+	GovernatorVersion          string
 	// V2 binds the exact transaction participants and final model-visible prompt.
 	Participants               map[string]ExecutableIdentity
 	ExactPromptHash            string
@@ -113,6 +154,7 @@ func (id ExecutionIdentity) Hash() string {
 	fmt.Fprintf(&b, "validator_toolset_hash=%s\n", id.ValidatorToolsetHash)
 	fmt.Fprintf(&b, "controller_toolset_hash=%s\n", id.ControllerToolsetHash)
 	fmt.Fprintf(&b, "controller_environment_hash=%s\n", id.ControllerEnvironmentHash)
+	fmt.Fprintf(&b, "containment_environment_hash=%s\n", id.ContainmentEnvironmentHash)
 	fmt.Fprintf(&b, "assayer_environment_hash=%s\n", id.AssayerEnvironmentHash)
 	fmt.Fprintf(&b, "consumed_artifacts_hash=%s\n", id.ConsumedArtifactsHash)
 	fmt.Fprintf(&b, "graph_provider_hash=%s\n", id.GraphProviderHash)
@@ -165,49 +207,50 @@ func (id ExecutionIdentity) Hash() string {
 // "pi" literally (via os.ReadFile, never through PATH) and always produced
 // the same "unreadable:pi" sentinel regardless of which binary that name
 // actually resolved to — a swapped executable never changed the identity.
-func computeExecutionIdentity(cfg config.Config, c contracts.Contract, agent agents.Agent, resolution agents.PathResolution, identity agents.BackendIdentity, dockerImage *runner.ImageIdentity, envPolicyHash, head, hash string, promptVer prompts.Version, capabilityAttestID string, bundle PolicyBundle, dynamicHashes ...string) ExecutionIdentity {
+func computeExecutionIdentity(cfg config.Config, c contracts.Contract, agent agents.Agent, resolution agents.PathResolution, identity agents.BackendIdentity, dockerImage *runner.ImageIdentity, envPolicyHash, head, hash string, promptVer prompts.Version, capabilityAttestID string, bundle PolicyBundle, containmentEnv containment.ContainmentEnvironment, dynamicHashes ...string) ExecutionIdentity {
 	compiledPromptHash, consumedArtifactsHash, graphProviderHash, graphSnapshotHash, controllerEnvironmentHash, validatorToolsetHash := dynamicIdentityHashes(dynamicHashes...)
 	if validatorToolsetHash == "unknown" {
 		validatorToolsetHash = hashJSON(contractValidatorToolset(c))
 	}
 	return ExecutionIdentity{
-		ContractHash:              hash,
-		ApprovedHead:              head,
-		ConfigHash:                cfg.Hash(),
-		ProtectedManifestHash:     hashFileContent(cfg.ProtectedManifest),
-		OrgPolicyHash:             hashJSON(bundle.OrgRules),
-		ProjectDoctrineHash:       hashJSON(bundle.ProjectRules),
-		PromptVersion:             promptVer.ID,
-		PromptChecksum:            promptVer.Checksum,
-		CompiledPromptHash:        compiledPromptHash,
-		ValidatorSetHash:          hashJSON(contractValidatorSet(c)),
-		ValidatorToolsetHash:      validatorToolsetHash,
-		ControllerToolsetHash:     hashJSON(map[string]string{"backend_path": resolution.CanonicalPath, "backend_sha256": resolution.SHA256}),
-		ControllerEnvironmentHash: controllerEnvironmentHash,
-		AssayerEnvironmentHash:    hashJSON(assayerInputs(cfg, c)),
-		ConsumedArtifactsHash:     consumedArtifactsHash,
-		GraphProviderHash:         graphProviderHash,
-		GraphSnapshotHash:         graphSnapshotHash,
-		GovernatorSelfSHA256:      governatorSelfSHA256(),
-		AssayerProfileHash:        hashJSON(assayerInputs(cfg, c)),
-		BackendAdapter:            agent.Name(),
-		BackendAdapterVersion:     adapterVersion(agent),
-		BackendBinaryPath:         resolution.CanonicalPath,
-		BackendBinarySHA256:       resolution.SHA256,
-		ModelID:                   agent.Name(),
-		BackendProvider:           identity.Provider,
-		BackendAccountID:          identity.AccountID,
-		BackendOrgID:              identity.OrgID,
-		BackendModelRevision:      identity.ModelRevision,
-		BackendEndpoint:           identity.Endpoint,
-		BackendReasoningMode:      identity.ReasoningMode,
-		BackendApprovalMode:       identity.ApprovalMode,
-		BackendSandboxMode:        identity.SandboxMode,
-		BackendIdentityHash:       identity.ConfigHash,
-		BackendIdentityKnown:      identity.Known(),
-		CapabilityAttestID:        capabilityAttestID,
-		RunnerConfigHash:          hashJSON(runnerConfig(c, dockerImage, envPolicyHash)),
-		GovernatorVersion:         governatorBuildID(),
+		ContractHash:               hash,
+		ApprovedHead:               head,
+		ConfigHash:                 cfg.Hash(),
+		ProtectedManifestHash:      hashFileContent(cfg.ProtectedManifest),
+		OrgPolicyHash:              hashJSON(bundle.OrgRules),
+		ProjectDoctrineHash:        hashJSON(bundle.ProjectRules),
+		PromptVersion:              promptVer.ID,
+		PromptChecksum:             promptVer.Checksum,
+		CompiledPromptHash:         compiledPromptHash,
+		ValidatorSetHash:           hashJSON(contractValidatorSet(c)),
+		ValidatorToolsetHash:       validatorToolsetHash,
+		ControllerToolsetHash:      hashJSON(map[string]string{"backend_path": resolution.CanonicalPath, "backend_sha256": resolution.SHA256}),
+		ControllerEnvironmentHash:  controllerEnvironmentHash,
+		ContainmentEnvironmentHash: containmentEnvironmentHash(containmentEnv),
+		AssayerEnvironmentHash:     hashJSON(assayerInputs(cfg, c)),
+		ConsumedArtifactsHash:      consumedArtifactsHash,
+		GraphProviderHash:          graphProviderHash,
+		GraphSnapshotHash:          graphSnapshotHash,
+		GovernatorSelfSHA256:       governatorSelfSHA256(),
+		AssayerProfileHash:         hashJSON(assayerInputs(cfg, c)),
+		BackendAdapter:             agent.Name(),
+		BackendAdapterVersion:      adapterVersion(agent),
+		BackendBinaryPath:          resolution.CanonicalPath,
+		BackendBinarySHA256:        resolution.SHA256,
+		ModelID:                    agent.Name(),
+		BackendProvider:            identity.Provider,
+		BackendAccountID:           identity.AccountID,
+		BackendOrgID:               identity.OrgID,
+		BackendModelRevision:       identity.ModelRevision,
+		BackendEndpoint:            identity.Endpoint,
+		BackendReasoningMode:       identity.ReasoningMode,
+		BackendApprovalMode:        identity.ApprovalMode,
+		BackendSandboxMode:         identity.SandboxMode,
+		BackendIdentityHash:        identity.ConfigHash,
+		BackendIdentityKnown:       identity.Known(),
+		CapabilityAttestID:         capabilityAttestID,
+		RunnerConfigHash:           hashJSON(runnerConfig(c, dockerImage, envPolicyHash)),
+		GovernatorVersion:          governatorBuildID(),
 	}
 }
 

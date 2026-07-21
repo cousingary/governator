@@ -4,6 +4,7 @@ import (
 	"fmt"
 
 	"github.com/cousingary/governator/internal/config"
+	"github.com/cousingary/governator/internal/containment"
 	"github.com/cousingary/governator/internal/contextgraph"
 	"github.com/cousingary/governator/internal/controllerenv"
 	"github.com/cousingary/governator/internal/protectedpaths"
@@ -53,8 +54,19 @@ type RunEnvironment struct {
 	// config file.
 	CredentialRoots []string
 	Controller      ControllerEnvironment
-	ToolRegistry    *toolregistry.Registry
-	GraphStatus     contextgraph.Status
+	// Containment is the run's frozen descendant-containment primitive
+	// environment (systemd-run/unshare held handles, cgroup v2 capability),
+	// resolved exactly once here via containment.ResolveEnvironment against
+	// this SAME ToolRegistry (rc4 Session 2, Sol10 P0-2). Every
+	// containment.NewScope call for the run's whole lifetime -- the
+	// run-level Scope and every stage's own Scope -- must be handed this one
+	// value, never re-resolve the registry itself; see NewScope's own doc
+	// comment. The caller that built this RunEnvironment owns closing it
+	// (Containment.Close), exactly once, after every Scope built from it has
+	// finished.
+	Containment  containment.ContainmentEnvironment
+	ToolRegistry *toolregistry.Registry
+	GraphStatus  contextgraph.Status
 }
 
 // buildRunEnvironment loads and freezes every configuration-derived input a
@@ -78,6 +90,10 @@ func buildRunEnvironment() (RunEnvironment, error) {
 		return RunEnvironment{}, fmt.Errorf("resolve graph provider: %w", err)
 	}
 	controllerEnv := controllerenv.Freeze()
+	containmentEnv, err := containment.ResolveEnvironment(registry)
+	if err != nil {
+		return RunEnvironment{}, fmt.Errorf("resolve containment environment: %w", err)
+	}
 	return RunEnvironment{
 		Config:                cfg,
 		ConfigHash:            cfg.Hash(),
@@ -85,6 +101,7 @@ func buildRunEnvironment() (RunEnvironment, error) {
 		ProtectedPatterns:     patterns,
 		CredentialRoots:       append([]string(nil), cfg.Credentials.Roots...),
 		Controller:            controllerEnv,
+		Containment:           containmentEnv,
 		ToolRegistry:          registry,
 		GraphStatus:           graphStatus,
 	}, nil

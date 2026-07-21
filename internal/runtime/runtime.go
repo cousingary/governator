@@ -2569,6 +2569,14 @@ func (r *Runner) runOnce(ctx context.Context, c contracts.Contract) (RunRecord, 
 	if err != nil {
 		return RunRecord{}, err
 	}
+	// env.Containment (rc4 Session 2, Sol10 P0-2) is resolved exactly once,
+	// above, alongside everything else RunEnvironment freezes. It is shared
+	// by every containment.NewScope call for this run's whole lifetime --
+	// the run-level Scope just below and every stage's own Scope
+	// (internal/stage.Executor.Run, reached via ctx) -- so Close it exactly
+	// once here, after every one of them has finished.
+	defer func() { _ = env.Containment.Close() }()
+	ctx = containment.WithEnvironment(ctx, env.Containment)
 	// id is minted here (rather than just before workspace creation, where it
 	// used to live) so the Phase 4 stage checkpoints below — PARSED and
 	// PREFLIGHTED happen before any workspace or quota reservation exists —
@@ -2982,7 +2990,7 @@ func (r *Runner) runOnce(ctx context.Context, c contracts.Contract) (RunRecord, 
 	compiledPromptForIdentity += minimalismAnnotation
 	compiledPromptHash := hashJSON(map[string]string{"prompt": compiledPromptForIdentity})
 	graphSnapshotHash := hashJSON(preReplayGraph)
-	identity := computeExecutionIdentity(cfg, c, agent, handle.PathResolution, handle.Identity, dockerImage, agents.EnvPolicyHash(handle.AllowedEnv), head, hash, promptVersion, capabilityAttestID, policyBundle, compiledPromptHash, consumedArtifactsHash(consumedIdentities), contextgraph.ProviderIdentityHash(graphStatus), graphSnapshotHash, env.Controller.Hash, validatorToolsetHash)
+	identity := computeExecutionIdentity(cfg, c, agent, handle.PathResolution, handle.Identity, dockerImage, agents.EnvPolicyHash(handle.AllowedEnv), head, hash, promptVersion, capabilityAttestID, policyBundle, env.Containment, compiledPromptHash, consumedArtifactsHash(consumedIdentities), contextgraph.ProviderIdentityHash(graphStatus), graphSnapshotHash, env.Controller.Hash, validatorToolsetHash)
 	identity.ProtectedManifestHash = hashJSON(env.ProtectedPatterns)
 	// Sol9 P0-4: build the Assayer execution snapshot HERE, before replay
 	// identity is calculated, and thread the one returned *assay.Snapshot
@@ -3212,7 +3220,7 @@ func (r *Runner) runOnce(ctx context.Context, c contracts.Contract) (RunRecord, 
 	// unconditionally on every path (success, backend error, timeout), and
 	// approval is impossible without a recorded successful extinction proof.
 	requireStrongDescendants := containment.RequiresStrongDescendantContainment(c, enforceLocalEffectful)
-	descendants, descScopeErr := containment.NewScope(id, requireStrongDescendants)
+	descendants, descScopeErr := containment.NewScope(id, requireStrongDescendants, env.Containment)
 	if descScopeErr != nil {
 		return RunRecord{}, fmt.Errorf("descendant containment: %w", descScopeErr)
 	}

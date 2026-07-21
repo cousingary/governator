@@ -601,3 +601,41 @@ cases:
     session: rc4-s1
     required: true
     status: implemented
+  - case: 110
+    name: TestV10Case9UnshareReplacedAfterFrozenEnvironmentConstructionHasNoEffect
+    session: rc4-s2
+    required: true
+    status: implemented
+  - case: 111
+    name: TestV10Case10SystemdRunReplacedAfterFrozenEnvironmentConstructionHasNoEffect
+    session: rc4-s2
+    required: true
+    status: implemented
+  - case: 112
+    name: TestV10Case11ContainmentRegistryMutatedAfterEnvironmentResolvedHasNoEffect
+    session: rc4-s2
+    required: true
+    status: implemented
+  - case: 113
+    name: TestV10Case12ScopeSelectionFailureLeaksZeroDescriptors
+    session: rc4-s2
+    required: true
+    conditional: true
+    allowed_skip:
+      predicate: no_systemd_user
+      reason: "a live systemd --user bus is present on this host"
+    status: implemented
+  - case: 114
+    name: TestV10Case13RealSystemdUserScopeLaunchExecutesExactVerifiedTarget
+    session: rc4-s2
+    required: true
+    conditional: true
+    allowed_skip:
+      predicate: has_systemd_user
+      reason: "no live systemd --user bus on this host"
+    status: implemented
+  - case: 115
+    name: TestV10Case14RealPIDNamespaceLaunchExecutesExactVerifiedTarget
+    session: rc4-s2
+    required: true
+    status: implemented

@@ -288,7 +288,36 @@ func (Executor) Run(ctx context.Context, spec StageSpec) (StageResult, error) {
 	// ActualWriteSet below is a real before/after reconciliation rather than
 	// the declared roots restated as if they were observed.
 	writeSnapshotBefore := snapshotWriteRoots(effectivePlan.WriteDirs, effectivePlan.WriteFiles)
-	scope, err := containment.NewScope(spec.RunID+"-"+spec.StageID+"-"+nonce(), spec.DescendantPolicy.RequireStrong)
+	// containmentEnv (rc4 Session 2, Sol10 P0-2): the run's frozen
+	// ContainmentEnvironment, resolved exactly once by runOnce
+	// (buildRunEnvironment) and threaded here via ctx
+	// (containment.WithEnvironment) rather than a StageSpec field -- every
+	// launch reached FROM A GOVERNED RUN (shellStage for validators/
+	// cleanup/Assayer, agents.LaunchStaged for the backend) has ctx already
+	// carrying it, so systemd-run/unshare never diverge from what the run's
+	// replay identity described.
+	//
+	// ok is false for a caller that never went through runOnce at all --
+	// internal/assay.Evaluate is invoked directly with context.Background()
+	// (both by governed Assayer stages AND by standalone callers/tests with
+	// no concept of a run or replay identity to freeze anything against),
+	// and gov doctor probes/direct package tests are the same shape. Such a
+	// caller resolves its own environment here, scoped to just this one
+	// launch -- this intentionally re-loads the registry per call, exactly
+	// like every stage did before this session, but that reload is no
+	// longer a defect for a caller with no frozen replay identity for it to
+	// diverge from; it only mattered for the once-per-run governed path
+	// above, which this fallback never touches.
+	containmentEnv, ok := containment.EnvironmentFromContext(ctx)
+	if !ok {
+		if registry, rerr := toolregistry.Load(); rerr == nil {
+			if resolved, eerr := containment.ResolveEnvironment(registry); eerr == nil {
+				containmentEnv = resolved
+				defer func() { _ = resolved.Close() }()
+			}
+		}
+	}
+	scope, err := containment.NewScope(spec.RunID+"-"+spec.StageID+"-"+nonce(), spec.DescendantPolicy.RequireStrong, containmentEnv)
 	if err != nil {
 		return StageResult{}, err
 	}

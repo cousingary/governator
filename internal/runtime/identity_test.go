@@ -10,6 +10,7 @@ import (
 
 	"github.com/cousingary/governator/internal/agents"
 	"github.com/cousingary/governator/internal/config"
+	"github.com/cousingary/governator/internal/containment"
 	"github.com/cousingary/governator/internal/contracts"
 	"github.com/cousingary/governator/internal/policy"
 	"github.com/cousingary/governator/internal/prompts"
@@ -448,13 +449,13 @@ func TestComputeIdentityCapturesBackendBinary(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	idA := computeExecutionIdentity(config.BuiltIn(), c, agent, resA, agents.BackendIdentity{}, nil, "", "dead", "ch", pv, "attest-1", PolicyBundle{})
+	idA := computeExecutionIdentity(config.BuiltIn(), c, agent, resA, agents.BackendIdentity{}, nil, "", "dead", "ch", pv, "attest-1", PolicyBundle{}, containment.ContainmentEnvironment{})
 	t.Setenv("GOV_CLAUDE_BIN", binB)
 	resB, err := agents.ResolvePath(agent)
 	if err != nil {
 		t.Fatal(err)
 	}
-	idB := computeExecutionIdentity(config.BuiltIn(), c, agent, resB, agents.BackendIdentity{}, nil, "", "dead", "ch", pv, "attest-1", PolicyBundle{})
+	idB := computeExecutionIdentity(config.BuiltIn(), c, agent, resB, agents.BackendIdentity{}, nil, "", "dead", "ch", pv, "attest-1", PolicyBundle{}, containment.ContainmentEnvironment{})
 	if idA.BackendBinarySHA256 == idB.BackendBinarySHA256 {
 		t.Fatal("different backend binaries produced the same identity binary hash")
 	}
@@ -491,13 +492,13 @@ func TestComputeIdentityCapturesDockerImageIdentity(t *testing.T) {
 	imgA := &runner.ImageIdentity{Reference: "example/agent:latest", ID: "sha256:" + strings.Repeat("a", 64)}
 	imgB := &runner.ImageIdentity{Reference: "example/agent:latest", ID: "sha256:" + strings.Repeat("b", 64)}
 
-	idA := computeExecutionIdentity(config.BuiltIn(), c, agent, res, agents.BackendIdentity{}, imgA, "", "dead", "ch", pv, "attest-1", PolicyBundle{})
-	idB := computeExecutionIdentity(config.BuiltIn(), c, agent, res, agents.BackendIdentity{}, imgB, "", "dead", "ch", pv, "attest-1", PolicyBundle{})
+	idA := computeExecutionIdentity(config.BuiltIn(), c, agent, res, agents.BackendIdentity{}, imgA, "", "dead", "ch", pv, "attest-1", PolicyBundle{}, containment.ContainmentEnvironment{})
+	idB := computeExecutionIdentity(config.BuiltIn(), c, agent, res, agents.BackendIdentity{}, imgB, "", "dead", "ch", pv, "attest-1", PolicyBundle{}, containment.ContainmentEnvironment{})
 	if idA.Hash() == idB.Hash() {
 		t.Fatal("a different resolved Docker image ID (same configured tag) did not change the full identity hash")
 	}
 
-	idNone := computeExecutionIdentity(config.BuiltIn(), c, agent, res, agents.BackendIdentity{}, nil, "", "dead", "ch", pv, "attest-1", PolicyBundle{})
+	idNone := computeExecutionIdentity(config.BuiltIn(), c, agent, res, agents.BackendIdentity{}, nil, "", "dead", "ch", pv, "attest-1", PolicyBundle{}, containment.ContainmentEnvironment{})
 	if idA.Hash() == idNone.Hash() {
 		t.Fatal("a resolved image identity vs. none (same tag) did not change the full identity hash")
 	}

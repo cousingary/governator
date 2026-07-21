@@ -10,6 +10,7 @@ import (
 
 	"github.com/cousingary/governator/internal/agents"
 	"github.com/cousingary/governator/internal/config"
+	"github.com/cousingary/governator/internal/containment"
 	"github.com/cousingary/governator/internal/contracts"
 	"github.com/cousingary/governator/internal/observability"
 	"github.com/cousingary/governator/internal/policy"
@@ -445,7 +446,7 @@ func TestPolicyBundleSharedBetweenGateAndIdentityIgnoresLaterDoctrineEdit(t *tes
 	// object a gate call would already have evaluated against — never a
 	// fresh load. Its ProjectDoctrineHash must reflect v1, not the v2 that is
 	// now on disk.
-	identity := computeExecutionIdentity(cfg, c, agent, res, agents.BackendIdentity{}, nil, "", "dead", "ch", pv, "attest-1", bundleAtGateTime)
+	identity := computeExecutionIdentity(cfg, c, agent, res, agents.BackendIdentity{}, nil, "", "dead", "ch", pv, "attest-1", bundleAtGateTime, containment.ContainmentEnvironment{})
 	if identity.ProjectDoctrineHash != hashJSON(bundleAtGateTime.ProjectRules) {
 		t.Fatal("identity's project doctrine hash did not match the bundle it was given")
 	}
