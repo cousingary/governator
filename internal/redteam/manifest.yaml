@@ -639,3 +639,33 @@ cases:
     session: rc4-s2
     required: true
     status: implemented
+  - case: 116
+    name: TestV10Case15OptionalCleanupCorruptionWithNonzeroExitDoesNotMerge
+    session: rc4-s3
+    required: true
+    status: implemented
+  - case: 117
+    name: TestV10Case16SuccessfulCleanupInvalidatingPassingValidatorBlocksApproval
+    session: rc4-s3
+    required: true
+    status: implemented
+  - case: 118
+    name: TestV10Case17CleanupPartialWriteBeforeTimeoutRestoresPreCleanupState
+    session: rc4-s3
+    required: true
+    status: implemented
+  - case: 119
+    name: TestV10Case18CleanupArtifactMutationCapturedBeforeFinalMeasurement
+    session: rc4-s3
+    required: true
+    status: implemented
+  - case: 120
+    name: TestV10Case19PreCleanupStateRestoredOnOptionalCleanupFailureRegardlessOfValidatorCoverage
+    session: rc4-s3
+    required: true
+    status: implemented
+  - case: 121
+    name: TestV10Case20SuccessValidatorsExecuteAfterLastCleanupMutation
+    session: rc4-s3
+    required: true
+    status: implemented

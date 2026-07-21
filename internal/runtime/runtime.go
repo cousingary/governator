@@ -595,6 +595,42 @@ func matchesAny(ps []string, n string) bool {
 	return false
 }
 
+// pathUnderRoot reports whether n is covered by the declared write root:
+// either an exact glob match (root contains * or **, e.g. "output/**") or n
+// equal to / nested under a plain directory root (e.g. ".governator/consumed"
+// covers ".governator/consumed/art"). ValidatorSpec.WriteRoots entries are
+// used both ways across the codebase, so a restore/scoping helper must
+// recognize both.
+func pathUnderRoot(root, n string) bool {
+	root = filepath.ToSlash(strings.TrimSuffix(root, "/"))
+	n = filepath.ToSlash(n)
+	if strings.ContainsAny(root, "*?") {
+		return glob(root, n)
+	}
+	return n == root || strings.HasPrefix(n, root+"/")
+}
+
+// snapshotPathsUnderRoots returns the sorted paths in snap covered by any of
+// roots. Sol10 P0-3 (Session 3) uses this to scope a pre-cleanup restore
+// snapshot to a cleanup validator's own declared write authority instead of
+// the whole worktree.
+func snapshotPathsUnderRoots(snap snapshot, roots []string) []string {
+	if len(roots) == 0 {
+		return nil
+	}
+	var out []string
+	for p := range snap {
+		for _, root := range roots {
+			if pathUnderRoot(root, p) {
+				out = append(out, p)
+				break
+			}
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
 func shell(ctx context.Context, dir, command string) (int, string, error) {
 	registry, rerr := toolregistry.Load()
 	if rerr != nil {
@@ -3673,6 +3709,145 @@ func (r *Runner) runOnce(ctx context.Context, c contracts.Contract) (RunRecord, 
 			violations = append(violations, verr.Error())
 		}
 	}
+	// Sol10 P0-3: cleanup runs BEFORE success validation now, not after
+	// (agents/governator-sol-upgrade10.md "P0-3: Cleanup can mutate the tree
+	// after it passed success validation"; agents/governator-sol-upgrade10-rc4-plan.md
+	// Session 3). Previously an optional (Required: false) cleanup validator
+	// could mutate the tree after every success validator had already
+	// approved it, and the final structural barrier below only checks
+	// forbidden/protected paths, budgets, required files and artifact
+	// identities -- it never repeats the contract-specific correctness
+	// checks a success validator embodies. Running cleanup first means
+	// whatever it does (successful or a failed-but-optional attempt) is
+	// always covered by every success validator, PostRunValidate, Assay and
+	// the final barrier that follow it in this function -- there is no
+	// window after the last mutation-capable stage where the tree goes
+	// unvalidated. A failed OPTIONAL cleanup validator that declared real
+	// write authority (ValidatorSpec.WriteRoots) additionally restores the
+	// exact files it was allowed to touch to their pre-attempt bytes before
+	// success validation runs, so a half-written file from an optional pass
+	// that crashed mid-write can never reach a validator (let alone merge)
+	// even when no validator happens to check that specific file. Required
+	// still governs only whether a nonzero cleanup EXIT CODE itself blocks
+	// approval -- never whether a partial mutation from a failed, optional
+	// cleanup gets to persist.
+	if len(violations) == 0 && c.Cleanup != nil {
+		for i, v := range c.Cleanup.Validators {
+			vctx, cancel, deadlineErr := stageTimeout(ctx, "cleanup validator")
+			if deadlineErr != nil {
+				if c.Cleanup.Required {
+					violations = append(violations, deadlineErr.Error())
+				}
+				break
+			}
+			// Sol9 P0-5: same structured-validator PATH policy as the
+			// success loop below. A structured cleanup validator runs
+			// with PATH = its sealed dir alone; legacy cleanup
+			// validators keep the ambient behavior.
+			var toolDirs []string
+			var sealedReadRoots []string
+			if i < len(cleanupValidatorSealed) && cleanupValidatorSealed[i] != nil {
+				sealed := cleanupValidatorSealed[i]
+				toolDirs = []string{sealed.Path}
+				sealedReadRoots = sealed.ReadRoots
+				// Sol9 P1-4: same immediately-before-launch re-verification
+				// as the success loop below. Unconditional regardless of
+				// c.Cleanup.Required, matching the extinction-failure
+				// posture below -- a same-UID tamper of a sealed tool is a
+				// security event, never merely "the lint pass had a bad
+				// day."
+				verifyFailed := false
+				for _, cp := range sealed.Copies {
+					if verr := cp.Verify(); verr != nil {
+						violations = append(violations, "verify sealed cleanup validator tool before launch: "+verr.Error())
+						verifyFailed = true
+					}
+				}
+				if verifyFailed {
+					cancel()
+					break
+				}
+			}
+			var validatorSpec *contracts.ValidatorSpec
+			if i < len(c.Cleanup.ValidatorSpecs) {
+				validatorSpec = &c.Cleanup.ValidatorSpecs[i]
+			}
+			// Sol10 P0-3: snapshot the exact bytes of every file this
+			// validator is declared allowed to write, immediately before
+			// launch, so a failed-but-optional mutation can be undone
+			// without guessing at its blast radius or paying for a
+			// whole-worktree copy (report Session 3 work item 3: "content
+			// addressed of the allowed write set is sufficient").
+			var restorePaths []string
+			recallID := id
+			if validatorSpec != nil && len(validatorSpec.WriteRoots) > 0 {
+				restorePaths = snapshotPathsUnderRoots(workAfter, validatorSpec.WriteRoots)
+				if len(restorePaths) > 0 {
+					recallID = fmt.Sprintf("%s-cleanup-%d", id, i)
+					if err := captureRecall(r.Home, recallID, work, restorePaths); err != nil {
+						violations = append(violations, "cleanup pre-mutation snapshot: "+err.Error())
+						cancel()
+						break
+					}
+				}
+			}
+			authority := validatorAuthority(work, validatorSpec, true, requireStrongDescendants)
+			authority.ReadRoots = append(authority.ReadRoots, sealedReadRoots...)
+			if externalConsumedStore {
+				// Sol10 P0-1: same reasoning as the success-validator loop
+				// below -- and read-only regardless of this cleanup
+				// validator's own write authority elsewhere in the
+				// workspace, since the ro-bind's RODirs rule is bound to a
+				// separate mount Landlock governs independently of the
+				// workspace's write grants.
+				authority.ROBinds = append(authority.ROBinds, enforce.ROBind{Src: stageDir, Dst: filepath.Join(work, ".governator", "consumed")})
+			}
+			code, out, e, extinctionErr := shellStage(vctx, id, "cleanup-validator", work, v, authority, env.Controller, toolDirs, env.ToolRegistry)
+			cancel()
+			// Sol redteam v7 S1 cleanup-specific fail-open defect: Required
+			// governs whether a nonzero cleanup EXIT CODE blocks the merge
+			// (line below) -- it must never also govern whether a failure to
+			// PROVE DESCENDANT EXTINCTION is acceptable. "Cleanup is
+			// optional" means "we don't care if the lint/format pass itself
+			// failed," never "we don't care whether something it spawned is
+			// still alive and unaccounted for." Unconditional regardless of
+			// c.Cleanup.Required.
+			if extinctionErr != nil {
+				violations = append(violations, "cleanup validator descendant containment: "+extinctionErr.Error())
+			}
+			if e != nil {
+				out += "\n" + e.Error()
+			}
+			recordValidatorEvidence(db, id, v, code, out, "cleanup")
+			// Sol10 P0-3: a failed OPTIONAL cleanup that had real write
+			// authority never gets to leave its partial mutation behind --
+			// restore is unconditional on failure here (not gated on
+			// c.Cleanup.Required, which only decides whether the EXIT CODE
+			// itself becomes a violation below). A restore failure is
+			// itself a violation: "restore the pre-cleanup snapshot, or
+			// quarantine" (Session 3 work item 2) -- silently keeping a
+			// half-written file was never an acceptable third option.
+			if (code != 0 || e != nil) && !c.Cleanup.Required && len(restorePaths) > 0 {
+				if rerr := restoreRecall(r.Home, recallID, work); rerr != nil {
+					violations = append(violations, "cleanup restore after failed optional mutation: "+rerr.Error())
+				} else {
+					rec.Notes = appendNote(rec.Notes, "cleanup_restored_after_failure: "+v)
+				}
+			}
+			beforeScan := len(violations)
+			violations = appendRuntimePathScanViolation(violations, "after cleanup validator", work)
+			if len(violations) > beforeScan {
+				break
+			}
+			if (code != 0 || e != nil) && c.Cleanup.Required {
+				if errors.Is(e, context.DeadlineExceeded) || errors.Is(ctx.Err(), context.DeadlineExceeded) {
+					violations = append(violations, fmt.Sprintf("run deadline exceeded during cleanup validator: %s", v))
+				} else {
+					violations = append(violations, fmt.Sprintf("cleanup validator failed (%d): %s", code, v))
+				}
+			}
+		}
+	}
 	for validatorIndex, v := range c.Success.Validators {
 		vctx, cancel, deadlineErr := stageTimeout(ctx, "success validator")
 		if deadlineErr != nil {
@@ -3740,95 +3915,6 @@ func (r *Runner) runOnce(ctx context.Context, c contracts.Contract) (RunRecord, 
 				violations = append(violations, fmt.Sprintf("run deadline exceeded during success validator: %s", v))
 			} else {
 				violations = append(violations, fmt.Sprintf("validator failed (%d): %s", code, v))
-			}
-		}
-	}
-	// Cleanup runs as a distinct pre-merge stage once every success validator
-	// has passed (doctrine gap #5): a lint/format/temp-file tidy pass with
-	// its own ledger rows (stage='cleanup') instead of being folded into
-	// success.validators. Required governs whether a failure blocks the
-	// merge like a success validator; unset (the default) records the run
-	// for visibility without gating it.
-	if len(violations) == 0 && c.Cleanup != nil {
-		for i, v := range c.Cleanup.Validators {
-			vctx, cancel, deadlineErr := stageTimeout(ctx, "cleanup validator")
-			if deadlineErr != nil {
-				if c.Cleanup.Required {
-					violations = append(violations, deadlineErr.Error())
-				}
-				break
-			}
-			// Sol9 P0-5: same structured-validator PATH policy as the
-			// success loop above. A structured cleanup validator runs
-			// with PATH = its sealed dir alone; legacy cleanup
-			// validators keep the ambient behavior.
-			var toolDirs []string
-			var sealedReadRoots []string
-			if i < len(cleanupValidatorSealed) && cleanupValidatorSealed[i] != nil {
-				sealed := cleanupValidatorSealed[i]
-				toolDirs = []string{sealed.Path}
-				sealedReadRoots = sealed.ReadRoots
-				// Sol9 P1-4: same immediately-before-launch re-verification
-				// as the success loop above. Unconditional regardless of
-				// c.Cleanup.Required, matching the extinction-failure
-				// posture below -- a same-UID tamper of a sealed tool is a
-				// security event, never merely "the lint pass had a bad
-				// day."
-				verifyFailed := false
-				for _, cp := range sealed.Copies {
-					if verr := cp.Verify(); verr != nil {
-						violations = append(violations, "verify sealed cleanup validator tool before launch: "+verr.Error())
-						verifyFailed = true
-					}
-				}
-				if verifyFailed {
-					cancel()
-					break
-				}
-			}
-			var validatorSpec *contracts.ValidatorSpec
-			if i < len(c.Cleanup.ValidatorSpecs) {
-				validatorSpec = &c.Cleanup.ValidatorSpecs[i]
-			}
-			authority := validatorAuthority(work, validatorSpec, true, requireStrongDescendants)
-			authority.ReadRoots = append(authority.ReadRoots, sealedReadRoots...)
-			if externalConsumedStore {
-				// Sol10 P0-1: same reasoning as the success-validator loop
-				// above -- and read-only regardless of this cleanup
-				// validator's own write authority elsewhere in the
-				// workspace, since the ro-bind's RODirs rule is bound to a
-				// separate mount Landlock governs independently of the
-				// workspace's write grants.
-				authority.ROBinds = append(authority.ROBinds, enforce.ROBind{Src: stageDir, Dst: filepath.Join(work, ".governator", "consumed")})
-			}
-			code, out, e, extinctionErr := shellStage(vctx, id, "cleanup-validator", work, v, authority, env.Controller, toolDirs, env.ToolRegistry)
-			cancel()
-			// Sol redteam v7 S1 cleanup-specific fail-open defect: Required
-			// governs whether a nonzero cleanup EXIT CODE blocks the merge
-			// (line below) -- it must never also govern whether a failure to
-			// PROVE DESCENDANT EXTINCTION is acceptable. "Cleanup is
-			// optional" means "we don't care if the lint/format pass itself
-			// failed," never "we don't care whether something it spawned is
-			// still alive and unaccounted for." Unconditional regardless of
-			// c.Cleanup.Required.
-			if extinctionErr != nil {
-				violations = append(violations, "cleanup validator descendant containment: "+extinctionErr.Error())
-			}
-			if e != nil {
-				out += "\n" + e.Error()
-			}
-			recordValidatorEvidence(db, id, v, code, out, "cleanup")
-			beforeScan := len(violations)
-			violations = appendRuntimePathScanViolation(violations, "after cleanup validator", work)
-			if len(violations) > beforeScan {
-				break
-			}
-			if (code != 0 || e != nil) && c.Cleanup.Required {
-				if errors.Is(e, context.DeadlineExceeded) || errors.Is(ctx.Err(), context.DeadlineExceeded) {
-					violations = append(violations, fmt.Sprintf("run deadline exceeded during cleanup validator: %s", v))
-				} else {
-					violations = append(violations, fmt.Sprintf("cleanup validator failed (%d): %s", code, v))
-				}
 			}
 		}
 	}
@@ -4047,7 +4133,23 @@ func (r *Runner) runOnce(ctx context.Context, c contracts.Contract) (RunRecord, 
 			rec.FailureTaxonomy = observability.ClassifyFailure(violations)
 		}
 		if git {
-			commit, err := preserveQuarantineWorktree(ctx, work, head, id)
+			// Sol10 P0-3 (rc4 Session 3): quarantine preservation is itself
+			// forensic bookkeeping that must survive the exact condition
+			// that produced the quarantine -- most importantly a run that
+			// quarantined because its own budget.max_minutes deadline
+			// expired (e.g. a cleanup validator killed mid-write). ctx is
+			// already permanently Done in that case, so every git plumbing
+			// call preserveQuarantineWorktree makes on it (open session,
+			// rev-parse, status, commit-tree, update-ref) would fail
+			// immediately with "context deadline exceeded", silently
+			// discarding the one record that could prove a restored
+			// pre-cleanup snapshot -- not the corrupted bytes -- is what
+			// got preserved. Mirrors destroyWorkspaceWithOutbox's existing
+			// detached-but-bounded pattern above: a fresh context.Background
+			// timeout, independent of the run's own exhausted deadline.
+			qctx, qcancel := context.WithTimeout(context.Background(), workspaceCleanupTimeout)
+			commit, err := preserveQuarantineWorktree(qctx, work, head, id)
+			qcancel()
 			if err != nil {
 				rec.Message = strings.TrimSpace(rec.Message + "; " + err.Error())
 			} else {
