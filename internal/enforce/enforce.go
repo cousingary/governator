@@ -69,6 +69,22 @@ type Plan struct {
 	// RESULT.json can't be granted in advance.
 	WriteDirs  []string
 	WriteFiles []string
+	// ROBinds are read-only bind mounts Wrap establishes inside a private
+	// mount namespace before exec'ing the backend (Sol10 P0-1): each Src
+	// (a controller-private path outside Workspace, e.g. a consumed-artifact
+	// store) is bind-mounted then remounted read-only onto Dst (a
+	// pre-created, empty placeholder directory the caller must have created
+	// beneath Workspace before Wrap's launch -- mount(2) requires the target
+	// to already exist, mirroring WriteDirs/WriteFiles's own "pre-create it
+	// before launch" contract). Landlock alone cannot carve a read-only hole
+	// out of an otherwise-writable RWDirs(Workspace) rule: rules within one
+	// ruleset are purely additive, so a narrower RODirs rule nested under a
+	// broader RWDirs ancestor grants nothing back. Making Dst a genuinely
+	// separate mount before the Landlock ruleset is applied is what lets the
+	// RODirs rule __sandbox_exec adds for it actually be authoritative --
+	// Landlock enforcement is mount-aware, so the ancestor Workspace rule's
+	// recursive reach stops at the new mount boundary. See RunSandboxExec.
+	ROBinds []ROBind
 
 	// selfExe is the string-based launch path used only when selfExeFile is
 	// nil: the SelfExeOverride test seam (a real, distinct sealed-copy file,
@@ -395,6 +411,28 @@ func (p Plan) WithWriteRoots(dirs, files []string) Plan {
 	return p
 }
 
+// ROBind is one read-only bind mount Wrap establishes before exec'ing the
+// backend. Src is a controller-private absolute path (never inside
+// Workspace); Dst is the pre-created, empty placeholder directory beneath
+// Workspace the backend will see it at.
+type ROBind struct {
+	Src string
+	Dst string
+}
+
+// WithReadOnlyBinds adds read-only bind-mount requirements for this launch
+// (Sol10 P0-1). Each Dst must already exist as an empty directory beneath
+// Workspace before Wrap's launch starts -- see ROBind's doc comment and
+// RunSandboxExec, which performs the actual mount(2) calls from inside the
+// namespace, before applying the Landlock ruleset.
+func (p Plan) WithReadOnlyBinds(binds ...ROBind) Plan {
+	if !p.Active || len(binds) == 0 {
+		return p
+	}
+	p.ROBinds = append(append([]ROBind(nil), p.ROBinds...), binds...)
+	return p
+}
+
 // Wrap rewrites bin/args so the process that actually starts is already
 // confined: Landlock is applied to it before it execs into bin (see
 // RunSandboxExec), and -- unless the run is permitted network access -- the
@@ -449,10 +487,17 @@ func (p Plan) Wrap(bin string, args []string) (string, []string, []*os.File) {
 	for _, file := range p.WriteFiles {
 		inner = append(inner, "--write-file", file)
 	}
+	for _, b := range p.ROBinds {
+		inner = append(inner, "--ro-bind", b.Src+"="+b.Dst)
+	}
 	inner = append(inner, "--")
 	inner = append(inner, bin)
 	inner = append(inner, args...)
-	if p.AllowNetwork {
+	// Sol10 P0-1: a read-only bind mount needs a private mount namespace
+	// regardless of network policy, so AllowNetwork alone no longer decides
+	// whether this launch goes through unshare -- it only decides whether
+	// --net (no configured route) is one of the namespaces unshared.
+	if p.AllowNetwork && len(p.ROBinds) == 0 {
 		return inner[0], inner[1:], extraFiles
 	}
 	// No configured route inside the namespace means every connect()/bind()
@@ -470,7 +515,17 @@ func (p Plan) Wrap(bin string, args []string) (string, []string, []*os.File) {
 	if p.unshareHandle != nil {
 		unshareArg = fdArg(p.unshareHandle.File())
 	}
-	full := append([]string{"--net", "--map-root-user", "--"}, inner...)
+	nsFlags := []string{}
+	if !p.AllowNetwork {
+		nsFlags = append(nsFlags, "--net")
+	}
+	nsFlags = append(nsFlags, "--map-root-user")
+	if len(p.ROBinds) > 0 {
+		// --mount: a private mount namespace so the ro-bind(s) __sandbox_exec
+		// establishes below never leak to the host or outlive this launch.
+		nsFlags = append(nsFlags, "--mount")
+	}
+	full := append(append(nsFlags, "--"), inner...)
 	return unshareArg, full, extraFiles
 }
 

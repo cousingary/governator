@@ -39,6 +39,16 @@ type Workspace struct {
 	Branch    string // git worktree branch name; "" for the non-git copy path
 	Git       bool
 	Container string // docker container name; "" for LocalWorktreeRunner
+	// ConsumedDir is the host absolute path of the private, controller-owned
+	// consumed-artifact store for this run (Sol10 P0-1's
+	// runtime.consumedArtifactStoreDir), set by the caller after Prepare
+	// returns, only when the contract declares Consumes and this run's
+	// consumed artifacts are staged externally rather than into the legacy
+	// <work>/.governator/consumed location. DockerRunner.runArgs bind-mounts
+	// it read-only onto /workspace/.governator/consumed when non-empty;
+	// LocalWorktreeRunner ignores it (the local path's equivalent protection
+	// goes through enforce.Plan.ROBinds instead, attached via context).
+	ConsumedDir string
 }
 
 // PrepareRequest is Prepare's input: enough to create the same disposable

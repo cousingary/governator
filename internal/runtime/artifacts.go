@@ -92,11 +92,40 @@ func consumedArtifactsHash(artifacts []stagedArtifact) string {
 	return hashJSON(artifacts)
 }
 
-func stageConsumedArtifacts(work string, artifacts []stagedArtifact) ([]stagedArtifact, error) {
+// ConsumedArtifactMutated is the exact quarantine token Sol10 P0-1 requires:
+// any consumed-artifact hash mismatch, at any of the four verification
+// points (before backend launch, after backend extinction, before
+// validation, after all validation), must report exactly this string --
+// never a differently-worded message that happens to describe the same
+// condition, so operators and the redteam corpus can grep for one fixed
+// token.
+const ConsumedArtifactMutated = "CONSUMED_ARTIFACT_MUTATED"
+
+// consumedArtifactStoreDir is the private, controller-owned directory
+// consumed artifacts are staged beneath for run runID (Sol10 P0-1): never
+// inside the worktree. A same-UID backend process can always chmod its way
+// past mode bits on a file inside its OWN writable workspace -- that is
+// ordinary, privilege-free Unix file-ownership semantics, not a namespace
+// escape, so 0400 inside <work> was never a real boundary regardless of
+// --map-root-user. This directory lives under home (Governator's own state
+// directory) and is only ever exposed to the backend read-only, through the
+// mechanism runOnce selects (enforce.Plan.WithReadOnlyBinds for local,
+// Workspace.ConsumedDir's docker :ro mount for docker) -- never granted
+// RWDirs/-v (writable) anywhere.
+func consumedArtifactStoreDir(home, runID string) string {
+	return filepath.Join(home, "consumed", runID)
+}
+
+// stageConsumedArtifacts writes every sealed artifact into dir (either
+// consumedArtifactStoreDir's external private store, or -- only when local
+// host containment is not active for this run, see runOnce -- the legacy
+// <work>/.governator/consumed location) with mode 0400. Mode 0400 remains a
+// courtesy against accidental same-process overwrite, never the actual
+// immutability boundary; see consumedArtifactStoreDir's doc comment.
+func stageConsumedArtifacts(dir string, artifacts []stagedArtifact) ([]stagedArtifact, error) {
 	if len(artifacts) == 0 {
 		return nil, nil
 	}
-	dir := filepath.Join(work, ".governator", "consumed")
 	if err := os.MkdirAll(dir, 0700); err != nil {
 		return nil, fmt.Errorf("stage consumed artifacts: %w", err)
 	}
@@ -110,6 +139,32 @@ func stageConsumedArtifacts(work string, artifacts []stagedArtifact) ([]stagedAr
 		}
 	}
 	return append([]stagedArtifact(nil), artifacts...), nil
+}
+
+// verifyConsumedArtifacts re-reads every staged artifact beneath dir and
+// hash-verifies it against the sealed identity captured before staging (Sol10
+// P0-1's four verification points: before backend launch, after backend
+// extinction, before validation, after all validation). Every lookup goes
+// through readRegularBeneath (openat2 RESOLVE_BENEATH|RESOLVE_NO_SYMLINKS|
+// RESOLVE_NO_MAGICLINKS), so a same-name symlink or hard-link swap fails the
+// read itself rather than silently resolving to different bytes. Any
+// mismatch -- unreadable, wrong size, wrong content -- is reported as exactly
+// ConsumedArtifactMutated; callers never re-copy or skip past a mismatch.
+func verifyConsumedArtifacts(dir string, artifacts []stagedArtifact) error {
+	for _, artifact := range artifacts {
+		data, info, err := readRegularBeneath(dir, artifact.Name)
+		if err != nil {
+			return fmt.Errorf("%s: consumed artifact %q unreadable beneath its sealed store: %w", ConsumedArtifactMutated, artifact.Name, err)
+		}
+		if info.Size() != artifact.Bytes {
+			return fmt.Errorf("%s: consumed artifact %q size changed: staged=%d now=%d", ConsumedArtifactMutated, artifact.Name, artifact.Bytes, info.Size())
+		}
+		sum := sha256.Sum256(data)
+		if actual := hex.EncodeToString(sum[:]); actual != artifact.SHA256 {
+			return fmt.Errorf("%s: consumed artifact %q content changed", ConsumedArtifactMutated, artifact.Name)
+		}
+	}
+	return nil
 }
 
 func artifactPromptAnnotation(staged []stagedArtifact, produced []contracts.ArtifactSpec) string {

@@ -561,3 +561,43 @@ cases:
     session: rc3-s8
     required: true
     status: implemented
+  - case: 102
+    name: TestV10Case1BackendOverwriteOfConsumedArtifactRefused
+    session: rc4-s1
+    required: true
+    status: implemented
+  - case: 103
+    name: TestV10Case2BackendTruncateOfConsumedArtifactRefused
+    session: rc4-s1
+    required: true
+    status: implemented
+  - case: 104
+    name: TestV10Case3BackendRenameOverConsumedArtifactRefused
+    session: rc4-s1
+    required: true
+    status: implemented
+  - case: 105
+    name: TestV10Case4BackendHardLinkReplacementOfConsumedArtifactRefused
+    session: rc4-s1
+    required: true
+    status: implemented
+  - case: 106
+    name: TestV10Case5ValidatorObservesExactOriginalBytesDespiteMutationAttempt
+    session: rc4-s1
+    required: true
+    status: implemented
+  - case: 107
+    name: TestV10Case6MutationDetectedAfterBackendExtinction
+    session: rc4-s1
+    required: true
+    status: implemented
+  - case: 108
+    name: TestV10Case7MutationDetectedAfterCleanupValidator
+    session: rc4-s1
+    required: true
+    status: implemented
+  - case: 109
+    name: TestV10Case8MutationDetectedAfterSuccessValidation
+    session: rc4-s1
+    required: true
+    status: implemented

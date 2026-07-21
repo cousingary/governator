@@ -360,6 +360,8 @@ func RunSandboxExec(argv []string) int {
 	fs.Var(&writeDirs, "write-dir", "pre-existing directory beneath workspace granted RW despite --readonly (repeatable)")
 	var writeFiles stringListFlag
 	fs.Var(&writeFiles, "write-file", "pre-existing file beneath workspace granted RW despite --readonly (repeatable)")
+	var roBinds stringListFlag
+	fs.Var(&roBinds, "ro-bind", "src=dst read-only bind mount, established before the Landlock ruleset (repeatable)")
 	if err := fs.Parse(argv); err != nil {
 		fmt.Fprintln(os.Stderr, "enforce: parse sandbox-exec args:", err)
 		return 2
@@ -373,7 +375,32 @@ func RunSandboxExec(argv []string) int {
 		fmt.Fprintln(os.Stderr, "enforce: sandbox-exec requires --workspace and -- <bin> [args...]")
 		return 2
 	}
-	if err := applyLandlockRuleset(*workspace, *readOnly, rest[0], readRoots, writeDirs, writeFiles); err != nil {
+	// Sol10 P0-1: establish every read-only bind mount BEFORE the Landlock
+	// ruleset is computed and applied. Wrap already unshared a private mount
+	// namespace (--mount) for this launch whenever roBinds is non-empty, so
+	// these mounts are visible only to this process tree and never leak to
+	// the host or outlive it. Each dst becomes a separate mount object --
+	// this is what lets the RODirs rule added for it below actually be
+	// authoritative despite an ancestor RWDirs(workspace) rule (Landlock
+	// rules within one ruleset are purely additive and cannot be narrowed by
+	// a nested rule on the SAME filesystem object, but a genuinely different
+	// mount is not the same object). Any failure here refuses the launch
+	// outright -- never falls through to exec with the artifact still only
+	// mode-bit-protected.
+	readRootsList := []string(readRoots)
+	for _, spec := range roBinds {
+		src, dst, ok := strings.Cut(spec, "=")
+		if !ok || src == "" || dst == "" {
+			fmt.Fprintln(os.Stderr, "enforce: malformed --ro-bind (want src=dst):", spec)
+			return 1
+		}
+		if err := bindMountReadOnly(src, dst); err != nil {
+			fmt.Fprintln(os.Stderr, "enforce: read-only bind mount", spec, "failed:", err)
+			return 1
+		}
+		readRootsList = append(readRootsList, dst)
+	}
+	if err := applyLandlockRuleset(*workspace, *readOnly, rest[0], readRootsList, writeDirs, writeFiles); err != nil {
 		fmt.Fprintln(os.Stderr, "enforce: apply landlock ruleset:", err)
 		return 1
 	}

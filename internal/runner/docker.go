@@ -330,6 +330,19 @@ func (d *DockerRunner) runArgs(ws Workspace, bin string, args []string) ([]strin
 	// worktree path can't shift where the repo lands inside the container.
 	wsPath := filepath.Clean(ws.Path)
 	out := []string{"run", "--name", ws.Container, "-v", wsPath + ":/workspace", "-w", "/workspace"}
+	// Sol10 P0-1: a second, more specific bind mount layered read-only over
+	// the writable /workspace mount above -- standard docker/mount-layering
+	// behavior, the more specific mount path wins for paths beneath it. The
+	// consumed-artifact store lives outside the host worktree entirely (see
+	// runtime.consumedArtifactStoreDir); mounting it here, instead of
+	// relying on the workspace bind's own permission bits, means even a
+	// container running as root (the common non-remapped-userns default)
+	// cannot write through this path without first defeating the mount
+	// itself, which requires CAP_SYS_ADMIN -- absent from Docker's default
+	// capability set and never added by this config.
+	if ws.ConsumedDir != "" {
+		out = append(out, "-v", filepath.Clean(ws.ConsumedDir)+":/workspace/.governator/consumed:ro")
+	}
 	if d.Config.MemoryLimit != "" {
 		out = append(out, "--memory", d.Config.MemoryLimit)
 	}

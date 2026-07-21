@@ -1464,17 +1464,19 @@ printf '{"type":"result","total_cost_usd":0.05}\n'
 
 // TestConsumedArtifactIsStagedReadOnlyForConsumer proves the artifact is
 // staged into the consumer's workspace with the expected content (sha256
-// sealed, mode 0400) and consumable. It does NOT prove the confined backend
-// is structurally unable to overwrite it -- see
-// agents/governator-sol-upgrade7-findings.md "consumed-artifact DAC
-// write-protection is bypassed by --map-root-user": the confined process
-// runs as root inside its own user namespace (needed elsewhere for mount
-// operations), which grants it CAP_DAC_OVERRIDE over files owned by the
-// mapped (real) uid -- so a 0400 file it owns is not actually write-blocked
-// by the OS. Landlock's write ruleset is workspace-root-wide (no
-// per-subpath write exclusion exists yet), so nothing else prevents the
-// write either. This is a known, accepted gap for v1.0.2-rc1, not something
-// this test can paper over by asserting a guarantee that does not hold.
+// sealed, mode 0400) and consumable. It does not itself exercise the
+// structural (kernel-enforced) immutability boundary -- that gap (the
+// confined process running as root inside its own user namespace, needed
+// elsewhere for mount operations, grants it CAP_DAC_OVERRIDE over files
+// owned by the mapped real uid, so 0400 alone never blocked a same-UID
+// overwrite) is closed by Sol10 P0-1: internal/redteam's
+// TestV10Case1BackendOverwriteOfConsumedArtifactRefused through
+// TestV10Case8MutationDetectedAfterSuccessValidation prove the real
+// boundary (an externally-staged store exposed only through a genuinely
+// separate mount Landlock grants a read-only rule on, plus
+// hash-reverification at four checkpoints) end to end. See
+// docs/security.md and agents/governator-sol-upgrade10-rc4-plan.md Session
+// 1.
 func TestConsumedArtifactIsStagedReadOnlyForConsumer(t *testing.T) {
 	root, _ := fixture(t)
 	writeArtifactSchema(t, root)

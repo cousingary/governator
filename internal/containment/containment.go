@@ -35,6 +35,15 @@ func Effectful(c contracts.Contract) bool {
 		len(c.Allowed.Execute) > 0 ||
 		len(c.Preflight.IntendedWrites) > 0 ||
 		len(c.Produces) > 0 ||
+		// Sol10 P0-1: a job that consumes another job's artifact needs the
+		// same host containment baseline as one that produces one -- the
+		// consumed-artifact immutable boundary (internal/enforce read-only
+		// bind + Landlock read root for local, the read-only docker mount for
+		// docker) is only ever wired up when host containment is active, so
+		// a consuming contract that could otherwise skip containment would
+		// silently fall back to no boundary at all rather than failing
+		// closed.
+		len(c.Consumes) > 0 ||
 		len(c.Success.Validators) > 0 ||
 		(c.Cleanup != nil && len(c.Cleanup.Validators) > 0) ||
 		(c.Docker != nil && len(c.Docker.CredentialMounts) > 0)

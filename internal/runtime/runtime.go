@@ -3124,7 +3124,53 @@ func (r *Runner) runOnce(ctx context.Context, c contracts.Contract) (RunRecord, 
 	if err := os.WriteFile(canaryPath, []byte(id+"\n"), 0400); err != nil {
 		return RunRecord{}, fmt.Errorf("create canary: %w", err)
 	}
-	_, err = stageConsumedArtifacts(work, transaction.Artifacts)
+	// Sol10 P0-1: consumed artifacts are staged outside the writable
+	// worktree whenever this run's own containment will actually be active
+	// -- docker always gets the external store (its read-only bind mount
+	// below does not depend on hardening tier), and local gets it exactly
+	// when requiresEnforcementWrap (computed by enforceContainment above,
+	// before this run's workspace even existed) says the enforce.Plan built
+	// further down will be Active. That mirrors NewPlanForExecutable's own
+	// fail-closed contract: requiresEnforcementWrap true on a host that
+	// cannot actually provide Landlock+unshare refuses the whole run before
+	// ever reaching here, rather than silently falling back. Only when local
+	// containment is not required at all (operator disabled
+	// enforce_local_effectful_tiering) does staging fall back to the legacy
+	// mode-bits-in-workspace location -- the same already-accepted reduced
+	// posture that setting gives every other control, honestly labelled
+	// below rather than left to imply a boundary that isn't there.
+	stageDir := filepath.Join(work, ".governator", "consumed")
+	consumedBoundary := ""
+	externalConsumedStore := false
+	if len(transaction.Artifacts) > 0 {
+		switch {
+		case c.EffectiveRunner() == "docker":
+			consumedBoundary = "docker-ro-bind-mount"
+		case requiresEnforcementWrap:
+			consumedBoundary = "landlock-mount-namespace-ro-bind"
+		default:
+			consumedBoundary = "mode-bits-degraded"
+		}
+		externalConsumedStore = consumedBoundary == "docker-ro-bind-mount" || consumedBoundary == "landlock-mount-namespace-ro-bind"
+		if externalConsumedStore {
+			stageDir = consumedArtifactStoreDir(r.Home, id)
+			// The workspace-relative mount point .governator/consumed must
+			// already exist, empty, before any of the docker :ro -v, the
+			// local backend's ro-bind mount(2) call, or a validator's own
+			// ro-bind (see the success/cleanup validator loops below --
+			// internal/stage.Executor always runs host-side regardless of
+			// runner kind, so a validator that reads a consumed artifact
+			// needs this same mount established for ITS OWN launch too, not
+			// just the backend's).
+			if err := os.MkdirAll(filepath.Join(work, ".governator", "consumed"), 0700); err != nil {
+				return RunRecord{}, fmt.Errorf("pre-create consumed-artifact mount point: %w", err)
+			}
+			if c.EffectiveRunner() == "docker" {
+				ws.ConsumedDir = stageDir
+			}
+		}
+	}
+	_, err = stageConsumedArtifacts(stageDir, transaction.Artifacts)
 	if err != nil {
 		return RunRecord{}, err
 	}
@@ -3215,6 +3261,12 @@ func (r *Runner) runOnce(ctx context.Context, c contracts.Contract) (RunRecord, 
 		}
 		enforcePlan = enforcePlan.WithWriteRoots(writeDirs, writeFiles)
 	}
+	if consumedBoundary == "landlock-mount-namespace-ro-bind" {
+		enforcePlan = enforcePlan.WithReadOnlyBinds(enforce.ROBind{
+			Src: stageDir,
+			Dst: filepath.Join(work, ".governator", "consumed"),
+		})
+	}
 	ctx = enforce.WithPlan(ctx, enforcePlan)
 	// Sol P0-6 / Session 3: thread the run's single resolved handle to
 	// whichever executor rn.Launch ends up calling (agents.defaultExecutor
@@ -3254,6 +3306,13 @@ func (r *Runner) runOnce(ctx context.Context, c contracts.Contract) (RunRecord, 
 			return rec, cerr
 		}
 		oneShotConsumed = true
+		// Sol10 P0-1 checkpoint 1/4: verify every consumed artifact
+		// immediately before the untrusted backend actually starts.
+		if len(transaction.Artifacts) > 0 {
+			if verr := verifyConsumedArtifacts(stageDir, transaction.Artifacts); verr != nil {
+				return RunRecord{}, verr
+			}
+		}
 		ar, aerr = rn.Launch(ctx, ws, runner.LaunchRequest{Agent: agent, Request: agents.Request{
 			Prompt: prompt, Workdir: work, Transcript: transcript,
 			Timeout: agentTimeout,
@@ -3313,6 +3372,13 @@ func (r *Runner) runOnce(ctx context.Context, c contracts.Contract) (RunRecord, 
 	if !ar.DescendantsGone {
 		return RunRecord{}, fmt.Errorf("descendant containment: backend stage did not confirm descendant extinction")
 	}
+	// Sol10 P0-1 checkpoint 2/4: verify every consumed artifact immediately
+	// after the backend's own descendant tree is kernel-confirmed extinct.
+	if len(transaction.Artifacts) > 0 {
+		if verr := verifyConsumedArtifacts(stageDir, transaction.Artifacts); verr != nil {
+			return RunRecord{}, verr
+		}
+	}
 	// Sol P0-3/P1-15 (Session 5) effect ledger: when this launch went through
 	// Governator's own externally enforced sandbox, record what that
 	// enforcement actually was and what the kernel observed -- independent
@@ -3344,8 +3410,19 @@ func (r *Runner) runOnce(ctx context.Context, c contracts.Contract) (RunRecord, 
 			DeclaredCredentialPolicy:  declaredCredentialPolicy(c),
 			ObservedCredentialAccess:  "unavailable",
 			OutputConsequence:         "unobserved",
+			ConsumedArtifactBoundary:  consumedBoundary,
 			Created:                   time.Now().UTC().Format(time.RFC3339Nano),
 		}
+		if err := observability.RecordEnforcement(db, enfRec); err != nil {
+			payload, _ := json.Marshal(enfRec)
+			noteOperationalFailure(db, id, opStageEvent, err, string(payload))
+		}
+	} else if consumedBoundary != "" {
+		// Sol10 P0-1: docker (and the mode-bits-degraded fallback) never go
+		// through the enforcePlan.Active branch above at all, but the
+		// consumed-artifact boundary mechanism must still be recorded
+		// evidence regardless of which runner provided it.
+		enfRec := observability.EnforcementRecord{RunID: id, ConsumedArtifactBoundary: consumedBoundary, Created: time.Now().UTC().Format(time.RFC3339Nano)}
 		if err := observability.RecordEnforcement(db, enfRec); err != nil {
 			payload, _ := json.Marshal(enfRec)
 			noteOperationalFailure(db, id, opStageEvent, err, string(payload))
@@ -3581,6 +3658,13 @@ func (r *Runner) runOnce(ctx context.Context, c contracts.Contract) (RunRecord, 
 	if err := lifecycle.Record(db, id, lifecycle.Validating, "", lifecycle.Now()); err != nil {
 		return rec, err
 	}
+	// Sol10 P0-1 checkpoint 3/4: verify every consumed artifact immediately
+	// before the validator phase a validator that reads it might run in.
+	if len(transaction.Artifacts) > 0 {
+		if verr := verifyConsumedArtifacts(stageDir, transaction.Artifacts); verr != nil {
+			violations = append(violations, verr.Error())
+		}
+	}
 	for validatorIndex, v := range c.Success.Validators {
 		vctx, cancel, deadlineErr := stageTimeout(ctx, "success validator")
 		if deadlineErr != nil {
@@ -3622,6 +3706,13 @@ func (r *Runner) runOnce(ctx context.Context, c contracts.Contract) (RunRecord, 
 		}
 		authority := validatorAuthority(work, validatorSpec, false, requireStrongDescendants)
 		authority.ReadRoots = append(authority.ReadRoots, sealedReadRoots...)
+		if externalConsumedStore {
+			// Sol10 P0-1: internal/stage.Executor compiles its own fresh
+			// enforce.Plan for this validator launch, independent of the
+			// backend's -- it needs its own ro-bind to see consumed
+			// artifacts at all now that they no longer live under work.
+			authority.ROBinds = append(authority.ROBinds, enforce.ROBind{Src: stageDir, Dst: filepath.Join(work, ".governator", "consumed")})
+		}
 		code, out, e, extinctionErr := shellStage(vctx, id, "success-validator", work, v, authority, env.Controller, toolDirs, env.ToolRegistry)
 		cancel()
 		if extinctionErr != nil {
@@ -3693,6 +3784,15 @@ func (r *Runner) runOnce(ctx context.Context, c contracts.Contract) (RunRecord, 
 			}
 			authority := validatorAuthority(work, validatorSpec, true, requireStrongDescendants)
 			authority.ReadRoots = append(authority.ReadRoots, sealedReadRoots...)
+			if externalConsumedStore {
+				// Sol10 P0-1: same reasoning as the success-validator loop
+				// above -- and read-only regardless of this cleanup
+				// validator's own write authority elsewhere in the
+				// workspace, since the ro-bind's RODirs rule is bound to a
+				// separate mount Landlock governs independently of the
+				// workspace's write grants.
+				authority.ROBinds = append(authority.ROBinds, enforce.ROBind{Src: stageDir, Dst: filepath.Join(work, ".governator", "consumed")})
+			}
 			code, out, e, extinctionErr := shellStage(vctx, id, "cleanup-validator", work, v, authority, env.Controller, toolDirs, env.ToolRegistry)
 			cancel()
 			// Sol redteam v7 S1 cleanup-specific fail-open defect: Required
@@ -3748,6 +3848,15 @@ func (r *Runner) runOnce(ctx context.Context, c contracts.Contract) (RunRecord, 
 	// not configured in Governator's own config still writes a
 	// VerdictSkipped row, so "skipped" is always visible and distinguishable
 	// from "never asked for" in the ledger.
+	// Sol10 P0-1 checkpoint 4/4: verify every consumed artifact after all
+	// validation (success validators, cleanup validators, PostRunValidate,
+	// Assay) has run, immediately before the final structural barrier and
+	// merge decision below.
+	if len(violations) == 0 && len(transaction.Artifacts) > 0 {
+		if verr := verifyConsumedArtifacts(stageDir, transaction.Artifacts); verr != nil {
+			violations = append(violations, verr.Error())
+		}
+	}
 	var approvedFinal finalStateMeasurement
 	if len(violations) == 0 {
 		var finalViolations []string

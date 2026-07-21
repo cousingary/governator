@@ -64,10 +64,18 @@ type StageAuthority struct {
 	Network            NetworkPolicy    `json:"network,omitempty"`
 	Credentials        CredentialPolicy `json:"credentials,omitempty"`
 	RequireStrongScope bool             `json:"require_strong_scope,omitempty"`
+	// ROBinds are read-only bind-mount requirements this stage's own
+	// compiled enforce.Plan must carry (Sol10 P0-1). internal/stage.Executor
+	// always launches host-side, through its OWN freshly compiled Plan,
+	// regardless of whether the run's backend used a docker container or
+	// Governator's local enforce wrap -- so a validator that reads a
+	// consumed artifact staged externally needs this set explicitly by the
+	// caller (runtime.go), never inherited from the backend's own plan.
+	ROBinds []enforce.ROBind `json:"-"`
 }
 
 func (a StageAuthority) RequiresExternalEnforcement() bool {
-	return len(a.ReadRoots) > 0 || len(a.WriteRoots) > 0 || a.Network == NetworkPolicyDenied || a.Credentials == CredentialPolicyNone
+	return len(a.ReadRoots) > 0 || len(a.WriteRoots) > 0 || a.Network == NetworkPolicyDenied || a.Credentials == CredentialPolicyNone || len(a.ROBinds) > 0
 }
 
 type OutputCaptureMode string
@@ -221,6 +229,7 @@ func (Executor) Run(ctx context.Context, spec StageSpec) (StageResult, error) {
 			if cerr != nil {
 				return StageResult{}, fmt.Errorf("stage: construct authority plan: %w", cerr)
 			}
+			compiledPlan = compiledPlan.WithReadOnlyBinds(authority.ROBinds...)
 			// Sol v9 P0-1/P0-2: compiledPlan may hold open descriptors (see
 			// enforce.Plan.Close's doc comment) -- release them once this
 			// stage's launch (below, still within this Run call) has

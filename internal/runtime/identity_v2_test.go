@@ -37,11 +37,11 @@ func TestSealedArtifactStagesCapturedBytes(t *testing.T) {
 	data := []byte("before replay")
 	sum := sha256.Sum256(data)
 	a := stagedArtifact{Name: "a.txt", Path: ".governator/consumed/a.txt", SHA256: hex.EncodeToString(sum[:]), Bytes: int64(len(data)), data: append([]byte(nil), data...)}
-	work := t.TempDir()
-	if _, err := stageConsumedArtifacts(work, []stagedArtifact{a}); err != nil {
+	dir := filepath.Join(t.TempDir(), ".governator", "consumed")
+	if _, err := stageConsumedArtifacts(dir, []stagedArtifact{a}); err != nil {
 		t.Fatal(err)
 	}
-	got, err := os.ReadFile(filepath.Join(work, ".governator", "consumed", "a.txt"))
+	got, err := os.ReadFile(filepath.Join(dir, "a.txt"))
 	if err != nil {
 		t.Fatal(err)
 	}
