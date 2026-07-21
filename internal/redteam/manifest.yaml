@@ -679,3 +679,23 @@ cases:
     session: rc4-s4
     required: true
     status: implemented
+  - case: 124
+    name: TestV10Case25SitecustomizeAttemptsToAlterEvaluationHasNoEffect
+    session: rc4-s5
+    required: true
+    status: implemented
+  - case: 125
+    name: TestV10Case26PthFileAttemptsStartupExecutionHasNoEffect
+    session: rc4-s5
+    required: true
+    status: implemented
+  - case: 126
+    name: TestV10Case27InstalledDependencyChangeWithoutLockfileChangeInvalidatesReplay
+    session: rc4-s5
+    required: true
+    status: implemented
+  - case: 127
+    name: TestV10Case28StdlibModuleChangeWithoutExecutableChangeInvalidatesReplay
+    session: rc4-s5
+    required: true
+    status: implemented

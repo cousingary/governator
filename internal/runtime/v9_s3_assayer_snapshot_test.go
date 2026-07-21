@@ -284,21 +284,26 @@ func TestV9Case15PythonRegistryRotationAfterSnapshotHasNoEffect(t *testing.T) {
 		t.Fatalf("expected the frozen snapshot to still execute via the pre-rotation python handle, got %+v", v)
 	}
 
-	// Control: a FRESH snapshot built AFTER the rotation resolves the
-	// now-current (broken) registry entry and must actually fail --
+	// Control: a FRESH snapshot build attempted AFTER the rotation resolves
+	// the now-current (broken) registry entry and must actually fail --
 	// proving the rotation really would have mattered without the freeze.
+	//
+	// Sol10 P0-5: BuildSnapshot itself now resolves and runs an isolated
+	// stdlib probe through the held python handle (buildRuntimeManifest),
+	// so a broken interpreter fails closed here, at construction time,
+	// rather than only later inside Evaluate's subprocess launch -- an
+	// earlier, stronger failure mode than this test originally exercised,
+	// but the same underlying point: without the freeze already in place
+	// (snap, built above, before the rotation), the rotated registry entry
+	// would have broken this transaction.
 	registryAfter, err := toolregistry.Load()
 	if err != nil {
 		t.Fatal(err)
 	}
 	freshSnap, ferr := assay.BuildSnapshot(registryAfter, assay.Config{Repo: repo, Python: "python3"})
-	if ferr != nil {
-		t.Fatal(ferr)
-	}
-	defer freshSnap.Close()
-	freshV := assay.Evaluate(context.Background(), assay.Config{Repo: repo, Python: "python3"}, req, path, freshSnap)
-	if freshV.Verdict == assay.VerdictPass {
-		t.Fatalf("expected a fresh snapshot built after the python3 rotation to fail (broken interpreter), got %+v", freshV)
+	if ferr == nil {
+		freshSnap.Close()
+		t.Fatal("expected building a fresh snapshot after the python3 rotation to fail closed (broken interpreter can't pass the frozen runtime-manifest probe)")
 	}
 }
 

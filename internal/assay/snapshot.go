@@ -13,6 +13,7 @@ import (
 	"sort"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/cousingary/governator/internal/controllerenv"
 	"github.com/cousingary/governator/internal/toolregistry"
@@ -73,6 +74,12 @@ type Snapshot struct {
 	// snapshot. Evaluate must launch through this handle, never re-resolve
 	// python for itself.
 	Python *toolregistry.Handle
+	// Runtime is Sol10 P0-5's frozen record of the Python runtime this
+	// snapshot's subprocess actually executes against -- the stdlib closure
+	// Evaluate grants read access to, hashed once here (isolated startup
+	// probe) rather than rediscovered live on every Evaluate call. See
+	// RuntimeManifest's doc comment.
+	Runtime RuntimeManifest
 	// Dirty is true when Repo was a real git checkout with uncommitted
 	// changes at snapshot-build time: what's on disk right now cannot
 	// necessarily be reproduced by a later audit against a specific commit,
@@ -241,6 +248,19 @@ func BuildSnapshot(registry *toolregistry.Registry, cfg Config) (*Snapshot, erro
 		}
 	}()
 
+	// Sol10 P0-5: resolve the frozen runtime manifest here, once, through
+	// the same held handle -- never inside Evaluate, and never via the old
+	// pythonStdlibReadRoots' live-per-call ambient probe. The stdlib
+	// closure this returns is the exact (and only) thing Evaluate grants
+	// read access to; a host whose stdlib this can't resolve/hash cannot
+	// back the immutable-evaluator guarantee at all, so this is fail
+	// closed like Session 1/2's boundary primitives, not best-effort like
+	// DescribeEnvironment's metadata probes below.
+	runtimeManifest, rerr := buildRuntimeManifest(pythonHandle, cfg.Repo)
+	if rerr != nil {
+		return nil, fmt.Errorf("assay: snapshot: resolve frozen python runtime manifest: %w", rerr)
+	}
+
 	if _, statErr := os.Stat(filepath.Join(cfg.Repo, "cli.py")); statErr != nil {
 		return nil, fmt.Errorf("assay: cli.py missing from repo %s: %w", cfg.Repo, statErr)
 	}
@@ -387,14 +407,231 @@ func BuildSnapshot(registry *toolregistry.Registry, cfg Config) (*Snapshot, erro
 		CLIPath:     filepath.Join(dir, "cli.py"),
 		TreeHash:    hex.EncodeToString(treeSum[:]),
 		Python:      pythonHandle,
+		Runtime:     runtimeManifest,
 		Dirty:       dirty,
 		DirtyReason: dirtyReason,
 		files:       files,
 	}, nil
 }
 
+// runtimeProbeTimeout bounds the isolated sysconfig probe subprocess only
+// (path discovery) -- the filesystem hashing that follows is local I/O, not
+// attacker-controlled, and is not itself context-bounded, matching
+// BuildSnapshot's own file-copy loop above.
+const runtimeProbeTimeout = 10 * time.Second
+
+// RuntimeManifest is Sol10 P0-5's frozen record of the Python runtime a
+// Snapshot's subprocess actually executes against.
+//
+// The defect: the pre-P0-5 pythonStdlibReadRoots discovered and permitted
+// *live* stdlib/platstdlib/purelib/platlib directories on every Evaluate
+// call, via `python -c "import sysconfig ..."` run with full site
+// initialization already in effect -- so ambient sitecustomize.py/.pth
+// files could shape the probe itself before it ever printed a path, and the
+// granted read roots (including site-packages) were whatever happened to be
+// on disk at call time, never frozen into replay identity.
+//
+// The fix has two parts. First, Evaluate always launches with the `-S`
+// interpreter flag (never here -- BuildSnapshot only *resolves* the
+// manifest; Evaluate is what launches), which disables the `site` module
+// entirely: no .pth file in any site-packages directory is ever processed,
+// sitecustomize.py/usercustomize.py are never imported, and site-packages
+// is never added to sys.path -- structurally, not by scanning for those
+// files. That is safe specifically because the `evaluate` subcommand never
+// imports a third-party package (`cli.py`'s own `from assayer.store import
+// Store` is safe: Store.client only imports `supabase` lazily, inside a
+// property -- see assay_integration_test.go's rationale comment), so
+// StdlibReadRoots below never needs to include purelib/platlib at all.
+// Second, the probe that resolves StdlibReadRoots itself now also runs with
+// `-S` (buildRuntimeManifest), closing Sol's "startup problem" for the
+// probe the same way.
+//
+// RuntimeHash and DependencyHash exist so a stdlib module or an installed
+// dependency changing bytes -- with or without a corresponding lockfile
+// change -- shows up in the frozen identity a later replay compares
+// against (Sol10 P0-5 cases 27/28), even though DependencyHash's inputs are
+// deliberately never granted read authority during execution.
+type RuntimeManifest struct {
+	// StdlibReadRoots are the exact directories Evaluate grants read access
+	// to so the interpreter can import its own standard library -- resolved
+	// once here, never re-probed live inside Evaluate. Never includes
+	// purelib/platlib (site-packages): see the type doc comment.
+	StdlibReadRoots []string
+	// RuntimeHash is a sha256 over the sorted (path, content) pairs of
+	// every file under StdlibReadRoots -- the frozen identity of exactly
+	// what Evaluate's subprocess can import.
+	RuntimeHash string
+	// DependencyHash is a sha256 over the sorted (path, content) pairs of
+	// every file actually installed under the resolved purelib/platlib
+	// directories (site-packages), when this host's python3 has any --
+	// present for identity/reproducibility only, since this content is
+	// deliberately never part of ReadRoots/PYTHONPATH (evaluate never
+	// imports it). Empty, with DependencyUnavailableReason set, when no
+	// site-packages directory is resolvable; that is a value observation
+	// about the host's Python layout, not a build failure -- unlike
+	// RuntimeHash/StdlibReadRoots, this half of the manifest is
+	// best-effort.
+	DependencyHash string
+	// LockHash is sha256(requirements-lock.txt) at cfg.Repo, when present
+	// -- the declared dependency lock's own identity, recorded separately
+	// from DependencyHash (the *installed* bytes) so "the lock file
+	// changed" and "what's installed changed" are two distinct signals,
+	// never collapsed into one.
+	LockHash string
+	// DependencyUnavailableReason explains why DependencyHash is empty.
+	DependencyUnavailableReason string
+}
+
+// buildRuntimeManifest resolves and hashes RuntimeManifest for python,
+// exactly once, at BuildSnapshot time. The stdlib half is mandatory (a
+// probe or hash failure fails snapshot construction closed); the
+// dependency half is best-effort, matching this file's DescribeEnvironment-
+// style probes.
+func buildRuntimeManifest(python *toolregistry.Handle, repo string) (RuntimeManifest, error) {
+	probeCtx, cancel := context.WithTimeout(context.Background(), runtimeProbeTimeout)
+	defer cancel()
+	// -S: isolated startup (Sol10 P0-5's "startup problem") -- this probe
+	// must not let ambient site configuration shape which paths it
+	// discovers, exactly like Evaluate's own launch must not let it shape
+	// evaluation.
+	cmd, err := python.Command(probeCtx, "-S", "-c",
+		"import sysconfig\n"+
+			"for k in ('stdlib','platstdlib','purelib','platlib'):\n"+
+			"    print(k + '=' + sysconfig.get_path(k))\n")
+	if err != nil {
+		return RuntimeManifest{}, fmt.Errorf("construct isolated sysconfig probe: %w", err)
+	}
+	cmd.Env = controllerenv.Base()
+	out, err := cmd.Output()
+	if err != nil {
+		return RuntimeManifest{}, fmt.Errorf("run isolated sysconfig probe: %w", err)
+	}
+
+	stdlibSeen := map[string]bool{}
+	siteSeen := map[string]bool{}
+	var stdlibRoots, siteRoots []string
+	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		key, path, ok := strings.Cut(strings.TrimSpace(line), "=")
+		if !ok || path == "" {
+			continue
+		}
+		if _, statErr := os.Stat(path); statErr != nil {
+			continue
+		}
+		switch key {
+		case "stdlib", "platstdlib":
+			if !stdlibSeen[path] {
+				stdlibSeen[path] = true
+				stdlibRoots = append(stdlibRoots, path)
+			}
+		case "purelib", "platlib":
+			if !siteSeen[path] {
+				siteSeen[path] = true
+				siteRoots = append(siteRoots, path)
+			}
+		}
+	}
+	if len(stdlibRoots) == 0 {
+		return RuntimeManifest{}, fmt.Errorf("isolated sysconfig probe resolved no stdlib/platstdlib directory")
+	}
+
+	runtimeHash, herr := hashPathTree(stdlibRoots)
+	if herr != nil {
+		return RuntimeManifest{}, fmt.Errorf("hash stdlib tree: %w", herr)
+	}
+	if runtimeHash == "" {
+		return RuntimeManifest{}, fmt.Errorf("stdlib tree hashed to no files at %v", stdlibRoots)
+	}
+
+	manifest := RuntimeManifest{StdlibReadRoots: stdlibRoots, RuntimeHash: runtimeHash}
+
+	depHash, depErr := hashPathTree(siteRoots)
+	switch {
+	case depErr != nil:
+		manifest.DependencyUnavailableReason = fmt.Sprintf("hash site-packages tree: %s", depErr)
+	case depHash == "":
+		manifest.DependencyUnavailableReason = "no site-packages directory resolved for this python3"
+	default:
+		manifest.DependencyHash = depHash
+	}
+
+	if data, rerr := os.ReadFile(filepath.Join(repo, "requirements-lock.txt")); rerr == nil {
+		sum := sha256.Sum256(data)
+		manifest.LockHash = hex.EncodeToString(sum[:])
+	}
+
+	return manifest, nil
+}
+
+// hashPathTree returns a sha256 over the sorted (root-qualified relative
+// path, content) pairs of every regular file under roots -- "" (never an
+// error) when roots resolves to zero files. __pycache__ directories and
+// symlinks are skipped: a symlink could resolve outside the declared root,
+// silently widening what's actually being attested to, and __pycache__ is
+// derived, non-source content that would make the hash flap on every
+// interpreter run without the underlying .py source ever changing. A
+// missing root is skipped, not an error -- callers decide whether an
+// entirely empty result is fatal (buildRuntimeManifest: fatal for stdlib,
+// best-effort for site-packages).
+func hashPathTree(roots []string) (string, error) {
+	type fileEntry struct{ key, sha string }
+	var entries []fileEntry
+	for _, root := range roots {
+		info, statErr := os.Stat(root)
+		if statErr != nil || !info.IsDir() {
+			continue
+		}
+		walkErr := filepath.Walk(root, func(path string, fi os.FileInfo, werr error) error {
+			if werr != nil {
+				return werr
+			}
+			if fi.IsDir() {
+				if fi.Name() == "__pycache__" {
+					return filepath.SkipDir
+				}
+				return nil
+			}
+			if fi.Mode()&os.ModeSymlink != 0 || !fi.Mode().IsRegular() {
+				return nil
+			}
+			data, rerr := os.ReadFile(path)
+			if rerr != nil {
+				return fmt.Errorf("read %s: %w", path, rerr)
+			}
+			sum := sha256.Sum256(data)
+			rel, relErr := filepath.Rel(root, path)
+			if relErr != nil {
+				return relErr
+			}
+			entries = append(entries, fileEntry{
+				key: root + "::" + filepath.ToSlash(rel),
+				sha: hex.EncodeToString(sum[:]),
+			})
+			return nil
+		})
+		if walkErr != nil {
+			return "", walkErr
+		}
+	}
+	if len(entries) == 0 {
+		return "", nil
+	}
+	sort.Slice(entries, func(i, j int) bool { return entries[i].key < entries[j].key })
+	items := make([]map[string]string, 0, len(entries))
+	for _, e := range entries {
+		items = append(items, map[string]string{"path": e.key, "sha256": e.sha})
+	}
+	canonical, err := json.Marshal(items)
+	if err != nil {
+		return "", err
+	}
+	sum := sha256.Sum256(canonical)
+	return hex.EncodeToString(sum[:]), nil
+}
+
 // snapshotDirty is a best-effort, read-only probe (same shape as
-// pythonStdlibReadRoots/environment.go's assayerCommit): any failure to
+// buildRuntimeManifest's DependencyHash half/environment.go's
+// assayerCommit): any failure to
 // resolve git or run the probe reports "not dirty" rather than blocking a
 // snapshot build over a diagnostic-only signal. A repo with no .git at all
 // (e.g. a pinned fixture) has no notion of "uncommitted changes" and is

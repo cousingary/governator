@@ -26,7 +26,6 @@ import (
 
 	"github.com/cousingary/governator/internal/controllerenv"
 	"github.com/cousingary/governator/internal/stage"
-	"github.com/cousingary/governator/internal/toolregistry"
 )
 
 // Verdict states Assayer's evaluate subcommand can return, plus one
@@ -248,21 +247,32 @@ func Evaluate(ctx context.Context, cfg Config, req Request, artifactPath string,
 	// snapshot directory -- never cfg.Repo, the live mutable checkout -- so
 	// the interpreter can only ever import the exact bytes replay identity
 	// was calculated over.
+	//
+	// Sol10 P0-5: ReadRoots also includes snap.Runtime.StdlibReadRoots --
+	// resolved and hashed once, at BuildSnapshot time (isolated -S probe),
+	// never rediscovered live here. Unlike the pre-P0-5
+	// pythonStdlibReadRoots, this never grants read access to
+	// purelib/platlib (site-packages): the "-S" argument below disables
+	// Python's `site` module entirely, so site-packages is never added to
+	// sys.path and no .pth file or sitecustomize.py/usercustomize.py
+	// anywhere is ever processed -- structurally, not by scanning for
+	// those files. That's safe because `evaluate` never imports a
+	// third-party package in the first place (see RuntimeManifest's doc
+	// comment in snapshot.go).
 	envValues := controllerenv.Base()
 	envValues = append(envValues, "PYTHONPATH="+snap.Dir)
 	authority := stage.StageAuthority{
-		ReadRoots:          []string{snap.Dir},
+		ReadRoots:          append([]string{snap.Dir}, snap.Runtime.StdlibReadRoots...),
 		Network:            stage.NetworkPolicyDenied,
 		Credentials:        stage.CredentialPolicyNone,
 		RequireStrongScope: true,
 	}
-	authority.ReadRoots = append(authority.ReadRoots, pythonStdlibReadRoots(runCtx, snap.Python)...)
 	var stdout, stderr bytes.Buffer
 	stageRes, runErr := stage.NewExecutor().Run(runCtx, stage.StageSpec{
 		RunID:            firstNonEmpty(req.RunID, "assay"),
 		StageID:          "assay-evaluate",
 		Executable:       stage.ExecutableIdentity{CanonicalPath: pythonIdentity.CanonicalPath, SHA256: pythonIdentity.SHA256},
-		Arguments:        []string{snap.CLIPath, "evaluate", "--profile", req.CheckProfile},
+		Arguments:        evaluateArguments(snap, req.CheckProfile),
 		WorkingDirectory: snap.Dir,
 		Environment:      stage.FrozenEnvironment{Values: envValues, Hash: controllerenv.Hash(envValues)},
 		ReadRoots:        nil,
@@ -339,47 +349,18 @@ func Blocks(verdict, enforcement string) bool {
 	return verdict != VerdictPass && verdict != VerdictAdvisory
 }
 
-// pythonStdlibReadRoots resolves python's own standard-library and
-// site-packages directories via sysconfig so a Landlock-confined invocation
-// can still import stdlib modules -- the exact same "an interpreter must
-// declare its own runtime" requirement enforce.exactReadClosure's doc
-// comment already states for shell scripts, except Python's runtime is a
-// directory tree of .py/.so files discovered dynamically (sysconfig paths
-// vary by distro/version), not a fixed ELF dependency graph the executable's
-// own closure computation would find. Read-only diagnostic probe (same
-// permanently-legitimate shape as agents/resolution.go's probeVersion) --
-// best-effort: any failure returns nil, so a python this can't introspect
-// just runs with no stdlib read root (whatever failure that causes downstream
-// is not a NEW failure mode introduced by this migration).
-func pythonStdlibReadRoots(ctx context.Context, python *toolregistry.Handle) []string {
-	probeCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
-	defer cancel()
-	cmd, err := python.Command(probeCtx, "-c",
-		"import sysconfig\n"+
-			"for k in ('stdlib','platstdlib','purelib','platlib'):\n"+
-			"    print(sysconfig.get_path(k))\n")
-	if err != nil {
-		return nil
-	}
-	cmd.Env = controllerenv.Base()
-	out, err := cmd.Output()
-	if err != nil {
-		return nil
-	}
-	seen := map[string]bool{}
-	var roots []string
-	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
-		line = strings.TrimSpace(line)
-		if line == "" || seen[line] {
-			continue
-		}
-		if _, statErr := os.Stat(line); statErr != nil {
-			continue
-		}
-		seen[line] = true
-		roots = append(roots, line)
-	}
-	return roots
+// evaluateArguments builds the exact interpreter arguments Evaluate launches
+// snap.Python with. Factored out of Evaluate itself so Sol10 P0-5's
+// red-team corpus (TestV10Case25.../TestV10Case26... in
+// v10_s5_managed_runtime_test.go) can drive the identical argument list --
+// most importantly the leading "-S" -- through the held handle directly,
+// proving the isolated-startup mechanism itself without also requiring this
+// host to provide external Landlock/unshare enforcement, which the full
+// stage.Executor pipeline (RequireStrongScope) needs and which this
+// package's fast unit tier deliberately does not exercise (see TestMain's
+// doc comment).
+func evaluateArguments(snap *Snapshot, profile string) []string {
+	return []string{"-S", snap.CLIPath, "evaluate", "--profile", profile}
 }
 
 // firstNonEmpty returns req.RunID for the stage's identity when set, or a
