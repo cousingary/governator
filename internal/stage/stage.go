@@ -92,28 +92,52 @@ var ErrOutputLimitExceeded = errors.New("STAGE_OUTPUT_LIMIT_EXCEEDED")
 // EffectLedger mirrors observability.EnforcementRecord's three-evidence-class
 // split (Sol9 P1-5) at the per-stage granularity: declared authority
 // (DeclaredNetworkPolicy, DeclaredWriteRoots, DeclaredCredentialPolicy),
-// applied enforcement (EnforcedNetworkPolicy, NetworkDenialMechanism,
-// KernelReadEnvelope, LandlockABI), and observed effects (ActualWriteSet,
-// PeakProcessCount, ObservedCredentialAccess, OutputConsequence,
-// NetworkAttemptObservation). ActualWriteSet is populated by snapshotting
-// every declared write root immediately before launch and reconciling
-// against the same roots after the scope is extinguished -- a real
-// before/after diff, not the declared roots restated as if observed.
+// applied enforcement (EnforcedNetworkPolicy, EnforcedWriteRoots,
+// NetworkDenialMechanism, KernelReadEnvelope, LandlockABI), and observed
+// effects (ActualWriteSet, PeakProcessCount, ObservedCredentialAccess,
+// OutputConsequence, NetworkAttemptObservation). Sol10 P1-2: these three
+// classes used to collapse to two for writes -- DeclaredWriteRoots was
+// actually restating the *compiled* (applied) plan's write roots, not what
+// the caller originally asked for, and ActualWriteSet was a same-size+mtime
+// comparison that only ever walked the after-state, so it could never
+// report a deletion. DeclaredWriteRoots is now the caller's own declared
+// authority (StageAuthority.WriteRoots/StageSpec.WriteRoots, pre-compile);
+// EnforcedWriteRoots is the compiled enforce.Plan's write roots (what a
+// containment mechanism actually installed); ActualWriteSet is a real
+// union-of-before/after reconciliation with content-addressed fingerprints,
+// reported as explicit created/modified/deleted/renamed operations.
 type EffectLedger struct {
-	ScopeMethod               string   `json:"scope_method,omitempty"`
-	WorkspaceFDScanClean      bool     `json:"workspace_fd_scan_clean"`
-	LandlockABI               int      `json:"landlock_abi,omitempty"`
-	KernelReadEnvelope        []string `json:"kernel_read_envelope,omitempty"`
-	DeclaredNetworkPolicy     string   `json:"declared_network_policy,omitempty"`
-	EnforcedNetworkPolicy     string   `json:"enforced_network_policy,omitempty"`
-	NetworkAttemptObservation string   `json:"network_attempt_observation,omitempty"`
-	NetworkDenialMechanism    string   `json:"network_denial_mechanism,omitempty"`
-	DeclaredWriteRoots        []string `json:"declared_write_roots,omitempty"`
-	ActualWriteSet            []string `json:"actual_write_set,omitempty"`
-	DeclaredCredentialPolicy  string   `json:"declared_credential_policy,omitempty"`
-	ObservedCredentialAccess  string   `json:"observed_credential_access,omitempty"`
-	PeakProcessCount          int      `json:"peak_process_count,omitempty"`
-	OutputConsequence         string   `json:"output_consequence,omitempty"`
+	ScopeMethod               string        `json:"scope_method,omitempty"`
+	WorkspaceFDScanClean      bool          `json:"workspace_fd_scan_clean"`
+	LandlockABI               int           `json:"landlock_abi,omitempty"`
+	KernelReadEnvelope        []string      `json:"kernel_read_envelope,omitempty"`
+	DeclaredNetworkPolicy     string        `json:"declared_network_policy,omitempty"`
+	EnforcedNetworkPolicy     string        `json:"enforced_network_policy,omitempty"`
+	NetworkAttemptObservation string        `json:"network_attempt_observation,omitempty"`
+	NetworkDenialMechanism    string        `json:"network_denial_mechanism,omitempty"`
+	DeclaredWriteRoots        []string      `json:"declared_write_roots,omitempty"`
+	EnforcedWriteRoots        []string      `json:"enforced_write_roots,omitempty"`
+	ActualWriteSet            []WriteEffect `json:"actual_write_set,omitempty"`
+	DeclaredCredentialPolicy  string        `json:"declared_credential_policy,omitempty"`
+	ObservedCredentialAccess  string        `json:"observed_credential_access,omitempty"`
+	PeakProcessCount          int           `json:"peak_process_count,omitempty"`
+	OutputConsequence         string        `json:"output_consequence,omitempty"`
+}
+
+// WriteEffect is one path's observed filesystem effect within a stage's
+// declared write roots (Sol10 P1-2): a real before/after reconciliation
+// result, distinguishing created, modified, deleted and renamed paths
+// rather than a flat list of "paths that look different now."
+// ContentSHA256/Size/Mode/SymlinkTarget describe the path's AFTER state
+// (empty/zero for a deleted path, which has no after state).
+type WriteEffect struct {
+	Path          string `json:"path"`
+	Operation     string `json:"operation"` // created | modified | deleted | renamed
+	RenamedFrom   string `json:"renamed_from,omitempty"`
+	ContentSHA256 string `json:"content_sha256,omitempty"`
+	Size          int64  `json:"size,omitempty"`
+	Mode          string `json:"mode,omitempty"`
+	SymlinkTarget string `json:"symlink_target,omitempty"`
 }
 
 // CommandFactory lets callers with already-sealed launch logic build the exact
@@ -495,8 +519,14 @@ func (Executor) Run(ctx context.Context, spec StageSpec) (StageResult, error) {
 			enforcedNetwork = string(NetworkPolicyAllowed)
 		}
 	}
-	declaredWrites := append([]string(nil), effectivePlan.WriteDirs...)
-	declaredWrites = append(declaredWrites, effectivePlan.WriteFiles...)
+	// Sol10 P1-2: DeclaredWriteRoots is the caller's own ask (authority.
+	// WriteRoots, merged from spec.Authority/spec.WriteRoots above --
+	// possibly relative, possibly a mix of dirs and files); EnforcedWriteRoots
+	// is what the compiled plan actually installed (abs-resolved, split into
+	// dirs/files). Distinct evidence classes, not the same list twice.
+	declaredWriteRoots := append([]string(nil), authority.WriteRoots...)
+	enforcedWriteRoots := append([]string(nil), effectivePlan.WriteDirs...)
+	enforcedWriteRoots = append(enforcedWriteRoots, effectivePlan.WriteFiles...)
 	actualWriteSet := reconcileWriteSet(writeSnapshotBefore, effectivePlan.WriteDirs, effectivePlan.WriteFiles)
 	declaredCredentialPolicy := "unspecified"
 	if authority.Credentials == CredentialPolicyNone || spec.CredentialPolicy == CredentialPolicyNone {
@@ -525,7 +555,8 @@ func (Executor) Run(ctx context.Context, spec StageSpec) (StageResult, error) {
 			EnforcedNetworkPolicy:     enforcedNetwork,
 			NetworkAttemptObservation: "unavailable",
 			NetworkDenialMechanism:    networkDenialMechanism(effectivePlan.Active, effectivePlan.AllowNetwork),
-			DeclaredWriteRoots:        declaredWrites,
+			DeclaredWriteRoots:        declaredWriteRoots,
+			EnforcedWriteRoots:        enforcedWriteRoots,
 			ActualWriteSet:            actualWriteSet,
 			DeclaredCredentialPolicy:  declaredCredentialPolicy,
 			ObservedCredentialAccess:  "unavailable",
@@ -554,12 +585,103 @@ func networkDenialMechanism(planActive, allowNetwork bool) string {
 	return ""
 }
 
-// writeRootStat is one file's size+mtime fingerprint within a snapshotted
-// write root, cheap enough to take twice per stage run without hashing
-// tree contents.
+// writeRootStat is one path's fingerprint within a snapshotted write root
+// (Sol10 P1-2, replacing the previous size+mtime pair): size, mode,
+// device+inode, ctime where the platform exposes it, and -- for a regular
+// file -- a content SHA-256, or -- for a symlink -- its target. mtime is
+// deliberately not part of this at all (same rationale as
+// internal/snapshots.same: it is never proof of anything, and a rewrite
+// that restores the original mtime, or a same-size in-place edit, must
+// still be detected). Cheap enough to take twice per stage run: declared
+// write roots are task-scoped output directories, not whole worktrees.
 type writeRootStat struct {
-	size  int64
-	mtime int64
+	size          int64
+	mode          fs.FileMode
+	dev, inode    uint64
+	ctimeNS       int64
+	isSymlink     bool
+	symlinkTarget string
+	contentSHA256 string
+}
+
+func (a writeRootStat) equal(b writeRootStat) bool {
+	return a.size == b.size && a.mode == b.mode && a.dev == b.dev && a.inode == b.inode &&
+		a.ctimeNS == b.ctimeNS && a.isSymlink == b.isSymlink &&
+		a.symlinkTarget == b.symlinkTarget && a.contentSHA256 == b.contentSHA256
+}
+
+// renameKey returns an identity key strong enough to correlate a deleted
+// path with a created path as the same underlying file having moved, and
+// ok=false when no such signal is available (never match on the absence of
+// one). Device+inode is preferred -- a real rename(2)/hardlink-replacement
+// within one write root's filesystem preserves it, so it survives even a
+// content-preserving metadata-only change; content SHA-256 is the fallback
+// for a symlink-free regular file when inode identity isn't exposed; a
+// symlink with neither falls back to its target.
+func (s writeRootStat) renameKey() (string, bool) {
+	if s.dev != 0 || s.inode != 0 {
+		return fmt.Sprintf("inode:%d:%d", s.dev, s.inode), true
+	}
+	if s.isSymlink {
+		if s.symlinkTarget == "" {
+			return "", false
+		}
+		return "symlink:" + s.symlinkTarget, true
+	}
+	if s.contentSHA256 != "" {
+		return "hash:" + s.contentSHA256, true
+	}
+	return "", false
+}
+
+func contentSHA256(path string) (string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
+}
+
+// statWriteRootPath fingerprints one path already known to exist (lstat
+// succeeded), without following a symlink into whatever it currently
+// targets. ok=false means the path vanished or became unreadable between
+// the directory walk and this call -- treated the same as "not found" by
+// the caller, exactly like the prior size+mtime version's silent-skip
+// contract.
+func statWriteRootPath(path string) (writeRootStat, bool) {
+	info, err := os.Lstat(path)
+	if err != nil {
+		return writeRootStat{}, false
+	}
+	stat := writeRootStat{size: info.Size(), mode: info.Mode()}
+	if st, ok := info.Sys().(*syscall.Stat_t); ok {
+		stat.dev = uint64(st.Dev)
+		stat.inode = uint64(st.Ino)
+		stat.ctimeNS = int64(st.Ctim.Sec)*int64(time.Second) + int64(st.Ctim.Nsec)
+	}
+	if info.Mode()&fs.ModeSymlink != 0 {
+		stat.isSymlink = true
+		if target, err := os.Readlink(path); err == nil {
+			stat.symlinkTarget = target
+		}
+		return stat, true
+	}
+	if !info.Mode().IsRegular() {
+		// Devices, sockets, FIFOs etc. under a write root: identity only,
+		// never attempt to read "content".
+		return stat, true
+	}
+	hash, err := contentSHA256(path)
+	if err != nil {
+		return writeRootStat{}, false
+	}
+	stat.contentSHA256 = hash
+	return stat, true
 }
 
 // snapshotWriteRoots walks every declared write directory and stats every
@@ -567,7 +689,7 @@ type writeRootStat struct {
 // roots (e.g. a directory a validator's `init` step is about to create) are
 // silently skipped rather than treated as an error -- their absence before
 // and presence after is exactly what reconcileWriteSet needs to detect a
-// write.
+// create.
 func snapshotWriteRoots(dirs, files []string) map[string]writeRootStat {
 	snap := map[string]writeRootStat{}
 	for _, d := range dirs {
@@ -575,38 +697,97 @@ func snapshotWriteRoots(dirs, files []string) map[string]writeRootStat {
 			if err != nil || entry.IsDir() {
 				return nil
 			}
-			info, ierr := entry.Info()
-			if ierr != nil {
-				return nil
+			if stat, ok := statWriteRootPath(path); ok {
+				snap[path] = stat
 			}
-			snap[path] = writeRootStat{size: info.Size(), mtime: info.ModTime().UnixNano()}
 			return nil
 		})
 	}
 	for _, f := range files {
-		if info, err := os.Stat(f); err == nil && !info.IsDir() {
-			snap[f] = writeRootStat{size: info.Size(), mtime: info.ModTime().UnixNano()}
+		if info, err := os.Lstat(f); err == nil && !info.IsDir() {
+			if stat, ok := statWriteRootPath(f); ok {
+				snap[f] = stat
+			}
 		}
 	}
 	return snap
 }
 
-// reconcileWriteSet is the Sol9 P1-5 observed-effects reconciliation: it
-// re-snapshots the same declared write roots after the stage has run and
-// extinguished, and reports every path that is new or whose size/mtime
-// fingerprint changed since before. Unlike the roots themselves (a declared
-// fact), this is an actual before/after diff -- the closest evidence
-// available without kernel-level write interposition.
-func reconcileWriteSet(before map[string]writeRootStat, dirs, files []string) []string {
+// reconcileWriteSet is the Sol10 P1-2 observed-effects reconciliation: a
+// real union-of-before/after diff over the declared write roots, reporting
+// every path as an explicit created/modified/deleted/renamed operation --
+// not, as before, a flat list restricted to paths present in the after
+// state (which structurally could never report a deletion) compared by a
+// size+mtime pair (which could miss a same-size rewrite with a restored
+// mtime, or any purely metadata-only change).
+func reconcileWriteSet(before map[string]writeRootStat, dirs, files []string) []WriteEffect {
 	after := snapshotWriteRoots(dirs, files)
-	changed := make([]string, 0, len(after))
-	for path, stat := range after {
-		if prev, existed := before[path]; !existed || prev != stat {
-			changed = append(changed, path)
+
+	var created, modified, deleted []string
+	for path := range before {
+		if _, ok := after[path]; !ok {
+			deleted = append(deleted, path)
 		}
 	}
-	sort.Strings(changed)
-	return changed
+	for path, stat := range after {
+		prev, existed := before[path]
+		if !existed {
+			created = append(created, path)
+			continue
+		}
+		if !prev.equal(stat) {
+			modified = append(modified, path)
+		}
+	}
+
+	// Rename attribution: correlate a deleted path with a created path
+	// sharing the same identity signal (see renameKey). Each deleted path
+	// is consumed by at most one created path, so a coincidental duplicate
+	// can't absorb two unrelated deletions.
+	deletedByKey := map[string]string{} // renameKey -> deleted path
+	for _, path := range deleted {
+		if key, ok := before[path].renameKey(); ok {
+			deletedByKey[key] = path
+		}
+	}
+	consumed := map[string]bool{}
+	var renamed []WriteEffect
+	remainingCreated := created[:0:0]
+	for _, path := range created {
+		key, ok := after[path].renameKey()
+		from, matched := deletedByKey[key]
+		if !ok || !matched || consumed[from] {
+			remainingCreated = append(remainingCreated, path)
+			continue
+		}
+		consumed[from] = true
+		stat := after[path]
+		renamed = append(renamed, WriteEffect{Path: path, Operation: "renamed", RenamedFrom: from, ContentSHA256: stat.contentSHA256, Size: stat.size, Mode: stat.mode.String(), SymlinkTarget: stat.symlinkTarget})
+	}
+	created = remainingCreated
+	remainingDeleted := deleted[:0:0]
+	for _, path := range deleted {
+		if !consumed[path] {
+			remainingDeleted = append(remainingDeleted, path)
+		}
+	}
+	deleted = remainingDeleted
+
+	effects := make([]WriteEffect, 0, len(created)+len(modified)+len(deleted)+len(renamed))
+	for _, path := range created {
+		stat := after[path]
+		effects = append(effects, WriteEffect{Path: path, Operation: "created", ContentSHA256: stat.contentSHA256, Size: stat.size, Mode: stat.mode.String(), SymlinkTarget: stat.symlinkTarget})
+	}
+	for _, path := range modified {
+		stat := after[path]
+		effects = append(effects, WriteEffect{Path: path, Operation: "modified", ContentSHA256: stat.contentSHA256, Size: stat.size, Mode: stat.mode.String(), SymlinkTarget: stat.symlinkTarget})
+	}
+	for _, path := range deleted {
+		effects = append(effects, WriteEffect{Path: path, Operation: "deleted"})
+	}
+	effects = append(effects, renamed...)
+	sort.Slice(effects, func(i, j int) bool { return effects[i].Path < effects[j].Path })
+	return effects
 }
 
 // syncBuffer is a mutex-guarded bytes.Buffer: os/exec copies a Cmd's Stdout

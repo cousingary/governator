@@ -386,8 +386,17 @@ func prepareFailure(snapshot Snapshot, mode string, err error) (Snapshot, error)
 	return snapshot, nil
 }
 
+// snapshotFromStats resolves the on-disk index path and hashes it into
+// Fingerprint. Sol10 P0-7: Available used to be set true before the
+// fingerprint hash was even attempted, so a hashFile failure (index path
+// missing/unreadable) still returned Available=true with an empty
+// Fingerprint -- and for any mode other than "required", the caller
+// (prepareFailure) swallowed the error entirely, silently handing the rest
+// of the run a snapshot that claimed to have graph state it did not
+// actually have. Available is now set only once the fingerprint has
+// actually been computed, so a hashing failure is honestly Available=false
+// in every mode, not just "required".
 func snapshotFromStats(snapshot Snapshot, stats Stats) (Snapshot, error) {
-	snapshot.Available = true
 	snapshot.ProjectPath = stats.ProjectPath
 	snapshot.IndexPath = stats.IndexPath
 	snapshot.FileCount = stats.FileCount
@@ -411,6 +420,7 @@ func snapshotFromStats(snapshot Snapshot, stats Stats) (Snapshot, error) {
 		return snapshot, fmt.Errorf("fingerprint graph index: %w", err)
 	}
 	snapshot.Fingerprint = fingerprint
+	snapshot.Available = true
 	return snapshot, nil
 }
 

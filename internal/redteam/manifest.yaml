@@ -714,3 +714,43 @@ cases:
     session: rc4-s6
     required: true
     status: implemented
+  - case: 131
+    name: TestV6Case23GraphDatabaseChangeBeforeReplayInvalidatesReplay
+    session: rc4-s7
+    required: true
+    status: implemented
+  - case: 132
+    name: TestV10Case32GraphDatabaseChangeImmediatelyBeforeReplayLookupInvalidatesReplayAcrossRepeatedCycles
+    session: rc4-s7
+    required: true
+    status: implemented
+  - case: 133
+    name: TestV10Case33GraphProviderEmptyFingerprintNeverReportsSnapshotAvailable
+    session: rc4-s7
+    required: true
+    status: implemented
+  - case: 134
+    name: TestV10Case34GraphIndexMutationDuringRunHasNoEffectOnThatRunsRecordedSnapshot
+    session: rc4-s7
+    required: true
+    status: implemented
+  - case: 135
+    name: TestV10Case35GraphProviderRequiredButUntrustedFailsRunBeforeBackendLaunch
+    session: rc4-s7
+    required: true
+    status: implemented
+  - case: 136
+    name: TestReconcileWriteSetReportsDeletedFiles
+    session: rc4-s7
+    required: true
+    status: implemented
+  - case: 137
+    name: TestReconcileWriteSetDetectsSameSizeRewriteWithRestoredMtime
+    session: rc4-s7
+    required: true
+    status: implemented
+  - case: 138
+    name: TestReconcileWriteSetAttributesRename
+    session: rc4-s7
+    required: true
+    status: implemented
