@@ -662,7 +662,7 @@ func statWriteRootPath(path string) (writeRootStat, bool) {
 	if st, ok := info.Sys().(*syscall.Stat_t); ok {
 		stat.dev = uint64(st.Dev)
 		stat.inode = uint64(st.Ino)
-		stat.ctimeNS = int64(st.Ctim.Sec)*int64(time.Second) + int64(st.Ctim.Nsec)
+		stat.ctimeNS = statCtimeNS(st)
 	}
 	if info.Mode()&fs.ModeSymlink != 0 {
 		stat.isSymlink = true
