@@ -1,12 +1,41 @@
 package claims
 
 import (
+	"compress/gzip"
+	"crypto/sha256"
+	"encoding/hex"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
 )
+
+// writeGzippedLog writes content gzip-compressed to root/rel and returns the
+// SHA-256 of the DECOMPRESSED content -- the shape verifyEvidenceLogObjects
+// (P1-4) expects: log_sha256 describes the plaintext, log_path names the
+// compressed object on disk.
+func writeGzippedLog(t *testing.T, root, rel, content string) string {
+	t.Helper()
+	full := filepath.Join(root, rel)
+	if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	f, err := os.Create(full)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	gz := gzip.NewWriter(f)
+	if _, err := gz.Write([]byte(content)); err != nil {
+		t.Fatal(err)
+	}
+	if err := gz.Close(); err != nil {
+		t.Fatal(err)
+	}
+	sum := sha256.Sum256([]byte(content))
+	return hex.EncodeToString(sum[:])
+}
 
 func TestLoadRejectsUnknownFields(t *testing.T) {
 	path := writeFile(t, t.TempDir(), "claims.yaml", `
@@ -396,6 +425,7 @@ func main() {
 		t.Fatal(err)
 	}
 	manifest := filepath.Join(root, "evidence", "release.json")
+	redteamLogHash := writeGzippedLog(t, root, "evidence/redteam.log.gz", "=== RUN TestPlaceholder\n--- PASS: TestPlaceholder (0.00s)\nPASS\n")
 	writeFile(t, root, "evidence/test-summary.json", `{
   "source_commit": "`+commit+`",
   "environment_capabilities": {"goos": "test", "machine": "test"},
@@ -404,7 +434,8 @@ func main() {
       "command": "go test -v -tags redteam -count=1 ./...",
       "result": "PASS",
       "source_commit": "`+commit+`",
-      "log_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "log_sha256": "`+redteamLogHash+`",
+      "log_path": "redteam.log.gz",
       "tests_discovered": 58,
       "tests_run": 58,
       "tests_skipped": 0,
@@ -672,5 +703,150 @@ func findRepoRoot(t *testing.T) string {
 			t.Fatal("could not find repository root (no go.mod found)")
 		}
 		dir = parent
+	}
+}
+
+// TestVerifyEvidenceLogObjectsRejectsMissingLogPath is P1-4 (Sol10 rc4
+// Session 8): a declared log_sha256 with no log_path is exactly the defect
+// the report found -- a hash a third party can see but never retrieve and
+// verify the object behind.
+func TestVerifyEvidenceLogObjectsRejectsMissingLogPath(t *testing.T) {
+	dir := t.TempDir()
+	summary := map[string]any{
+		"suites": map[string]any{
+			"unit": map[string]any{"log_sha256": "deadbeef"},
+		},
+	}
+	ok, problems := verifyEvidenceLogObjects(dir, summary)
+	if ok {
+		t.Fatalf("expected failure for a log_sha256 with no log_path")
+	}
+	if !containsSubstring(problems, "referenced test log absent") {
+		t.Fatalf("expected a problem naming the absent log, got %v", problems)
+	}
+}
+
+// TestVerifyEvidenceLogObjectsRejectsWrongSHA256 proves the check actually
+// decompresses and rehashes rather than trusting the declared value.
+func TestVerifyEvidenceLogObjectsRejectsWrongSHA256(t *testing.T) {
+	dir := t.TempDir()
+	writeGzippedLog(t, dir, "unit.log.gz", "real log content\n")
+	summary := map[string]any{
+		"suites": map[string]any{
+			"unit": map[string]any{
+				"log_sha256": "0000000000000000000000000000000000000000000000000000000000000",
+				"log_path":   "unit.log.gz",
+			},
+		},
+	}
+	ok, problems := verifyEvidenceLogObjects(dir, summary)
+	if ok {
+		t.Fatalf("expected failure for a log object whose content does not hash to the declared sha256")
+	}
+	if !containsSubstring(problems, "sha256 mismatch") {
+		t.Fatalf("expected a sha256 mismatch problem, got %v", problems)
+	}
+}
+
+// TestVerifyEvidenceLogObjectsAcceptsMatchingObject is the positive case:
+// a real gzip object whose decompressed content matches the declared hash
+// passes cleanly.
+func TestVerifyEvidenceLogObjectsAcceptsMatchingObject(t *testing.T) {
+	dir := t.TempDir()
+	hash := writeGzippedLog(t, dir, "redteam.log.gz", "=== RUN Test\n--- PASS: Test (0.00s)\n")
+	summary := map[string]any{
+		"suites": map[string]any{
+			"redteam": map[string]any{
+				"log_sha256": hash,
+				"log_path":   "redteam.log.gz",
+			},
+		},
+	}
+	ok, problems := verifyEvidenceLogObjects(dir, summary)
+	if !ok {
+		t.Fatalf("expected a matching log object to pass, got problems %v", problems)
+	}
+}
+
+// TestVerifyAssayerMatrixPatchVersionsRejectsBareMinorVersion is P1-1
+// (Sol10 rc4 Session 8): "the matrix should record full versions... rather
+// than only 3.13" -- a bare minor version hides which patch actually ran.
+func TestVerifyAssayerMatrixPatchVersionsRejectsBareMinorVersion(t *testing.T) {
+	summary := map[string]any{
+		"suites": map[string]any{
+			"assayer_matrix": map[string]any{
+				"versions": []any{
+					map[string]any{"python_version": "3.13"},
+				},
+			},
+		},
+	}
+	ok, problems := verifyAssayerMatrixPatchVersions(summary)
+	if ok {
+		t.Fatalf("expected a bare minor version to be rejected")
+	}
+	if !containsSubstring(problems, "non-patch python_version") {
+		t.Fatalf("expected a non-patch python_version problem, got %v", problems)
+	}
+}
+
+// TestVerifyNoActiveGapMarkersRejectsUnclosedMarkerOnAbsoluteClaim is P1-7
+// (Sol10 rc4 Session 8): an absolute claim (the default claim_scope) may
+// not stand next to an unresolved known_gap_pending_hardening/"known,
+// accepted gap"/"not fixed" marker in its own implementation file.
+func TestVerifyNoActiveGapMarkersRejectsUnclosedMarkerOnAbsoluteClaim(t *testing.T) {
+	root := t.TempDir()
+	writeFile(t, root, "pkg/x.go", "package pkg\n\n// known_gap_pending_hardening: this path is not yet enforced.\nfunc X() {}\n")
+	c := Claim{Implementation: []FileSymbols{{File: "pkg/x.go", Symbols: []string{"X"}}}}
+	ok, problems := verifyNoActiveGapMarkers(root, c)
+	if ok {
+		t.Fatalf("expected an unclosed gap marker to fail an absolute claim")
+	}
+	if !containsSubstring(problems, "active gap marker") {
+		t.Fatalf("expected a problem naming the active gap marker, got %v", problems)
+	}
+}
+
+// TestVerifyNoActiveGapMarkersAcceptsClosedMarkerNarration confirms the
+// codebase's own "Closed ... Fixed:" historical-narration convention
+// (docs/security.md's pattern) is not flagged as a live gap.
+func TestVerifyNoActiveGapMarkersAcceptsClosedMarkerNarration(t *testing.T) {
+	root := t.TempDir()
+	writeFile(t, root, "pkg/x.go", "package pkg\n\n// Closed 2026-07-21: the known_gap_pending_hardening marker was removed once X was fixed: see commit abc123.\nfunc X() {}\n")
+	c := Claim{Implementation: []FileSymbols{{File: "pkg/x.go", Symbols: []string{"X"}}}}
+	ok, problems := verifyNoActiveGapMarkers(root, c)
+	if !ok {
+		t.Fatalf("expected closed-marker narration to pass, got problems %v", problems)
+	}
+}
+
+// TestVerifyNoActiveGapMarkersExemptsNonAbsoluteScope confirms a claim that
+// honestly declares claim_scope: partial/platform-dependent/
+// development-only is exempt -- the disclosure IS the fix P1-7 asked for.
+func TestVerifyNoActiveGapMarkersExemptsNonAbsoluteScope(t *testing.T) {
+	root := t.TempDir()
+	writeFile(t, root, "pkg/x.go", "package pkg\n\n// known, accepted gap: darwin builds cannot enforce this.\nfunc X() {}\n")
+	c := Claim{Implementation: []FileSymbols{{File: "pkg/x.go", Symbols: []string{"X"}}}, ClaimScope: ScopePlatformDependent}
+	ok, problems := verifyNoActiveGapMarkers(root, c)
+	if !ok {
+		t.Fatalf("expected a platform-dependent claim to be exempt, got problems %v", problems)
+	}
+}
+
+// TestVerifyAssayerMatrixPatchVersionsAcceptsFullPatchVersion is the
+// positive case: a full X.Y.Z version passes.
+func TestVerifyAssayerMatrixPatchVersionsAcceptsFullPatchVersion(t *testing.T) {
+	summary := map[string]any{
+		"suites": map[string]any{
+			"assayer_matrix": map[string]any{
+				"versions": []any{
+					map[string]any{"python_version": "3.13.5"},
+				},
+			},
+		},
+	}
+	ok, problems := verifyAssayerMatrixPatchVersions(summary)
+	if !ok {
+		t.Fatalf("expected a full patch version to pass, got problems %v", problems)
 	}
 }

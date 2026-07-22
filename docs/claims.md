@@ -32,6 +32,32 @@ artifact this ladder feeds.
 `claimed_maturity` requires — a claim that only asserts `tested` is never
 penalized for lacking acceptance evidence it never promised.
 
+## Claim scope (P1-7, Sol10 rc4 Session 8)
+
+`claim_scope` is a second, optional axis, orthogonal to the maturity ladder
+above — it describes how *absolute* the claim is, not how far up the
+ladder it's climbed.
+
+| `claim_scope` | Meaning |
+|---|---|
+| `implemented` / `production-required` (default when unset) | Fully absolute: this claim holds unconditionally in production, with no disclosed limitation. |
+| `partial` | Holds, but only for part of what the title describes — the rest is a known, disclosed limitation. |
+| `platform-dependent` | Holds on some platforms/hosts but not others (e.g. Darwin's `feature_limited`/`non-approving` release artifacts). |
+| `development-only` | Holds in development but is not asserted for a production release. |
+
+A claim whose `claim_scope` is absolute (`implemented`/`production-required`,
+including every claim that omits the field) must not have any of
+`known_gap_pending_hardening`, `known, accepted gap`, or `not fixed`
+sitting, unclosed, in any file it names under `implementation` — see
+`internal/claims.verifyNoActiveGapMarkers`. A source comment carrying one of
+those strings is only "closed" if this codebase's own closure narration
+(`Closed`/`removed`/`fixed:`/`no longer`) appears nearby; otherwise the
+claim is capped at `unimplemented` regardless of what maturity it asserts.
+If a claim genuinely has a known limitation, declare `claim_scope: partial`
+(or `platform-dependent`/`development-only`) instead of leaving an absolute
+claim standing next to an undisclosed gap — the disclosure itself is what
+exempts it from this check.
+
 ## Adding or updating a claim
 
 1. Pick real files and symbol names — copy them from the code, don't

@@ -27,7 +27,13 @@ ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$ROOT"
 
 REF=${REF:-HEAD}
-OUT_DIR=${OUT_DIR:-audit-bundle}
+# P1-6 (Sol10 rc4 Session 8): the bundle used to land inside the checkout
+# by default ("audit-bundle" resolves under $ROOT), which the report found
+# can misle source counts, get recursively packaged by a later step, or
+# leave an ambiguous dirty-state report. Default to a sibling directory
+# now; OUT_DIR set explicitly to anything still resolving inside the
+# checkout is refused below, not just discouraged.
+OUT_DIR=${OUT_DIR:-"$(cd "$ROOT/.." && pwd)/governator-audit-bundle"}
 DIST_DIR=${DIST_DIR:-dist}
 ARCHITECTURE_DOC=${GOV_ARCHITECTURE_DOC:-$ROOT/../agents/governator_architecture.md}
 
@@ -35,6 +41,15 @@ if [ -n "$(git status --porcelain --untracked-files=all)" ]; then
   echo "audit_bundle: refusing to bundle a dirty tree (uncommitted/untracked changes present) -- commit or stash first" >&2
   exit 1
 fi
+
+OUT_DIR_ABS=$(python3 -c 'import os,sys; print(os.path.abspath(sys.argv[1]))' "$OUT_DIR")
+case "$OUT_DIR_ABS" in
+  "$ROOT"|"$ROOT"/*)
+    echo "audit_bundle: refusing to generate the bundle inside the source checkout (${OUT_DIR_ABS} is under ${ROOT}) -- set OUT_DIR to a sibling or /tmp path (P1-6)" >&2
+    exit 1
+    ;;
+esac
+OUT_DIR=$OUT_DIR_ABS
 
 rm -rf "$OUT_DIR"
 mkdir -p "$OUT_DIR/source" "$OUT_DIR/dist" "$OUT_DIR/architecture" "$OUT_DIR/evidence"

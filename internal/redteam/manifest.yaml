@@ -754,3 +754,38 @@ cases:
     session: rc4-s7
     required: true
     status: implemented
+  - case: 139
+    name: TestV10Case30FullPython3135SuiteExitsCleanly
+    session: rc4-s8
+    required: true
+    status: implemented
+  - case: 140
+    name: TestV10Case36ProductionReleaseWithOneSkippedRedteamTestFailsRelease
+    session: rc4-s8
+    required: true
+    status: implemented
+  - case: 141
+    name: TestV10Case37ReferencedTestLogAbsentFailsRelease
+    session: rc4-s8
+    required: true
+    status: implemented
+  - case: 142
+    name: TestV10Case38ReferencedTestLogWithWrongSHA256FailsRelease
+    session: rc4-s8
+    required: true
+    status: implemented
+  - case: 143
+    name: TestV10Case39AssayerMatrixOmittingPatchVersionsFailsRelease
+    session: rc4-s8
+    required: true
+    status: implemented
+  - case: 144
+    name: TestV10Case40ReleaseSignedWithNonproductionUnknownKeyFailsRelease
+    session: rc4-s8
+    required: true
+    status: implemented
+  - case: 145
+    name: TestV10Case41AuditBundleGeneratedInsideSourceTreeFailsRelease
+    session: rc4-s8
+    required: true
+    status: implemented

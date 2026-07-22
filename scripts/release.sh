@@ -251,8 +251,23 @@ print(json.dumps({
     'has_kernel_landlock_full_abi': os.environ.get('GOV_REDTEAM_HAS_LANDLOCK_FULL_ABI', '') == '1',
 }))
 ")
+# P1-3 (Sol10 rc4 Session 8): a production release (REQUIRE_TAG=1 -- the
+# one path .github/workflows/release.yml actually uses to ship) must not
+# rely on ANY red-team skip, even one the manifest's allowed_skip
+# mechanism would otherwise authorize (report: "a production release
+# should not rely on a kernel-dependent skip" for a security-sensitive
+# invariant). Ordinary local dry-runs keep the normal conditional-skip
+# policy. GOV_RELEASE_REQUIRE_ZERO_SKIPS lets an operator opt a local run
+# into the stricter policy explicitly (e.g. on the designated host where
+# case 8's fixture reaches its required blocking state) without waiting
+# for REQUIRE_TAG.
+REQUIRE_ZERO_SKIPS=${GOV_RELEASE_REQUIRE_ZERO_SKIPS:-$REQUIRE_TAG}
+REDTEAM_GATE_EXTRA_ARGS=()
+if [ "$REQUIRE_ZERO_SKIPS" = 1 ]; then
+  REDTEAM_GATE_EXTRA_ARGS+=(--require-zero-skips)
+fi
 REDTEAM_GATE_JSON="$OUT_DIR/.redteam-gate.json"
-if go run ./cmd/gov redteam-gate verify --manifest "$REDTEAM_MANIFEST" --log "$REDTEAM_LOG" --capabilities "$REDTEAM_CAPABILITIES_JSON" >"$REDTEAM_GATE_JSON" 2>"$OUT_DIR/.redteam-gate.stderr"; then
+if go run ./cmd/gov redteam-gate verify --manifest "$REDTEAM_MANIFEST" --log "$REDTEAM_LOG" --capabilities "$REDTEAM_CAPABILITIES_JSON" "${REDTEAM_GATE_EXTRA_ARGS[@]}" >"$REDTEAM_GATE_JSON" 2>"$OUT_DIR/.redteam-gate.stderr"; then
   REDTEAM_GATE_OK=true
 else
   REDTEAM_GATE_OK=false
@@ -315,7 +330,15 @@ PY
     ASSAYER_CASE_START_EPOCH=$(date +%s)
     ASSAYER_EXIT_CODE=0
     ASSAYER_TIMEOUT=false
+    # P1-1 (Sol10 rc4 Session 8): the matrix used to record only the
+    # requested minor version (e.g. "3.13"), which is what let a release
+    # evidence file claim a clean run on "3.13" while the audit's actual
+    # 3.13.5 install hung on shutdown -- there was no way to tell which
+    # patch release the matrix ran without re-deriving it. Ask the
+    # interpreter directly; a mismatch or empty result fails the case.
+    ASSAYER_PY_FULL=""
     if command -v "$ASSAYER_BIN" >/dev/null 2>&1; then
+      ASSAYER_PY_FULL=$("$ASSAYER_BIN" -c 'import platform; print(platform.python_version())' 2>/dev/null || true)
       if timeout 900s bash -lc "cd '$ASSAYER_REPO' && '$ASSAYER_BIN' -m pytest -q" >"$ASSAYER_CASE_LOG" 2>&1; then
         ASSAYER_CASE_RESULT=PASS
       else
@@ -326,6 +349,17 @@ PY
         ASSAYER_CASE_RESULT=FAIL
         ASSAYER_RESULT=FAIL
         cat "$ASSAYER_CASE_LOG" >&2
+      fi
+      # A dedicated conftest.py hook (tests/conftest.py, P1-1) asserts
+      # multiprocessing.active_children()==[], no unexpected non-daemon
+      # threads, and no surviving cli.py subprocess at session end, and
+      # forces pytest's own exit status non-zero if any of them hold --
+      # "197 passed" alone is not release evidence of a clean exit.
+      # `timeout` still bounds the case in case the process hangs anyway.
+      if ! echo "$ASSAYER_PY_FULL" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+        ASSAYER_CASE_RESULT=FAIL
+        ASSAYER_RESULT=FAIL
+        echo "could not determine ${ASSAYER_BIN}'s full patch version (got '${ASSAYER_PY_FULL}')" >>"$ASSAYER_CASE_LOG"
       fi
     else
       ASSAYER_CASE_RESULT=FAIL
@@ -338,22 +372,32 @@ PY
     ASSAYER_CASE_END_EPOCH=$(date +%s)
     ASSAYER_CASE_SUMMARY=$(tail -1 "$ASSAYER_CASE_LOG")
     ASSAYER_CASE_LOG_SHA=$(sha256sum "$ASSAYER_CASE_LOG" | awk '{print $1}')
-    python3 - "$ASSAYER_MATRIX_JSON" "$ASSAYER_PY" "$ASSAYER_BIN" "$ASSAYER_CASE_RESULT" "$ASSAYER_EXIT_CODE" "$ASSAYER_TIMEOUT" "$ASSAYER_CASE_STARTED" "$ASSAYER_CASE_ENDED" "$((ASSAYER_CASE_END_EPOCH - ASSAYER_CASE_START_EPOCH))" "$ASSAYER_CASE_LOG_SHA" "$ASSAYER_CASE_SUMMARY" <<'PY'
+    # P1-4 (Sol10 rc4 Session 8): a published hash with no retrievable
+    # object behind it proves nothing. Ship the log itself, gzip-
+    # compressed (Go's stdlib compress/gzip verifies it back in
+    # internal/claims without a new external decompressor dependency),
+    # named after the interpreter's own reported version so it survives
+    # alongside every other patch build in the same $OUT_DIR.
+    ASSAYER_CASE_LOG_PATH="assayer-python${ASSAYER_PY_FULL//./}.log.gz"
+    gzip -c "$ASSAYER_CASE_LOG" >"$OUT_DIR/$ASSAYER_CASE_LOG_PATH"
+    python3 - "$ASSAYER_MATRIX_JSON" "$ASSAYER_PY" "$ASSAYER_PY_FULL" "$ASSAYER_BIN" "$ASSAYER_CASE_RESULT" "$ASSAYER_EXIT_CODE" "$ASSAYER_TIMEOUT" "$ASSAYER_CASE_STARTED" "$ASSAYER_CASE_ENDED" "$((ASSAYER_CASE_END_EPOCH - ASSAYER_CASE_START_EPOCH))" "$ASSAYER_CASE_LOG_SHA" "$ASSAYER_CASE_SUMMARY" "$ASSAYER_CASE_LOG_PATH" <<'PY'
 import json, pathlib, sys
 path = pathlib.Path(sys.argv[1])
 data = json.loads(path.read_text())
 data.append({
-    "python_version": sys.argv[2],
-    "python_executable": sys.argv[3],
-    "command": f"{sys.argv[3]} -m pytest -q",
-    "result": sys.argv[4],
-    "exit_code": int(sys.argv[5]),
-    "timeout": sys.argv[6] == "true",
-    "started_at": sys.argv[7],
-    "ended_at": sys.argv[8],
-    "duration_seconds": int(sys.argv[9]),
-    "log_sha256": sys.argv[10],
-    "summary": sys.argv[11].strip(),
+    "python_version": sys.argv[3] or sys.argv[2],
+    "python_version_requested": sys.argv[2],
+    "python_executable": sys.argv[4],
+    "command": f"{sys.argv[4]} -m pytest -q",
+    "result": sys.argv[5],
+    "exit_code": int(sys.argv[6]),
+    "timeout": sys.argv[7] == "true",
+    "started_at": sys.argv[8],
+    "ended_at": sys.argv[9],
+    "duration_seconds": int(sys.argv[10]),
+    "log_sha256": sys.argv[11],
+    "log_path": sys.argv[13],
+    "summary": sys.argv[12].strip(),
 })
 path.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n")
 PY
@@ -625,9 +669,16 @@ data = {
         "python": __import__("sys").version.split()[0],
     },
     "suites": {
-        "unit": {"command": f"go test {par} -count=1 ./...", "result": unit_result, "duration_seconds": int(unit_seconds), "started_at": unit_started, "ended_at": unit_ended, "log_sha256": unit_log_sha},
-        "race": {"command": f"go test -race {par} -count=1 ./...", "result": race_result, "duration_seconds": int(race_seconds), "started_at": race_started, "ended_at": race_ended, "log_sha256": race_log_sha},
-        "integration": {"command": f"go test -tags integration {par} -count=1 ./internal/assay/...", "result": integration_result, "duration_seconds": int(integration_seconds), "started_at": integration_started, "ended_at": integration_ended, "log_sha256": integration_log_sha},
+        # P1-4 (Sol10 rc4 Session 8): "a third party can see the claimed
+        # hashes but cannot retrieve and verify the objects those hashes
+        # identify." log_path names the gzip-compressed object this
+        # invocation writes into $OUT_DIR right after this file is written
+        # (see the compression loop below) -- log_sha256 is always the hash
+        # of the DECOMPRESSED content, so a verifier gunzips log_path and
+        # compares, never trusts the summary's word alone.
+        "unit": {"command": f"go test {par} -count=1 ./...", "result": unit_result, "duration_seconds": int(unit_seconds), "started_at": unit_started, "ended_at": unit_ended, "log_sha256": unit_log_sha, "log_path": "unit.log.gz"},
+        "race": {"command": f"go test -race {par} -count=1 ./...", "result": race_result, "duration_seconds": int(race_seconds), "started_at": race_started, "ended_at": race_ended, "log_sha256": race_log_sha, "log_path": "race.log.gz"},
+        "integration": {"command": f"go test -tags integration {par} -count=1 ./internal/assay/...", "result": integration_result, "duration_seconds": int(integration_seconds), "started_at": integration_started, "ended_at": integration_ended, "log_sha256": integration_log_sha, "log_path": "integration.log.gz"},
         "black_box_corpus": {
             "command": f"go test -run Sol3 -v {par} -count=1 ./...",
             "result": corpus_result,
@@ -635,6 +686,7 @@ data = {
             "started_at": corpus_started,
             "ended_at": corpus_ended,
             "log_sha256": corpus_log_sha,
+            "log_path": "corpus.log.gz",
             "tests_run": int(corpus_tests_run),
             "tests_failed": int(corpus_tests_failed),
         },
@@ -646,6 +698,7 @@ data = {
             "started_at": redteam_started,
             "ended_at": redteam_ended,
             "log_sha256": redteam_log_sha,
+            "log_path": "redteam.log.gz",
             "tests_discovered": int(redteam_tests_discovered),
             "tests_run": int(redteam_tests_run),
             "tests_skipped": int(redteam_tests_skipped),
@@ -665,6 +718,7 @@ data = {
             "started_at": redteam_race_started,
             "ended_at": redteam_race_ended,
             "log_sha256": redteam_race_log_sha,
+            "log_path": "redteam-race.log.gz",
         },
         "fuzz": fuzz,
         "assayer_matrix": {
@@ -694,6 +748,16 @@ if assayer_version_tag_result != "PASS":
 data["overall_result"] = overall
 pathlib.Path(summary_path).write_text(json.dumps(data, indent=2, sort_keys=True) + "\n")
 PYTESTSUMMARY
+
+# P1-4: ship the evidence objects test-summary.json's log_sha256 fields
+# describe, not just their hashes -- gzip each tier's raw log to the exact
+# log_path named above and keep it in $OUT_DIR (covered by checksums.txt
+# below), instead of deleting it once its hash is captured.
+for _entry in "$UNIT_LOG:unit.log.gz" "$RACE_LOG:race.log.gz" "$INTEGRATION_LOG:integration.log.gz" "$CORPUS_LOG:corpus.log.gz" "$REDTEAM_LOG:redteam.log.gz" "$REDTEAM_RACE_LOG:redteam-race.log.gz"; do
+  _raw=${_entry%%:*}
+  _dest=${_entry##*:}
+  gzip -c "$_raw" >"$OUT_DIR/$_dest"
+done
 rm -f "$FUZZ_RESULTS_JSON" "$UNIT_LOG" "$RACE_LOG" "$INTEGRATION_LOG" "$CORPUS_LOG" "$REDTEAM_LOG" "$REDTEAM_RACE_LOG" "$ASSAYER_LOG" "$ASSAYER_VERSION_TAG_LOG" "$ASSAYER_MATRIX_JSON" "$OUT_DIR"/test-assayer-py*.log "$OUT_DIR"/test-fuzz-*.log
 
 # ---------------------------------------------------------------------------
@@ -915,7 +979,7 @@ rm -rf "$OUT_DIR"/stage-*
 # production binary").
 # ---------------------------------------------------------------------------
 CHECKSUMS="$OUT_DIR/checksums.txt"
-(cd "$OUT_DIR" && sha256sum -- *.tar.gz build-manifest.json architecture-build-metadata.json sbom.json claims.yaml test-summary.json acceptance-summary.json claims-verify-report.txt gov >"$(basename "$CHECKSUMS")")
+(cd "$OUT_DIR" && sha256sum -- *.tar.gz build-manifest.json architecture-build-metadata.json sbom.json claims.yaml test-summary.json acceptance-summary.json claims-verify-report.txt gov *.log.gz >"$(basename "$CHECKSUMS")")
 
 # ---------------------------------------------------------------------------
 # checksums.txt.hmac — HMAC-SHA256 over checksums.txt, keyed by an
@@ -955,7 +1019,16 @@ if [ -n "${GOV_RELEASE_MINISIGN_KEY:-}" ] && command -v minisign >/dev/null 2>&1
 else
   echo "release: no asymmetric signature — set GOV_RELEASE_MINISIGN_KEY (+ minisign on PATH) to add one" >&2
 fi
-python3 "$ROOT/scripts/release_policy.py" signature --version "$VERSION" --require "$REQUIRE_ASYMMETRIC_SIGNATURE" --minisig "$MINISIG"
+# P1-5 (Sol10 rc4 Session 8): when a signature is required (true
+# production releases), the signer's own key ID must also be in
+# docs/TRUSTED_SIGNING_KEYS.txt -- the out-of-band-published trust root,
+# never a key bundled inside the release itself. That file is empty until
+# Jeremy explicitly authorizes generating and publishing a permanent
+# production key (docs/signing_key.md); until then this intentionally
+# fails every REQUIRE_ASYMMETRIC_SIGNATURE=1 release rather than accept a
+# signature from an unanchored, effectively anonymous key.
+TRUSTED_SIGNING_KEYS_FILE="$SOURCE_ROOT/docs/TRUSTED_SIGNING_KEYS.txt"
+python3 "$ROOT/scripts/release_policy.py" signature --version "$VERSION" --require "$REQUIRE_ASYMMETRIC_SIGNATURE" --minisig "$MINISIG" --trusted-fingerprints-file "$TRUSTED_SIGNING_KEYS_FILE"
 
 echo "release: OK — $OUT_DIR" >&2
 ls -la "$OUT_DIR" >&2

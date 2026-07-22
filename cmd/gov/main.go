@@ -2036,13 +2036,14 @@ func claimsCmd(args []string) int {
 // captured `go test -v -tags redteam` log, and verifies exact test
 // identity — not just totals — via internal/redteamgate.
 func redteamGateCmd(args []string) int {
-	usage := "usage: gov redteam-gate verify --manifest <path> --log <path> [--capabilities <json>]"
+	usage := "usage: gov redteam-gate verify --manifest <path> --log <path> [--capabilities <json>] [--require-zero-skips]"
 	if len(args) < 1 || args[0] != "verify" {
 		return bad(usage)
 	}
 	manifestPath := ""
 	logPath := ""
 	capabilitiesJSON := ""
+	requireZeroSkips := false
 	rest := args[1:]
 	for len(rest) > 0 {
 		switch rest[0] {
@@ -2064,6 +2065,13 @@ func redteamGateCmd(args []string) int {
 			}
 			capabilitiesJSON = rest[1]
 			rest = rest[2:]
+		case "--require-zero-skips":
+			// P1-3 (Sol10 rc4 Session 8): a production release must not
+			// rely on a kernel-dependent conditional skip for a
+			// security-sensitive invariant. Ordinary development CI omits
+			// this flag and keeps the normal manifest allowed_skip policy.
+			requireZeroSkips = true
+			rest = rest[1:]
 		default:
 			return bad(usage)
 		}
@@ -2089,7 +2097,7 @@ func redteamGateCmd(args []string) int {
 			return 1
 		}
 	}
-	result := redteamgate.Evaluate(manifest, string(logData), capabilities)
+	result := redteamgate.EvaluateWithOptions(manifest, string(logData), capabilities, redteamgate.Options{RequireZeroSkips: requireZeroSkips})
 	if err := json.NewEncoder(os.Stdout).Encode(result); err != nil {
 		fmt.Fprintln(os.Stderr, "redteam-gate:", err)
 		return 1
@@ -2854,6 +2862,6 @@ Usage:
   gov doctor
   gov health [reset <backend>]
   gov claims verify [--file <path>] [--repo <path>] [--artifact <path>] [--manifest <path>] [--release] [--portable-release]
-  gov redteam-gate verify --manifest <path> --log <path> [--capabilities <json>]
+  gov redteam-gate verify --manifest <path> --log <path> [--capabilities <json>] [--require-zero-skips]
   gov version`)
 }

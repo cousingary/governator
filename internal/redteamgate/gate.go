@@ -137,16 +137,17 @@ func ParseVerboseLog(log string) map[string]Outcome {
 
 // Result is the identity-based gate's verdict over one redteam run.
 type Result struct {
-	OK              bool     `json:"ok"`
-	Discovered      int      `json:"discovered"`
-	Run             int      `json:"run"`
-	Skipped         int      `json:"skipped"`
-	Failed          int      `json:"failed"`
-	MissingTests    []string `json:"missing_tests,omitempty"`
-	UnexpectedTests []string `json:"unexpected_tests,omitempty"`
-	FailedTests     []string `json:"failed_tests,omitempty"`
-	UnexpectedSkips []string `json:"unexpected_skips,omitempty"`
-	Problems        []string `json:"problems,omitempty"`
+	OK               bool     `json:"ok"`
+	Discovered       int      `json:"discovered"`
+	Run              int      `json:"run"`
+	Skipped          int      `json:"skipped"`
+	Failed           int      `json:"failed"`
+	MissingTests     []string `json:"missing_tests,omitempty"`
+	UnexpectedTests  []string `json:"unexpected_tests,omitempty"`
+	FailedTests      []string `json:"failed_tests,omitempty"`
+	UnexpectedSkips  []string `json:"unexpected_skips,omitempty"`
+	RequireZeroSkips bool     `json:"require_zero_skips"`
+	Problems         []string `json:"problems,omitempty"`
 }
 
 // Evaluate checks a parsed `go test -v -tags redteam` log against the
@@ -164,8 +165,25 @@ type Result struct {
 //     ("the wrong test skipping while the count stays the same") this gate
 //     replaces the old count-based check to close.
 func Evaluate(manifest Manifest, log string, capabilities map[string]bool) Result {
+	return EvaluateWithOptions(manifest, log, capabilities, Options{})
+}
+
+// Options tunes Evaluate's policy for the caller's release mode.
+type Options struct {
+	// RequireZeroSkips is P1-3 (Sol10 rc4 Session 8): a production release
+	// must not rely on a kernel-dependent conditional skip for a
+	// security-sensitive invariant, no matter how well-authorized that
+	// skip is by the manifest's normal allowed_skip mechanism. When set,
+	// ANY skip -- authorized or not -- blocks the release; conditional
+	// skips stay available only for ordinary development CI runs that
+	// leave this unset.
+	RequireZeroSkips bool
+}
+
+func EvaluateWithOptions(manifest Manifest, log string, capabilities map[string]bool, opts Options) Result {
 	outcomes := ParseVerboseLog(log)
 	var res Result
+	res.RequireZeroSkips = opts.RequireZeroSkips
 	byName := make(map[string]CaseEntry, len(manifest.Cases))
 	for _, c := range manifest.Cases {
 		byName[c.Name] = c
@@ -203,8 +221,12 @@ func Evaluate(manifest Manifest, log string, capabilities map[string]bool) Resul
 			res.UnexpectedTests = append(res.UnexpectedTests, name)
 			continue
 		}
-		if o.Result == "SKIP" && !skipAllowed(c, o.Reason, capabilities) {
-			res.UnexpectedSkips = append(res.UnexpectedSkips, name)
+		if o.Result == "SKIP" {
+			if opts.RequireZeroSkips {
+				res.UnexpectedSkips = append(res.UnexpectedSkips, name)
+			} else if !skipAllowed(c, o.Reason, capabilities) {
+				res.UnexpectedSkips = append(res.UnexpectedSkips, name)
+			}
 		}
 	}
 
@@ -234,7 +256,11 @@ func Evaluate(manifest Manifest, log string, capabilities map[string]bool) Resul
 		res.Problems = append(res.Problems, fmt.Sprintf("failed corpus test(s): %s", strings.Join(res.FailedTests, ", ")))
 	}
 	if len(res.UnexpectedSkips) > 0 {
-		res.Problems = append(res.Problems, fmt.Sprintf("unexpected skip(s) (not an authorized manifest conditional): %s", strings.Join(res.UnexpectedSkips, ", ")))
+		if opts.RequireZeroSkips {
+			res.Problems = append(res.Problems, fmt.Sprintf("production mode requires zero red-team skips (P1-3): %s", strings.Join(res.UnexpectedSkips, ", ")))
+		} else {
+			res.Problems = append(res.Problems, fmt.Sprintf("unexpected skip(s) (not an authorized manifest conditional): %s", strings.Join(res.UnexpectedSkips, ", ")))
+		}
 	}
 	return res
 }

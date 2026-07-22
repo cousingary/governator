@@ -129,7 +129,7 @@ func TestV9Case38BundleWithStaleBinaryRejected(t *testing.T) {
 	}
 	commitAll(t, fixture, "accidentally commit a stale binary")
 
-	out, err := runAuditBundle(t, fixture, filepath.Join(fixture, "audit-out"))
+	out, err := runAuditBundle(t, fixture, t.TempDir())
 	if err == nil {
 		t.Fatalf("expected audit_bundle.sh to refuse a bundle containing bin/gov, but it succeeded:\n%s", out)
 	}
@@ -151,7 +151,7 @@ func TestV9Case39BundleWithVenvOrCacheRejected(t *testing.T) {
 	}
 	commitAll(t, fixture, "accidentally commit a venv")
 
-	out, err := runAuditBundle(t, fixture, filepath.Join(fixture, "audit-out"))
+	out, err := runAuditBundle(t, fixture, t.TempDir())
 	if err == nil {
 		t.Fatalf("expected audit_bundle.sh to refuse a bundle containing .venv, but it succeeded:\n%s", out)
 	}
@@ -177,7 +177,7 @@ func TestV9Case40StaleArchitectureFinalSectionRejected(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = os.Remove(staleDoc) })
 
-	out, err := runAuditBundle(t, fixture, filepath.Join(fixture, "audit-out"), "GOV_ARCHITECTURE_DOC="+staleDoc)
+	out, err := runAuditBundle(t, fixture, t.TempDir(), "GOV_ARCHITECTURE_DOC="+staleDoc)
 	if err == nil {
 		t.Fatalf("expected audit_bundle.sh to refuse a stale architecture doc, but it succeeded:\n%s", out)
 	}
@@ -295,12 +295,13 @@ func TestV9Case43ClaimsDivergenceWithoutProvenanceRejected(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	out, err := runAuditBundle(t, fixture, filepath.Join(fixture, "audit-out"))
+	auditOut := t.TempDir()
+	out, err := runAuditBundle(t, fixture, auditOut)
 	if err != nil {
 		t.Fatalf("audit_bundle.sh should still succeed on a legitimate source/dist claims divergence, got error: %v\n%s", err, out)
 	}
 
-	provenancePath := filepath.Join(fixture, "audit-out", "evidence", "CLAIMS_PROVENANCE.txt")
+	provenancePath := filepath.Join(auditOut, "evidence", "CLAIMS_PROVENANCE.txt")
 	provenance, rerr := os.ReadFile(provenancePath)
 	if rerr != nil {
 		t.Fatalf("expected evidence/CLAIMS_PROVENANCE.txt to exist and record the divergence: %v", rerr)
@@ -309,7 +310,7 @@ func TestV9Case43ClaimsDivergenceWithoutProvenanceRejected(t *testing.T) {
 		t.Fatalf("expected CLAIMS_PROVENANCE.txt to flag the divergence as DIVERGENT, got:\n%s", provenance)
 	}
 
-	if _, statErr := os.Stat(filepath.Join(fixture, "audit-out", "evidence", "claims.yaml")); !os.IsNotExist(statErr) {
+	if _, statErr := os.Stat(filepath.Join(auditOut, "evidence", "claims.yaml")); !os.IsNotExist(statErr) {
 		t.Fatalf("evidence/ must never carry an unlabeled third claims.yaml copy (stat err=%v)", statErr)
 	}
 }

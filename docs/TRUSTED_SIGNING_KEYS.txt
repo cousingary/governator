@@ -1,0 +1,23 @@
+# Governator production release signing keys — the out-of-band trust root
+# for checksums.txt.minisig (P1-5, Sol10 rc4 Session 8).
+#
+# One fingerprint per line, uppercase hex, as printed by `minisign -G`'s
+# "minisign public key <FINGERPRINT>" comment. Lines starting with # and
+# blank lines are ignored. scripts/release_policy.py reads this file
+# directly; it is never generated or edited by any release script itself.
+#
+# THIS FILE IS INTENTIONALLY EMPTY. No permanent production signing key has
+# been generated for this project yet -- see docs/signing_key.md for the
+# ceremony required before the first entry may be added. A
+# REQUIRE_ASYMMETRIC_SIGNATURE=1 release (any real, non-candidate version)
+# fails release_policy.py's signature check while this file has zero
+# entries, by design: an unanchored key is not a trust root, it is just
+# another file in the release.
+#
+# Add an entry ONLY after:
+#   1. the key was generated per docs/signing_key.md's ceremony, with
+#      Jeremy's explicit authorization to generate/publish it, and
+#   2. its fingerprint was published through an independent channel (never
+#      only inside this repository or a release archive), and
+#   3. that publication is cross-checkable by a third party independently
+#      of this file.
