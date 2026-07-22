@@ -3,11 +3,15 @@
 P1-5 (Sol10 rc4 Session 8): "a public key shipped only beside its own
 signature proves nothing." This document is the procedure for anchoring a
 real trust root before Governator ships its first signed production
-release. **No permanent production signing key exists yet** — generating
-or publishing one is an external, irreversible action and requires
-Jeremy's explicit go-ahead each time, not a standing authorization. Nothing
-in this session (rc4 Session 8) generated or published a key; this file
-records the procedure the next explicit authorization will follow.
+release.
+
+**The permanent production signing key was generated and anchored on
+2026-07-22** (rc4 Session 8 close-out, Jeremy's explicit authorization).
+Fingerprint `B5CBEE8BBA8826A7`, published out-of-band in
+`agents/governator-signing-key-fingerprint.txt` and mirrored to VPS
+`monpaga@216.158.228.204:~/governator-signing-key-fingerprint.txt`.
+rc4 is the first release signed by this key. The procedure below remains
+authoritative for all future rotations and revocations.
 
 ## 1. Generate the key
 

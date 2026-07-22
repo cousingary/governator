@@ -6,18 +6,20 @@
 # blank lines are ignored. scripts/release_policy.py reads this file
 # directly; it is never generated or edited by any release script itself.
 #
-# THIS FILE IS INTENTIONALLY EMPTY. No permanent production signing key has
-# been generated for this project yet -- see docs/signing_key.md for the
-# ceremony required before the first entry may be added. A
-# REQUIRE_ASYMMETRIC_SIGNATURE=1 release (any real, non-candidate version)
-# fails release_policy.py's signature check while this file has zero
-# entries, by design: an unanchored key is not a trust root, it is just
-# another file in the release.
-#
-# Add an entry ONLY after:
+# Anchored production signing keys. Each entry was added ONLY after:
 #   1. the key was generated per docs/signing_key.md's ceremony, with
 #      Jeremy's explicit authorization to generate/publish it, and
 #   2. its fingerprint was published through an independent channel (never
 #      only inside this repository or a release archive), and
 #   3. that publication is cross-checkable by a third party independently
 #      of this file.
+#
+# First entry added 2026-07-22 (rc4 Session 8 close-out). The fingerprint
+# is published out-of-band in:
+#   - agents/governator-signing-key-fingerprint.txt (separate nested repo)
+#   - monpaga@216.158.228.204:~/governator-signing-key-fingerprint.txt (VPS)
+# This rc4 cut is the first release signed by an anchored production key;
+# prior rc2/rc3 archives were signed by an un-anchored key
+# (C7775DF3FA155113) and are not verifiable against this trust root.
+
+B5CBEE8BBA8826A7
