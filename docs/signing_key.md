@@ -43,14 +43,23 @@ that instruction possible to follow.
 ## 4. Anchor it in the repo
 
 Only after step 3, add the fingerprint (and only the fingerprint — never
-the secret key) to `docs/TRUSTED_SIGNING_KEYS.txt`. From that commit
-forward, `scripts/release_policy.py signature --trusted-fingerprints-file
-docs/TRUSTED_SIGNING_KEYS.txt` (wired into `scripts/release.sh`) refuses
-any REQUIRE_ASYMMETRIC_SIGNATURE=1 release whose `checksums.txt.minisig`
-was not signed by a key on this list — see
-`internal/redteam`'s `TestV10Case40ReleaseSignedWithNonproductionUnknownKeyFailsRelease`
-for the enforcement proof (run against an ephemeral, non-production test
-key pair, never a real one).
+the secret key) to `docs/TRUSTED_SIGNING_KEYS.txt`, AND pin the matching
+public key at `docs/signing_keys/<FINGERPRINT>.pub` (as of rc5, Sol11 P0-1).
+A key ID alone cannot verify a signature, so the release toolchain keeps its
+own pinned copy of the Ed25519 verification public key here; its fingerprint
+must equal an entry in `docs/TRUSTED_SIGNING_KEYS.txt` (the out-of-band
+anchor), and it is never discovered beside a release or via PATH lookup.
+From that commit forward, `scripts/release_policy.py signature` (wired into
+`scripts/release.sh`) refuses any `REQUIRE_ASYMMETRIC_SIGNATURE=1` release
+whose `checksums.txt.minisig` was not signed by an anchored key, AND
+cryptographically verifies (`minisign -V`) the signature over the exact
+`checksums.txt` bytes using that pinned public key — so a forged packet
+carrying a trusted key ID, a signature over a different file, or checksums
+modified after signing is rejected. See `internal/redteam`'s
+`TestV10Case40ReleaseSignedWithNonproductionUnknownKeyFailsRelease` (rc4,
+unanchored-key refusal) and the `TestV11Case1`..`TestV11Case8` corpus
+(rc5, cryptographic-verification refusals), all run against ephemeral,
+non-production test key pairs.
 
 ## 5. Sign releases
 

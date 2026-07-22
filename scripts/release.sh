@@ -1019,16 +1019,44 @@ if [ -n "${GOV_RELEASE_MINISIGN_KEY:-}" ] && command -v minisign >/dev/null 2>&1
 else
   echo "release: no asymmetric signature — set GOV_RELEASE_MINISIGN_KEY (+ minisign on PATH) to add one" >&2
 fi
-# P1-5 (Sol10 rc4 Session 8): when a signature is required (true
-# production releases), the signer's own key ID must also be in
-# docs/TRUSTED_SIGNING_KEYS.txt -- the out-of-band-published trust root,
-# never a key bundled inside the release itself. That file is empty until
-# Jeremy explicitly authorizes generating and publishing a permanent
-# production key (docs/signing_key.md); until then this intentionally
-# fails every REQUIRE_ASYMMETRIC_SIGNATURE=1 release rather than accept a
-# signature from an unanchored, effectively anonymous key.
+# P1-5 (Sol10 rc4 Session 8) + Sol11 P0-1: when a signature is required
+# (true production releases), the release gate now CRYPTOGRAPHICALLY
+# verifies the signature -- not just the signer key ID. Three trust roots
+# cooperate, none discovered beside the release:
+#   1. docs/TRUSTED_SIGNING_KEYS.txt  -- the out-of-band-published signer
+#      fingerprint(s) (agents/ repo + VPS mirror are the independent
+#      channels). The .minisig's own signer key ID must be anchored here.
+#   2. docs/signing_keys/<fp>.pub    -- the release toolchain's PINNED copy
+#      of the Ed25519 verification public key. Its fingerprint must match
+#      root #1. A key ID alone cannot verify a signature; this is the key
+#      minisign -V actually uses.
+#   3. the minisign verifier itself, resolved to an absolute path and
+#      recorded by SHA-256 so a fake minisign on PATH cannot intercept
+#      verification (a forged packet is rejected by minisign -V regardless).
+#      Hash-anchoring against a pre-recorded expected value lands with the
+#      immutable builder image (S8 / P1-6); here the absolute-path pin +
+#      recorded hash is the minimum Sol11 P0-1 asks for.
+# A REQUIRE_ASYMMETRIC_SIGNATURE=1 release whose signature does not
+# cryptographically verify over the exact checksums.txt bytes, whose
+# checksums no longer describe the shipped artifacts, or whose verifier
+# was substituted now fails closed here.
 TRUSTED_SIGNING_KEYS_FILE="$SOURCE_ROOT/docs/TRUSTED_SIGNING_KEYS.txt"
-python3 "$ROOT/scripts/release_policy.py" signature --version "$VERSION" --require "$REQUIRE_ASYMMETRIC_SIGNATURE" --minisig "$MINISIG" --trusted-fingerprints-file "$TRUSTED_SIGNING_KEYS_FILE"
+TRUSTED_PUBLIC_KEYS_DIR="$SOURCE_ROOT/docs/signing_keys"
+MINISIGN_BIN=$(command -v minisign || true)
+MINISIGN_BIN_HASH=""
+if [ -n "$MINISIGN_BIN" ]; then
+  MINISIGN_BIN_HASH=$(sha256sum "$MINISIGN_BIN" | awk '{print $1}')
+fi
+python3 "$ROOT/scripts/release_policy.py" signature \
+  --version "$VERSION" \
+  --require "$REQUIRE_ASYMMETRIC_SIGNATURE" \
+  --minisig "$MINISIG" \
+  --trusted-fingerprints-file "$TRUSTED_SIGNING_KEYS_FILE" \
+  --checksums "$CHECKSUMS" \
+  --trusted-public-keys-dir "$TRUSTED_PUBLIC_KEYS_DIR" \
+  --artifacts-dir "$OUT_DIR" \
+  --minisign-bin "$MINISIGN_BIN" \
+  --minisign-bin-hash "$MINISIGN_BIN_HASH"
 
 echo "release: OK — $OUT_DIR" >&2
 ls -la "$OUT_DIR" >&2

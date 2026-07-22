@@ -1226,7 +1226,7 @@ claims:
         build_tag: redteam
 
   - id: sol8-release-integrity-gates
-    title: "The release-blocking claims-verify gate refuses a shipped artifact whose own version --json reports dirty=true (source drifted from a clean tag); scripts/release_policy.py's signature command separately refuses an rc/production version with no accompanying asymmetric minisign signature. An rc/production release cannot ship an unproven or unsigned artifact. (release_policy.py is Python and is not symbol-resolved by this Go verifier; its behavior is asserted only through the redteam test below.)"
+    title: "The release-blocking claims-verify gate refuses a shipped artifact whose own version --json reports dirty=true (source drifted from a clean tag); scripts/release_policy.py's signature command separately refuses an rc/production version with no accompanying asymmetric minisign signature. An rc/production release cannot ship an unproven or unsigned artifact. As of rc5 (Sol11 P0-1), the signature command additionally CRYPTOGRAPHICALLY verifies the Ed25519 signature over the exact checksums.txt bytes using a pinned public key (docs/signing_keys/<fp>.pub) whose fingerprint matches the out-of-band anchor (docs/TRUSTED_SIGNING_KEYS.txt), refuses a forged or mismatched signature or one over a different file, re-checks that checksums still describe every shipped artifact, and pins the minisign verifier by absolute path plus recorded SHA-256. (release_policy.py is Python and is not symbol-resolved by this Go verifier; its behavior is asserted only through the redteam tests below.)"
     first_shipped_version: v1.0.2-rc2
     claimed_maturity: tested
     implementation:
@@ -1237,6 +1237,17 @@ claims:
         funcs:
           - TestV8Case20DirtyReleaseArtifactRejected
           - TestV8Case21UnsignedRCReleaseRejected
+        build_tag: redteam
+      - file: internal/redteam/v11_s1_release_signature_test.go
+        funcs:
+          - TestV11Case1ForgedSignatureWithTrustedKeyIDRejected
+          - TestV11Case2ValidSignatureOverDifferentChecksumFileRejected
+          - TestV11Case3SignatureFromUntrustedKeyRejected
+          - TestV11Case4FakeMinisignBinaryWritesSyntacticPacketRejected
+          - TestV11Case5ChecksumsModifiedAfterSigningRejected
+          - TestV11Case6ArchiveModifiedAfterChecksumGenerationRejected
+          - TestV11Case7MissingTrustedPublicKeyRejected
+          - TestV11Case8TrustedFingerprintDoesNotMatchVerificationKeyRejected
         build_tag: redteam
 
   - id: sol8-replay-identity-hardening

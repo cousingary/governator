@@ -789,3 +789,47 @@ cases:
     session: rc4-s8
     required: true
     status: implemented
+  # Sol11 rc5 Session 1 (P0-1): the release signature gate must
+  # cryptographically verify checksums.txt.minisig, not just the signer key
+  # ID. Cases 146-153 prove the eight forged/mismatched inputs from Sol11's
+  # "Release signature" corpus are each rejected.
+  - case: 146
+    name: TestV11Case1ForgedSignatureWithTrustedKeyIDRejected
+    session: rc5-s1
+    required: true
+    status: implemented
+  - case: 147
+    name: TestV11Case2ValidSignatureOverDifferentChecksumFileRejected
+    session: rc5-s1
+    required: true
+    status: implemented
+  - case: 148
+    name: TestV11Case3SignatureFromUntrustedKeyRejected
+    session: rc5-s1
+    required: true
+    status: implemented
+  - case: 149
+    name: TestV11Case4FakeMinisignBinaryWritesSyntacticPacketRejected
+    session: rc5-s1
+    required: true
+    status: implemented
+  - case: 150
+    name: TestV11Case5ChecksumsModifiedAfterSigningRejected
+    session: rc5-s1
+    required: true
+    status: implemented
+  - case: 151
+    name: TestV11Case6ArchiveModifiedAfterChecksumGenerationRejected
+    session: rc5-s1
+    required: true
+    status: implemented
+  - case: 152
+    name: TestV11Case7MissingTrustedPublicKeyRejected
+    session: rc5-s1
+    required: true
+    status: implemented
+  - case: 153
+    name: TestV11Case8TrustedFingerprintDoesNotMatchVerificationKeyRejected
+    session: rc5-s1
+    required: true
+    status: implemented
