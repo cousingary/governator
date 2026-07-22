@@ -220,16 +220,22 @@ func TestV10Case34GraphIndexMutationDuringRunHasNoEffectOnThatRunsRecordedSnapsh
 
 	// The backend sleeps before producing its result -- run 1 (workspace
 	// prep, preReplayGraph capture, backend launch) always happens well
-	// before this sleep even starts, so a short fixed wait below reliably
-	// lands the mutation while the backend is still inside its sleep,
-	// without needing the backend to signal anything itself (which would
-	// require a marker write -- but a marker path outside this contract's
-	// declared write authority fails under real enforcement even in
-	// "degraded" containment mode, since write-root scoping is a property
-	// of the compiled enforce.Plan, not the containment/descendant-tracking
+	// before this sleep even starts, so a fixed wait below reliably lands
+	// the mutation while the backend is still inside its sleep, without
+	// needing the backend to signal anything itself (which would require a
+	// marker write -- but a marker path outside this contract's declared
+	// write authority fails under real enforcement even in "degraded"
+	// containment mode, since write-root scoping is a property of the
+	// compiled enforce.Plan, not the containment/descendant-tracking
 	// mechanism s6BypassHostContainment relaxes).
+	//
+	// rc4 (post-S8): the original 400ms wait against a 1s backend sleep
+	// flaked under host contention (observed the mutation landing before
+	// preReplayGraph capture finished, exactly like the outbox test's
+	// documented lease-margin flake) -- widened to remove the timing
+	// dependency without changing what the test proves.
 	c := baseContract(root)
-	backendBin := fakeBackend(t, standardBackendBody("sleep 1\n"))
+	backendBin := fakeBackend(t, standardBackendBody("sleep 3\n"))
 
 	// Everything runGovernedAllowError would normally do, performed here on
 	// the test's own goroutine before the run is launched on a separate one
@@ -253,7 +259,7 @@ func TestV10Case34GraphIndexMutationDuringRunHasNoEffectOnThatRunsRecordedSnapsh
 		done <- outcome{rec, err}
 	}()
 
-	time.Sleep(400 * time.Millisecond)
+	time.Sleep(1500 * time.Millisecond)
 	if err := os.WriteFile(dbFile, []byte("v2-concurrent-mutation"), 0644); err != nil {
 		t.Fatal(err)
 	}
