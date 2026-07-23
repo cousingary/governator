@@ -3,6 +3,7 @@ package containment
 import (
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -213,6 +214,129 @@ func TestScopeCommandLaunchesThroughSealedCopyNeverPathname(t *testing.T) {
 				t.Fatalf("sealed primitive copy at %q reads %q, want the original verified bytes %q -- the same-uid replacement of the enrolled path must have no effect on what actually executes", cmd.Path, got, original)
 			}
 		})
+	}
+}
+
+// TestV11Case31CommandWithLaunchesUnshareThroughDescriptorNeverPathname is
+// Sol11 rc5 Session 4 corpus case 27 (agents/governator-sol-upgrade11.md
+// P0-5): "replace unshare after final Verify and before exec". Mirrors
+// TestScopeCommandLaunchesThroughSealedCopyNeverPathname's exact same-uid
+// tamper (pin a real verified binary into a Handle, then REPLACE the file
+// at that same enrolled path via rename), but exercises CommandWith --
+// which launches ScopePIDNamespace's primitive through
+// s.primitiveHandle's own held, already-verified descriptor
+// (/proc/self/fd/<n>, via a shared toolregistry.FDAllocator) instead of a
+// freshly sealed, re-verified private copy referenced by a real pathname.
+// The retained descriptor CommandWith registers into alloc is read back
+// directly here (rewound first) to prove it still holds the ORIGINAL
+// verified bytes, immune to the pathname replacement -- the same
+// evidentiary standard the sealed-copy sibling test uses (reading the
+// launch target's bytes without actually starting a process).
+func TestV11Case31CommandWithLaunchesUnshareThroughDescriptorNeverPathname(t *testing.T) {
+	t.Setenv("GOV_TOOLREGISTRY_FILE", filepath.Join(t.TempDir(), "tools.yaml"))
+	pinned := filepath.Join(t.TempDir(), "primitive-binary")
+	const original = "#!/bin/sh\nprintf original\n"
+	if err := os.WriteFile(pinned, []byte(original), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := toolregistry.Enroll("unshare", pinned); err != nil {
+		t.Fatalf("enroll unshare: %v", err)
+	}
+	registry, err := toolregistry.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	handle, err := registry.ResolveHandle("unshare", "unshare", toolregistry.KindTrustedController)
+	if err != nil {
+		t.Fatalf("ResolveHandle: %v", err)
+	}
+	t.Cleanup(func() { _ = handle.Close() })
+
+	const replacement = "#!/bin/sh\nprintf replacement\n"
+	replacementPath := pinned + ".replacement"
+	if err := os.WriteFile(replacementPath, []byte(replacement), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(replacementPath, pinned); err != nil {
+		t.Fatal(err)
+	}
+
+	s := &Scope{method: ScopePIDNamespace, runID: "unit-test", primitiveHandle: handle}
+	alloc := &toolregistry.FDAllocator{}
+	cmd := s.CommandWith(context.Background(), alloc, "some-backend", []string{"--flag"}, t.TempDir())
+	if cmd.Path == "" || cmd.Path == pinned || strings.Contains(cmd.Path, "nonexistent") || !strings.HasPrefix(cmd.Path, "/proc/self/fd/") {
+		t.Fatalf("CommandWith built argv0=%q, want a /proc/self/fd/<n> descriptor path, never the enrolled pathname or a fail-closed sentinel", cmd.Path)
+	}
+	files := alloc.Files()
+	if len(files) == 0 {
+		t.Fatal("CommandWith registered no descriptor with the shared allocator")
+	}
+	f := files[len(files)-1]
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		t.Fatal(err)
+	}
+	got, err := io.ReadAll(f)
+	if err != nil {
+		t.Fatalf("read retained primitive descriptor: %v", err)
+	}
+	if string(got) != original {
+		t.Fatalf("retained primitive descriptor reads %q, want the original verified bytes %q -- the same-uid replacement of the enrolled path must have no effect on what would actually execute", got, original)
+	}
+}
+
+// TestV11Case32CommandWithLaunchesSystemdRunThroughDescriptorNeverPathname
+// is corpus case 28: "replace systemd-run after final Verify and before
+// exec". Identical to case 31 above for ScopeSystemdUserScope's own
+// primitive instead of ScopePIDNamespace's.
+func TestV11Case32CommandWithLaunchesSystemdRunThroughDescriptorNeverPathname(t *testing.T) {
+	t.Setenv("GOV_TOOLREGISTRY_FILE", filepath.Join(t.TempDir(), "tools.yaml"))
+	pinned := filepath.Join(t.TempDir(), "primitive-binary")
+	const original = "#!/bin/sh\nprintf original\n"
+	if err := os.WriteFile(pinned, []byte(original), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := toolregistry.Enroll("systemd-run", pinned); err != nil {
+		t.Fatalf("enroll systemd-run: %v", err)
+	}
+	registry, err := toolregistry.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	handle, err := registry.ResolveHandle("systemd-run", "systemd-run", toolregistry.KindTrustedController)
+	if err != nil {
+		t.Fatalf("ResolveHandle: %v", err)
+	}
+	t.Cleanup(func() { _ = handle.Close() })
+
+	const replacement = "#!/bin/sh\nprintf replacement\n"
+	replacementPath := pinned + ".replacement"
+	if err := os.WriteFile(replacementPath, []byte(replacement), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(replacementPath, pinned); err != nil {
+		t.Fatal(err)
+	}
+
+	s := &Scope{method: ScopeSystemdUserScope, runID: "unit-test", unitName: "unit-test-unit", primitiveHandle: handle}
+	alloc := &toolregistry.FDAllocator{}
+	cmd := s.CommandWith(context.Background(), alloc, "some-backend", []string{"--flag"}, t.TempDir())
+	if cmd.Path == "" || cmd.Path == pinned || strings.Contains(cmd.Path, "nonexistent") || !strings.HasPrefix(cmd.Path, "/proc/self/fd/") {
+		t.Fatalf("CommandWith built argv0=%q, want a /proc/self/fd/<n> descriptor path, never the enrolled pathname or a fail-closed sentinel", cmd.Path)
+	}
+	files := alloc.Files()
+	if len(files) == 0 {
+		t.Fatal("CommandWith registered no descriptor with the shared allocator")
+	}
+	f := files[len(files)-1]
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		t.Fatal(err)
+	}
+	got, err := io.ReadAll(f)
+	if err != nil {
+		t.Fatalf("read retained primitive descriptor: %v", err)
+	}
+	if string(got) != original {
+		t.Fatalf("retained primitive descriptor reads %q, want the original verified bytes %q -- the same-uid replacement of the enrolled path must have no effect on what would actually execute", got, original)
 	}
 }
 

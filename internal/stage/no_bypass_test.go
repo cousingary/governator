@@ -56,11 +56,15 @@ func TestNoRawProcessLaunchOutsideStageExecutor(t *testing.T) {
 		// Read-only `--version`/`--help`/`worktree -h` diagnostic probes for
 		// the doctor health-check command; never executes a governed job.
 		"internal/doctor/doctor.go": 7,
-		// Four raw launches remain: the cgroup-direct and degraded primitives,
-		// plus defensive primitivePath fallbacks used only when a test
-		// constructs a Scope directly without a real sealed handle. Production
-		// systemd-run/unshare launches now use sealed handles.
-		"internal/containment/descendants.go": 4,
+		// Eight raw launches: Command's four (cgroup-direct, degraded, and
+		// the systemd-run/unshare sealed-copy primitives) plus
+		// CommandWith's own four of the identical shape (Sol11 P0-5,
+		// rc5 Session 4) -- CommandWith is the descriptor-backed sibling
+		// entry point production callers that can supply a shared
+		// toolregistry.FDAllocator use instead of Command's
+		// sealed-pathname fallback for the systemd-run/unshare primitive,
+		// not a second bypass of the same gate.
+		"internal/containment/descendants.go": 8,
 		// The sealed-handle `/proc/self/fd/<n>` launch mechanism itself
 		// (report §S4 "Required correction": "launch via fexecve or
 		// /proc/self/fd/<n>") — foundational launch primitive, not a bypass.

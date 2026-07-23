@@ -348,41 +348,28 @@ func (Executor) Run(ctx context.Context, spec StageSpec) (StageResult, error) {
 	bin := spec.Executable.CanonicalPath
 	args := append([]string(nil), spec.Arguments...)
 	factory := spec.CommandFactory
-	// sealedCopy (Sol9 P1-4) is set inside the factory below when it seals
-	// spec.ExecutableHandle's bytes to a real path for the enforced-plan
-	// branch. It must stay open on disk for as long as the launched
-	// process can reference it by that path, so it is only closed here,
-	// after this Run call's process has fully finished -- not inside the
-	// factory closure itself.
-	var sealedCopy *toolregistry.SealedCopy
-	defer func() {
-		if sealedCopy != nil {
-			_ = sealedCopy.Close()
-		}
-	}()
 	if factory == nil && spec.ExecutableHandle != nil {
 		factory = func(c context.Context, s *containment.Scope, p enforce.Plan, b string, a []string, d string) (*exec.Cmd, error) {
 			if p.Active {
-				sealed, err := spec.ExecutableHandle.SealedExecutablePath()
+				// Sol11 P0-5: launch the final stage executable through its
+				// held, already-verified descriptor via a shared
+				// FDAllocator, composed with this launch's own self-exec/
+				// unshare/containment-primitive descriptors -- never by
+				// sealing a private copy to a real pathname and exec'ing
+				// that pathname after Verify, which still left a
+				// Verify-then-replace-then-exec window open. The ELF read
+				// closure below still inspects the executable's canonical
+				// enrolled path (metadata only, never the exec target
+				// itself), matching how spec.ExecutableHandle was already
+				// verified against that exact path when it was resolved.
+				alloc := &toolregistry.FDAllocator{}
+				extended, err := p.WithExecutableAndReadRoots(spec.ExecutableHandle.Identity.CanonicalPath, filepath.Dir(spec.ExecutableHandle.Identity.CanonicalPath))
 				if err != nil {
 					return nil, err
 				}
-				sealedCopy = sealed
-				// Sol9 P1-4: re-verify the published copy immediately
-				// before it is referenced by path below -- a private
-				// read-only copy is not kernel-immutable, so this is the
-				// last point Governator can catch a same-UID tamper
-				// before launch.
-				if verr := sealed.Verify(); verr != nil {
-					return nil, fmt.Errorf("verify sealed executable before launch: %w", verr)
-				}
-				extended, err := p.WithExecutableAndReadRoots(sealed.Path, filepath.Dir(sealed.Path))
-				if err != nil {
-					return nil, err
-				}
-				wb, wa, wf := extended.Wrap(sealed.Path, a)
-				cmd := s.Command(c, wb, wa, d)
-				cmd.ExtraFiles = append(cmd.ExtraFiles, wf...)
+				wb, wa := extended.WrapWith(alloc, "", spec.ExecutableHandle.File(), a)
+				cmd := s.CommandWith(c, alloc, wb, wa, d)
+				cmd.ExtraFiles = append(cmd.ExtraFiles, alloc.Files()...)
 				return cmd, nil
 			}
 			return spec.ExecutableHandle.CommandWith(c, a, func(cc context.Context, sealed string, sealedArgs []string) *exec.Cmd {

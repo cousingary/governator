@@ -561,6 +561,81 @@ func (s *Scope) Command(ctx context.Context, bin string, args []string, dir stri
 	return cmd
 }
 
+// CommandWith is Command's composable, descriptor-backed form (Sol11 P0-5):
+// a caller that must combine this Scope's own primitive launch
+// (systemd-run/unshare) with another descriptor-backed layer of its own --
+// concretely, enforce.Plan.WrapWith's self-exec/unshare/final-executable
+// descriptors -- passes one shared alloc so every layer's
+// /proc/self/fd/<n> argv string lands at the fd number Start will actually
+// dup it to, instead of two independently-numbered ExtraFiles lists
+// colliding at fd 3. That collision is exactly why Command above still
+// falls back to a sealed pathname copy of its primitive (see Command's own
+// doc comment): it has no shared allocator to compose through. CommandWith
+// closes the Verify-then-replace-then-exec race a sealed copy cannot by
+// never reopening a pathname for the primitive at all -- it launches
+// through s.primitiveHandle's own held, already-verified descriptor
+// (/proc/self/fd/<n>, via alloc), the same object NewScope resolved and
+// verified once, for the run's whole lifetime.
+//
+// The caller must set the returned cmd's ExtraFiles to alloc.Files() once
+// every composed layer -- including this one -- has finished registering.
+func (s *Scope) CommandWith(ctx context.Context, alloc *toolregistry.FDAllocator, bin string, args []string, dir string) *exec.Cmd {
+	var cmd *exec.Cmd
+	switch s.method {
+	case ScopeSystemdUserScope:
+		full := append([]string{
+			"--user", "--scope", "--quiet", "--collect",
+			"--unit=" + s.unitName,
+			"--",
+			bin,
+		}, args...)
+		primitive := s.primitiveArg(alloc)
+		cmd = exec.CommandContext(ctx, primitive, full...) // govratchet:exec-allow(production_launch_factory) -- primitive is s.primitiveHandle's own held, already-verified descriptor via /proc/self/fd/<n>, never a reopened pathname
+		cmd.Env = controllerenv.Base()
+		cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	case ScopeCgroupDirect:
+		cmd = exec.CommandContext(ctx, bin, args...) // govratchet:exec-allow(production_launch_factory) -- bin is already the caller's verified/sealed path
+		cmd.SysProcAttr = cgroupDirectSysProcAttr(s.cgroupFile.Fd())
+	case ScopePIDNamespace:
+		full := []string{
+			"--user",
+			fmt.Sprintf("--map-user=%d", os.Getuid()),
+			fmt.Sprintf("--map-group=%d", os.Getgid()),
+			"--pid", "--fork", "--mount-proc",
+			"--",
+			bin,
+		}
+		full = append(full, args...)
+		primitive := s.primitiveArg(alloc)
+		cmd = exec.CommandContext(ctx, primitive, full...) // govratchet:exec-allow(production_launch_factory) -- primitive is s.primitiveHandle's own held, already-verified descriptor via /proc/self/fd/<n>, never a reopened pathname
+		cmd.Env = controllerenv.Base()
+		cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	default: // scopeDegraded
+		cmd = exec.CommandContext(ctx, bin, args...) // govratchet:exec-allow(production_launch_factory) -- bin is already the caller's verified/sealed path
+		cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	}
+	cmd.Dir = dir
+	return cmd
+}
+
+// primitiveArg returns the /proc/self/fd/<n> argv form of s.primitiveHandle's
+// held, already-verified descriptor via alloc, for CommandWith's
+// descriptor-backed primitive launch (Sol11 P0-5). On any failure to obtain
+// a usable descriptor it returns a fixed, guaranteed-nonexistent path so the
+// resulting exec.Cmd fails closed at Start() rather than falling back to a
+// mutable pathname -- mirroring sealPrimitive's own fail-closed contract.
+func (s *Scope) primitiveArg(alloc *toolregistry.FDAllocator) string {
+	const failClosedPath = "/nonexistent/governator-sealed-primitive-unavailable"
+	if s.primitiveHandle == nil {
+		return failClosedPath
+	}
+	f := s.primitiveHandle.File()
+	if f == nil {
+		return failClosedPath
+	}
+	return alloc.Arg(f)
+}
+
 // sealPrimitive seals s.primitiveHandle's held, verified bytes into a fresh
 // private copy, re-verifies that copy immediately, and returns its path --
 // see Command's doc comment. On any failure it returns a fixed,

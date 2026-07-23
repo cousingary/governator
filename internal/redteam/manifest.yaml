@@ -966,3 +966,27 @@ cases:
     session: rc5-s3
     required: true
     status: implemented
+  # Sol11 rc5 Session 4 (P0-5): controller "sealed copies" (systemd-run,
+  # unshare, stage executables routed through enforcement wrappers) still
+  # retained a same-uid Verify-then-replace-then-exec race, since Verify
+  # only re-checked a private copy immediately before an ordinary pathname
+  # launch the kernel re-resolves. Cases 176-178 prove the descriptor-backed
+  # fix (toolregistry.FDAllocator + enforce.Plan.WrapWith +
+  # containment.Scope.CommandWith) launches through each object's own held,
+  # already-verified descriptor instead, immune to a same-uid replacement of
+  # the enrolled pathname after resolution.
+  - case: 176
+    name: TestV11Case31CommandWithLaunchesUnshareThroughDescriptorNeverPathname
+    session: rc5-s4
+    required: true
+    status: implemented
+  - case: 177
+    name: TestV11Case32CommandWithLaunchesSystemdRunThroughDescriptorNeverPathname
+    session: rc5-s4
+    required: true
+    status: implemented
+  - case: 178
+    name: TestV11Case33EnforcedStageExecutableLaunchesThroughDescriptorNeverPathname
+    session: rc5-s4
+    required: true
+    status: implemented

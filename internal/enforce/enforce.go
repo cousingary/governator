@@ -446,19 +446,42 @@ func (p Plan) WithReadOnlyBinds(binds ...ROBind) Plan {
 // child at the deterministic fd numbers Wrap assigned. A no-op/inactive
 // Plan returns bin/args unchanged and a nil extraFiles.
 func (p Plan) Wrap(bin string, args []string) (string, []string, []*os.File) {
+	alloc := &toolregistry.FDAllocator{}
+	wb, wa := p.WrapWith(alloc, bin, nil, args)
+	return wb, wa, alloc.Files()
+}
+
+// WrapWith is Wrap's composable form (Sol11 P0-5): a caller that must
+// combine this Plan's own descriptor-backed layers (Governator's self-exec,
+// unshare) with ANOTHER descriptor-backed layer of its own -- most
+// concretely containment.Scope's own primitive launcher (systemd-run/
+// unshare-for-containment, via Scope.CommandWith), or the final stage
+// executable itself -- passes one shared alloc so every layer's
+// /proc/self/fd/<n> argv string lands at the fd number Start will actually
+// dup it to, instead of two independently-numbered ExtraFiles lists
+// colliding at fd 3 (the composition hazard containment.Scope's own Command
+// doc comment describes, which is why Command still falls back to a sealed
+// pathname copy for its primitive when no shared allocator is available).
+//
+// binFile, when non-nil, is the final stage executable's own held,
+// already-verified descriptor (toolregistry.Handle.File()): it is fd-arged
+// through alloc exactly like selfExeFile/unshareHandle, so the final exec
+// never reopens a same-uid-mutable pathname after that executable's own
+// verification. bin is used unchanged, as a literal argv string, only when
+// binFile is nil (legacy string-path callers, and Wrap itself).
+//
+// The caller must set exec.Cmd.ExtraFiles = alloc.Files() itself once every
+// layer it composes -- including any registered after WrapWith returns,
+// such as Scope.CommandWith's own primitive descriptor -- has finished
+// registering.
+func (p Plan) WrapWith(alloc *toolregistry.FDAllocator, bin string, binFile *os.File, args []string) (string, []string) {
 	if !p.Active {
-		return bin, args, nil
+		return bin, args
 	}
 
-	// fdArg records f as the next descriptor Start must inherit and returns
-	// its deterministic /proc/self/fd/<n> argv form -- entry i of
-	// exec.Cmd.ExtraFiles always becomes fd 3+i in the child, so callers
-	// never need to guess a number: whichever order fdArg is called in here
-	// is the order extraFiles comes back in.
-	var extraFiles []*os.File
-	fdArg := func(f *os.File) string {
-		extraFiles = append(extraFiles, f)
-		return fmt.Sprintf("/proc/self/fd/%d", 2+len(extraFiles))
+	execArg := bin
+	if binFile != nil {
+		execArg = alloc.Arg(binFile)
 	}
 
 	// selfArg is Governator's own re-exec target. selfExeFile (set by
@@ -471,7 +494,7 @@ func (p Plan) Wrap(bin string, args []string) (string, []string, []*os.File) {
 	// when there is no descriptor to pass.
 	selfArg := p.selfExe
 	if p.selfExeFile != nil {
-		selfArg = fdArg(p.selfExeFile)
+		selfArg = alloc.Arg(p.selfExeFile)
 	}
 
 	inner := []string{selfArg, SandboxExecArg, "--workspace", p.Workspace}
@@ -491,14 +514,14 @@ func (p Plan) Wrap(bin string, args []string) (string, []string, []*os.File) {
 		inner = append(inner, "--ro-bind", b.Src+"="+b.Dst)
 	}
 	inner = append(inner, "--")
-	inner = append(inner, bin)
+	inner = append(inner, execArg)
 	inner = append(inner, args...)
 	// Sol10 P0-1: a read-only bind mount needs a private mount namespace
 	// regardless of network policy, so AllowNetwork alone no longer decides
 	// whether this launch goes through unshare -- it only decides whether
 	// --net (no configured route) is one of the namespaces unshared.
 	if p.AllowNetwork && len(p.ROBinds) == 0 {
-		return inner[0], inner[1:], extraFiles
+		return inner[0], inner[1:]
 	}
 	// No configured route inside the namespace means every connect()/bind()
 	// past loopback fails at the kernel level -- this is not a policy the
@@ -513,7 +536,7 @@ func (p Plan) Wrap(bin string, args []string) (string, []string, []*os.File) {
 	// tests as struct literals, which never populate unshareHandle.
 	unshareArg := p.unsharePath
 	if p.unshareHandle != nil {
-		unshareArg = fdArg(p.unshareHandle.File())
+		unshareArg = alloc.Arg(p.unshareHandle.File())
 	}
 	nsFlags := []string{}
 	if !p.AllowNetwork {
@@ -526,7 +549,7 @@ func (p Plan) Wrap(bin string, args []string) (string, []string, []*os.File) {
 		nsFlags = append(nsFlags, "--mount")
 	}
 	full := append(append(nsFlags, "--"), inner...)
-	return unshareArg, full, extraFiles
+	return unshareArg, full
 }
 
 type planContextKey struct{}

@@ -109,6 +109,44 @@ func (h *Handle) CommandWith(ctx context.Context, args []string, build func(cont
 	return cmd, nil
 }
 
+// FDAllocator assigns deterministic /proc/self/fd/<n> argv strings to every
+// descriptor-backed object composed into ONE launch chain -- containment
+// wrapper (Scope's own systemd-run/unshare primitive) -> enforcement
+// wrapper (enforce.Plan's Governator self-exec and unshare) -> final stage
+// executable (Sol11 P0-5). Before this type, each layer independently
+// numbered its own exec.Cmd.ExtraFiles starting at fd 3, so composing two
+// fd-based layers into the same launch made them collide on the same
+// number; the only working fallback was a sealed private copy re-verified
+// then exec'd by a real, same-uid-mutable pathname, which is exactly the
+// Verify-then-replace-then-exec race Sol11 P0-5 reports. A caller that
+// threads one shared FDAllocator through every composed layer instead gets
+// a collision-free /proc/self/fd/<n> string per layer, so nothing needs to
+// be reopened by pathname after its own verification.
+//
+// Exactly one FDAllocator must back one exec.Cmd: the caller assigns
+// Files() to that cmd's ExtraFiles once every layer has finished
+// registering, and Start dup's entry i to fd 3+i in the child -- the same
+// number Arg already returned for that entry.
+type FDAllocator struct {
+	files []*os.File
+}
+
+// Arg registers f as the next descriptor the eventual exec.Cmd.Start must
+// inherit and returns its deterministic /proc/self/fd/<n> argv form.
+func (a *FDAllocator) Arg(f *os.File) string {
+	a.files = append(a.files, f)
+	return fmt.Sprintf("/proc/self/fd/%d", 2+len(a.files))
+}
+
+// Files returns the accumulated descriptors in allocation order, for the
+// caller to assign to exec.Cmd.ExtraFiles verbatim.
+func (a *FDAllocator) Files() []*os.File {
+	if a == nil {
+		return nil
+	}
+	return append([]*os.File(nil), a.files...)
+}
+
 // SealedCopy is a private copy of a verified controller tool's bytes,
 // published at a real filesystem path so PATH-based lookup by another
 // process (bash finding "git" through PATH) or Landlock's path-based rule
