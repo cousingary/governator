@@ -1035,3 +1035,69 @@ cases:
     session: rc5-s6
     required: true
     status: implemented
+  # Sol11 rc5 Session 7 (P1-1, P1-2, P1-3): three fail-open evidence gaps
+  # left over from earlier sessions -- omitted executable content from the
+  # frozen Python runtime hash (pyc/symlinks/native extensions), an Assayer
+  # git-cleanliness probe that reported "clean" on every failure to actually
+  # check, and a workspace fd scan that treated every unreadable process the
+  # same as a confirmed-absent one. Cases 183-185 (internal/assay) prove
+  # hashPathTree now includes __pycache__ and resolves symlinks (both
+  # content and target identity). Cases 186-188 (internal/assay) prove
+  # snapshotDirty's tri-state Cleanliness reports "unknown" instead of the
+  # old silent "not dirty" for a probe failure/unresolvable git/timeout.
+  # Case 189 (internal/runtime) proves an "unknown" Assayer checkout blocks
+  # merge/approval, not merely strict replay. Case 190 (internal/containment)
+  # proves the fd scan fails closed on a relevant-but-unreadable process
+  # while continuing to ignore unrelated ones.
+  - case: 183
+    name: TestV11Case38MaliciousPycChangeWithoutSourceChangeInvalidatesReplay
+    session: rc5-s7
+    required: true
+    status: implemented
+  - case: 184
+    name: TestV11Case39SymlinkRetargetWithIdenticalBytesElsewhereInvalidatesReplay
+    session: rc5-s7
+    required: true
+    status: implemented
+  - case: 185
+    name: TestV11Case40NativeExtensionReachedThroughSymlinkChangeInvalidatesReplay
+    session: rc5-s7
+    required: true
+    status: implemented
+  - case: 186
+    name: TestV11Case41GitStatusProbeFailsInvalidatesReplay
+    session: rc5-s7
+    required: true
+    conditional: true
+    allowed_skip:
+      predicate: git_trusted
+      reason: "git not"
+    status: implemented
+  - case: 187
+    name: TestV11Case42GitBinaryUnavailableInvalidatesReplay
+    session: rc5-s7
+    required: true
+    status: implemented
+  - case: 188
+    name: TestV11Case43GitStatusTimesOutInvalidatesReplay
+    session: rc5-s7
+    required: true
+    conditional: true
+    allowed_skip:
+      predicate: git_trusted
+      reason: "git not"
+    status: implemented
+  - case: 189
+    name: TestV11Case44UnknownAssayerCleanlinessCannotMergeOrApprove
+    session: rc5-s7
+    required: true
+    status: implemented
+  - case: 190
+    name: TestV11Case45FDScanIndeterminatePermissionDeniedFailsClosed
+    session: rc5-s7
+    required: true
+    conditional: true
+    allowed_skip:
+      predicate: proc1_fd_unreadable
+      reason: "cannot exercise the permission-denied path on this host"
+    status: implemented

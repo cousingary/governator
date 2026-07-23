@@ -33,17 +33,17 @@ func TestLoadManifestRejectsBlankName(t *testing.T) {
 
 // TestLoadManifestAcceptsRealManifest is a regression check that
 // internal/redteam/manifest.yaml (the actual release-gating manifest, not a
-// fixture) parses cleanly and reserves exactly 182 uniquely-named cases --
-// the corpus size after rc5 Session 6's immutable consumed-artifact
-// additions (cases 181-182, Sol11 P0-7).
+// fixture) parses cleanly and reserves exactly 190 uniquely-named cases --
+// the corpus size after rc5 Session 7's runtime-identity/cleanliness/fd-scan
+// additions (cases 183-190, Sol11 P1-1/P1-2/P1-3).
 func TestLoadManifestAcceptsRealManifest(t *testing.T) {
 	path := filepath.Join("..", "redteam", "manifest.yaml")
 	m, err := LoadManifest(path)
 	if err != nil {
 		t.Fatalf("LoadManifest(%s): %v", path, err)
 	}
-	if len(m.Cases) != 182 {
-		t.Fatalf("expected 182 cases in the mandatory final attack corpus, got %d", len(m.Cases))
+	if len(m.Cases) != 190 {
+		t.Fatalf("expected 190 cases in the mandatory final attack corpus, got %d", len(m.Cases))
 	}
 	seen := make(map[int]bool)
 	for _, c := range m.Cases {

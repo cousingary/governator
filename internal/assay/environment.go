@@ -15,9 +15,13 @@ import (
 )
 
 // environmentProbeTimeout bounds every local subprocess this file runs (git
-// rev-parse, python --version). These are diagnostic metadata, never gating,
-// so a hung probe must never be able to stall an evaluation.
-const environmentProbeTimeout = 5 * time.Second
+// rev-parse, python --version) and snapshot.go's snapshotDirty git-status
+// probe. These are diagnostic/cleanliness metadata, never approval-gating on
+// their own timing, so a hung probe must never be able to stall an
+// evaluation. A var (not const) so Sol11 P1-2's red-team corpus can shrink
+// it to deterministically exercise the "probe times out" path without an
+// actual multi-second sleep; production code never assigns it.
+var environmentProbeTimeout = 5 * time.Second
 
 // Environment captures identifying metadata about the Assayer checkout and
 // the python interpreter Evaluate used, so an evaluation's ledger row can be

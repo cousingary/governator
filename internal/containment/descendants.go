@@ -762,12 +762,27 @@ func (s *Scope) Extinguish(ctx context.Context, deadline time.Duration, workspac
 	start := time.Now()
 	proof := Proof{Method: s.method, ProcessesObservedPeak: -1}
 
+	// relevant scopes scanWorkspaceFD's post-extinction sweep (Sol11 P1-3)
+	// to processes this specific Extinguish call can actually attribute to
+	// the scope it just tore down -- set in exactly one branch below,
+	// before scanWorkspaceFD is called. See scanWorkspaceFD's doc comment
+	// for why an unattributable process is out of scope entirely (never
+	// fails closed) while an attributable-but-unreadable one does.
+	var relevant func(pid int) bool
+
 	switch s.method {
 	case ScopeSystemdUserScope, ScopeCgroupDirect:
 		s.mu.Lock()
 		cg := s.cgroupPath
 		rerr := s.resolveErr
 		s.mu.Unlock()
+		relevant = func(pid int) bool {
+			if cg == "" {
+				return false
+			}
+			p, perr := cgroupPathForPID(pid)
+			return perr == nil && p == cg
+		}
 		if cg == "" {
 			if rerr != nil {
 				return proof, fmt.Errorf("containment: scope cgroup was never resolved: %w", rerr)
@@ -813,6 +828,16 @@ func (s *Scope) Extinguish(ctx context.Context, deadline time.Duration, workspac
 		pid := s.pid
 		rerr := s.resolveErr
 		s.mu.Unlock()
+		// Descendant set rooted at whichever of target/pid actually
+		// identifies this scope: a namespace init's orphaned children
+		// reparent to it (namespace membership, not process-group games,
+		// is what makes escape structurally impossible here), so a
+		// transitive child-set walk from the root still finds them.
+		root := target
+		if root == 0 {
+			root = pid
+		}
+		relevant = descendantSetPredicate(root)
 		if pid != 0 && target == 0 {
 			if err := waitPIDGone(pid, 0); err == nil {
 				proof.Killed = true
@@ -844,11 +869,24 @@ func (s *Scope) Extinguish(ctx context.Context, deadline time.Duration, workspac
 		if pid != 0 {
 			_ = syscall.Kill(-pid, syscall.SIGKILL)
 		}
+		// Process-group membership, matching the Kill(-pid) primitive this
+		// degraded fallback actually uses -- deliberately not a transitive
+		// descendant walk, since this scope's own documented limitation is
+		// exactly that it does not cover a setsid/double-fork escape out of
+		// the group; the fd scan should not silently claim coverage this
+		// primitive was never able to provide.
+		relevant = func(candidate int) bool {
+			if pid == 0 {
+				return false
+			}
+			pgid, perr := syscall.Getpgid(candidate)
+			return perr == nil && pgid == pid
+		}
 		proof.Degraded = true
 		proof.Note = "no descendant-owning primitive was available; fell back to process-group kill, which does not cover setsid/double-fork escapes"
 	}
 
-	clean, err := scanWorkspaceFD(workspacePath)
+	clean, err := scanWorkspaceFD(workspacePath, relevant)
 	if err != nil {
 		return proof, fmt.Errorf("containment: workspace fd scan failed: %w", err)
 	}
@@ -929,7 +967,36 @@ func waitPIDGone(pid int, deadline time.Duration) error {
 // used. This is the plan's defense-in-depth check: it catches a descendant
 // that somehow survived the primitive itself, not just a descendant the
 // primitive never knew about.
-func scanWorkspaceFD(workspacePath string) (bool, error) {
+//
+// scanWorkspaceFD sweeps /proc for any process still holding an open file
+// descriptor or cwd into workspacePath after extinction. relevant reports
+// whether a candidate pid is attributable to the scope Extinguish just tore
+// down (governed cgroup membership, pid-namespace descendant set, or
+// process-group membership -- see the three call sites in Extinguish).
+//
+// Sol11 P1-3: before this session, ANY error reading /proc/<pid>/fd -- the
+// process having genuinely exited, a permission/hidepid restriction, or any
+// other indeterminate condition -- was silently treated the same as "this
+// process holds nothing," i.e. clean. That conflated "checked and clean"
+// with "could not check" for a governed process, which is exactly the
+// unsafe direction to guess in a proof that gates DESCENDANTS_TERMINATED.
+// The fix has two parts:
+//
+//  1. relevant scopes the sweep to processes this call can actually
+//     attribute to the just-torn-down scope. A process this proof cannot
+//     attribute to the scope at all is out of scope for it entirely --
+//     Governator never claimed to police every process on the host, only
+//     the ones belonging to what it just launched and killed -- so it is
+//     silently skipped, exactly as before, with no fail-closed penalty.
+//  2. For a relevant process, a read failure is no longer collapsed into
+//     one case: confirmed disappearance (ENOENT: the process was reaped
+//     between the /proc listing and this read) still means absent, but any
+//     other error (EACCES/EPERM from hidepid or similar, or anything else
+//     unexpected) is indeterminate and now fails the scan closed -- this
+//     function returns an error instead of silently continuing, so the
+//     caller's WorkspaceFDScanClean can never read true over a process it
+//     was unable to actually check.
+func scanWorkspaceFD(workspacePath string, relevant func(pid int) bool) (bool, error) {
 	if workspacePath == "" {
 		return true, nil
 	}
@@ -951,10 +1018,21 @@ func scanWorkspaceFD(workspacePath string) (bool, error) {
 			// for processes other than the one performing it.
 			continue
 		}
+		if relevant == nil || !relevant(pid) {
+			// Not attributable to this launch's governed scope: out of
+			// scope for this proof (see doc comment above), not a
+			// clean/indeterminate observation about it either way.
+			continue
+		}
 		fdDir := fmt.Sprintf("/proc/%d/fd", pid)
 		fds, readErr := os.ReadDir(fdDir)
 		if readErr != nil {
-			continue // process exited between ReadDir(/proc) and here, or not readable by us
+			if os.IsNotExist(readErr) {
+				// Confirmed gone between the /proc listing and this read --
+				// nothing left to hold a handle.
+				continue
+			}
+			return false, fmt.Errorf("pid %d belongs to this scope but its open file descriptors could not be read (indeterminate, not confirmed absent): %w", pid, readErr)
 		}
 		for _, fd := range fds {
 			target, linkErr := os.Readlink(filepath.Join(fdDir, fd.Name()))
@@ -972,6 +1050,36 @@ func scanWorkspaceFD(workspacePath string) (bool, error) {
 		}
 	}
 	return true, nil
+}
+
+// descendantSetPredicate returns a membership predicate over root and every
+// transitive descendant of root, discovered via /proc/<pid>/task/<pid>/
+// children (directChildren). Bounded (maxDescendantSetNodes) so a
+// pathological fork bomb inside the namespace cannot make an extinction
+// proof hang. root == 0 (no process was ever identified for this scope)
+// always returns false -- there is nothing to attribute.
+func descendantSetPredicate(root int) func(pid int) bool {
+	if root == 0 {
+		return func(int) bool { return false }
+	}
+	const maxDescendantSetNodes = 4096
+	seen := map[int]bool{root: true}
+	queue := []int{root}
+	for len(queue) > 0 && len(seen) < maxDescendantSetNodes {
+		next := queue[0]
+		queue = queue[1:]
+		children, err := directChildren(next)
+		if err != nil {
+			continue
+		}
+		for _, c := range children {
+			if !seen[c] {
+				seen[c] = true
+				queue = append(queue, c)
+			}
+		}
+	}
+	return func(pid int) bool { return seen[pid] }
 }
 
 func cgroupPathForPID(pid int) (string, error) {

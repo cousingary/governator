@@ -4040,6 +4040,22 @@ func (r *Runner) runOnce(ctx context.Context, c contracts.Contract) (RunRecord, 
 	if containment.DevelopmentContainmentMode(cfg.Containment.LocalEffectfulTiering) {
 		violations = append(violations, "development containment mode (containment.local_effectful_tiering: off) is non-approving; merge is skipped and a production transaction requires qualifying host containment, hardened Docker, or a signed containment override")
 	}
+	// Sol11 P1-2: snapshotDirty used to conflate "definitely clean" with
+	// "could not tell" (git unresolvable, command construction failed,
+	// `git status` itself failed or timed out), reporting both as clean --
+	// so a transaction built from an Assayer checkout whose cleanliness was
+	// never actually observed looked, in evidence and replay identity,
+	// exactly like one that was verified clean. assay.CleanlinessUnknown
+	// (assay/snapshot.go) already disables strict replay via Dirty above;
+	// this closes the other half -- an indeterminate checkout must not
+	// merge/approve either. Deliberately no override flag: an unsigned
+	// compatibility switch is exactly what this same cycle's P0-3/P0-4
+	// removed elsewhere. The only way to "resolve" this is for a later
+	// probe against the same checkout to return a definitive clean or dirty
+	// verdict.
+	if assaySnapshot != nil && assaySnapshot.Cleanliness == assay.CleanlinessUnknown {
+		violations = append(violations, fmt.Sprintf("assayer checkout cleanliness is unknown (%s); a production transaction cannot merge or approve until this resolves to a definitive clean or dirty state", assaySnapshot.DirtyReason))
+	}
 	rootCommitted := false
 	if len(violations) == 0 {
 		if git {

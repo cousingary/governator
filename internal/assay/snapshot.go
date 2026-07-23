@@ -67,6 +67,16 @@ type SnapshotIdentity struct {
 	RuntimeHash    string
 	DependencyHash string
 	LockHash       string
+	// InterpreterIdentityHash is Sol11 P1-1's addition: a sha256 over the
+	// isolated probe's own interpreter-identity JSON (sys.version,
+	// sys.implementation name/cache_tag, hexversion, abiflags, byteorder,
+	// platform, and the SOABI/EXT_SUFFIX/Py_ENABLE_SHARED/SIZEOF_VOID_P/
+	// WITH_PYMALLOC config vars) -- see buildRuntimeManifest. RuntimeHash
+	// alone hashes stdlib file content but says nothing about which exact
+	// interpreter build produced that content (ABI tag, word size, build
+	// config); this closes that gap so a same-stdlib-bytes-different-
+	// interpreter-build swap still changes replay identity.
+	InterpreterIdentityHash string
 	// ProfileHash is assayer/profiles.py's content hash at copy time, taken
 	// directly from the bytes actually copied into Dir -- never a separate
 	// live read of cfg.Repo.
@@ -80,6 +90,9 @@ type SnapshotIdentity struct {
 	GitCommit string
 	// Dirty mirrors Snapshot.Dirty.
 	Dirty bool
+	// Cleanliness mirrors Snapshot.Cleanliness -- see that field's doc
+	// comment and the Cleanliness type doc comment (Sol11 P1-2).
+	Cleanliness Cleanliness
 }
 
 // Snapshot is the executable Assayer distribution -- cli.py plus the
@@ -159,12 +172,18 @@ type Snapshot struct {
 	// probe) rather than rediscovered live on every Evaluate call. See
 	// RuntimeManifest's doc comment.
 	Runtime RuntimeManifest
-	// Dirty is true when Repo was a real git checkout with uncommitted
-	// changes at snapshot-build time: what's on disk right now cannot
-	// necessarily be reproduced by a later audit against a specific commit,
-	// so strict replay must be disabled for a transaction built from one.
+	// Dirty is true whenever Cleanliness is not CleanlinessClean -- i.e. Repo
+	// was a real git checkout with uncommitted changes at snapshot-build
+	// time, OR its cleanliness could not be determined at all (Sol11 P1-2:
+	// an indeterminate checkout is never treated as clean). What's on disk
+	// right now cannot necessarily be reproduced by a later audit against a
+	// specific commit, so strict replay must be disabled for a transaction
+	// built from either state.
 	Dirty       bool
 	DirtyReason string
+	// Cleanliness is the tri-state result snapshotDirty actually observed
+	// (Sol11 P1-2). See the Cleanliness type doc comment.
+	Cleanliness Cleanliness
 
 	// Identity is Sol10 P0-6's SnapshotIdentity -- the sole source of
 	// Assayer transaction identity. See that type's doc comment.
@@ -383,7 +402,7 @@ func BuildSnapshot(registry *toolregistry.Registry, cfg Config) (*Snapshot, erro
 		return fail("chmod workspace anchor dir: %s", cerr)
 	}
 
-	dirty, dirtyReason := snapshotDirty(registry, cfg.Repo)
+	cleanliness, cleanlinessReason := snapshotDirty(registry, cfg.Repo)
 
 	// Sol10 P0-6: resolved once, here, from data this call already has in
 	// hand -- profileHash from the bytes just packaged (never a separate
@@ -398,15 +417,17 @@ func BuildSnapshot(registry *toolregistry.Registry, cfg Config) (*Snapshot, erro
 		}
 	}
 	identity := SnapshotIdentity{
-		PackageHash:     packageHash,
-		PythonIdentity:  pythonHandle.Identity,
-		RuntimeHash:     runtimeManifest.RuntimeHash,
-		DependencyHash:  runtimeManifest.DependencyHash,
-		LockHash:        runtimeManifest.LockHash,
-		ProfileHash:     profileHash,
-		ProtocolVersion: SnapshotProtocolVersion,
-		GitCommit:       assayerCommit(cfg.Repo),
-		Dirty:           dirty,
+		PackageHash:             packageHash,
+		PythonIdentity:          pythonHandle.Identity,
+		RuntimeHash:             runtimeManifest.RuntimeHash,
+		DependencyHash:          runtimeManifest.DependencyHash,
+		LockHash:                runtimeManifest.LockHash,
+		InterpreterIdentityHash: runtimeManifest.InterpreterIdentityHash,
+		ProfileHash:             profileHash,
+		ProtocolVersion:         SnapshotProtocolVersion,
+		GitCommit:               assayerCommit(cfg.Repo),
+		Dirty:                   cleanliness != CleanlinessClean,
+		Cleanliness:             cleanliness,
 	}
 
 	ok = true
@@ -417,8 +438,9 @@ func BuildSnapshot(registry *toolregistry.Registry, cfg Config) (*Snapshot, erro
 		WorkDir:     workDir,
 		Python:      pythonHandle,
 		Runtime:     runtimeManifest,
-		Dirty:       dirty,
-		DirtyReason: dirtyReason,
+		Dirty:       cleanliness != CleanlinessClean,
+		DirtyReason: cleanlinessReason,
+		Cleanliness: cleanliness,
 		Identity:    identity,
 	}, nil
 }
@@ -489,13 +511,44 @@ type RuntimeManifest struct {
 	LockHash string
 	// DependencyUnavailableReason explains why DependencyHash is empty.
 	DependencyUnavailableReason string
+	// InterpreterIdentityHash mirrors SnapshotIdentity.InterpreterIdentityHash
+	// -- see that field's doc comment. Mandatory, like RuntimeHash: a probe
+	// that cannot produce it fails BuildSnapshot closed.
+	InterpreterIdentityHash string
 }
 
+// interpreterProbeScript is buildRuntimeManifest's single isolated ("-S")
+// probe. It emits one "PATH k=v" line per sysconfig path resolved (the
+// pre-existing stdlib/site-packages discovery) plus one "IDENTITY {json}"
+// line describing the interpreter build itself -- Sol11 P1-1's addition.
+// RuntimeHash (via hashPathTree over StdlibReadRoots) already changes when
+// stdlib file *content* changes; it says nothing about which interpreter
+// *build* produced that content (word size, ABI tag, build configuration),
+// so a same-bytes-different-build swap could otherwise go unnoticed. The
+// identity JSON is emitted with sort_keys=True so its exact printed bytes
+// are a deterministic function of the interpreter's own reported values,
+// safe to hash directly without re-parsing.
+const interpreterProbeScript = "import sysconfig, sys, json\n" +
+	"for k in ('stdlib', 'platstdlib', 'purelib', 'platlib'):\n" +
+	"    print('PATH ' + k + '=' + sysconfig.get_path(k))\n" +
+	"identity = {\n" +
+	"    'version': sys.version,\n" +
+	"    'implementation_name': sys.implementation.name,\n" +
+	"    'cache_tag': getattr(sys.implementation, 'cache_tag', ''),\n" +
+	"    'hexversion': sys.hexversion,\n" +
+	"    'abiflags': getattr(sys, 'abiflags', ''),\n" +
+	"    'maxsize': sys.maxsize,\n" +
+	"    'byteorder': sys.byteorder,\n" +
+	"    'platform': sys.platform,\n" +
+	"    'config_vars': {k: sysconfig.get_config_var(k) for k in ('SOABI', 'EXT_SUFFIX', 'Py_ENABLE_SHARED', 'SIZEOF_VOID_P', 'WITH_PYMALLOC')},\n" +
+	"}\n" +
+	"print('IDENTITY ' + json.dumps(identity, sort_keys=True))\n"
+
 // buildRuntimeManifest resolves and hashes RuntimeManifest for python,
-// exactly once, at BuildSnapshot time. The stdlib half is mandatory (a
-// probe or hash failure fails snapshot construction closed); the
-// dependency half is best-effort, matching this file's DescribeEnvironment-
-// style probes.
+// exactly once, at BuildSnapshot time. The stdlib half (including
+// InterpreterIdentityHash) is mandatory (a probe or hash failure fails
+// snapshot construction closed); the dependency half is best-effort,
+// matching this file's DescribeEnvironment-style probes.
 func buildRuntimeManifest(python *toolregistry.Handle, repo string) (RuntimeManifest, error) {
 	probeCtx, cancel := context.WithTimeout(context.Background(), runtimeProbeTimeout)
 	defer cancel()
@@ -503,10 +556,7 @@ func buildRuntimeManifest(python *toolregistry.Handle, repo string) (RuntimeMani
 	// must not let ambient site configuration shape which paths it
 	// discovers, exactly like Evaluate's own launch must not let it shape
 	// evaluation.
-	cmd, err := python.Command(probeCtx, "-S", "-c",
-		"import sysconfig\n"+
-			"for k in ('stdlib','platstdlib','purelib','platlib'):\n"+
-			"    print(k + '=' + sysconfig.get_path(k))\n")
+	cmd, err := python.Command(probeCtx, "-S", "-c", interpreterProbeScript)
 	if err != nil {
 		return RuntimeManifest{}, fmt.Errorf("construct isolated sysconfig probe: %w", err)
 	}
@@ -519,9 +569,19 @@ func buildRuntimeManifest(python *toolregistry.Handle, repo string) (RuntimeMani
 	stdlibSeen := map[string]bool{}
 	siteSeen := map[string]bool{}
 	var stdlibRoots, siteRoots []string
+	var interpreterIdentityLine string
 	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
-		key, path, ok := strings.Cut(strings.TrimSpace(line), "=")
-		if !ok || path == "" {
+		line = strings.TrimSpace(line)
+		if rest, ok := strings.CutPrefix(line, "IDENTITY "); ok {
+			interpreterIdentityLine = rest
+			continue
+		}
+		rest, ok := strings.CutPrefix(line, "PATH ")
+		if !ok {
+			continue
+		}
+		key, path, cutOK := strings.Cut(rest, "=")
+		if !cutOK || path == "" {
 			continue
 		}
 		if _, statErr := os.Stat(path); statErr != nil {
@@ -543,6 +603,9 @@ func buildRuntimeManifest(python *toolregistry.Handle, repo string) (RuntimeMani
 	if len(stdlibRoots) == 0 {
 		return RuntimeManifest{}, fmt.Errorf("isolated sysconfig probe resolved no stdlib/platstdlib directory")
 	}
+	if strings.TrimSpace(interpreterIdentityLine) == "" {
+		return RuntimeManifest{}, fmt.Errorf("isolated sysconfig probe produced no interpreter identity line")
+	}
 
 	runtimeHash, herr := hashPathTree(stdlibRoots)
 	if herr != nil {
@@ -552,7 +615,12 @@ func buildRuntimeManifest(python *toolregistry.Handle, repo string) (RuntimeMani
 		return RuntimeManifest{}, fmt.Errorf("stdlib tree hashed to no files at %v", stdlibRoots)
 	}
 
-	manifest := RuntimeManifest{StdlibReadRoots: stdlibRoots, RuntimeHash: runtimeHash}
+	idSum := sha256.Sum256([]byte(interpreterIdentityLine))
+	manifest := RuntimeManifest{
+		StdlibReadRoots:         stdlibRoots,
+		RuntimeHash:             runtimeHash,
+		InterpreterIdentityHash: hex.EncodeToString(idSum[:]),
+	}
 
 	depHash, depErr := hashPathTree(siteRoots)
 	switch {
@@ -572,16 +640,26 @@ func buildRuntimeManifest(python *toolregistry.Handle, repo string) (RuntimeMani
 	return manifest, nil
 }
 
-// hashPathTree returns a sha256 over the sorted (root-qualified relative
-// path, content) pairs of every regular file under roots -- "" (never an
-// error) when roots resolves to zero files. __pycache__ directories and
-// symlinks are skipped: a symlink could resolve outside the declared root,
-// silently widening what's actually being attested to, and __pycache__ is
-// derived, non-source content that would make the hash flap on every
-// interpreter run without the underlying .py source ever changing. A
-// missing root is skipped, not an error -- callers decide whether an
-// entirely empty result is fatal (buildRuntimeManifest: fatal for stdlib,
-// best-effort for site-packages).
+// hashPathTree returns a sha256 over the sorted (root-qualified logical
+// path, content-or-target) tuples of every executable object under roots --
+// "" (never an error) when roots resolves to zero entries. A missing root is
+// skipped, not an error -- callers decide whether an entirely empty result
+// is fatal (buildRuntimeManifest: fatal for stdlib, best-effort for
+// site-packages).
+//
+// Sol11 P1-1: before this session, __pycache__ directories and symlinks were
+// both skipped entirely -- but Python can execute a .pyc from __pycache__,
+// a symlinked module, or a native extension reached through a symlink, so
+// the recorded hash could stay unchanged while executable runtime content
+// actually changed. Neither is skipped now: __pycache__ is walked like any
+// other directory, and a symlink is resolved and its TARGET's content is
+// hashed under the symlink's own logical path -- with the symlink's own
+// resolved-target string also recorded as a distinct entry, so retargeting
+// the link to different bytes at a different location is caught even when
+// the two locations happen to contain byte-identical content (a change to
+// either the content or the identity of what a logical path resolves to
+// must change this hash). A symlinked directory is walked exactly once per
+// root (visitedTargets below), bounding the walk against a symlink cycle.
 func hashPathTree(roots []string) (string, error) {
 	type fileEntry struct{ key, sha string }
 	var entries []fileEntry
@@ -590,36 +668,73 @@ func hashPathTree(roots []string) (string, error) {
 		if statErr != nil || !info.IsDir() {
 			continue
 		}
-		walkErr := filepath.Walk(root, func(path string, fi os.FileInfo, werr error) error {
-			if werr != nil {
-				return werr
-			}
-			if fi.IsDir() {
-				if fi.Name() == "__pycache__" {
-					return filepath.SkipDir
-				}
-				return nil
-			}
-			if fi.Mode()&os.ModeSymlink != 0 || !fi.Mode().IsRegular() {
-				return nil
-			}
-			data, rerr := os.ReadFile(path)
+		visitedTargets := map[string]bool{}
+		var walk func(rel, dir string) error
+		walk = func(rel, dir string) error {
+			names, rerr := os.ReadDir(dir)
 			if rerr != nil {
-				return fmt.Errorf("read %s: %w", path, rerr)
+				return fmt.Errorf("read %s: %w", dir, rerr)
 			}
-			sum := sha256.Sum256(data)
-			rel, relErr := filepath.Rel(root, path)
-			if relErr != nil {
-				return relErr
+			for _, name := range names {
+				entryRel := name.Name()
+				if rel != "" {
+					entryRel = rel + "/" + entryRel
+				}
+				full := filepath.Join(dir, name.Name())
+				fi, lerr := os.Lstat(full)
+				if lerr != nil {
+					return fmt.Errorf("lstat %s: %w", full, lerr)
+				}
+				switch {
+				case fi.Mode()&os.ModeSymlink != 0:
+					resolved, everr := filepath.EvalSymlinks(full)
+					if everr != nil {
+						return fmt.Errorf("resolve symlink %s: %w", full, everr)
+					}
+					rinfo, serr := os.Stat(resolved)
+					if serr != nil {
+						return fmt.Errorf("stat symlink target %s -> %s: %w", full, resolved, serr)
+					}
+					entries = append(entries, fileEntry{
+						key: root + "::" + entryRel + "::SYMLINK_TARGET",
+						sha: resolved,
+					})
+					if rinfo.IsDir() {
+						if visitedTargets[resolved] {
+							continue
+						}
+						visitedTargets[resolved] = true
+						if werr := walk(entryRel, resolved); werr != nil {
+							return werr
+						}
+						continue
+					}
+					data, rerr := os.ReadFile(resolved)
+					if rerr != nil {
+						return fmt.Errorf("read symlink target %s -> %s: %w", full, resolved, rerr)
+					}
+					sum := sha256.Sum256(data)
+					entries = append(entries, fileEntry{key: root + "::" + entryRel, sha: hex.EncodeToString(sum[:])})
+				case fi.IsDir():
+					if werr := walk(entryRel, full); werr != nil {
+						return werr
+					}
+				case fi.Mode().IsRegular():
+					data, rerr := os.ReadFile(full)
+					if rerr != nil {
+						return fmt.Errorf("read %s: %w", full, rerr)
+					}
+					sum := sha256.Sum256(data)
+					entries = append(entries, fileEntry{key: root + "::" + entryRel, sha: hex.EncodeToString(sum[:])})
+				default:
+					// device/socket/fifo/etc -- never executable Python
+					// content, not part of this identity.
+				}
 			}
-			entries = append(entries, fileEntry{
-				key: root + "::" + filepath.ToSlash(rel),
-				sha: hex.EncodeToString(sum[:]),
-			})
 			return nil
-		})
-		if walkErr != nil {
-			return "", walkErr
+		}
+		if werr := walk("", root); werr != nil {
+			return "", werr
 		}
 	}
 	if len(entries) == 0 {
@@ -638,36 +753,72 @@ func hashPathTree(roots []string) (string, error) {
 	return hex.EncodeToString(sum[:]), nil
 }
 
-// snapshotDirty is a best-effort, read-only probe (same shape as
-// buildRuntimeManifest's DependencyHash half/environment.go's
-// assayerCommit): any failure to
-// resolve git or run the probe reports "not dirty" rather than blocking a
-// snapshot build over a diagnostic-only signal. A repo with no .git at all
-// (e.g. a pinned fixture) has no notion of "uncommitted changes" and is
-// never dirty.
-func snapshotDirty(registry *toolregistry.Registry, repo string) (bool, string) {
+// Cleanliness is Sol11 P1-2's tri-state result for whether the Assayer
+// checkout could be verified free of uncommitted changes at snapshot-build
+// time. Before this session snapshotDirty returned a plain bool that
+// conflated "definitely clean" with "could not tell" (git unresolvable,
+// command construction failed, `git status` itself failed or timed out) --
+// every one of those indeterminate cases silently reported false ("not
+// dirty"), so an Assayer checkout whose cleanliness Governator could not
+// actually observe was represented in evidence and replay identity exactly
+// as if it had been verified clean. CleanlinessUnknown makes that
+// distinction real: like CleanlinessDirty, it disables strict replay
+// (Snapshot.Dirty is true for both), and internal/runtime's runOnce refuses
+// to let a transaction built from an CleanlinessUnknown snapshot merge or
+// approve at all -- there is deliberately no override flag for this: the
+// only way to "resolve" it is for a later probe against the same checkout
+// to return a definitive CleanlinessClean or CleanlinessDirty.
+type Cleanliness string
+
+const (
+	CleanlinessClean   Cleanliness = "clean"
+	CleanlinessDirty   Cleanliness = "dirty"
+	CleanlinessUnknown Cleanliness = "unknown"
+)
+
+// snapshotDirty probes repo's git cleanliness. Unlike
+// buildRuntimeManifest's DependencyHash half/environment.go's assayerCommit
+// (genuinely best-effort diagnostic metadata that must never block a
+// snapshot build), a git probe failure here is NOT waved through as clean:
+// Sol11 P1-2 requires every path that used to report "not dirty" on
+// failure -- can't resolve git, can't construct the command, `git status`
+// itself errors or times out via environmentProbeTimeout's context deadline
+// -- to report CleanlinessUnknown with a reason instead. A repo with no
+// .git entry at all (e.g. a pinned, non-git fixture/distribution) has no
+// notion of "uncommitted changes" at all and is unambiguously
+// CleanlinessClean, not indeterminate -- that is a real, positive
+// observation about the repo's shape, not a failed probe.
+func snapshotDirty(registry *toolregistry.Registry, repo string) (Cleanliness, string) {
 	if _, err := os.Stat(filepath.Join(repo, ".git")); err != nil {
-		return false, ""
+		if os.IsNotExist(err) {
+			return CleanlinessClean, ""
+		}
+		return CleanlinessUnknown, fmt.Sprintf("stat %s: %s", filepath.Join(repo, ".git"), err)
 	}
 	gitHandle, err := registry.ResolveHandle("git", "git", toolregistry.KindTrustedController)
 	if err != nil {
-		return false, ""
+		return CleanlinessUnknown, fmt.Sprintf("resolve trusted git handle: %s", err)
 	}
 	defer gitHandle.Close()
 	ctx, cancel := context.WithTimeout(context.Background(), environmentProbeTimeout)
 	defer cancel()
 	cmd, cerr := gitHandle.Command(ctx, "-C", repo, "status", "--porcelain")
 	if cerr != nil {
-		return false, ""
+		return CleanlinessUnknown, fmt.Sprintf("construct git status probe: %s", cerr)
 	}
 	cmd.Env = controllerenv.Base()
-	var out bytes.Buffer
+	var out, errOut bytes.Buffer
 	cmd.Stdout = &out
+	cmd.Stderr = &errOut
 	if rerr := cmd.Run(); rerr != nil {
-		return false, ""
+		reason := strings.TrimSpace(errOut.String())
+		if reason == "" {
+			reason = rerr.Error()
+		}
+		return CleanlinessUnknown, fmt.Sprintf("git status probe failed: %s", reason)
 	}
 	if strings.TrimSpace(out.String()) != "" {
-		return true, "assayer repo has uncommitted changes at snapshot-build time"
+		return CleanlinessDirty, "assayer repo has uncommitted changes at snapshot-build time"
 	}
-	return false, ""
+	return CleanlinessClean, ""
 }
