@@ -28,10 +28,13 @@
 // Cases 6-8 exercise the hash-reverification detection layer itself
 // (runtime.verifyConsumedArtifacts's four checkpoints), by deliberately
 // running under the operator-accepted degraded posture
-// (GOV_CONTAINMENT_LOCAL_EFFECTFUL_TIERING=off) where no OS-level boundary
-// exists at all and a same-UID mutation genuinely succeeds -- proving
-// Governator's own before/after hashing still catches it and quarantines
-// with exactly CONSUMED_ARTIFACT_MUTATED: at the backend-extinction
+// (containment.local_effectful_tiering: off, authored to a config file via
+// writeTieringConfig -- Sol11 P0-4 made the equivalent environment variable,
+// GOV_CONTAINMENT_LOCAL_EFFECTFUL_TIERING, inert, so the config-file route is
+// the only sanctioned way to reach this posture now) where no OS-level
+// boundary exists at all and a same-UID mutation genuinely succeeds --
+// proving Governator's own before/after hashing still catches it and
+// quarantines with exactly CONSUMED_ARTIFACT_MUTATED: at the backend-extinction
 // checkpoint (6, a hard pre-merge failure), the after-cleanup-validator
 // checkpoint (7), and the after-success-validation checkpoint (8).
 package redteam
@@ -224,16 +227,19 @@ printf '{"type":"result","total_cost_usd":0.25}\n'
 // TestV10Case6MutationDetectedAfterBackendExtinction exercises the
 // hash-reverification detection layer directly: deliberately running under
 // the operator-accepted degraded posture (no Landlock/mount boundary at all,
-// the same reduced posture GOV_CONTAINMENT_LOCAL_EFFECTFUL_TIERING=off
-// already gives every other control), a same-UID backend genuinely succeeds
-// at chmod+overwriting the consumed artifact. Governator's own
-// verifyConsumedArtifacts, called immediately after the backend's descendant
-// tree is confirmed extinct, must still catch the mismatch and refuse the
-// run outright (a hard pre-merge failure, matching the severity of the
-// adjacent descendant-extinction check) with exactly CONSUMED_ARTIFACT_MUTATED.
+// the same reduced posture containment.local_effectful_tiering: off already
+// gives every other control -- authored to a config file, since Sol11 P0-4
+// made the GOV_CONTAINMENT_LOCAL_EFFECTFUL_TIERING env variant inert), a
+// same-UID backend genuinely succeeds at chmod+overwriting the consumed
+// artifact. Governator's own verifyConsumedArtifacts, called immediately
+// after the backend's descendant tree is confirmed extinct, must still catch
+// the mismatch and refuse the run outright (a hard pre-merge failure,
+// matching the severity of the adjacent descendant-extinction check) with
+// exactly CONSUMED_ARTIFACT_MUTATED.
 func TestV10Case6MutationDetectedAfterBackendExtinction(t *testing.T) {
 	s6BypassHostContainment(t)
 	root, home, producerJobID := v10ProducerConsumer(t)
+	t.Setenv("GOV_CONFIG", writeTieringConfig(t, "off"))
 	consumer := v10DegradedConsumerContract(root, producerJobID)
 	body := `mkdir -p output
 chmod u+w .governator/consumed/art 2>/dev/null || true
@@ -272,6 +278,7 @@ func TestV10Case7MutationDetectedAfterCleanupValidator(t *testing.T) {
 		}
 	}
 	root, home, producerJobID := v10ProducerConsumer(t)
+	t.Setenv("GOV_CONFIG", writeTieringConfig(t, "off"))
 	consumer := v10DegradedConsumerContract(root, producerJobID)
 	mutateCmd := `chmod u+w .governator/consumed/art 2>/dev/null || true; printf 'MUTATED-BY-CLEANUP' > .governator/consumed/art 2>/dev/null || true`
 	consumer.Cleanup = &contracts.Cleanup{
@@ -308,6 +315,7 @@ printf '{"type":"result","total_cost_usd":0.25}\n'
 func TestV10Case8MutationDetectedAfterSuccessValidation(t *testing.T) {
 	s6BypassHostContainment(t)
 	root, home, producerJobID := v10ProducerConsumer(t)
+	t.Setenv("GOV_CONFIG", writeTieringConfig(t, "off"))
 	consumer := v10DegradedConsumerContract(root, producerJobID)
 	consumer.PostRunValidate = func(work string) error {
 		artPath := filepath.Join(work, ".governator", "consumed", "art")

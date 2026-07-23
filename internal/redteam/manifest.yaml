@@ -833,3 +833,48 @@ cases:
     session: rc5-s1
     required: true
     status: implemented
+  # Sol11 rc5 Session 2 (P0-3, P0-4): production authority (descendant
+  # containment scope selection, local_effectful_tiering) must never be
+  # weakened by an inherited environment variable. Cases 154-160 prove
+  # Sol11's "Production authority bypasses" corpus (report cases 20-26) is
+  # closed: the removed GOV_CONTAINMENT_FORCE_DEGRADED env read is inert
+  # (154-156), the local_effectful_tiering: off compatibility mode is
+  # non-approving by construction and its env variant cannot weaken
+  # production authority (157-158), an unsigned containment override cannot
+  # downgrade a high-risk run (159), and development containment mode is
+  # never strict-replay eligible (160).
+  - case: 154
+    name: TestV11Case9ForceDegradedEnvOnHighRiskRunHasNoEffect
+    session: rc5-s2
+    required: true
+    status: implemented
+  - case: 155
+    name: TestV11Case10ForceDegradedEnvOnEffectfulLowRiskRunHasNoEffect
+    session: rc5-s2
+    required: true
+    status: implemented
+  - case: 156
+    name: TestV11Case11WrapperInjectedDegradedEnvironmentHasNoEffect
+    session: rc5-s2
+    required: true
+    status: implemented
+  - case: 157
+    name: TestV11Case12LocalEffectfulTieringOffCannotReachApprovedOrMerge
+    session: rc5-s2
+    required: true
+    status: implemented
+  - case: 158
+    name: TestV11Case13LocalEffectfulTieringOffEnvVariantCannotWeakenApproval
+    session: rc5-s2
+    required: true
+    status: implemented
+  - case: 159
+    name: TestV11Case14UnsignedContainmentOverrideCannotDowngradeHighRiskRun
+    session: rc5-s2
+    required: true
+    status: implemented
+  - case: 160
+    name: TestV11Case15StrictReplayRefusedUnderDevelopmentContainmentMode
+    session: rc5-s2
+    required: true
+    status: implemented

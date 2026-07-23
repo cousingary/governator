@@ -68,8 +68,7 @@ func TestV6Case6BashEnvControllerInjectionNeverExecutes(t *testing.T) {
 	// S3 exercises controller environment sanitization, not host descendant
 	// primitive availability. Keep this corpus case runnable on hosts without
 	// writable cgroup/systemd scopes.
-	t.Setenv("GOV_CONTAINMENT_LOCAL_EFFECTFUL_TIERING", "off")
-	t.Setenv("GOV_CONTAINMENT_FORCE_DEGRADED", "1")
+	useDegradedContainmentScopeForTest(t)
 
 	c := baseContract(root)
 	bin := fakeBackend(t, standardBackendBody(""))
@@ -120,8 +119,7 @@ static void governator_redteam_ld_preload_marker(void) {
 	// S3 exercises controller environment sanitization, not host descendant
 	// primitive availability. Keep this corpus case runnable on hosts without
 	// writable cgroup/systemd scopes.
-	t.Setenv("GOV_CONTAINMENT_LOCAL_EFFECTFUL_TIERING", "off")
-	t.Setenv("GOV_CONTAINMENT_FORCE_DEGRADED", "1")
+	useDegradedContainmentScopeForTest(t)
 
 	c := baseContract(root)
 	bin := fakeBackend(t, standardBackendBody(""))

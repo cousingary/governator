@@ -152,8 +152,18 @@ type Containment struct {
 	// LocalEffectfulTiering controls Session 6's medium/high effectful local-run
 	// containment gate. "enforce" (the built-in default) requires hardened
 	// Docker, a behaviorally attested native OS sandbox, or a signed override.
-	// "off" is the explicit compatibility escape hatch for operators who choose
-	// to keep medium-risk effectful jobs on local worktrees temporarily.
+	//
+	// "off" is an explicit, operator-authored, DEVELOPMENT-ONLY compatibility
+	// mode (Sol11 P0-4). It is honored ONLY from the config file -- never from
+	// the GOV_CONTAINMENT_LOCAL_EFFECTFUL_TIERING environment variable, which is
+	// ignored so an inherited environment can never weaken production authority.
+	// Under "off", effectful local work may run without host containment for
+	// local iteration, BUT the transaction is non-approving by construction:
+	// strict replay is disabled, merge is disabled, and the final result can
+	// never reach APPROVED. A production approval exception must instead use the
+	// signed containment override flow (containment.VerifyOverride), bound to
+	// contract hash, repository identity, authority, expiration, operator, and
+	// the exact containment exception.
 	LocalEffectfulTiering string `yaml:"local_effectful_tiering"`
 }
 
@@ -726,9 +736,15 @@ func applyEnv(cfg *Config) {
 	if value := Env("GOV_CONTAINMENT_OVERRIDE_PUBLIC_KEY"); value != "" {
 		cfg.Containment.OverridePublicKey = value
 	}
-	if value := Env("GOV_CONTAINMENT_LOCAL_EFFECTFUL_TIERING"); value != "" {
-		cfg.Containment.LocalEffectfulTiering = value
-	}
+	// Sol11 P0-4: GOV_CONTAINMENT_LOCAL_EFFECTFUL_TIERING is deliberately NOT
+	// honored from the environment. local_effectful_tiering is an
+	// operator-authored, development-only compatibility mode (config file
+	// only) that disables strict replay, merge, and final approval -- never a
+	// production authority. An inherited environment variable alone must never
+	// weaken production authority (the rc5 governing invariant); a launcher,
+	// wrapper or compromised shell must not be able to flip containment tiering
+	// by exporting a variable. Operators who need the development mode write it
+	// to config.yaml explicitly, where it is honestly non-approving.
 }
 
 func firstEnv(names ...string) string {

@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/cousingary/governator/internal/containment"
 	"github.com/cousingary/governator/internal/enforce"
 	"github.com/cousingary/governator/internal/observability"
 	"github.com/cousingary/governator/internal/toolregistry"
@@ -130,7 +131,13 @@ exit 1
 	if _, err := toolregistry.Enroll("codegraph", fake); err != nil {
 		t.Fatal(err)
 	}
-	t.Setenv("GOV_CONTAINMENT_FORCE_DEGRADED", "1")
+	// Sol11 P0-3: the GOV_CONTAINMENT_FORCE_DEGRADED env var this formerly
+	// set was an inherited-environment production bypass and is gone. Use the
+	// test-only descendant-containment seam (not env-flippable) so this check
+	// can build its authority plan without real systemd/cgroup/PID-namespace
+	// primitives.
+	containment.ForceDegradedScopeForTesting.Store(true)
+	t.Cleanup(func() { containment.ForceDegradedScopeForTesting.Store(false) })
 
 	check := checkContextGraph()
 	if !enforce.Supported() {

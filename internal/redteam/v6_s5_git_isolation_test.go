@@ -38,8 +38,7 @@ import (
 func TestV6Case14GitObjectDirectoryRedirectionDoesNotEscapeRepository(t *testing.T) {
 
 	root := fixtureRepo(t)
-	t.Setenv("GOV_CONTAINMENT_LOCAL_EFFECTFUL_TIERING", "off")
-	t.Setenv("GOV_CONTAINMENT_FORCE_DEGRADED", "1")
+	useDegradedContainmentScopeForTest(t)
 	external := t.TempDir()
 	t.Setenv("GIT_OBJECT_DIRECTORY", external)
 
@@ -75,8 +74,7 @@ func TestV6Case14GitObjectDirectoryRedirectionDoesNotEscapeRepository(t *testing
 func TestV6Case15GitAlternateObjectDirectoriesRedirectionDoesNotEscapeRepository(t *testing.T) {
 
 	root := fixtureRepo(t)
-	t.Setenv("GOV_CONTAINMENT_LOCAL_EFFECTFUL_TIERING", "off")
-	t.Setenv("GOV_CONTAINMENT_FORCE_DEGRADED", "1")
+	useDegradedContainmentScopeForTest(t)
 	external := t.TempDir()
 	realObjects := filepath.Join(root, ".git", "objects")
 	t.Setenv("GIT_OBJECT_DIRECTORY", external)
@@ -111,8 +109,7 @@ func TestV6Case15GitAlternateObjectDirectoriesRedirectionDoesNotEscapeRepository
 func TestV6Case16GitDirWorkTreeInjectionDoesNotRedirectApprovedCommit(t *testing.T) {
 
 	root := fixtureRepo(t)
-	t.Setenv("GOV_CONTAINMENT_LOCAL_EFFECTFUL_TIERING", "off")
-	t.Setenv("GOV_CONTAINMENT_FORCE_DEGRADED", "1")
+	useDegradedContainmentScopeForTest(t)
 	decoy := t.TempDir()
 	if err := exec.Command("git", "-C", decoy, "init", "-b", "main").Run(); err != nil {
 		t.Fatal(err)
@@ -154,8 +151,7 @@ func TestV6Case16GitDirWorkTreeInjectionDoesNotRedirectApprovedCommit(t *testing
 func TestV6Case17QuarantinePreCommitHookNeverFires(t *testing.T) {
 
 	root := fixtureRepo(t)
-	t.Setenv("GOV_CONTAINMENT_LOCAL_EFFECTFUL_TIERING", "off")
-	t.Setenv("GOV_CONTAINMENT_FORCE_DEGRADED", "1")
+	useDegradedContainmentScopeForTest(t)
 	hookMarker := filepath.Join(root, "quarantine-hook-ran.txt")
 	hook := filepath.Join(root, ".git", "hooks", "pre-commit")
 	hookScript := "#!/bin/sh\nprintf 'injected\\n' > " + hookMarker + "\n"
@@ -188,8 +184,7 @@ printf 'out-of-scope\n' > unauthorized.txt
 func TestV6Case18QuarantineCleanFilterNeverRuns(t *testing.T) {
 
 	root := fixtureRepo(t)
-	t.Setenv("GOV_CONTAINMENT_LOCAL_EFFECTFUL_TIERING", "off")
-	t.Setenv("GOV_CONTAINMENT_FORCE_DEGRADED", "1")
+	useDegradedContainmentScopeForTest(t)
 	if err := os.WriteFile(filepath.Join(root, ".gitattributes"), []byte("output/result.txt filter=redact\n"), 0644); err != nil {
 		t.Fatal(err)
 	}

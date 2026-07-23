@@ -22,6 +22,7 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/cousingary/governator/internal/containment"
 	"github.com/cousingary/governator/internal/contracts"
 	"github.com/cousingary/governator/internal/enforce"
 	govruntime "github.com/cousingary/governator/internal/runtime"
@@ -33,6 +34,25 @@ var (
 	govBinaryPath string
 	govBinaryErr  error
 )
+
+// useDegradedContainmentScopeForTest swaps in the test-only descendant-
+// fixture can drive Governator's approval/merge/replay paths end to end on a
+// host that lacks systemd --user, a usable cgroup v2 subtree, or a PID
+// namespace. It is the sanctioned substitute for the Sol11 P0-3 production
+// bypass GOV_CONTAINMENT_FORCE_DEGRADED (an inherited env var that could force
+// degraded containment for a stage that should fail closed) and for the Sol11
+// P0-4 env weakening GOV_CONTAINMENT_LOCAL_EFFECTFUL_TIERING: a package-level
+// Go variable cannot be flipped by a launcher/wrapper/compromised shell, so
+// production authority is never weakened, while the corpus still runs without
+// real kernel primitives. The seam is reset on test cleanup. Note this does
+// NOT put the run in development containment mode (local_effectful_tiering:
+// off) -- the run still enforces host containment (Landlock) as production
+// does; only the descendant-owning primitive is simulated as degraded.
+func useDegradedContainmentScopeForTest(t *testing.T) {
+	t.Helper()
+	containment.ForceDegradedScopeForTesting.Store(true)
+	t.Cleanup(func() { containment.ForceDegradedScopeForTesting.Store(false) })
+}
 
 // govBinary builds the real cmd/gov CLI exactly once per test process and
 // returns the path to the resulting executable. Attacks that exercise

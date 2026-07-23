@@ -28,6 +28,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -245,6 +246,24 @@ type Scope struct {
 	sealedPrimitive *toolregistry.SealedCopy
 }
 
+// ForceDegradedScopeForTesting is a TEST-ONLY seam. When true, NewScope returns
+// a degraded (bare process-group) scope without probing for any real
+// descendant-owning primitive, so the red-team corpus can exercise Governator's
+// approval/merge/replay paths end to end on hosts that lack systemd --user, a
+// usable cgroup v2 subtree, or a PID namespace.
+//
+// It exists ONLY because the Sol11 P0-3 defect it replaces — the
+// GOV_CONTAINMENT_FORCE_DEGRADED environment variable — was a production
+// bypass: any launcher, wrapper or compromised shell could export that var to
+// force degraded containment for a stage that should have failed closed. An
+// inherited environment variable must never weaken production authority (Sol11
+// P0-3 / the rc5 governing invariant); a package-level Go variable set only by
+// _test.go code cannot be flipped by environment, so it is the sanctioned test
+// substitute. Production code MUST NEVER set this; nothing links the setter
+// into a release binary's execution path. Mirrors the established test-seam
+// pattern of internal/enforce.SelfExeOverride and ForceUnsupported.
+var ForceDegradedScopeForTesting atomic.Bool
+
 // NewScope selects the strongest descendant-owning primitive available on
 // this host, in the order the plan specifies: systemd --user transient
 // scope, then a directly managed cgroup v2 subtree, then a PID namespace.
@@ -258,7 +277,7 @@ type Scope struct {
 // handed the SAME env value, so the primitive actually launched can never
 // diverge from the one the run's replay identity was computed against.
 func NewScope(runID string, requireStrong bool, env ContainmentEnvironment) (*Scope, error) {
-	if os.Getenv("GOV_CONTAINMENT_FORCE_DEGRADED") == "1" {
+	if ForceDegradedScopeForTesting.Load() {
 		return &Scope{method: scopeDegraded, runID: runID}, nil
 	}
 	if s, err := newSystemdUserScope(runID, env.SystemdRun); err == nil {

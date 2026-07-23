@@ -25,6 +25,20 @@ func LocalEffectfulTieringEnforced(mode string) bool {
 	return strings.TrimSpace(mode) != "off"
 }
 
+// DevelopmentContainmentMode reports whether the run is executing under the
+// development-only local_effectful_tiering: "off" compatibility mode (Sol11
+// P0-4). When true, effectful local work may proceed without host containment,
+// but the transaction is NON-APPROVING by construction: strict replay is
+// disabled, merge is disabled, and the final result can never reach APPROVED.
+// Any production approval exception must instead use the signed containment
+// override flow (VerifyOverride). This is the inverse of
+// LocalEffectfulTieringEnforced, exposed as a named predicate so every
+// approval/merge/replay gate asserts the same development-mode signal without
+// re-spelling the literal "off" comparison.
+func DevelopmentContainmentMode(mode string) bool {
+	return strings.TrimSpace(mode) == "off"
+}
+
 // Effectful reports whether a contract can create persistent effects or run
 // external helper/controller stages. Pure read-only scout contracts with no
 // declared external stages can avoid host containment; any write, produced

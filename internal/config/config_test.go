@@ -477,13 +477,35 @@ func TestLoadContainmentLocalEffectfulTieringFromFileAndEnv(t *testing.T) {
 		t.Fatalf("file local_effectful_tiering = %q", cfg.Containment.LocalEffectfulTiering)
 	}
 
-	t.Setenv("GOV_CONTAINMENT_LOCAL_EFFECTFUL_TIERING", "enforce")
+	// Sol11 P0-4: GOV_CONTAINMENT_LOCAL_EFFECTFUL_TIERING is deliberately NOT
+	// honored from the environment -- an inherited environment variable alone
+	// must never weaken production authority. Whether the file says "enforce"
+	// or "off", exporting the env variant to the opposite value must leave the
+	// loaded config equal to the file's explicit, operator-authored value.
+	if err := os.WriteFile(path, []byte("containment: {local_effectful_tiering: enforce}\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("GOV_CONTAINMENT_LOCAL_EFFECTFUL_TIERING", "off")
 	cfg, err = Load()
 	if err != nil {
 		t.Fatal(err)
 	}
 	if cfg.Containment.LocalEffectfulTiering != "enforce" {
-		t.Fatalf("env local_effectful_tiering = %q", cfg.Containment.LocalEffectfulTiering)
+		t.Fatalf("env local_effectful_tiering weakened the file value: got %q, want enforce (env variant must be ignored)", cfg.Containment.LocalEffectfulTiering)
+	}
+
+	// And the inverse: file says off, env tries to strengthen -- still ignored,
+	// so the development-only mode is whatever the operator wrote to the file.
+	if err := os.WriteFile(path, []byte("containment: {local_effectful_tiering: off}\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("GOV_CONTAINMENT_LOCAL_EFFECTFUL_TIERING", "enforce")
+	cfg, err = Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Containment.LocalEffectfulTiering != "off" {
+		t.Fatalf("env local_effectful_tiering changed the file value: got %q, want off (env variant must be ignored)", cfg.Containment.LocalEffectfulTiering)
 	}
 }
 

@@ -3097,6 +3097,16 @@ func (r *Runner) runOnce(ctx context.Context, c contracts.Contract) (RunRecord, 
 		identity.StrictReplayEligible = false
 		identity.StrictReplayDisabledReason = assaySnapshot.DirtyReason
 	}
+	// Sol11 P0-4: a run under the development-only
+	// local_effectful_tiering: "off" compatibility mode executed without
+	// host containment. Its result is non-approving and cannot be reproduced
+	// as a trusted prior approval, so strict replay is disabled for it -- a
+	// later identical contract must re-execute rather than replaying a
+	// development-mode approval as if it were a production verdict.
+	if containment.DevelopmentContainmentMode(cfg.Containment.LocalEffectfulTiering) {
+		identity.StrictReplayEligible = false
+		identity.StrictReplayDisabledReason = "development containment mode (containment.local_effectful_tiering: off) is non-approving; strict replay disabled"
+	}
 	transaction := newTransactionSnapshot(hash, env.ConfigHash, env.ProtectedPatterns, graphSnapshotHash, compiledPromptForIdentity, env.Controller.Hash, identity.CredentialIdentityHash, identity.Participants, consumedIdentities)
 	if priorID, perr := replayMatch(db, func() string {
 		if identity.StrictReplayEligible {
@@ -3994,6 +4004,22 @@ func (r *Runner) runOnce(ctx context.Context, c contracts.Contract) (RunRecord, 
 	}
 	if rec.Diff == "" {
 		rec.Diff = workspaceDiff(root, work, git, changed, deleted)
+	}
+	// Sol11 P0-4: a run executed under the development-only
+	// local_effectful_tiering: "off" compatibility mode ran effectful local
+	// work without host containment. It may NOT reach an approving production
+	// transaction, and -- unlike a merely cosmetic status change -- the merge
+	// itself (git commit / live-root copy below) must never execute for such
+	// a run. This check must run BEFORE the merge block starts, not merely
+	// before the final APPROVED/QUARANTINED decision: appending it after the
+	// merge already executed would let development-mode work land on the live
+	// root before being retroactively quarantined. A genuine production
+	// approval exception must use the signed containment override flow
+	// (containment.VerifyOverride), not this environment-weakened
+	// compatibility mode. (Strict replay was already disabled for the same
+	// reason when ExecutionIdentity was built above.)
+	if containment.DevelopmentContainmentMode(cfg.Containment.LocalEffectfulTiering) {
+		violations = append(violations, "development containment mode (containment.local_effectful_tiering: off) is non-approving; merge is skipped and a production transaction requires qualifying host containment, hardened Docker, or a signed containment override")
 	}
 	rootCommitted := false
 	if len(violations) == 0 {

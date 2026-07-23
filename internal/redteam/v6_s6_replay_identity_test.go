@@ -68,8 +68,14 @@ func s6SecureExecutable(t *testing.T, src string) string {
 
 func s6BypassHostContainment(t *testing.T) {
 	t.Helper()
-	t.Setenv("GOV_CONTAINMENT_LOCAL_EFFECTFUL_TIERING", "off")
-	t.Setenv("GOV_CONTAINMENT_FORCE_DEGRADED", "1")
+	// Sol11 P0-3/P0-4: the env vars this formerly set
+	// (GOV_CONTAINMENT_FORCE_DEGRADED, GOV_CONTAINMENT_LOCAL_EFFECTFUL_TIERING)
+	// are gone -- they were inherited-environment production bypasses. The
+	// corpus now uses the test-only descendant-containment seam, which cannot
+	// be flipped by environment, so production authority is never weakened
+	// while these fixtures still run without real systemd/cgroup/PID-namespace
+	// primitives.
+	useDegradedContainmentScopeForTest(t)
 }
 
 // TestV6Case22ConsumedArtifactChangeBeforeConsumerReplayInvalidatesReplay
