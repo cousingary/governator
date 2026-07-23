@@ -1,6 +1,7 @@
 package assay
 
 import (
+	"archive/zip"
 	"bytes"
 	"context"
 	"crypto/sha256"
@@ -10,10 +11,12 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
-	"syscall"
 	"time"
+
+	"golang.org/x/sys/unix"
 
 	"github.com/cousingary/governator/internal/controllerenv"
 	"github.com/cousingary/governator/internal/toolregistry"
@@ -79,10 +82,10 @@ type SnapshotIdentity struct {
 	Dirty bool
 }
 
-// Snapshot is a private, read-only copy of the executable Assayer
-// distribution -- cli.py plus the assayer/ package -- built once per
-// governed transaction, before that transaction's replay identity is
-// calculated. It is the ONLY thing Evaluate ever executes against.
+// Snapshot is the executable Assayer distribution -- cli.py plus the
+// assayer/ package -- built once per governed transaction, before that
+// transaction's replay identity is calculated. It is the ONLY thing
+// Evaluate ever executes against.
 //
 // Sol9 P0-4: the old Evaluate reloaded the trusted-tool registry, resolved
 // python3 again, sealed only cli.py, and set PYTHONPATH to the live
@@ -93,34 +96,59 @@ type SnapshotIdentity struct {
 // python handle) before replay and threading that same object through
 // every Evaluate call in the transaction closes that TOCTOU window.
 //
-// Sol10 P0-4: mode 0400/0500 alone is not immutability against a second
-// process sharing this same OS user -- exactly like
-// toolregistry.SealedCopy's own doc comment concludes for a single sealed
-// executable (memfd_create+F_ADD_SEALS was tried and rejected: linkat(2)
-// publishing an anonymous shmem-backed inode into a real, PATH-discoverable
-// directory entry fails EXDEV, and FS_IMMUTABLE_FL needs
-// CAP_LINUX_IMMUTABLE, which Governator does not run with) -- that same
-// process can chmod the directory or a file back open, overwrite a file in
-// place, or unlink/rename a replacement over it. So, like SealedCopy, this
-// is honestly a private read-only copy, never an immutable one: Dir/files
-// hold no kernel-enforced write boundary against this same UID. What makes
-// it safe to execute against is Verify -- every file's bytes are retained
-// through an open descriptor from the moment it is copied, and the caller
-// (assay.Evaluate) MUST call Verify immediately before the launch that will
-// import Dir, and again immediately after that launch completes, before
-// trusting the verdict it produced. Any mismatch is exactly
-// AssayerSnapshotMutated; there is no retry or silent re-copy.
+// Sol10 P0-4 built a private, chmod(0400/0500) read-only directory copy,
+// with every file's bytes retained through an open descriptor and
+// re-verified immediately before and after each launch. Sol11 P0-6 found
+// the remaining gap: a same-UID process could chmod the directory back
+// open between the two Verify calls, replace a module's bytes while
+// Python's import machinery (which reads by PATHNAME from PYTHONPATH, never
+// through the retained descriptor) was actually reading it, then restore
+// the original bytes before the post-launch Verify -- both verification
+// passes succeed while different bytes actually produced the verdict, since
+// neither one is checking DURING the window that matters. Mode bits are a
+// permission check a same-UID chmod can always undo; they were never a
+// kernel boundary (exactly SealedCopy's own doc comment, and toolregistry's
+// memfd_create+F_ADD_SEALS note this file's history already carried: EXDEV
+// blocks linkat(2)'ing a sealed memfd into a real, PATH-discoverable
+// directory entry, which is why every PATH-based tool launch elsewhere in
+// this codebase settled for "private copy + re-verify" instead).
+//
+// The fix removes the pathname entirely rather than trying to detect
+// tampering of one. Package is a sealed, unlinked memfd (memfd_create,
+// never linkat'd into any directory) holding a zip archive -- cli.py
+// renamed to __main__.py, plus assayer/*.py -- sealed with F_SEAL_WRITE |
+// F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_SEAL immediately after being
+// written. Evaluate launches Python with Package's own held descriptor
+// passed as the script argument (via toolregistry.FDAllocator, exactly like
+// Sol11 P0-5's descriptor-only executable launch); Python's zipimport reads
+// __main__.py and every assayer/*.py member straight out of the zip, never
+// touching PYTHONPATH or any real directory. There is no directory entry
+// for a same-UID process to chmod, unlink, or rename over: the kernel
+// refuses every write/truncate/mmap-write syscall against the sealed fd
+// outright, for every process holding any descriptor to it (verified
+// empirically: even the owning process's own second, freshly-reopened
+// /proc/self/fd/<n> handle to the same memfd is refused identically -- see
+// TestV11Case34/35 in v11_s5_immutable_package_test.go). Verify below is
+// now defense-in-depth (confirms the seals are still exactly what
+// BuildSnapshot set, and that the bytes still match, in case of a Go-level
+// bug elsewhere) rather than the load-bearing detection mechanism it was
+// before this session -- the actual guarantee is now structural, not
+// after-the-fact.
 type Snapshot struct {
-	// Dir is the private, read-only directory containing the copied cli.py
-	// and assayer/ package.
-	Dir string
-	// CLIPath is Dir/cli.py -- the only entry point ever executed.
-	CLIPath string
-	// TreeHash is a sha256 over exactly the file set copied into Dir
-	// (path+content), sorted by path. This is the execution identity --
-	// also exposed as Identity.PackageHash, the copy every replay-identity
+	// Package is the sealed, unlinked memfd holding the zip archive Evaluate
+	// executes. See the type doc comment.
+	Package *os.File
+	// PackageHash is a sha256 over Package's exact sealed bytes. Also
+	// exposed as Identity.PackageHash, the copy every replay-identity
 	// caller should read (see SnapshotIdentity's doc comment).
-	TreeHash string
+	PackageHash string
+	// WorkDir is a private, empty directory created once per Snapshot,
+	// containing nothing: Evaluate's launch still needs a real,
+	// stat-able Workspace path to anchor its (read-only) Landlock rule, but
+	// the package itself is never read from a directory anymore, so this
+	// directory holds no Assayer content at all -- unlike the old Dir, its
+	// own contents carry no execution identity.
+	WorkDir string
 	// Python is the verified, held python3 handle resolved once for this
 	// snapshot. Evaluate must launch through this handle, never re-resolve
 	// python for itself.
@@ -141,31 +169,10 @@ type Snapshot struct {
 	// Identity is Sol10 P0-6's SnapshotIdentity -- the sole source of
 	// Assayer transaction identity. See that type's doc comment.
 	Identity SnapshotIdentity
-
-	// files is the retained-descriptor manifest Verify walks: one entry per
-	// file copied into Dir, opened read-only immediately after it was
-	// written and chmod'd, so later re-reads go through the same
-	// descriptor rather than reopening the (possibly since-replaced) path.
-	files []snapshotFile
 }
 
-// snapshotFile is one copied file's golden identity: the relative path
-// inside Dir, its content hash at copy time, the retained read-only
-// descriptor, and the dev/inode pair that descriptor's directory entry
-// resolved to at open time -- mirrors toolregistry.SealedCopy's fields
-// exactly, for the same reason (Verify below is SealedCopy.Verify's
-// same-UID-tamper check, generalized from one file to a whole tree).
-type snapshotFile struct {
-	rel    string
-	sha256 string
-	file   *os.File
-	dev    uint64
-	ino    uint64
-}
-
-// Close releases the held python handle and every retained per-file
-// descriptor, then removes the private snapshot directory. Safe to call on
-// a nil Snapshot.
+// Close releases the held python handle and the sealed package descriptor,
+// then removes WorkDir. Safe to call on a nil Snapshot.
 func (s *Snapshot) Close() {
 	if s == nil {
 		return
@@ -173,105 +180,54 @@ func (s *Snapshot) Close() {
 	if s.Python != nil {
 		s.Python.Close()
 	}
-	for _, sf := range s.files {
-		if sf.file != nil {
-			_ = sf.file.Close()
-		}
+	if s.Package != nil {
+		_ = s.Package.Close()
 	}
-	if s.Dir != "" {
-		_ = filepath.Walk(s.Dir, func(path string, info os.FileInfo, err error) error {
-			if err == nil && info.IsDir() {
-				_ = os.Chmod(path, 0o700)
-			}
-			return nil
-		})
-		_ = os.RemoveAll(s.Dir)
+	if s.WorkDir != "" {
+		_ = os.RemoveAll(s.WorkDir)
 	}
 }
 
-// Verify re-checks every copied snapshot file against its retained
-// descriptor and dev/inode identity, and confirms Dir's tree still
-// contains exactly the files that were copied -- no more, no fewer (Sol10
-// P0-4 cases 21/22). The caller MUST invoke this immediately before
-// launching Python against the snapshot, and again immediately after that
-// launch completes, before trusting the verdict it produced: a same-UID
-// process elsewhere on the host can chmod Dir back open and, at any point
-// between BuildSnapshot's tree-hash calculation and either check, unlink
-// and replace a file, rename a different file over one, or chmod-and-
-// overwrite one in place -- mode 0400/0500 alone denies none of that to a
-// process sharing this same UID (see Snapshot's doc comment). Any mismatch
-// is reported as exactly AssayerSnapshotMutated; Verify never re-copies or
-// otherwise repairs what it finds, only reports it.
+// packageSeals is the exact seal set BuildSnapshot applies to Package --
+// content can never again be written, shrunk, grown, or have further seals
+// added, for any process holding any descriptor to this memfd.
+const packageSeals = unix.F_SEAL_WRITE | unix.F_SEAL_SHRINK | unix.F_SEAL_GROW | unix.F_SEAL_SEAL
+
+// Verify re-checks Package's bytes and seal state against what
+// BuildSnapshot recorded. Sol11 P0-6 makes this defense-in-depth rather than
+// the load-bearing detection mechanism it was before this session (see
+// Snapshot's doc comment): the sealed, unlinked memfd cannot actually be
+// mutated by any same-UID process in the first place, so a mismatch here
+// would mean a bug in this process's own bookkeeping (wrong descriptor,
+// double-close-and-reuse of the fd number) rather than an external attack.
+// The caller (assay.Evaluate) still calls this immediately before and after
+// every launch, matching the pre-existing double-check convention. Any
+// mismatch is reported as exactly AssayerSnapshotMutated.
 func (s *Snapshot) Verify() error {
 	if s == nil {
 		return fmt.Errorf("assay: cannot verify a nil snapshot")
 	}
-	seen := make(map[string]bool, len(s.files))
-	for _, sf := range s.files {
-		seen[sf.rel] = true
-		abs := filepath.Join(s.Dir, filepath.FromSlash(sf.rel))
-		info, err := os.Lstat(abs)
-		if err != nil {
-			return fmt.Errorf("%s: snapshot file %q unreadable: %w", AssayerSnapshotMutated, sf.rel, err)
-		}
-		if info.Mode()&os.ModeSymlink != 0 {
-			return fmt.Errorf("%s: snapshot file %q replaced with a symlink", AssayerSnapshotMutated, sf.rel)
-		}
-		st, ok := info.Sys().(*syscall.Stat_t)
-		if !ok {
-			return fmt.Errorf("%s: snapshot file %q: platform exposes no inode identity", AssayerSnapshotMutated, sf.rel)
-		}
-		if uint64(st.Dev) != sf.dev || uint64(st.Ino) != sf.ino {
-			return fmt.Errorf("%s: snapshot file %q: directory entry replaced since publish (dev/inode mismatch)", AssayerSnapshotMutated, sf.rel)
-		}
-		if _, err := sf.file.Seek(0, io.SeekStart); err != nil {
-			return fmt.Errorf("%s: snapshot file %q: rewind retained descriptor: %w", AssayerSnapshotMutated, sf.rel, err)
-		}
-		sum := sha256.New()
-		if _, err := io.Copy(sum, sf.file); err != nil {
-			return fmt.Errorf("%s: snapshot file %q: read retained descriptor: %w", AssayerSnapshotMutated, sf.rel, err)
-		}
-		if hex.EncodeToString(sum.Sum(nil)) != sf.sha256 {
-			return fmt.Errorf("%s: snapshot file %q: content changed since publish", AssayerSnapshotMutated, sf.rel)
-		}
+	if s.Package == nil {
+		return fmt.Errorf("%s: snapshot has no package descriptor", AssayerSnapshotMutated)
 	}
-	// An attacker need not overwrite an enrolled file if Python's import
-	// machinery will just as happily pick up a brand-new module dropped
-	// alongside it -- confirm the tree contains no file outside the
-	// enrolled manifest.
-	extra, err := extraSnapshotFile(s.Dir, seen)
+	seals, err := unix.FcntlInt(s.Package.Fd(), unix.F_GET_SEALS, 0)
 	if err != nil {
-		return fmt.Errorf("%s: walk snapshot tree: %w", AssayerSnapshotMutated, err)
+		return fmt.Errorf("%s: read package seal state: %w", AssayerSnapshotMutated, err)
 	}
-	if extra != "" {
-		return fmt.Errorf("%s: unexpected file %q present in snapshot tree", AssayerSnapshotMutated, extra)
+	if seals&packageSeals != packageSeals {
+		return fmt.Errorf("%s: package seal state changed (want at least %#o, got %#o)", AssayerSnapshotMutated, packageSeals, seals)
+	}
+	if _, err := s.Package.Seek(0, io.SeekStart); err != nil {
+		return fmt.Errorf("%s: rewind package descriptor: %w", AssayerSnapshotMutated, err)
+	}
+	sum := sha256.New()
+	if _, err := io.Copy(sum, s.Package); err != nil {
+		return fmt.Errorf("%s: read package descriptor: %w", AssayerSnapshotMutated, err)
+	}
+	if hex.EncodeToString(sum.Sum(nil)) != s.PackageHash {
+		return fmt.Errorf("%s: package content changed since publish", AssayerSnapshotMutated)
 	}
 	return nil
-}
-
-// extraSnapshotFile walks dir and returns the first regular file whose
-// path (relative to dir, slash-normalized) is not a key in enrolled, or ""
-// if every file on disk is enrolled.
-func extraSnapshotFile(dir string, enrolled map[string]bool) (string, error) {
-	var found string
-	err := filepath.Walk(dir, func(path string, info os.FileInfo, werr error) error {
-		if werr != nil {
-			return werr
-		}
-		if info.IsDir() || found != "" {
-			return nil
-		}
-		rel, relErr := filepath.Rel(dir, path)
-		if relErr != nil {
-			return relErr
-		}
-		rel = filepath.ToSlash(rel)
-		if !enrolled[rel] {
-			found = rel
-		}
-		return nil
-	})
-	return found, err
 }
 
 // BuildSnapshot copies cfg.Repo's executable distribution into a private
@@ -319,38 +275,44 @@ func BuildSnapshot(registry *toolregistry.Registry, cfg Config) (*Snapshot, erro
 	if _, statErr := os.Stat(filepath.Join(cfg.Repo, "cli.py")); statErr != nil {
 		return nil, fmt.Errorf("assay: cli.py missing from repo %s: %w", cfg.Repo, statErr)
 	}
-
-	dir, err := os.MkdirTemp("", "governator-assayer-snapshot-*")
-	if err != nil {
-		return nil, fmt.Errorf("assay: create snapshot dir: %w", err)
+	if runtime.GOOS != "linux" {
+		return nil, fmt.Errorf("assay: sealed-memfd package execution is unsupported on %s", runtime.GOOS)
 	}
+
+	type packagedFile struct{ rel, sha string }
+	var packaged []packagedFile
+
+	buf := &bytes.Buffer{}
+	zw := zip.NewWriter(buf)
 	fail := func(format string, args ...any) (*Snapshot, error) {
-		_ = os.RemoveAll(dir)
 		return nil, fmt.Errorf("assay: snapshot: "+format, args...)
 	}
 
-	type copiedFile struct{ rel, sha string }
-	var copied []copiedFile
-
-	copyOne := func(srcRel string) error {
-		src := filepath.Join(cfg.Repo, filepath.FromSlash(srcRel))
-		data, rerr := os.ReadFile(src)
+	// addOne writes srcRel's content into the zip under zipRel, recording
+	// its content hash for PackageHash/ProfileHash below. cli.py is
+	// deliberately renamed to __main__.py: Python's zipimport machinery
+	// treats a zip archive containing __main__.py as directly executable
+	// (the same shape `python archive.pyz` runs today), which is exactly
+	// what lets Evaluate hand the whole package to Python as one launch
+	// argument instead of a script path plus a PYTHONPATH directory entry.
+	addOne := func(srcRel, zipRel string) error {
+		data, rerr := os.ReadFile(filepath.Join(cfg.Repo, filepath.FromSlash(srcRel)))
 		if rerr != nil {
 			return fmt.Errorf("read %s: %w", srcRel, rerr)
 		}
-		dst := filepath.Join(dir, filepath.FromSlash(srcRel))
-		if merr := os.MkdirAll(filepath.Dir(dst), 0o700); merr != nil {
-			return fmt.Errorf("mkdir for %s: %w", srcRel, merr)
+		w, werr := zw.Create(zipRel)
+		if werr != nil {
+			return fmt.Errorf("add %s to package: %w", zipRel, werr)
 		}
-		if werr := os.WriteFile(dst, data, 0o600); werr != nil {
-			return fmt.Errorf("write %s: %w", srcRel, werr)
+		if _, werr := w.Write(data); werr != nil {
+			return fmt.Errorf("write %s into package: %w", zipRel, werr)
 		}
 		sum := sha256.Sum256(data)
-		copied = append(copied, copiedFile{rel: filepath.ToSlash(srcRel), sha: hex.EncodeToString(sum[:])})
+		packaged = append(packaged, packagedFile{rel: zipRel, sha: hex.EncodeToString(sum[:])})
 		return nil
 	}
 
-	if cerr := copyOne("cli.py"); cerr != nil {
+	if cerr := addOne("cli.py", "__main__.py"); cerr != nil {
 		return fail("%s", cerr)
 	}
 
@@ -373,104 +335,70 @@ func BuildSnapshot(registry *toolregistry.Registry, cfg Config) (*Snapshot, erro
 			if relErr != nil {
 				return relErr
 			}
-			return copyOne(rel)
+			return addOne(rel, filepath.ToSlash(rel))
 		})
 		if walkErr != nil {
-			return fail("copy assayer package: %s", walkErr)
+			return fail("package assayer package: %s", walkErr)
 		}
 	}
+	if cerr := zw.Close(); cerr != nil {
+		return fail("close package archive: %s", cerr)
+	}
+	zipBytes := buf.Bytes()
+	packageSum := sha256.Sum256(zipBytes)
+	packageHash := hex.EncodeToString(packageSum[:])
 
-	// Lock down: no writer, including this same process, touches these
-	// bytes again before Close() explicitly tears the snapshot down.
-	for _, cf := range copied {
-		if cerr := os.Chmod(filepath.Join(dir, filepath.FromSlash(cf.rel)), 0o400); cerr != nil {
-			return fail("chmod %s: %s", cf.rel, cerr)
-		}
+	fd, merr := unix.MemfdCreate("governator-assayer-package", unix.MFD_CLOEXEC|unix.MFD_ALLOW_SEALING)
+	if merr != nil {
+		return fail("create sealed package memfd: %s", merr)
 	}
-	dirErr := filepath.Walk(dir, func(path string, info os.FileInfo, werr error) error {
-		if werr != nil {
-			return werr
-		}
-		if info.IsDir() {
-			return os.Chmod(path, 0o500)
-		}
-		return nil
-	})
-	if dirErr != nil {
-		return fail("lock directory tree: %s", dirErr)
-	}
-
-	// Retain an open read-only descriptor to every copied file, right here
-	// while the tree is freshest, so Verify's later re-reads (immediately
-	// before launch, and again immediately after evaluation) go through the
-	// descriptor rather than reopening a path a same-UID process may since
-	// have unlinked and replaced (Sol10 P0-4). filesOK guards cleanup on any
-	// failure in this loop -- an error here must not leak the descriptors
-	// already opened.
-	files := make([]snapshotFile, 0, len(copied))
-	filesOK := false
+	pkg := os.NewFile(uintptr(fd), "governator-assayer-package")
+	pkgOK := false
 	defer func() {
-		if !filesOK {
-			for _, sf := range files {
-				if sf.file != nil {
-					_ = sf.file.Close()
-				}
-			}
+		if !pkgOK {
+			_ = pkg.Close()
 		}
 	}()
-	for _, cf := range copied {
-		f, oerr := os.Open(filepath.Join(dir, filepath.FromSlash(cf.rel)))
-		if oerr != nil {
-			return fail("open retained descriptor for %s: %s", cf.rel, oerr)
-		}
-		info, serr := f.Stat()
-		if serr != nil {
-			_ = f.Close()
-			return fail("stat retained descriptor for %s: %s", cf.rel, serr)
-		}
-		st, stok := info.Sys().(*syscall.Stat_t)
-		if !stok {
-			_ = f.Close()
-			return fail("retain %s: platform exposes no inode identity", cf.rel)
-		}
-		sum := sha256.New()
-		if _, cerr := io.Copy(sum, f); cerr != nil {
-			_ = f.Close()
-			return fail("hash retained descriptor for %s: %s", cf.rel, cerr)
-		}
-		if hex.EncodeToString(sum.Sum(nil)) != cf.sha {
-			_ = f.Close()
-			return fail("retained descriptor for %s does not match the bytes just written", cf.rel)
-		}
-		files = append(files, snapshotFile{rel: cf.rel, sha256: cf.sha, file: f, dev: uint64(st.Dev), ino: uint64(st.Ino)})
+	if _, werr := pkg.Write(zipBytes); werr != nil {
+		return fail("write sealed package memfd: %s", werr)
 	}
-	filesOK = true
+	// Seal immediately after writing, before this snapshot is handed to any
+	// caller: from this point on the kernel refuses every write/truncate/
+	// mmap-write against this memfd, for every process holding any
+	// descriptor to it (including this one) -- not merely a permission bit
+	// a same-UID chmod could undo. See Snapshot's doc comment.
+	if _, serr := unix.FcntlInt(pkg.Fd(), unix.F_ADD_SEALS, packageSeals); serr != nil {
+		return fail("seal package memfd: %s", serr)
+	}
+	if _, serr := pkg.Seek(0, io.SeekStart); serr != nil {
+		return fail("rewind sealed package memfd: %s", serr)
+	}
 
-	sort.Slice(copied, func(i, j int) bool { return copied[i].rel < copied[j].rel })
-	items := make([]map[string]string, 0, len(copied))
-	for _, cf := range copied {
-		items = append(items, map[string]string{"path": cf.rel, "sha256": cf.sha})
+	workDir, werr := os.MkdirTemp("", "governator-assayer-workdir-*")
+	if werr != nil {
+		return fail("create workspace anchor dir: %s", werr)
 	}
-	canonical, _ := json.Marshal(items)
-	treeSum := sha256.Sum256(canonical)
+	if cerr := os.Chmod(workDir, 0o500); cerr != nil {
+		_ = os.RemoveAll(workDir)
+		return fail("chmod workspace anchor dir: %s", cerr)
+	}
 
 	dirty, dirtyReason := snapshotDirty(registry, cfg.Repo)
 
 	// Sol10 P0-6: resolved once, here, from data this call already has in
-	// hand -- profileHash from the bytes just copied (never a separate live
-	// read), gitCommit from one probe at build time (never re-read by a
-	// later identity calculation against the possibly-since-changed live
+	// hand -- profileHash from the bytes just packaged (never a separate
+	// live read), gitCommit from one probe at build time (never re-read by
+	// a later identity calculation against the possibly-since-changed live
 	// checkout).
-	treeHash := hex.EncodeToString(treeSum[:])
 	profileHash := ""
-	for _, cf := range copied {
-		if cf.rel == "assayer/profiles.py" {
-			profileHash = cf.sha
+	for _, pf := range packaged {
+		if pf.rel == "assayer/profiles.py" {
+			profileHash = pf.sha
 			break
 		}
 	}
 	identity := SnapshotIdentity{
-		PackageHash:     treeHash,
+		PackageHash:     packageHash,
 		PythonIdentity:  pythonHandle.Identity,
 		RuntimeHash:     runtimeManifest.RuntimeHash,
 		DependencyHash:  runtimeManifest.DependencyHash,
@@ -482,16 +410,16 @@ func BuildSnapshot(registry *toolregistry.Registry, cfg Config) (*Snapshot, erro
 	}
 
 	ok = true
+	pkgOK = true
 	return &Snapshot{
-		Dir:         dir,
-		CLIPath:     filepath.Join(dir, "cli.py"),
-		TreeHash:    treeHash,
+		Package:     pkg,
+		PackageHash: packageHash,
+		WorkDir:     workDir,
 		Python:      pythonHandle,
 		Runtime:     runtimeManifest,
 		Dirty:       dirty,
 		DirtyReason: dirtyReason,
 		Identity:    identity,
-		files:       files,
 	}, nil
 }
 

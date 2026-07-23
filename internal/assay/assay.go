@@ -21,11 +21,15 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"os/exec"
 	"strings"
 	"time"
 
+	"github.com/cousingary/governator/internal/containment"
 	"github.com/cousingary/governator/internal/controllerenv"
+	"github.com/cousingary/governator/internal/enforce"
 	"github.com/cousingary/governator/internal/stage"
+	"github.com/cousingary/governator/internal/toolregistry"
 )
 
 // Verdict states Assayer's evaluate subcommand can return, plus one
@@ -243,26 +247,31 @@ func Evaluate(ctx context.Context, cfg Config, req Request, artifactPath string,
 	// verdict to stdout, so it needs no write access and no network. A host
 	// that cannot provide the requested external sandbox now fails closed.
 	//
-	// Sol9 P0-4: PYTHONPATH and ReadRoots point exclusively at the frozen
-	// snapshot directory -- never cfg.Repo, the live mutable checkout -- so
-	// the interpreter can only ever import the exact bytes replay identity
-	// was calculated over.
+	// Sol9 P0-4: the interpreter can only ever import the exact bytes replay
+	// identity was calculated over, never cfg.Repo (the live mutable
+	// checkout).
 	//
-	// Sol10 P0-5: ReadRoots also includes snap.Runtime.StdlibReadRoots --
-	// resolved and hashed once, at BuildSnapshot time (isolated -S probe),
-	// never rediscovered live here. Unlike the pre-P0-5
-	// pythonStdlibReadRoots, this never grants read access to
-	// purelib/platlib (site-packages): the "-S" argument below disables
-	// Python's `site` module entirely, so site-packages is never added to
-	// sys.path and no .pth file or sitecustomize.py/usercustomize.py
-	// anywhere is ever processed -- structurally, not by scanning for
-	// those files. That's safe because `evaluate` never imports a
-	// third-party package in the first place (see RuntimeManifest's doc
-	// comment in snapshot.go).
+	// Sol11 P0-6: there is no PYTHONPATH and no snap.Dir anymore -- the
+	// package is a sealed, unlinked memfd (snap.Package; see Snapshot's doc
+	// comment), so ReadRoots below is exactly snap.Runtime.StdlibReadRoots,
+	// nothing more: a memfd is never reached through Landlock's path-based
+	// rules at all, it is inherited as an already-open descriptor, so
+	// granting it a ReadRoot would be meaningless (there is no path to grant
+	// one over) as well as unnecessary.
+	//
+	// Sol10 P0-5: ReadRoots is snap.Runtime.StdlibReadRoots -- resolved and
+	// hashed once, at BuildSnapshot time (isolated -S probe), never
+	// rediscovered live here. Unlike the pre-P0-5 pythonStdlibReadRoots,
+	// this never grants read access to purelib/platlib (site-packages): the
+	// "-S" argument below disables Python's `site` module entirely, so
+	// site-packages is never added to sys.path and no .pth file or
+	// sitecustomize.py/usercustomize.py anywhere is ever processed --
+	// structurally, not by scanning for those files. That's safe because
+	// `evaluate` never imports a third-party package in the first place
+	// (see RuntimeManifest's doc comment in snapshot.go).
 	envValues := controllerenv.Base()
-	envValues = append(envValues, "PYTHONPATH="+snap.Dir)
 	authority := stage.StageAuthority{
-		ReadRoots:          append([]string{snap.Dir}, snap.Runtime.StdlibReadRoots...),
+		ReadRoots:          append([]string(nil), snap.Runtime.StdlibReadRoots...),
 		Network:            stage.NetworkPolicyDenied,
 		Credentials:        stage.CredentialPolicyNone,
 		RequireStrongScope: true,
@@ -273,7 +282,7 @@ func Evaluate(ctx context.Context, cfg Config, req Request, artifactPath string,
 		StageID:          "assay-evaluate",
 		Executable:       stage.ExecutableIdentity{CanonicalPath: pythonIdentity.CanonicalPath, SHA256: pythonIdentity.SHA256},
 		Arguments:        evaluateArguments(snap, req.CheckProfile),
-		WorkingDirectory: snap.Dir,
+		WorkingDirectory: snap.WorkDir,
 		Environment:      stage.FrozenEnvironment{Values: envValues, Hash: controllerenv.Hash(envValues)},
 		ReadRoots:        nil,
 		NetworkPolicy:    authority.Network,
@@ -287,6 +296,28 @@ func Evaluate(ctx context.Context, cfg Config, req Request, artifactPath string,
 		Stdout:           &stdout,
 		Stderr:           &stderr,
 		ExecutableHandle: snap.Python,
+		// Sol11 P0-6: the package's own launch argument is a
+		// descriptor-backed /proc/self/fd/<n>, never a pathname -- built
+		// here (not by evaluateArguments, which only declares the logical
+		// arg list for logging) because the concrete fd number depends on
+		// composition order inside a shared toolregistry.FDAllocator this
+		// factory owns. plan.Active is unconditionally true whenever this
+		// factory is even reached: Authority above always sets ReadRoots,
+		// Network denied and RequireStrongScope, so
+		// StageAuthority.RequiresExternalEnforcement() is always true and
+		// stage.Run's highRisk=true NewPlanForExecutable call either
+		// compiles an Active plan or fails the whole stage before ever
+		// calling a CommandFactory -- there is no silent-degrade path to
+		// guard against here.
+		CommandFactory: func(ctx context.Context, s *containment.Scope, p enforce.Plan, _ string, _ []string, dir string) (*exec.Cmd, error) {
+			if !p.Active {
+				return nil, fmt.Errorf("assay: evaluate reached its command factory with an inactive enforcement plan (internal error: authority resolution should always compile an active one or fail the stage first)")
+			}
+			alloc := &toolregistry.FDAllocator{}
+			pkgArg := alloc.Arg(snap.Package)
+			launchArgs := []string{"-S", pkgArg, "evaluate", "--profile", req.CheckProfile}
+			return stage.ComposeHandleLaunch(ctx, s, p, snap.Python, alloc, launchArgs, dir)
+		},
 	})
 	if runCtx.Err() == context.DeadlineExceeded {
 		return errorVerdict(fmt.Sprintf("assay: subprocess timed out after %s", timeout))
@@ -349,18 +380,25 @@ func Blocks(verdict, enforcement string) bool {
 	return verdict != VerdictPass && verdict != VerdictAdvisory
 }
 
-// evaluateArguments builds the exact interpreter arguments Evaluate launches
-// snap.Python with. Factored out of Evaluate itself so Sol10 P0-5's
-// red-team corpus (TestV10Case25.../TestV10Case26... in
-// v10_s5_managed_runtime_test.go) can drive the identical argument list --
-// most importantly the leading "-S" -- through the held handle directly,
+// evaluateArguments declares the logical interpreter argument list Evaluate
+// launches snap.Python with, for logging/StageSpec.Arguments purposes and
+// for Sol10 P0-5's red-team corpus (TestV10Case25.../TestV10Case26... in
+// v10_s5_managed_runtime_test.go, which drives the identical argument list
+// -- most importantly the leading "-S" -- through the held handle directly,
 // proving the isolated-startup mechanism itself without also requiring this
 // host to provide external Landlock/unshare enforcement, which the full
 // stage.Executor pipeline (RequireStrongScope) needs and which this
-// package's fast unit tier deliberately does not exercise (see TestMain's
+// package's fast unit tier deliberately does not exercise; see TestMain's
 // doc comment).
+//
+// Sol11 P0-6: the real launch argv Evaluate's CommandFactory actually
+// builds substitutes a concrete /proc/self/fd/<n> (snap.Package, registered
+// into that factory's own toolregistry.FDAllocator) for the placeholder
+// second element here -- the exact fd number depends on allocator
+// composition order that this function, called before any allocator
+// exists, cannot know.
 func evaluateArguments(snap *Snapshot, profile string) []string {
-	return []string{"-S", snap.CLIPath, "evaluate", "--profile", profile}
+	return []string{"-S", "<assayer-package>", "evaluate", "--profile", profile}
 }
 
 // firstNonEmpty returns req.RunID for the stage's identity when set, or a

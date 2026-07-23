@@ -311,9 +311,12 @@ func TestV9Case15PythonRegistryRotationAfterSnapshotHasNoEffect(t *testing.T) {
 // P0-4 report case 16: even a hostile cli.py that hardcodes the ORIGINAL
 // live repo's absolute path (not merely relying on relative paths that the
 // copy mechanism alone would already defeat) must be denied by real
-// Landlock enforcement when it tries to read outside the snapshot
-// directory -- ReadRoots is exactly snap.Dir (+ python's own stdlib), never
-// cfg.Repo.
+// Landlock enforcement when it tries to read outside the snapshot package
+// -- ReadRoots is exactly snap.Runtime.StdlibReadRoots (python's own
+// stdlib), never cfg.Repo. Sol11 P0-6: the package itself (snap.Package) is
+// no longer even a candidate for a Landlock ReadRoot at all -- it's a
+// sealed memfd inherited as an already-open descriptor, never reached
+// through path-based Landlock rules in the first place.
 func TestV9Case16SnapshotReadRootsExcludeLiveRepoUnderRealLandlock(t *testing.T) {
 	// Piggyback fixture()'s enforce.SelfExeOverride/govTestBinary setup --
 	// this case needs the real external sandbox, not the
@@ -489,8 +492,8 @@ func TestV9Case20FreshSnapshotAfterMutationReflectsNewBytes(t *testing.T) {
 	}
 	defer after.Close()
 
-	if before.TreeHash == after.TreeHash {
-		t.Fatal("a fresh snapshot built after mutating checks.py has the same tree hash as the pre-mutation snapshot -- the fix must not freeze Assayer forever, only per already-built transaction")
+	if before.PackageHash == after.PackageHash {
+		t.Fatal("a fresh snapshot built after mutating checks.py has the same package hash as the pre-mutation snapshot -- the fix must not freeze Assayer forever, only per already-built transaction")
 	}
 
 	dir := t.TempDir()

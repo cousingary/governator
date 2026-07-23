@@ -11,7 +11,6 @@ import re
 import sys
 import uuid
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
 
 try:
     from dotenv import load_dotenv
@@ -252,9 +251,18 @@ def _validator_implementation_hash() -> str:
     """sha256 of assayer/checks.py's own source bytes — "which validator
     implementation" produced a result, independent of the outcome and of
     which profile/config selected which checks. Computed once per process,
-    not per evaluation: the module's source doesn't change mid-run."""
-    source_path = Path(checks_mod.__file__)
-    return hashlib.sha256(source_path.read_bytes()).hexdigest()
+    not per evaluation: the module's source doesn't change mid-run.
+
+    Reads through checks_mod.__loader__.get_data() rather than a plain
+    Path(...).read_bytes(): both the regular SourceFileLoader and
+    zipimport's zipimporter implement get_data(path), so this works
+    identically whether this process was launched against a real directory
+    or against a Governator-sealed single-file package (Sol11 P0-6) — a
+    plain filesystem read would raise FileNotFoundError for the latter,
+    since checks_mod.__file__ is then a composite "archive/member" string
+    with no corresponding real path on disk.
+    """
+    return hashlib.sha256(checks_mod.__loader__.get_data(checks_mod.__file__)).hexdigest()
 
 
 _VALIDATOR_IMPLEMENTATION_HASH = _validator_implementation_hash()

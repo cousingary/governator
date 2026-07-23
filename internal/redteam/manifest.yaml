@@ -990,3 +990,23 @@ cases:
     session: rc5-s4
     required: true
     status: implemented
+  # Sol11 rc5 Session 5 (P0-6): Assayer's package snapshot (Sol10 P0-4's
+  # chmod'd private directory copy) still had a same-uid
+  # verify-then-replace-then-restore window during Python's own import,
+  # since Python reads by pathname and never through the retained
+  # descriptor Verify re-checks. Cases 179-180 prove the fix
+  # (assay.Snapshot.Package: a sealed, unlinked memfd, never a real
+  # directory entry) end-to-end under real Landlock+unshare enforcement: a
+  # same-uid reopen-and-write attempt is rejected at the kernel level (not
+  # merely detected afterward) and a real evaluation still executes
+  # correctly with no Assayer content ever touching a real filesystem path.
+  - case: 179
+    name: TestV11Case34SameUIDReopenAndWriteAttemptNeverAltersRealEvaluationVerdict
+    session: rc5-s5
+    required: true
+    status: implemented
+  - case: 180
+    name: TestV11Case35PackageNeverTouchesAnyRealFilesystemPath
+    session: rc5-s5
+    required: true
+    status: implemented

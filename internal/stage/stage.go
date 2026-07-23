@@ -148,6 +148,32 @@ type WriteEffect struct {
 // redteam v7 HS2: the sealed-executable handle discarding the enforce wrap).
 type CommandFactory func(ctx context.Context, scope *containment.Scope, plan enforce.Plan, bin string, args []string, dir string) (*exec.Cmd, error)
 
+// ComposeHandleLaunch is Sol11 P0-5's descriptor-only launch composition
+// (previously inlined in Run's default CommandFactory below): it wires
+// handle's held, already-verified descriptor into plan's own self-exec/
+// unshare layers and scope's own containment primitive, all through one
+// shared alloc, and returns the fully-composed *exec.Cmd with ExtraFiles
+// already populated. plan.Active must already be true -- callers gate that
+// themselves (Run's default factory only calls this on the p.Active branch).
+//
+// Exported so a caller with an additional descriptor-backed launch argument
+// of its own can register it into alloc BEFORE calling this (via
+// alloc.Arg), and splice the returned /proc/self/fd/<n> string into args --
+// Sol11 P0-6's immutable Assayer package object (a sealed, unlinked memfd;
+// see internal/assay.Evaluate's own CommandFactory) is the first such
+// caller. A fresh caller with nothing of its own to register simply passes
+// &toolregistry.FDAllocator{}.
+func ComposeHandleLaunch(ctx context.Context, scope *containment.Scope, plan enforce.Plan, handle *toolregistry.Handle, alloc *toolregistry.FDAllocator, args []string, dir string) (*exec.Cmd, error) {
+	extended, err := plan.WithExecutableAndReadRoots(handle.Identity.CanonicalPath, filepath.Dir(handle.Identity.CanonicalPath))
+	if err != nil {
+		return nil, err
+	}
+	wb, wa := extended.WrapWith(alloc, "", handle.File(), args)
+	cmd := scope.CommandWith(ctx, alloc, wb, wa, dir)
+	cmd.ExtraFiles = append(cmd.ExtraFiles, alloc.Files()...)
+	return cmd, nil
+}
+
 type StageSpec struct {
 	RunID, StageID   string
 	Executable       ExecutableIdentity
@@ -351,26 +377,7 @@ func (Executor) Run(ctx context.Context, spec StageSpec) (StageResult, error) {
 	if factory == nil && spec.ExecutableHandle != nil {
 		factory = func(c context.Context, s *containment.Scope, p enforce.Plan, b string, a []string, d string) (*exec.Cmd, error) {
 			if p.Active {
-				// Sol11 P0-5: launch the final stage executable through its
-				// held, already-verified descriptor via a shared
-				// FDAllocator, composed with this launch's own self-exec/
-				// unshare/containment-primitive descriptors -- never by
-				// sealing a private copy to a real pathname and exec'ing
-				// that pathname after Verify, which still left a
-				// Verify-then-replace-then-exec window open. The ELF read
-				// closure below still inspects the executable's canonical
-				// enrolled path (metadata only, never the exec target
-				// itself), matching how spec.ExecutableHandle was already
-				// verified against that exact path when it was resolved.
-				alloc := &toolregistry.FDAllocator{}
-				extended, err := p.WithExecutableAndReadRoots(spec.ExecutableHandle.Identity.CanonicalPath, filepath.Dir(spec.ExecutableHandle.Identity.CanonicalPath))
-				if err != nil {
-					return nil, err
-				}
-				wb, wa := extended.WrapWith(alloc, "", spec.ExecutableHandle.File(), a)
-				cmd := s.CommandWith(c, alloc, wb, wa, d)
-				cmd.ExtraFiles = append(cmd.ExtraFiles, alloc.Files()...)
-				return cmd, nil
+				return ComposeHandleLaunch(c, s, p, spec.ExecutableHandle, &toolregistry.FDAllocator{}, a, d)
 			}
 			return spec.ExecutableHandle.CommandWith(c, a, func(cc context.Context, sealed string, sealedArgs []string) *exec.Cmd {
 				return s.Command(cc, sealed, sealedArgs, d)

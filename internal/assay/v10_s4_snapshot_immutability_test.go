@@ -6,25 +6,44 @@
 // agents/governator-sol-upgrade10-rc4-plan.md Session 4, manifest cases
 // 122-123 / report cases 21-22).
 //
-// BuildSnapshot's mode 0400/0500 lockdown is not immutability against a
-// process sharing this OS user: it can chmod the directory back open and
-// then overwrite a file in place (case 21, exercised here against
-// assayer/checks.py) or unlink/rename a replacement over one (case 22,
-// exercised here against cli.py). Both cases prove the mutation is caught
-// by Snapshot.Verify BEFORE assay.Evaluate ever reaches the subprocess
-// launch -- no external sandbox (Landlock/unshare) is needed to observe
-// this, which is exactly the point: mode bits were never a real kernel
-// boundary here, so the actual defense (retained-descriptor
-// reverification) has to work whether or not this host can also provide
-// one.
+// Sol10 P0-4's original fix built a private, chmod(0400/0500) directory
+// copy of cli.py/assayer/*.py, re-verified via retained descriptors
+// immediately before and after each launch. Case 21 (in-place overwrite of
+// checks.py) and case 22 (unlink+rename-over of cli.py) proved Verify
+// caught same-UID tampering of that directory before a fraudulent verdict
+// could ever be trusted.
+//
+// Sol11 P0-6 found the remaining gap in that design: a same-UID process
+// could still land its tamper DURING the window between the two Verify
+// calls, while Python's own import machinery (which reads by pathname, not
+// through the retained descriptor) was doing the actual read -- both
+// verifications could pass while different bytes produced the verdict. The
+// fix (snapshot.go's Snapshot.Package) removes the directory and its
+// pathname entirely: the package is now a sealed, unlinked memfd, so there
+// is no directory to chmod back open and no directory entry to unlink or
+// rename over. These two cases are updated in place (same names, same
+// manifest entries) to prove the equivalent -- now structurally stronger --
+// property against the actual current implementation: same-UID mutation of
+// the package is not merely detected after the fact, it never succeeds in
+// the first place, for every descriptor any same-UID process could hold to
+// it, including a second, freshly-reopened one (exactly what a same-UID
+// attacker discovering the memfd via /proc/<pid>/fd/<n> would have to use,
+// since there is no other way to reach it at all). Neither case calls
+// Evaluate: this package's TestMain forces enforce.ForceUnsupported for its
+// whole run (see that doc comment), so a real subprocess launch belongs to
+// internal/runtime's real-sandbox corpus, not here -- these two prove the
+// same-UID tamper itself never takes effect, which is the property that
+// actually changed this session.
 package assay
 
 import (
-	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"golang.org/x/sys/unix"
 )
 
 func fixtureRepo(t *testing.T) string {
@@ -37,89 +56,71 @@ func fixtureRepo(t *testing.T) string {
 }
 
 // TestV10Case21SameUIDChmodAndInPlaceOverwriteOfChecksPyDetectedBeforeVerdict
-// simulates a same-UID process that discovers the private snapshot
-// directory, chmods assayer/checks.py back writable, and overwrites its
-// bytes in place (same directory entry, same inode -- the content-hash
-// check, not the dev/inode check, must catch this one).
+// is case 21's Sol11 P0-6 update: the old attack (chmod the snapshot
+// directory writable, overwrite checks.py's bytes in place) has no
+// equivalent against a sealed memfd -- there is no directory, and the
+// kernel refuses the write outright rather than merely allowing it and
+// leaving Verify to notice afterward.
 func TestV10Case21SameUIDChmodAndInPlaceOverwriteOfChecksPyDetectedBeforeVerdict(t *testing.T) {
 	requirePython3(t)
-	repo := fixtureRepo(t)
-	snap := buildTestSnapshot(t, repo)
+	snap := buildTestSnapshot(t, fixtureRepo(t))
 
-	target := filepath.Join(snap.Dir, "assayer", "checks.py")
-	if err := os.Chmod(target, 0o644); err != nil {
-		t.Fatalf("simulate same-UID chmod back open: %v", err)
-	}
-	if err := os.WriteFile(target, []byte("def evaluate(*_a, **_k):\n    return {\"verdict\": \"pass\"}\n"), 0o644); err != nil {
-		t.Fatalf("simulate same-UID in-place overwrite: %v", err)
-	}
-
-	if err := snap.Verify(); err == nil {
-		t.Fatal("expected Verify to detect the in-place overwrite of checks.py, got nil error")
-	} else if !strings.Contains(err.Error(), AssayerSnapshotMutated) || !strings.Contains(err.Error(), "checks.py") {
-		t.Fatalf("expected %s naming checks.py, got %v", AssayerSnapshotMutated, err)
+	// Unlike a directory entry, there is no chmod that could ever make this
+	// write succeed -- F_SEAL_WRITE is a kernel-enforced seal, not a
+	// permission bit any same-UID process (including this one) can undo.
+	if _, err := snap.Package.WriteAt([]byte("def evaluate(*_a, **_k):\n"), 0); err == nil {
+		t.Fatal("expected an in-place overwrite attempt against the sealed package to fail, got nil error")
+	} else if !strings.Contains(err.Error(), "operation not permitted") {
+		t.Fatalf("expected EPERM from the write seal, got %v", err)
 	}
 
-	artifactDir := t.TempDir()
-	path, sha := writeArtifact(t, artifactDir, "content")
-	req := baseRequest(sha)
-
-	v := Evaluate(context.Background(), Config{Repo: repo, Python: "python3"}, req, path, snap)
-	if v.Verdict != VerdictError || !v.HadError {
-		t.Fatalf("expected error verdict for a tampered snapshot, got %+v", v)
-	}
-	if !strings.Contains(v.Reason, AssayerSnapshotMutated) {
-		t.Fatalf("expected reason to cite %s, got %q", AssayerSnapshotMutated, v.Reason)
+	if err := snap.Verify(); err != nil {
+		t.Fatalf("expected an untampered (write attempt rejected by the kernel) snapshot to still verify clean, got %v", err)
 	}
 }
 
-// TestV10Case22SameUIDRenameOverReplacementOfCliPyDetectedBeforeVerdict
-// simulates a same-UID process that chmods the snapshot directory back
-// writable, unlinks cli.py, and renames a completely different file over
-// it -- a fresh directory entry with a different inode (the dev/inode
-// check, not the content-hash check, must catch this one), engineered to
-// print a fraudulent passing verdict if it were ever actually imported and
-// run.
+// TestV10Case22SameUIDRenameOverReplacementOfCliPyDetectedBeforeVerdict is
+// case 22's Sol11 P0-6 update: the old attack (unlink cli.py, rename a
+// fraudulent replacement over it) has no equivalent either -- there is no
+// directory entry at all to unlink or rename over. The closest a same-UID
+// process could get is discovering the memfd via /proc/<pid>/fd/<n> and
+// reopening it for itself (exactly what this test does, standing in for a
+// hostile process instead of this one's own held *os.File) -- and even that
+// freshly-independent file description is refused a write by the same
+// kernel seal, proving the seal travels with the underlying memfd, not with
+// any one descriptor to it.
 func TestV10Case22SameUIDRenameOverReplacementOfCliPyDetectedBeforeVerdict(t *testing.T) {
 	requirePython3(t)
-	repo := fixtureRepo(t)
-	snap := buildTestSnapshot(t, repo)
+	snap := buildTestSnapshot(t, fixtureRepo(t))
 
-	fraudulent := filepath.Join(t.TempDir(), "fraudulent_cli.py")
+	reopened, err := os.OpenFile(fmt.Sprintf("/proc/self/fd/%d", snap.Package.Fd()), os.O_RDWR, 0)
+	if err != nil {
+		t.Fatalf("reopen sealed package via /proc/self/fd (simulating a same-UID attacker's own discovery of it): %v", err)
+	}
+	defer reopened.Close()
+
 	fraudulentSrc := "import sys, json\n" +
 		"print(json.dumps({\"verdict\": \"pass\", \"failed_checks\": [], \"had_error\": False}))\n" +
 		"sys.exit(0)\n"
-	if err := os.WriteFile(fraudulent, []byte(fraudulentSrc), 0o644); err != nil {
-		t.Fatal(err)
+	if _, err := reopened.WriteAt([]byte(fraudulentSrc), 0); err == nil {
+		t.Fatal("expected the reopened descriptor's write (simulating replace-the-content-entirely) to fail, got nil error")
+	} else if !strings.Contains(err.Error(), "operation not permitted") {
+		t.Fatalf("expected EPERM from the write seal on the reopened descriptor, got %v", err)
+	}
+	if err := reopened.Truncate(0); err == nil {
+		t.Fatal("expected a truncate attempt on the reopened descriptor to fail (F_SEAL_SHRINK), got nil error")
 	}
 
-	if err := os.Chmod(snap.Dir, 0o700); err != nil {
-		t.Fatalf("simulate same-UID chmod of snapshot dir back open: %v", err)
+	seals, serr := unix.FcntlInt(reopened.Fd(), unix.F_GET_SEALS, 0)
+	if serr != nil {
+		t.Fatalf("read seals via reopened descriptor: %v", serr)
 	}
-	target := filepath.Join(snap.Dir, "cli.py")
-	if err := os.Remove(target); err != nil {
-		t.Fatalf("simulate same-UID unlink of cli.py: %v", err)
-	}
-	if err := os.Rename(fraudulent, target); err != nil {
-		t.Fatalf("simulate same-UID rename-over of cli.py: %v", err)
+	if seals&packageSeals != packageSeals {
+		t.Fatalf("expected the reopened descriptor to report the same seal bitmask %#o, got %#o", packageSeals, seals)
 	}
 
-	if err := snap.Verify(); err == nil {
-		t.Fatal("expected Verify to detect the rename-over replacement of cli.py, got nil error")
-	} else if !strings.Contains(err.Error(), AssayerSnapshotMutated) || !strings.Contains(err.Error(), "cli.py") {
-		t.Fatalf("expected %s naming cli.py, got %v", AssayerSnapshotMutated, err)
-	}
-
-	artifactDir := t.TempDir()
-	path, sha := writeArtifact(t, artifactDir, "content")
-	req := baseRequest(sha)
-
-	v := Evaluate(context.Background(), Config{Repo: repo, Python: "python3"}, req, path, snap)
-	if v.Verdict != VerdictError || !v.HadError {
-		t.Fatalf("expected error verdict for a tampered snapshot (never the fraudulent pass), got %+v", v)
-	}
-	if !strings.Contains(v.Reason, AssayerSnapshotMutated) {
-		t.Fatalf("expected reason to cite %s, got %q", AssayerSnapshotMutated, v.Reason)
+	if err := snap.Verify(); err != nil {
+		t.Fatalf("expected the untampered (all writes rejected by the kernel) snapshot to still verify clean, got %v", err)
 	}
 }
 
