@@ -88,11 +88,35 @@ func readRealFile(t *testing.T, path string) string {
 // refuses a dirty tree by design -- see the fixture repo's own untracked-
 // changes gate), then runs scripts/audit_bundle.sh from inside it with the
 // given extra environment.
+//
+// Sol11 rc5 Session 9: this fixture repo intentionally has no sibling
+// agents/ directory, so every one of these tests (except the one that sets
+// GOV_ARCHITECTURE_DOC itself via extraEnv) expects audit_bundle.sh to find
+// no architecture doc at all. That held by construction until scripts/
+// release.sh started exporting GOV_ARCHITECTURE_DOC (to pass the resolved
+// path across its own outer/scratch-worktree re-exec boundary) -- an
+// ambient environment variable which then leaks into every `go test`
+// subprocess release.sh's own tier pipeline spawns, including this one.
+// Once the real agents/governator_architecture.md carried front matter
+// (Sol11 P1-7), that leaked env var started making these "no architecture
+// doc" fixtures see the REAL doc instead, whose front matter names a tag
+// this synthetic repo doesn't have (TAG_COMMIT_MISMATCH). Exactly the
+// ambient-inheritance failure mode this codebase's own controllerenv
+// package exists to prevent for production code -- applied here to keep
+// this test hermetic against the calling process's own environment,
+// regardless of what invoked `go test`.
 func runAuditBundle(t *testing.T, fixture string, outDir string, extraEnv ...string) (string, error) {
 	t.Helper()
 	cmd := exec.Command("bash", "scripts/audit_bundle.sh")
 	cmd.Dir = fixture
-	cmd.Env = append(os.Environ(), extraEnv...)
+	var env []string
+	for _, kv := range os.Environ() {
+		if strings.HasPrefix(kv, "GOV_ARCHITECTURE_DOC=") {
+			continue
+		}
+		env = append(env, kv)
+	}
+	cmd.Env = append(env, extraEnv...)
 	cmd.Env = append(cmd.Env, "OUT_DIR="+outDir)
 	out, err := cmd.CombinedOutput()
 	return string(out), err
