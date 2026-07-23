@@ -10,6 +10,16 @@ name: Release
 # GOV_RELEASE_HMAC_KEY is configured; Sol9 P2-2 renamed this from the
 # ambiguous "signature").
 #
+# Sol11 rc5 Session 8 (P1-4/P1-6/P1-8): this workflow now reproduces the
+# FULL local release pipeline on a clean GitHub-hosted runner. Before this
+# session it checked out only Governator and configured Go, omitting the
+# Assayer checkout, the Python 3.10–3.13 matrix, Minisign, and ASSAYER_REPO
+# — so the documented tag-push workflow could not actually produce the
+# release it claimed (Sol11 P1-4). It now checks out Assayer at the ref
+# pinned in assayer.lock, installs every required interpreter and minisign,
+# and lets release.sh auto-detect strict release mode from HEAD's own tag
+# (P1-8) while recording every tool's exact binary hash (P1-6).
+#
 # This workflow is inert until a git remote and a `v*` tag exist (docs/
 # publishing.md step 2/5) — it is committed now so the CI proof mechanism is
 # declared and ready, per the audit's P2.3 correction, even though no live
@@ -31,10 +41,87 @@ jobs:
         with:
           fetch-depth: 0
 
+      # P1-4 (Sol11 rc5 Session 8): read the pinned Assayer ref from the
+      # version-controlled assayer.lock so CI and local releases check out
+      # the exact same Assayer commit. scripts/assayer_verify.sh (run inside
+      # release.sh) independently confirms the checkout's HEAD carries a Git
+      # tag matching Assayer's own pyproject.toml version.
+      - name: Read pinned Assayer ref from assayer.lock
+        id: assayer-ref
+        run: |
+          ref=$(python3 -c "
+          import sys
+          for line in open(sys.argv[1]):
+              line = line.split('#', 1)[0].strip()
+              if line.startswith('ref='):
+                  print(line[4:]); break
+          " assayer.lock)
+          if [ -z "$ref" ]; then
+            echo "::error::assayer.lock does not declare a ref= entry"
+            exit 1
+          fi
+          echo "ref=$ref" >> "$GITHUB_OUTPUT"
+
+      - name: Check out Assayer at its pinned ref
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ vars.ASSAYER_REPOSITORY || 'cousingary/assayer' }}
+          ref: ${{ steps.assayer-ref.outputs.ref }}
+          path: assayer
+
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
           cache: false
+
+      # P1-4 (Sol11 rc5 Session 8): release.sh's Assayer matrix exercises
+      # Python 3.10, 3.11, 3.12, and 3.13 explicitly (python3.10 .. python3.13).
+      # A GitHub-hosted runner ships only the system Python; install each
+      # minor explicitly so the matrix runs for real, not four invocations of
+      # the same interpreter mislabeled as a matrix.
+      - name: Install Python 3.10
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+      - name: Install Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install Python 3.13
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      # P1-6 (Sol11 rc5 Session 8): install minisign. release_toolset.py
+      # (run by release.sh) records the exact binary's SHA-256 in
+      # dist/toolset.json -- the authoritative per-release pin. ubuntu-latest's
+      # apt minisign is deterministic for that runner image's ubuntu version;
+      # for a fully immutable digest-pinned builder image, replace this step
+      # with a download verified against a pre-recorded SHA-256 (the toolset
+      # hash check then catches any substitution).
+      - name: Install Minisign
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y minisign
+          command -v minisign && minisign -v 2>&1 || true
+
+      # P1-4: assert every interpreter the Assayer matrix requires is actually
+      # on PATH -- a clean runner has none of them pre-installed, and a missing
+      # python3.X is a release-blocking FAIL inside release.sh. Failing here
+      # gives a clearer error than a mid-matrix discovery.
+      - name: Verify the full Python matrix is on PATH
+        run: |
+          for py in python3.10 python3.11 python3.12 python3.13; do
+            if ! command -v "$py" >/dev/null 2>&1; then
+              echo "::error::${py} is not on PATH — the Assayer matrix cannot run"
+              exit 1
+            fi
+            echo "$py: $("$py" -c 'import platform; print(platform.python_version())')"
+          done
 
       - name: Derive VERSION from the pushed tag
         run: echo "VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
@@ -63,11 +150,15 @@ jobs:
         env:
           GOV_RELEASE_HMAC_KEY: ${{ secrets.GOV_RELEASE_HMAC_KEY }}
           GOV_RELEASE_MINISIGN_KEY: ${{ env.MINISIGN_KEY_PATH }}
-          # P0-7 (Sol redteam v4 S8): this is the actual publish path (tag
-          # push only) -- always require HEAD to carry the exact v<version>
-          # tag this run claims, closing "build releases only from a clean,
-          # tagged commit." Local dry-runs (docs/publishing.md) leave this
-          # unset and keep working from a clean but untagged tree.
+          # P1-4 (Sol11 rc5 Session 8): ASSAYER_REPO set explicitly to the
+          # path the Assayer checkout step materialized above. Before this,
+          # release.sh defaulted to /mnt/e/downloads/assayer, a path that
+          # does not exist on a GitHub-hosted runner.
+          ASSAYER_REPO: ${{ github.workspace }}/assayer
+          # P1-8 (Sol11 rc5 Session 8): release.sh now auto-detects strict
+          # release mode from HEAD's own v* tag, so REQUIRE_TAG would engage
+          # without this env var. Kept explicit as belt-and-suspenders and
+          # to document intent -- a tag push is always a real release.
           REQUIRE_TAG: "1"
           REQUIRE_ASYMMETRIC_SIGNATURE: "1"
         run: scripts/release.sh
@@ -87,6 +178,7 @@ jobs:
             dist/test-summary.json
             dist/acceptance-summary.json
             dist/claims-verify-report.txt
+            dist/toolset.json
             dist/checksums.txt.hmac
           if-no-files-found: warn
 
@@ -105,4 +197,5 @@ jobs:
             dist/test-summary.json
             dist/acceptance-summary.json
             dist/claims-verify-report.txt
+            dist/toolset.json
             dist/checksums.txt.hmac

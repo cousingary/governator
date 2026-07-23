@@ -1,0 +1,16 @@
+# Pinned Assayer ref for reproducible releases (Sol11 rc5 Session 8, P1-4).
+#
+# Both scripts/release.sh and .github/workflows/release.yml read this file so
+# a local release and a CI release check out the exact same Assayer commit.
+# scripts/assayer_verify.sh additionally confirms the checked-out commit
+# carries a Git tag matching Assayer's own pyproject.toml version -- a tag
+# pointing at the wrong commit, or a pyproject version with no tag at all,
+# fails the release outright (Sol v7 S8, corpus case 37).
+#
+# Before this file existed, .github/workflows/release.yml checked out only
+# Governator and left ASSAYER_REPO unset; release.sh defaulted ASSAYER_REPO
+# to /mnt/e/downloads/assayer, which does not exist on a GitHub-hosted
+# runner, so the documented tag-push workflow could not reproduce the local
+# release pipeline (Sol11 P1-4). Update this ref as part of the same
+# change that bumps the Assayer pin -- never point it at a moving branch.
+ref=v1.1.3

@@ -62,14 +62,28 @@ if [ -z "${VERSION:-}" ]; then
   fi
 fi
 
+# P1-8 (Sol11 rc5 Session 8): auto-detect release mode from HEAD's own tag
+# state, not a caller-set env var. When HEAD carries an exact v* tag and
+# VERSION matches it, this run is unambiguously a production release --
+# REQUIRE_TAG (and everything that derives from it: REQUIRE_ZERO_SKIPS,
+# the architecture-doc/signature evidence gates) defaults ON without the
+# operator remembering to set REQUIRE_TAG=1. The rc4 failure mode the
+# report names ("tagged release semantics still depend on caller-supplied
+# environment") was a manual invocation from a tagged rc commit that got
+# weaker semantics unless the caller remembered the env var. Local dev
+# candidates (local-candidate-*, an explicit VERSION from an untagged
+# tree) keep their existing weaker defaults.
+EXACT_TAG_AT_HEAD=$(git describe --tags --exact-match HEAD 2>/dev/null || true)
+AUTO_RELEASE_MODE=0
+if [ -n "$EXACT_TAG_AT_HEAD" ] && [ "v${VERSION}" = "$EXACT_TAG_AT_HEAD" ]; then
+  AUTO_RELEASE_MODE=1
+fi
 # P0-7 (Sol redteam v4 S8): "build releases only from a clean, tagged
-# commit." REQUIRE_TAG defaults off so docs/publishing.md's documented local
-# dry-run ("check the pipeline is clean before tagging") keeps working
-# unchanged; .github/workflows/release.yml -- the actual publish path,
-# triggered only by a v* tag push -- sets REQUIRE_TAG=1, so the one pipeline
-# that ships a real release always asserts HEAD carries the exact tag this
-# VERSION claims.
-REQUIRE_TAG=${REQUIRE_TAG:-0}
+# commit." REQUIRE_TAG defaults to AUTO_RELEASE_MODE (P1-8 above) so a
+# tagged HEAD enters strict release mode without any env var; an operator
+# can still force it off (REQUIRE_TAG=0) for a local dry-run of a tagged
+# commit, or force it on (REQUIRE_TAG=1) on an untagged tree.
+REQUIRE_TAG=${REQUIRE_TAG:-$AUTO_RELEASE_MODE}
 if [ "$REQUIRE_TAG" = 1 ]; then
   TAG_AT_HEAD=$(git tag --points-at HEAD | grep -x "v${VERSION}" || true)
   if [ -z "$TAG_AT_HEAD" ]; then
@@ -145,7 +159,29 @@ GO_TEST_PARALLELISM=${GO_TEST_PARALLELISM:-2}
 # platforms with CGO_ENABLED=0 (modernc.org/sqlite is pure Go, no cgo
 # toolchain needed for cross-compilation).
 PLATFORMS=${PLATFORMS:-"linux/amd64 linux/arm64 darwin/amd64 darwin/arm64"}
+# P1-4 (Sol11 rc5 Session 8): ASSAYER_REPO defaults to the sibling checkout
+# for local runs; .github/workflows/release.yml sets it explicitly to the
+# path actions/checkout materialized Assayer at (the local default
+# /mnt/e/downloads/assayer does not exist on a GitHub-hosted runner).
 ASSAYER_REPO=${ASSAYER_REPO:-/mnt/e/downloads/assayer}
+# P1-4: assayer.lock is the version-controlled pin of which Assayer ref
+# both local and CI releases must check out. When the Assayer checkout
+# exists, record the locked ref in the release record so a downstream
+# verifier can confirm this release was built against the declared Assayer
+# version, not an arbitrary HEAD. scripts/assayer_verify.sh independently
+# confirms the checkout's HEAD carries a Git tag matching Assayer's own
+# pyproject.toml version.
+ASSAYER_LOCK_FILE="$SOURCE_ROOT/assayer.lock"
+ASSAYER_LOCKED_REF=""
+if [ -f "$ASSAYER_LOCK_FILE" ]; then
+  ASSAYER_LOCKED_REF=$(python3 -c "
+import sys
+for line in open(sys.argv[1]):
+    line = line.split('#', 1)[0].strip()
+    if line.startswith('ref='):
+        print(line[4:]); break
+" "$ASSAYER_LOCK_FILE" 2>/dev/null || true)
+fi
 # P1-5: Assayer's commit is part of release IDENTITY (a checkpoint from a
 # release attempt built against a different Assayer checkout must never be
 # reused) -- computed here, before any test tier runs, rather than only
@@ -159,6 +195,19 @@ fi
 GO_SUM_HASH=$(sha256sum go.sum | awk '{print $1}')
 
 # ---------------------------------------------------------------------------
+# P1-6 (Sol11 rc5 Session 8): record every release tool's exact binary
+# identity (absolute path + SHA-256 + version) into toolset.json BEFORE the
+# checkpoint identity is computed, so the toolset_hash is folded into
+# TOOLCHAIN_HASH below -- a substituted tool (different binary SHA-256, same
+# name on PATH) invalidates every prior checkpoint, exactly as the forged-
+# minisign result (S1/P0-1) demonstrated matters. toolset.json itself is
+# written to a temp file here (OUT_DIR may be wiped below for a fresh
+# attempt) and moved into place once OUT_DIR is settled.
+# ---------------------------------------------------------------------------
+TOOLSET_JSON_TEMP=$(mktemp)
+TOOLSET_HASH=$(python3 "$ROOT/scripts/release_toolset.py" --out "$TOOLSET_JSON_TEMP")
+
+# ---------------------------------------------------------------------------
 # P1-5 (Sol11): release-attempt state machine identity + resumable
 # checkpoints. Every field below, if it changes between a crashed attempt
 # and a resuming one, invalidates every existing tier checkpoint -- a fresh
@@ -167,7 +216,11 @@ GO_SUM_HASH=$(sha256sum go.sum | awk '{print $1}')
 # as the crashed attempt left them, and each tier below reuses its
 # checkpoint instead of re-running (scripts/release_tier_pipeline.sh).
 # ---------------------------------------------------------------------------
-TOOLCHAIN_HASH=$(printf '%s|%s\n' "$(go version)" "$(python3 --version 2>&1)" | sha256sum | awk '{print $1}')
+# P1-6: TOOLCHAIN_HASH now folds in TOOLSET_HASH (actual binary hashes), not
+# just go/python version strings -- a checkpoint from an attempt whose go
+# binary changed underneath it (same go version string, different binary)
+# is correctly invalidated.
+TOOLCHAIN_HASH=$(printf '%s|%s|%s\n' "$(go version)" "$(python3 --version 2>&1)" "$TOOLSET_HASH" | sha256sum | awk '{print $1}')
 ENVIRONMENT_HASH=$(printf '%s|GOMAXPROCS=%s|parallelism=%s|platforms=%s\n' "$(uname -a)" "${GOMAXPROCS:-}" "$GO_TEST_PARALLELISM" "$PLATFORMS" | sha256sum | awk '{print $1}')
 RELEASE_TAG_FOR_IDENTITY=$(git tag --points-at HEAD 2>/dev/null | sort | head -1)
 
@@ -200,6 +253,11 @@ fi
 IDENTITY_FILE="$CHECKPOINT_STATE_DIR/identity.json"
 python3 "$ROOT/scripts/release_checkpoint.py" init --state-dir "$CHECKPOINT_STATE_DIR" --identity-file "$CANDIDATE_IDENTITY" --attempt-id "$RELEASE_ATTEMPT_ID" >/dev/null
 rm -f "$CANDIDATE_IDENTITY"
+
+# P1-6: now that OUT_DIR is settled (either reused from a matching prior
+# attempt or freshly wiped+recreated), materialize the toolset record that
+# was computed against the temp file above into its shipped location.
+mv "$TOOLSET_JSON_TEMP" "$OUT_DIR/toolset.json"
 
 # ---------------------------------------------------------------------------
 # Stability preflight (Sol11 P1-5): record the exact host conditions this
@@ -1015,13 +1073,15 @@ PYARCH
 
 MANIFEST="$OUT_DIR/build-manifest.json"
 python3 - "$MANIFEST" "$VERSION" "$COMMIT" "$BUILD_TS" "$GO_VERSION" "$LDFLAGS" "$CLAIMS_HASH" "$ADAPTER_PROTOCOL_VERSION" "$ARTIFACTS_JSON" \
-  "$HOST_ARCHIVE_NAME" "$HOST_ARCHIVE_SHA" "$HOST_BIN_SHA" "$TEST_RUN_ID" "$TEST_SUMMARY" "$ACCEPTANCE_RUN_ID" "$ACCEPTANCE_RESULT" "$(basename "$ARCHITECTURE_METADATA")" "$RELEASE_ATTEMPT_ID" <<'PYMANIFEST'
+  "$HOST_ARCHIVE_NAME" "$HOST_ARCHIVE_SHA" "$HOST_BIN_SHA" "$TEST_RUN_ID" "$TEST_SUMMARY" "$ACCEPTANCE_RUN_ID" "$ACCEPTANCE_RESULT" "$(basename "$ARCHITECTURE_METADATA")" "$RELEASE_ATTEMPT_ID" \
+  "$TOOLSET_HASH" "$ASSAYER_LOCKED_REF" "$ASSAYER_VERSION" <<'PYMANIFEST'
 import json, pathlib, sys
 
 (manifest, version, commit, build_ts, go_version, build_flags, claims_hash,
  adapter_protocol_version, artifacts_path,
  host_archive_name, host_archive_sha, host_bin_sha, test_run_id, test_summary_path, acceptance_run_id, acceptance_result, architecture_metadata_path,
- release_attempt_id) = sys.argv[1:]
+ release_attempt_id,
+ toolset_hash, assayer_locked_ref, assayer_version) = sys.argv[1:]
 
 artifacts = []
 for line in pathlib.Path(artifacts_path).read_text().splitlines():
@@ -1058,6 +1118,21 @@ data = {
     # release-mode check, Session 3) can confirm every piece of evidence it
     # ships actually belongs to this one attempt.
     "release_attempt_id": release_attempt_id,
+    # P1-6 (Sol11 rc5 Session 8): the exact release-toolset hash -- every
+    # release tool's binary SHA-256 is recorded in toolset.json (shipped
+    # alongside this manifest); this combined hash is the identity a
+    # downstream verifier compares to confirm the release was produced by
+    # the exact toolset this manifest claims, not ambient PATH-resolved
+    # executables a substituted binary could have intercepted.
+    "toolset_hash": toolset_hash,
+    "toolset_path": "toolset.json",
+    # P1-4 (Sol11 rc5 Session 8): the Assayer ref assayer.lock declared for
+    # this release -- the version-controlled pin both local and CI releases
+    # check out, so the two produce byte-for-byte comparable evidence.
+    # scripts/assayer_verify.sh independently confirms the checkout's HEAD
+    # carries a Git tag matching Assayer's own pyproject.toml version.
+    "assayer_locked_ref": assayer_locked_ref,
+    "assayer_version": assayer_version,
 }
 key = pathlib.os.environ.get("GOV_RELEASE_HMAC_KEY", "")
 if key:
@@ -1108,7 +1183,7 @@ rm -rf "$OUT_DIR"/stage-*
 rm -f "$MAIN_TIER_JSONL" "$OUT_DIR/.checkpoint-aggregate.json"
 
 CHECKSUMS="$OUT_DIR/checksums.txt"
-(cd "$OUT_DIR" && sha256sum -- *.tar.gz build-manifest.json architecture-build-metadata.json sbom.json claims.yaml test-summary.json acceptance-summary.json claims-verify-report.txt preflight.json gov *.log.gz >"$(basename "$CHECKSUMS")")
+(cd "$OUT_DIR" && sha256sum -- *.tar.gz build-manifest.json architecture-build-metadata.json sbom.json claims.yaml test-summary.json acceptance-summary.json claims-verify-report.txt preflight.json toolset.json gov *.log.gz >"$(basename "$CHECKSUMS")")
 
 # ---------------------------------------------------------------------------
 # checksums.txt.hmac — HMAC-SHA256 over checksums.txt, keyed by an

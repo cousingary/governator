@@ -135,7 +135,7 @@ func s3BuildCompleteDist(t *testing.T, commit string) string {
 	t.Helper()
 	dist := t.TempDir()
 	s3WriteDummyArchive(t, filepath.Join(dist, "gov_1.0.0-test_linux_amd64.tar.gz"))
-	for _, name := range []string{"checksums.txt", "checksums.txt.minisig", "architecture-build-metadata.json", "sbom.json", "claims.yaml", "claims-verify-report.txt", "preflight.json"} {
+	for _, name := range []string{"checksums.txt", "checksums.txt.minisig", "architecture-build-metadata.json", "sbom.json", "claims.yaml", "claims-verify-report.txt", "preflight.json", "toolset.json"} {
 		if err := os.WriteFile(filepath.Join(dist, name), []byte("placeholder\n"), 0o644); err != nil {
 			t.Fatal(err)
 		}

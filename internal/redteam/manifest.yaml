@@ -1101,3 +1101,26 @@ cases:
       predicate: proc1_fd_unreadable
       reason: "cannot exercise the permission-denied path on this host"
     status: implemented
+  # Sol11 rc5 Session 8 (P1-4, P1-6, P1-8): release workflow, pinned tools,
+  # auto-detect release mode. Case 191 (corpus 45) proves a test log
+  # referenced by test-summary.json but absent from dist/ fails the release
+  # evidence gate. Cases 192-193 (corpus 47/48) prove the canonical GitHub
+  # workflow can reproduce the full local pipeline on a clean runner
+  # (Assayer checkout at pinned ref, Python 3.10-3.13 matrix, Minisign,
+  # ASSAYER_REPO) and that a workflow without Assayer checkout cannot
+  # produce a release (assayer.lock pin + release.sh's hard-fail gate).
+  - case: 191
+    name: TestV11Case46ExactTestLogReferencedButAbsentFailsRelease
+    session: rc5-s8
+    required: true
+    status: implemented
+  - case: 192
+    name: TestV11Case47CanonicalGitHubWorkflowReproducesOnCleanRunner
+    session: rc5-s8
+    required: true
+    status: implemented
+  - case: 193
+    name: TestV11Case48ReleaseWorkflowWithoutAssayerCheckoutFails
+    session: rc5-s8
+    required: true
+    status: implemented
