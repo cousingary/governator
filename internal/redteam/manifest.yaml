@@ -1124,3 +1124,17 @@ cases:
     session: rc5-s8
     required: true
     status: implemented
+  # Sol11 rc5 Session 9 (terminal): corpus cases 44 and 49, deliberately left
+  # for this session rather than 1-8 since both require the release identity
+  # mechanics (Session 3) and zero-skip gate (Session 1/8) to already exist
+  # and are proved against the real toolchain/manifest, not a synthetic one.
+  - case: 194
+    name: TestV11Case49TagRepointedAfterReleaseFailsAuditBundleValidation
+    session: rc5-s9
+    required: true
+    status: implemented
+  - case: 195
+    name: TestV11Case50ProductionManifestSkipOfAnyAttackFailsRelease
+    session: rc5-s9
+    required: true
+    status: implemented
