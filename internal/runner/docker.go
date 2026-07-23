@@ -340,6 +340,19 @@ func (d *DockerRunner) runArgs(ws Workspace, bin string, args []string) ([]strin
 	// cannot write through this path without first defeating the mount
 	// itself, which requires CAP_SYS_ADMIN -- absent from Docker's default
 	// capability set and never added by this config.
+	//
+	// Sol11 P0-7: this closes overwrite THROUGH the mounted path, but the
+	// underlying host directory ws.ConsumedDir names is still an ordinary
+	// same-UID-writable directory on the host -- another process running as
+	// Governator's own user (not the container) can still alter it there and
+	// restore it before the next hash check. The local backend's own launch
+	// and every validator no longer use this directory at all (they read a
+	// sealed, kernel-write-sealed memfd projected into a private tmpfs
+	// instead -- see runtime.sealConsumedArtifacts), but Docker's daemon is
+	// a wholly separate process that needs a real host path to bind from,
+	// and Governator has no privilege to make that path itself immutable.
+	// This remains an honestly-labelled residual gap; see
+	// runtime.consumedArtifactStoreDir's doc comment.
 	if ws.ConsumedDir != "" {
 		out = append(out, "-v", filepath.Clean(ws.ConsumedDir)+":/workspace/.governator/consumed:ro")
 	}

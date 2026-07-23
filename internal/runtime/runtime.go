@@ -3196,6 +3196,8 @@ func (r *Runner) runOnce(ctx context.Context, c contracts.Contract) (RunRecord, 
 	stageDir := filepath.Join(work, ".governator", "consumed")
 	consumedBoundary := ""
 	externalConsumedStore := false
+	plainConsumedStaged := false
+	var sealedConsumed []sealedConsumedArtifact
 	if len(transaction.Artifacts) > 0 {
 		switch {
 		case c.EffectiveRunner() == "docker":
@@ -3207,27 +3209,41 @@ func (r *Runner) runOnce(ctx context.Context, c contracts.Contract) (RunRecord, 
 		}
 		externalConsumedStore = consumedBoundary == "docker-ro-bind-mount" || consumedBoundary == "landlock-mount-namespace-ro-bind"
 		if externalConsumedStore {
-			stageDir = consumedArtifactStoreDir(r.Home, id)
 			// The workspace-relative mount point .governator/consumed must
 			// already exist, empty, before any of the docker :ro -v, the
-			// local backend's ro-bind mount(2) call, or a validator's own
-			// ro-bind (see the success/cleanup validator loops below --
+			// local backend's private-tmpfs projection, or a validator's own
+			// projection (see the success/cleanup validator loops below --
 			// internal/stage.Executor always runs host-side regardless of
 			// runner kind, so a validator that reads a consumed artifact
-			// needs this same mount established for ITS OWN launch too, not
-			// just the backend's).
+			// needs this same mount point established for ITS OWN launch
+			// too, not just the backend's).
 			if err := os.MkdirAll(filepath.Join(work, ".governator", "consumed"), 0700); err != nil {
 				return RunRecord{}, fmt.Errorf("pre-create consumed-artifact mount point: %w", err)
 			}
-			if c.EffectiveRunner() == "docker" {
-				ws.ConsumedDir = stageDir
+		}
+		// Sol11 P0-7: the local backend's own launch and every validator
+		// (both runner kinds) read consumed artifacts exclusively through
+		// sealed memfd content from here on -- see
+		// consumedArtifactStoreDir's doc comment for why a real host
+		// directory (stageConsumedArtifacts below) is still populated for
+		// the docker-backend and mode-bits-degraded sub-cases specifically.
+		var sealErr error
+		sealedConsumed, sealErr = sealConsumedArtifacts(transaction.Artifacts)
+		if sealErr != nil {
+			return RunRecord{}, sealErr
+		}
+		if consumedBoundary == "docker-ro-bind-mount" {
+			stageDir = consumedArtifactStoreDir(r.Home, id)
+			ws.ConsumedDir = stageDir
+		}
+		if consumedBoundary == "docker-ro-bind-mount" || consumedBoundary == "mode-bits-degraded" {
+			plainConsumedStaged = true
+			if _, err := stageConsumedArtifacts(stageDir, transaction.Artifacts); err != nil {
+				return RunRecord{}, err
 			}
 		}
 	}
-	_, err = stageConsumedArtifacts(stageDir, transaction.Artifacts)
-	if err != nil {
-		return RunRecord{}, err
-	}
+	defer closeSealedConsumedArtifacts(sealedConsumed)
 	if err = observability.RecordIdentity(db, c.JobID, c.JobType, resolved.Agent, rec.Created); err != nil {
 		return rec, err
 	}
@@ -3316,10 +3332,9 @@ func (r *Runner) runOnce(ctx context.Context, c contracts.Contract) (RunRecord, 
 		enforcePlan = enforcePlan.WithWriteRoots(writeDirs, writeFiles)
 	}
 	if consumedBoundary == "landlock-mount-namespace-ro-bind" {
-		enforcePlan = enforcePlan.WithReadOnlyBinds(enforce.ROBind{
-			Src: stageDir,
-			Dst: filepath.Join(work, ".governator", "consumed"),
-		})
+		// Sol11 P0-7: sealed memfd content projected into a private tmpfs,
+		// never a real host directory bound in.
+		enforcePlan = enforcePlan.WithConsumedArtifacts(filepath.Join(work, ".governator", "consumed"), consumedArtifactFDs(sealedConsumed))
 	}
 	ctx = enforce.WithPlan(ctx, enforcePlan)
 	// Sol P0-6 / Session 3: thread the run's single resolved handle to
@@ -3363,7 +3378,7 @@ func (r *Runner) runOnce(ctx context.Context, c contracts.Contract) (RunRecord, 
 		// Sol10 P0-1 checkpoint 1/4: verify every consumed artifact
 		// immediately before the untrusted backend actually starts.
 		if len(transaction.Artifacts) > 0 {
-			if verr := verifyConsumedArtifacts(stageDir, transaction.Artifacts); verr != nil {
+			if verr := verifyConsumedArtifactsAll(stageDir, plainConsumedStaged, sealedConsumed, transaction.Artifacts); verr != nil {
 				return RunRecord{}, verr
 			}
 		}
@@ -3429,7 +3444,7 @@ func (r *Runner) runOnce(ctx context.Context, c contracts.Contract) (RunRecord, 
 	// Sol10 P0-1 checkpoint 2/4: verify every consumed artifact immediately
 	// after the backend's own descendant tree is kernel-confirmed extinct.
 	if len(transaction.Artifacts) > 0 {
-		if verr := verifyConsumedArtifacts(stageDir, transaction.Artifacts); verr != nil {
+		if verr := verifyConsumedArtifactsAll(stageDir, plainConsumedStaged, sealedConsumed, transaction.Artifacts); verr != nil {
 			return RunRecord{}, verr
 		}
 	}
@@ -3715,7 +3730,7 @@ func (r *Runner) runOnce(ctx context.Context, c contracts.Contract) (RunRecord, 
 	// Sol10 P0-1 checkpoint 3/4: verify every consumed artifact immediately
 	// before the validator phase a validator that reads it might run in.
 	if len(transaction.Artifacts) > 0 {
-		if verr := verifyConsumedArtifacts(stageDir, transaction.Artifacts); verr != nil {
+		if verr := verifyConsumedArtifactsAll(stageDir, plainConsumedStaged, sealedConsumed, transaction.Artifacts); verr != nil {
 			violations = append(violations, verr.Error())
 		}
 	}
@@ -3804,13 +3819,14 @@ func (r *Runner) runOnce(ctx context.Context, c contracts.Contract) (RunRecord, 
 			authority := validatorAuthority(work, validatorSpec, true, requireStrongDescendants)
 			authority.ReadRoots = append(authority.ReadRoots, sealedReadRoots...)
 			if externalConsumedStore {
-				// Sol10 P0-1: same reasoning as the success-validator loop
-				// below -- and read-only regardless of this cleanup
-				// validator's own write authority elsewhere in the
-				// workspace, since the ro-bind's RODirs rule is bound to a
-				// separate mount Landlock governs independently of the
-				// workspace's write grants.
-				authority.ROBinds = append(authority.ROBinds, enforce.ROBind{Src: stageDir, Dst: filepath.Join(work, ".governator", "consumed")})
+				// Sol11 P0-7: same reasoning as the success-validator loop
+				// below -- sealed memfd content projected into a private
+				// tmpfs, read-only regardless of this cleanup validator's
+				// own write authority elsewhere in the workspace, since the
+				// tmpfs is a separate mount Landlock governs independently
+				// of the workspace's write grants.
+				authority.ConsumedDst = filepath.Join(work, ".governator", "consumed")
+				authority.ConsumedArtifacts = consumedArtifactFDs(sealedConsumed)
 			}
 			code, out, e, extinctionErr := shellStage(vctx, id, "cleanup-validator", work, v, authority, env.Controller, toolDirs, env.ToolRegistry)
 			cancel()
@@ -3900,11 +3916,14 @@ func (r *Runner) runOnce(ctx context.Context, c contracts.Contract) (RunRecord, 
 		authority := validatorAuthority(work, validatorSpec, false, requireStrongDescendants)
 		authority.ReadRoots = append(authority.ReadRoots, sealedReadRoots...)
 		if externalConsumedStore {
-			// Sol10 P0-1: internal/stage.Executor compiles its own fresh
+			// Sol11 P0-7: internal/stage.Executor compiles its own fresh
 			// enforce.Plan for this validator launch, independent of the
-			// backend's -- it needs its own ro-bind to see consumed
-			// artifacts at all now that they no longer live under work.
-			authority.ROBinds = append(authority.ROBinds, enforce.ROBind{Src: stageDir, Dst: filepath.Join(work, ".governator", "consumed")})
+			// backend's -- it needs its own sealed-memfd projection to see
+			// consumed artifacts at all now that they no longer live under
+			// work, and never through a real host directory another
+			// same-UID process could reach.
+			authority.ConsumedDst = filepath.Join(work, ".governator", "consumed")
+			authority.ConsumedArtifacts = consumedArtifactFDs(sealedConsumed)
 		}
 		code, out, e, extinctionErr := shellStage(vctx, id, "success-validator", work, v, authority, env.Controller, toolDirs, env.ToolRegistry)
 		cancel()
@@ -3957,7 +3976,7 @@ func (r *Runner) runOnce(ctx context.Context, c contracts.Contract) (RunRecord, 
 	// Assay) has run, immediately before the final structural barrier and
 	// merge decision below.
 	if len(violations) == 0 && len(transaction.Artifacts) > 0 {
-		if verr := verifyConsumedArtifacts(stageDir, transaction.Artifacts); verr != nil {
+		if verr := verifyConsumedArtifactsAll(stageDir, plainConsumedStaged, sealedConsumed, transaction.Artifacts); verr != nil {
 			violations = append(violations, verr.Error())
 		}
 	}

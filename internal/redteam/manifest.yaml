@@ -1010,3 +1010,28 @@ cases:
     session: rc5-s5
     required: true
     status: implemented
+  # Sol11 rc5 Session 6 (P0-7): consumed artifacts were moved outside the
+  # writable worktree and exposed read-only (Sol10 P0-1), but the SOURCE
+  # object at consumedArtifactStoreDir(home, runID) remained an ordinary
+  # same-UID-writable directory -- another process running as Governator's
+  # own user could alter it after the pre-run hash check and restore it
+  # before the next one, with the read-only mount never protecting the
+  # underlying host source at all. Cases 181-182 prove the fix
+  # (internal/runtime/artifacts.go's sealConsumedArtifacts +
+  # enforce.Plan.WithConsumedArtifacts): every consumed artifact under the
+  # landlock-mount-namespace-ro-bind boundary exists only as a sealed,
+  # unlinked memfd projected into a fresh private tmpfs at launch time, for
+  # both the backend's own launch and every validator launch, regardless of
+  # runner kind -- no host source directory is ever created for this
+  # boundary at all, and even a same-UID process that obtains the memfd's
+  # descriptor directly cannot write to it.
+  - case: 181
+    name: TestV11Case36ConsumedArtifactSealedMemfdReopenWriteAttemptRejected
+    session: rc5-s6
+    required: true
+    status: implemented
+  - case: 182
+    name: TestV11Case37ConsumedArtifactStoreNeverCreatedUnderLandlockBoundary
+    session: rc5-s6
+    required: true
+    status: implemented

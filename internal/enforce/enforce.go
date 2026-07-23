@@ -86,6 +86,18 @@ type Plan struct {
 	// recursive reach stops at the new mount boundary. See RunSandboxExec.
 	ROBinds []ROBind
 
+	// ConsumedDst/ConsumedArtifacts project sealed, kernel-write-sealed
+	// memfd content directly into a fresh, private tmpfs __sandbox_exec
+	// mounts at ConsumedDst (Sol11 P0-7): unlike ROBinds, there is no real
+	// host source directory at all -- the retained descriptors in
+	// ConsumedArtifacts are the only place the bytes exist prior to
+	// projection, so no same-UID process outside this one launch's own
+	// private mount namespace ever has a filesystem path to locate and
+	// mutate them. ConsumedDst is a pre-created, empty placeholder
+	// directory beneath Workspace, exactly like ROBind.Dst.
+	ConsumedDst       string
+	ConsumedArtifacts []ConsumedArtifactFD
+
 	// selfExe is the string-based launch path used only when selfExeFile is
 	// nil: the SelfExeOverride test seam (a real, distinct sealed-copy file,
 	// never process-relative) or a non-Linux os.Executable() result. Never
@@ -433,6 +445,34 @@ func (p Plan) WithReadOnlyBinds(binds ...ROBind) Plan {
 	return p
 }
 
+// ConsumedArtifactFD is one named consumed artifact's sealed, unlinked memfd
+// content (runtime.sealConsumedArtifacts), threaded through Wrap/WrapWith
+// exactly like selfExeFile/unshareHandle/binFile: the retained descriptor,
+// never a real host directory path, is what __sandbox_exec inherits and
+// projects into a fresh, private tmpfs at Plan.ConsumedDst.
+type ConsumedArtifactFD struct {
+	Name string
+	File *os.File
+}
+
+// WithConsumedArtifacts requires a fresh, private, read-only tmpfs be
+// mounted directly at dst (a pre-created, empty placeholder directory
+// beneath Workspace, mirroring ROBind.Dst's contract) and populated from
+// files' sealed memfd content, inside the private mount namespace Wrap
+// unshares for this launch (Sol11 P0-7). Unlike WithReadOnlyBinds, dst is
+// never bound from a real host source path: the bytes exist only as
+// kernel-write-sealed, unlinked memfd objects the caller retains, so no
+// same-UID process -- inside or outside this launch's own fresh namespace --
+// ever has a filesystem path to the content at all.
+func (p Plan) WithConsumedArtifacts(dst string, files []ConsumedArtifactFD) Plan {
+	if !p.Active || dst == "" || len(files) == 0 {
+		return p
+	}
+	p.ConsumedDst = dst
+	p.ConsumedArtifacts = append([]ConsumedArtifactFD(nil), files...)
+	return p
+}
+
 // Wrap rewrites bin/args so the process that actually starts is already
 // confined: Landlock is applied to it before it execs into bin (see
 // RunSandboxExec), and -- unless the run is permitted network access -- the
@@ -513,14 +553,28 @@ func (p Plan) WrapWith(alloc *toolregistry.FDAllocator, bin string, binFile *os.
 	for _, b := range p.ROBinds {
 		inner = append(inner, "--ro-bind", b.Src+"="+b.Dst)
 	}
+	for _, cf := range p.ConsumedArtifacts {
+		// Sol11 P0-7: cf.File is a sealed, unlinked memfd -- alloc.Arg
+		// threads it through the same inherited-descriptor mechanism as
+		// selfExeFile/unshareHandle above, so __sandbox_exec receives
+		// /proc/self/fd/<n> referencing its OWN inherited copy, never a real
+		// host pathname another same-UID process could locate.
+		fdArg := alloc.Arg(cf.File)
+		inner = append(inner, "--consumed-fd", fdArg+"="+cf.Name)
+	}
+	if p.ConsumedDst != "" {
+		inner = append(inner, "--consumed-dst", p.ConsumedDst)
+	}
 	inner = append(inner, "--")
 	inner = append(inner, execArg)
 	inner = append(inner, args...)
 	// Sol10 P0-1: a read-only bind mount needs a private mount namespace
 	// regardless of network policy, so AllowNetwork alone no longer decides
 	// whether this launch goes through unshare -- it only decides whether
-	// --net (no configured route) is one of the namespaces unshared.
-	if p.AllowNetwork && len(p.ROBinds) == 0 {
+	// --net (no configured route) is one of the namespaces unshared. Sol11
+	// P0-7's consumed-artifact tmpfs projection needs the same private mount
+	// namespace, so it joins ROBinds in that decision.
+	if p.AllowNetwork && len(p.ROBinds) == 0 && p.ConsumedDst == "" {
 		return inner[0], inner[1:]
 	}
 	// No configured route inside the namespace means every connect()/bind()
@@ -543,9 +597,10 @@ func (p Plan) WrapWith(alloc *toolregistry.FDAllocator, bin string, binFile *os.
 		nsFlags = append(nsFlags, "--net")
 	}
 	nsFlags = append(nsFlags, "--map-root-user")
-	if len(p.ROBinds) > 0 {
-		// --mount: a private mount namespace so the ro-bind(s) __sandbox_exec
-		// establishes below never leak to the host or outlive this launch.
+	if len(p.ROBinds) > 0 || p.ConsumedDst != "" {
+		// --mount: a private mount namespace so the ro-bind(s)/consumed-
+		// artifact tmpfs __sandbox_exec establishes below never leak to the
+		// host or outlive this launch.
 		nsFlags = append(nsFlags, "--mount")
 	}
 	full := append(append(nsFlags, "--"), inner...)

@@ -72,10 +72,18 @@ type StageAuthority struct {
 	// consumed artifact staged externally needs this set explicitly by the
 	// caller (runtime.go), never inherited from the backend's own plan.
 	ROBinds []enforce.ROBind `json:"-"`
+	// ConsumedDst/ConsumedArtifacts are Sol11 P0-7's replacement for
+	// ROBinds when a validator needs to read consumed artifacts: sealed
+	// memfd content projected into a private tmpfs, never a real host
+	// directory. Every validator launch (both success and cleanup,
+	// regardless of runner kind) sets this instead of ROBinds now -- see
+	// runtime.go's consumedArtifactFDs.
+	ConsumedDst       string                       `json:"-"`
+	ConsumedArtifacts []enforce.ConsumedArtifactFD `json:"-"`
 }
 
 func (a StageAuthority) RequiresExternalEnforcement() bool {
-	return len(a.ReadRoots) > 0 || len(a.WriteRoots) > 0 || a.Network == NetworkPolicyDenied || a.Credentials == CredentialPolicyNone || len(a.ROBinds) > 0
+	return len(a.ReadRoots) > 0 || len(a.WriteRoots) > 0 || a.Network == NetworkPolicyDenied || a.Credentials == CredentialPolicyNone || len(a.ROBinds) > 0 || len(a.ConsumedArtifacts) > 0
 }
 
 type OutputCaptureMode string
@@ -280,6 +288,7 @@ func (Executor) Run(ctx context.Context, spec StageSpec) (StageResult, error) {
 				return StageResult{}, fmt.Errorf("stage: construct authority plan: %w", cerr)
 			}
 			compiledPlan = compiledPlan.WithReadOnlyBinds(authority.ROBinds...)
+			compiledPlan = compiledPlan.WithConsumedArtifacts(authority.ConsumedDst, authority.ConsumedArtifacts)
 			// Sol v9 P0-1/P0-2: compiledPlan may hold open descriptors (see
 			// enforce.Plan.Close's doc comment) -- release them once this
 			// stage's launch (below, still within this Run call) has

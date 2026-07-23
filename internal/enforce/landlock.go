@@ -362,6 +362,9 @@ func RunSandboxExec(argv []string) int {
 	fs.Var(&writeFiles, "write-file", "pre-existing file beneath workspace granted RW despite --readonly (repeatable)")
 	var roBinds stringListFlag
 	fs.Var(&roBinds, "ro-bind", "src=dst read-only bind mount, established before the Landlock ruleset (repeatable)")
+	var consumedFDs stringListFlag
+	fs.Var(&consumedFDs, "consumed-fd", "fdpath=name sealed consumed-artifact descriptor to project into --consumed-dst (repeatable, Sol11 P0-7)")
+	consumedDst := fs.String("consumed-dst", "", "placeholder directory to mount a private read-only tmpfs onto, populated from --consumed-fd entries")
 	if err := fs.Parse(argv); err != nil {
 		fmt.Fprintln(os.Stderr, "enforce: parse sandbox-exec args:", err)
 		return 2
@@ -399,6 +402,21 @@ func RunSandboxExec(argv []string) int {
 			return 1
 		}
 		readRootsList = append(readRootsList, dst)
+	}
+	// Sol11 P0-7: consumed artifacts are projected from sealed memfds into a
+	// fresh, private tmpfs at *consumedDst -- never bound from a real host
+	// source directory -- established before the Landlock ruleset below,
+	// exactly like the ro-binds above.
+	if len(consumedFDs) > 0 {
+		if *consumedDst == "" {
+			fmt.Fprintln(os.Stderr, "enforce: --consumed-fd requires --consumed-dst")
+			return 1
+		}
+		if err := mountConsumedArtifacts(*consumedDst, []string(consumedFDs)); err != nil {
+			fmt.Fprintln(os.Stderr, "enforce: project consumed artifacts failed:", err)
+			return 1
+		}
+		readRootsList = append(readRootsList, *consumedDst)
 	}
 	if err := applyLandlockRuleset(*workspace, *readOnly, rest[0], readRootsList, writeDirs, writeFiles); err != nil {
 		fmt.Fprintln(os.Stderr, "enforce: apply landlock ruleset:", err)

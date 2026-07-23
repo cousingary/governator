@@ -15,7 +15,10 @@ import (
 	"sort"
 	"strings"
 
+	"golang.org/x/sys/unix"
+
 	"github.com/cousingary/governator/internal/contracts"
+	"github.com/cousingary/governator/internal/enforce"
 	"github.com/cousingary/governator/internal/observability"
 	"github.com/cousingary/governator/internal/pathsafe"
 )
@@ -107,11 +110,33 @@ const ConsumedArtifactMutated = "CONSUMED_ARTIFACT_MUTATED"
 // past mode bits on a file inside its OWN writable workspace -- that is
 // ordinary, privilege-free Unix file-ownership semantics, not a namespace
 // escape, so 0400 inside <work> was never a real boundary regardless of
-// --map-root-user. This directory lives under home (Governator's own state
-// directory) and is only ever exposed to the backend read-only, through the
-// mechanism runOnce selects (enforce.Plan.WithReadOnlyBinds for local,
-// Workspace.ConsumedDir's docker :ro mount for docker) -- never granted
-// RWDirs/-v (writable) anywhere.
+// --map-root-user.
+//
+// Sol11 P0-7: the read-only bind mount onto the workspace never made THIS
+// directory itself immutable -- it only made the backend's *view* of it
+// read-only, while the underlying directory entries remained ordinary,
+// same-UID-writable files any other process running as Governator's own
+// user could locate by this exact path and overwrite, then restore. runOnce
+// no longer routes the local backend's own launch, or any validator launch
+// (stage.Executor, regardless of runner kind), through this directory at
+// all: they read consumed artifacts exclusively via sealConsumedArtifacts's
+// sealed, kernel-write-sealed memfds, projected straight into a private
+// tmpfs at launch time (enforce.Plan.WithConsumedArtifacts) with no host
+// directory entry ever created for the landlock boundary.
+//
+// This directory is retained ONLY for the Docker-backend sub-case
+// (Workspace.ConsumedDir's docker :ro mount): the Docker daemon is a wholly
+// separate process, never a descendant of any private mount namespace
+// Governator establishes, so it needs a real host path it can resolve a
+// bind-mount source from -- and Governator has no privilege (no
+// CAP_SYS_ADMIN in the host mount namespace, no CAP_LINUX_IMMUTABLE) to make
+// that path itself immutable the way the memfd projection does for
+// everything else. This remains an honestly-labelled, open residual: fully
+// closing it needs either a root-owned dedicated-service-UID store or
+// fs-verity enabled out of band, neither available at Governator's own
+// runtime privilege level. Docker-backend runs still get the existing
+// hash-reverification detection layer (verifyConsumedArtifacts) as their
+// only boundary against this specific gap.
 func consumedArtifactStoreDir(home, runID string) string {
 	return filepath.Join(home, "consumed", runID)
 }
@@ -165,6 +190,141 @@ func verifyConsumedArtifacts(dir string, artifacts []stagedArtifact) error {
 		}
 	}
 	return nil
+}
+
+// consumedArtifactSeals matches assay.packageSeals exactly (Sol11 P0-6's
+// precedent): once applied, the kernel refuses every write/truncate/
+// mmap-write against the memfd, for every process holding any descriptor to
+// it -- including this one -- never merely a permission bit a same-UID
+// chmod could undo.
+const consumedArtifactSeals = unix.F_SEAL_WRITE | unix.F_SEAL_SHRINK | unix.F_SEAL_GROW | unix.F_SEAL_SEAL
+
+// sealedConsumedArtifact is one consumed artifact's content, held only as a
+// sealed, unlinked memfd (Sol11 P0-7): unlike stageConsumedArtifacts, no
+// real host directory entry is ever created for it, so no same-UID process
+// -- inside or outside Governator's own private mount namespaces -- has any
+// filesystem path through which to locate and mutate it. The controller
+// retains file for the run's whole lifetime and threads it through
+// enforce.Plan.WithConsumedArtifacts/stage.StageAuthority.ConsumedArtifacts
+// for every launch (the local backend's own, and every validator's,
+// regardless of runner kind) that must read it.
+type sealedConsumedArtifact struct {
+	Name   string
+	SHA256 string
+	Bytes  int64
+	file   *os.File
+}
+
+// sealConsumedArtifacts seals every artifact's already-verified data (see
+// consumedArtifactIdentities) into its own sealed, unlinked memfd. Returns
+// nil, nil for no artifacts. On any error, every memfd created so far is
+// closed before returning.
+func sealConsumedArtifacts(artifacts []stagedArtifact) ([]sealedConsumedArtifact, error) {
+	if len(artifacts) == 0 {
+		return nil, nil
+	}
+	out := make([]sealedConsumedArtifact, 0, len(artifacts))
+	ok := false
+	defer func() {
+		if !ok {
+			closeSealedConsumedArtifacts(out)
+		}
+	}()
+	for _, artifact := range artifacts {
+		sum := sha256.Sum256(artifact.data)
+		if hex.EncodeToString(sum[:]) != artifact.SHA256 || int64(len(artifact.data)) != artifact.Bytes {
+			return nil, fmt.Errorf("sealed consumed artifact %q identity mismatch", artifact.Name)
+		}
+		fd, merr := unix.MemfdCreate("governator-consumed-"+artifact.Name, unix.MFD_CLOEXEC|unix.MFD_ALLOW_SEALING)
+		if merr != nil {
+			return nil, fmt.Errorf("create sealed consumed-artifact memfd %q: %w", artifact.Name, merr)
+		}
+		f := os.NewFile(uintptr(fd), "governator-consumed-"+artifact.Name)
+		if _, werr := f.Write(artifact.data); werr != nil {
+			_ = f.Close()
+			return nil, fmt.Errorf("write sealed consumed-artifact memfd %q: %w", artifact.Name, werr)
+		}
+		// Seal immediately after writing, before this artifact is handed to
+		// any launch: from this point on the kernel refuses every mutation
+		// against this memfd, for every process holding any descriptor to it
+		// (Sol11 P0-7).
+		if _, serr := unix.FcntlInt(f.Fd(), unix.F_ADD_SEALS, consumedArtifactSeals); serr != nil {
+			_ = f.Close()
+			return nil, fmt.Errorf("seal consumed-artifact memfd %q: %w", artifact.Name, serr)
+		}
+		if _, serr := f.Seek(0, io.SeekStart); serr != nil {
+			_ = f.Close()
+			return nil, fmt.Errorf("rewind sealed consumed-artifact memfd %q: %w", artifact.Name, serr)
+		}
+		out = append(out, sealedConsumedArtifact{Name: artifact.Name, SHA256: artifact.SHA256, Bytes: artifact.Bytes, file: f})
+	}
+	ok = true
+	return out, nil
+}
+
+// closeSealedConsumedArtifacts releases every retained memfd. Safe to call
+// with a nil/empty slice.
+func closeSealedConsumedArtifacts(sealed []sealedConsumedArtifact) {
+	for _, a := range sealed {
+		if a.file != nil {
+			_ = a.file.Close()
+		}
+	}
+}
+
+// verifySealedConsumedArtifacts re-hashes every sealed artifact directly
+// from its retained descriptor. F_SEAL_WRITE makes a real mismatch a
+// structural impossibility rather than a race Governator might lose, but
+// this stays in place as the same defense-in-depth re-check every other
+// verification checkpoint performs -- a logic bug that skipped sealing, not
+// a same-UID tamper, is what this would actually catch.
+func verifySealedConsumedArtifacts(sealed []sealedConsumedArtifact) error {
+	for _, a := range sealed {
+		if _, err := a.file.Seek(0, io.SeekStart); err != nil {
+			return fmt.Errorf("%s: consumed artifact %q unreadable from its sealed memfd: %w", ConsumedArtifactMutated, a.Name, err)
+		}
+		sum := sha256.New()
+		n, err := io.Copy(sum, a.file)
+		if err != nil {
+			return fmt.Errorf("%s: consumed artifact %q unreadable from its sealed memfd: %w", ConsumedArtifactMutated, a.Name, err)
+		}
+		if n != a.Bytes {
+			return fmt.Errorf("%s: consumed artifact %q size changed: staged=%d now=%d", ConsumedArtifactMutated, a.Name, a.Bytes, n)
+		}
+		if actual := hex.EncodeToString(sum.Sum(nil)); actual != a.SHA256 {
+			return fmt.Errorf("%s: consumed artifact %q content changed", ConsumedArtifactMutated, a.Name)
+		}
+	}
+	return nil
+}
+
+// verifyConsumedArtifactsAll re-verifies every consumed-artifact identity
+// this run staged, across every mechanism actually in play for this run's
+// consumedBoundary (Sol11 P0-7): the plain host directory (Docker's own
+// container mount, or the legacy in-workspace mode-bits-degraded path) when
+// plainStaged is true, and the sealed memfd content whenever any was
+// sealed. Called at all four Sol10 P0-1 checkpoints.
+func verifyConsumedArtifactsAll(stageDir string, plainStaged bool, sealed []sealedConsumedArtifact, artifacts []stagedArtifact) error {
+	if plainStaged {
+		if err := verifyConsumedArtifacts(stageDir, artifacts); err != nil {
+			return err
+		}
+	}
+	return verifySealedConsumedArtifacts(sealed)
+}
+
+// consumedArtifactFDs converts sealed artifacts into the form
+// enforce.Plan.WithConsumedArtifacts/stage.StageAuthority.ConsumedArtifacts
+// take.
+func consumedArtifactFDs(sealed []sealedConsumedArtifact) []enforce.ConsumedArtifactFD {
+	if len(sealed) == 0 {
+		return nil
+	}
+	out := make([]enforce.ConsumedArtifactFD, len(sealed))
+	for i, a := range sealed {
+		out[i] = enforce.ConsumedArtifactFD{Name: a.Name, File: a.file}
+	}
+	return out
 }
 
 func artifactPromptAnnotation(staged []stagedArtifact, produced []contracts.ArtifactSpec) string {
