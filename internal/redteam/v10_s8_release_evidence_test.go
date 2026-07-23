@@ -422,8 +422,11 @@ func TestV10Case41AuditBundleGeneratedInsideSourceTreeFailsRelease(t *testing.T)
 	}
 
 	// Positive case: a sibling directory (the new default's own shape)
-	// succeeds.
-	out, err = runAuditBundle(t, fixture, filepath.Join(fixture, "..", "audit-bundle-sibling"))
+	// succeeds. Sol11 P0-2: this fixture has no populated release dist/, so
+	// the (now-default) release mode's evidence-completeness requirement
+	// would refuse it for an unrelated reason -- source-only mode isolates
+	// this assertion to the OUT_DIR-location behavior it targets.
+	out, err = runAuditBundle(t, fixture, filepath.Join(fixture, "..", "audit-bundle-sibling"), "AUDIT_BUNDLE_MODE=source-only")
 	if err != nil {
 		t.Fatalf("expected audit_bundle.sh to accept an OUT_DIR outside the checkout, got error: %v\n%s", err, out)
 	}

@@ -1,0 +1,181 @@
+#!/usr/bin/env bash
+# scripts/release_tier_pipeline.sh -- Sol11 rc5 Session 3 (P1-5): runs a
+# sequence of named tiers, each backed by an atomic, identity-scoped
+# checkpoint (scripts/release_checkpoint.py), with fail-fast semantics: the
+# first required tier that does not pass PASS aborts the whole pipeline
+# immediately -- later tiers in the same spec are never executed (corpus
+# case 19: "required tier fails and later tiers do not run").
+#
+# A tier whose checkpoint already matches the current release identity
+# byte-for-byte (same commit, same toolchain, same Assayer commit, same
+# go.sum hash, same environment, same go test parallelism, same exact
+# command) AND whose recorded result is PASS is reused instead of re-run --
+# this is what makes a crashed-and-restarted scripts/release.sh invocation
+# resumable rather than a full always-run-everything-again retry (corpus
+# case 18: "resume after exact matching completed checkpoint" must SUCCEED
+# and reuse, not re-run).
+#
+# Usage:
+#   release_tier_pipeline.sh run --state-dir DIR --identity-file FILE --spec SPECFILE
+#
+# SPECFILE: one tier per line, TAB-separated: name<TAB>logfile<TAB>command
+# (command is executed via `bash -c "$command"`). Blank lines and lines
+# starting with # are ignored.
+#
+# Emits one JSON object per line to stdout (JSON Lines), one per tier
+# actually visited, in spec order. On the first tier whose result is not
+# PASS, one final {"tier":"__pipeline__","aborted":true,...} line names the
+# failed tier and every tier that was skipped as a result, and this script
+# exits 1. On full success it exits 0 after every spec tier's line has been
+# emitted.
+set -euo pipefail
+
+ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+CHECKPOINT_PY="$ROOT/scripts/release_checkpoint.py"
+
+usage() {
+  echo "usage: $0 run --state-dir DIR --identity-file FILE --spec SPECFILE" >&2
+  exit 2
+}
+
+[ "${1:-}" = "run" ] || usage
+shift
+
+STATE_DIR=""
+IDENTITY_FILE=""
+SPEC=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --state-dir) STATE_DIR=$2; shift 2 ;;
+    --identity-file) IDENTITY_FILE=$2; shift 2 ;;
+    --spec) SPEC=$2; shift 2 ;;
+    *) usage ;;
+  esac
+done
+[ -n "$STATE_DIR" ] && [ -n "$IDENTITY_FILE" ] && [ -n "$SPEC" ] || usage
+[ -f "$SPEC" ] || { echo "release_tier_pipeline: spec file $SPEC not found" >&2; exit 2; }
+mkdir -p "$STATE_DIR"
+
+# emit_json_line: print one JSON object built entirely from argv (never from
+# string-interpolated bash variables inside a python -c body) -- avoids any
+# quoting/injection hazard from a tier name, log path, or command containing
+# characters meaningful to Python source.
+emit_json_line() {
+  python3 - "$@" <<'PY'
+import json, sys
+keys = sys.argv[1::2]
+vals = sys.argv[2::2]
+def coerce(v):
+    if v in ("__true__", "__false__"):
+        return v == "__true__"
+    try:
+        return int(v)
+    except ValueError:
+        return v
+print(json.dumps(dict(zip(keys, (coerce(v) for v in vals)))))
+PY
+}
+
+FAILED_TIER=""
+declare -a SPEC_NAMES=()
+while IFS=$'\t' read -r t_name _t_log _t_cmd || [ -n "$t_name" ]; do
+  [ -z "$t_name" ] && continue
+  case "$t_name" in \#*) continue ;; esac
+  SPEC_NAMES+=("$t_name")
+done <"$SPEC"
+
+ABORTED=false
+while IFS=$'\t' read -r NAME LOG CMD || [ -n "$NAME" ]; do
+  [ -z "$NAME" ] && continue
+  case "$NAME" in \#*) continue ;; esac
+
+  if [ "$ABORTED" = true ]; then
+    break
+  fi
+
+  CKPT="$STATE_DIR/${NAME}.json"
+  RESUMED=false
+  RESULT=""
+  SECONDS_=0
+  STARTED=""
+  ENDED=""
+  LOGSHA=""
+  EXITCODE=0
+
+  CHECK_ERR_FILE=$(mktemp)
+  if CHECK_OUT=$(python3 "$CHECKPOINT_PY" check --checkpoint "$CKPT" --identity-file "$IDENTITY_FILE" --command "$CMD" 2>"$CHECK_ERR_FILE"); then
+    if [ -f "$LOG" ]; then
+      RESUMED=true
+      RESULT=$(python3 -c "import json,sys; print(json.load(open(sys.argv[1]))['result'])" "$CKPT")
+      SECONDS_=$(python3 -c "import json,sys; print(json.load(open(sys.argv[1])).get('duration_seconds',0))" "$CKPT")
+      STARTED=$(python3 -c "import json,sys; print(json.load(open(sys.argv[1]))['started'])" "$CKPT")
+      ENDED=$(python3 -c "import json,sys; print(json.load(open(sys.argv[1]))['completed'])" "$CKPT")
+      LOGSHA=$(python3 -c "import json,sys; print(json.load(open(sys.argv[1]))['log_sha256'])" "$CKPT")
+      EXITCODE=$(python3 -c "import json,sys; print(json.load(open(sys.argv[1]))['exit_code'])" "$CKPT")
+    else
+      echo "release_tier_pipeline: tier ${NAME} checkpoint matches identity but its log ${LOG} is missing on disk -- re-running rather than trusting an unretrievable result" >&2
+    fi
+  else
+    echo "release_tier_pipeline: tier ${NAME} checkpoint not reusable: $(cat "$CHECK_ERR_FILE")" >&2
+  fi
+  rm -f "$CHECK_ERR_FILE"
+
+  if [ "$RESUMED" != true ]; then
+    START_EPOCH=$(date +%s)
+    STARTED=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+    mkdir -p "$(dirname "$LOG")"
+    set +e
+    bash -c "$CMD" >"$LOG" 2>&1
+    EXITCODE=$?
+    set -e
+    if [ "$EXITCODE" -eq 0 ]; then RESULT=PASS; else RESULT=FAIL; fi
+    END_EPOCH=$(date +%s)
+    ENDED=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+    SECONDS_=$((END_EPOCH - START_EPOCH))
+    LOGSHA=$(sha256sum "$LOG" | awk '{print $1}')
+    python3 "$CHECKPOINT_PY" write --checkpoint "$CKPT" --identity-file "$IDENTITY_FILE" \
+      --command "$CMD" --started "$STARTED" --completed "$ENDED" \
+      --exit-code "$EXITCODE" --log-sha256 "$LOGSHA" --result "$RESULT" --duration-seconds "$SECONDS_" >/dev/null
+  fi
+
+  echo "release_tier_pipeline: tier ${NAME} $([ "$RESUMED" = true ] && echo REUSED || echo RAN) result=${RESULT} (${SECONDS_}s)" >&2
+
+  emit_json_line \
+    tier "$NAME" \
+    ran "$([ "$RESUMED" = true ] && echo __false__ || echo __true__)" \
+    resumed "$([ "$RESUMED" = true ] && echo __true__ || echo __false__)" \
+    result "$RESULT" \
+    duration_seconds "$SECONDS_" \
+    started "$STARTED" \
+    completed "$ENDED" \
+    log_sha256 "$LOGSHA" \
+    exit_code "$EXITCODE" \
+    log_path "$LOG"
+
+  if [ "$RESULT" != PASS ]; then
+    ABORTED=true
+    FAILED_TIER="$NAME"
+  fi
+done <"$SPEC"
+
+if [ "$ABORTED" = true ]; then
+  SKIPPED=()
+  found=false
+  for n in "${SPEC_NAMES[@]}"; do
+    if [ "$found" = true ]; then
+      SKIPPED+=("$n")
+    fi
+    if [ "$n" = "$FAILED_TIER" ]; then
+      found=true
+    fi
+  done
+  SKIPPED_JSON=$(python3 -c "import json,sys; print(json.dumps(sys.argv[1:]))" "${SKIPPED[@]}")
+  python3 -c "
+import json, sys
+print(json.dumps({'tier': '__pipeline__', 'aborted': True, 'failed_tier': sys.argv[1], 'skipped_tiers': json.loads(sys.argv[2])}))
+" "$FAILED_TIER" "$SKIPPED_JSON"
+  echo "release_tier_pipeline: required tier ${FAILED_TIER} FAILED -- aborting, ${#SKIPPED[@]} later tier(s) not run: ${SKIPPED[*]:-none}" >&2
+  exit 1
+fi
+
+exit 0

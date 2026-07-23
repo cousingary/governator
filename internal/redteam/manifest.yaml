@@ -878,3 +878,91 @@ cases:
     session: rc5-s2
     required: true
     status: implemented
+  # Sol11 rc5 Session 3 (P0-2, P1-5, P1-7): "atomic resumable release +
+  # audit-bundle modes + architecture-truth checker". Cases 161-171 close
+  # P1-5 (the release-attempt state machine: scripts/release_checkpoint.py
+  # + scripts/release_tier_pipeline.sh) and part of P0-2 (a truncated/
+  # incomplete dist/ must fail loudly, never "audit_bundle: OK") -- report
+  # corpus cases 9-19. Cases 172-175 close P1-7 (the architecture-truth
+  # checker's five contradiction categories, extended
+  # scripts/check_architecture_doc.py) and the rest of P0-2 (the
+  # tier-checkpoint cross-check in scripts/audit_bundle_validate.py) --
+  # report corpus cases 41, 42, 43, 46. Case 170 is the one POSITIVE case
+  # in this batch: it proves an exact-identity-matching completed
+  # checkpoint is reused (resumed), not re-run -- resumability actually
+  # works, not merely "everything else correctly refuses to resume".
+  - case: 161
+    name: TestV11Case16CrashDuringUnitTierLeavesNoTrustedCheckpoint
+    session: rc5-s3
+    required: true
+    status: implemented
+  - case: 162
+    name: TestV11Case17CrashBeforeCheckpointRenameLeavesNoCorruptCheckpoint
+    session: rc5-s3
+    required: true
+    status: implemented
+  - case: 163
+    name: TestV11Case18TruncatedTestLogFailsReleaseEvidenceValidation
+    session: rc5-s3
+    required: true
+    status: implemented
+  - case: 164
+    name: TestV11Case19NonemptyDistWithOnlyOneLogFailsReleaseEvidenceValidation
+    session: rc5-s3
+    required: true
+    status: implemented
+  - case: 165
+    name: TestV11Case20StaleCheckpointFromAnotherCommitNotReused
+    session: rc5-s3
+    required: true
+    status: implemented
+  - case: 166
+    name: TestV11Case21StaleCheckpointFromAnotherGoToolchainNotReused
+    session: rc5-s3
+    required: true
+    status: implemented
+  - case: 167
+    name: TestV11Case22StaleCheckpointFromAnotherAssayerCommitNotReused
+    session: rc5-s3
+    required: true
+    status: implemented
+  - case: 168
+    name: TestV11Case23MixedTierEvidenceFromTwoAttemptsRejected
+    session: rc5-s3
+    required: true
+    status: implemented
+  - case: 169
+    name: TestV11Case24AuditBundleBeforeFinalManifestFails
+    session: rc5-s3
+    required: true
+    status: implemented
+  - case: 170
+    name: TestV11Case25ResumeAfterExactMatchingCheckpointSucceeds
+    session: rc5-s3
+    required: true
+    status: implemented
+  - case: 171
+    name: TestV11Case26RequiredTierFailsLaterTiersDoNotRun
+    session: rc5-s3
+    required: true
+    status: implemented
+  - case: 172
+    name: TestV11Case27ArchitectureCompleteWithNoArtifactsRejected
+    session: rc5-s3
+    required: true
+    status: implemented
+  - case: 173
+    name: TestV11Case28ArchitectureTagCommitDiffersFromGitTagRejected
+    session: rc5-s3
+    required: true
+    status: implemented
+  - case: 174
+    name: TestV11Case29ArchitectureCheckerSeesConflictingCurrentCommitsRejected
+    session: rc5-s3
+    required: true
+    status: implemented
+  - case: 175
+    name: TestV11Case30TestSummaryPassWithIncompleteTierCheckpointRejected
+    session: rc5-s3
+    required: true
+    status: implemented

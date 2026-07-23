@@ -129,7 +129,12 @@ func TestV9Case38BundleWithStaleBinaryRejected(t *testing.T) {
 	}
 	commitAll(t, fixture, "accidentally commit a stale binary")
 
-	out, err := runAuditBundle(t, fixture, t.TempDir())
+	// Sol11 P0-2: release mode (the new default) is release-evidence-first
+	// and would refuse this fixture's empty dist/ with
+	// INCOMPLETE_RELEASE_EVIDENCE before ever reaching the contamination
+	// scan this test targets. source-only mode is the explicit, still-run
+	// path for source-tree-only concerns like this one.
+	out, err := runAuditBundle(t, fixture, t.TempDir(), "AUDIT_BUNDLE_MODE=source-only")
 	if err == nil {
 		t.Fatalf("expected audit_bundle.sh to refuse a bundle containing bin/gov, but it succeeded:\n%s", out)
 	}
@@ -151,7 +156,9 @@ func TestV9Case39BundleWithVenvOrCacheRejected(t *testing.T) {
 	}
 	commitAll(t, fixture, "accidentally commit a venv")
 
-	out, err := runAuditBundle(t, fixture, t.TempDir())
+	// Sol11 P0-2: see TestV9Case38's comment -- source-only mode isolates
+	// this test to the contamination scan it targets.
+	out, err := runAuditBundle(t, fixture, t.TempDir(), "AUDIT_BUNDLE_MODE=source-only")
 	if err == nil {
 		t.Fatalf("expected audit_bundle.sh to refuse a bundle containing .venv, but it succeeded:\n%s", out)
 	}
@@ -295,8 +302,15 @@ func TestV9Case43ClaimsDivergenceWithoutProvenanceRejected(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	// Sol11 P0-2: this fixture's dist/ only ever carries claims.yaml (it is
+	// testing provenance recording, not release-evidence completeness) --
+	// release mode's new completeness requirement would refuse it with
+	// INCOMPLETE_RELEASE_EVIDENCE. source-only mode still copies dist/
+	// verbatim and still writes the claims provenance record; it just
+	// skips the full-evidence requirement irrelevant to what this test
+	// checks.
 	auditOut := t.TempDir()
-	out, err := runAuditBundle(t, fixture, auditOut)
+	out, err := runAuditBundle(t, fixture, auditOut, "AUDIT_BUNDLE_MODE=source-only")
 	if err != nil {
 		t.Fatalf("audit_bundle.sh should still succeed on a legitimate source/dist claims divergence, got error: %v\n%s", err, out)
 	}

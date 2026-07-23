@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# scripts/audit_bundle.sh — Sol9 P2-2: the single, canonical audit/source
-# bundle generator.
+# scripts/audit_bundle.sh — Sol9 P2-2 / Sol11 P0-2: the single, canonical
+# audit/source bundle generator.
 #
 # Before this script, the audit archive handed to a reviewer read like a
 # plain directory tar: it contained a partial .venv, Python/pytest caches,
@@ -16,6 +16,23 @@
 # so a regression (e.g. a future change that copies from the working tree
 # instead of the archive) fails loudly instead of shipping quietly.
 #
+# Sol11 P0-2: this used to treat ANY nonempty dist/ as sufficient release
+# content -- run against a dist/ containing only a truncated
+# test-unit.log, it printed "audit_bundle: OK" with a bundle carrying no
+# binary/manifest/checksums/signature/summaries. There are now TWO
+# EXPLICIT, SEPARATE bundle modes (AUDIT_BUNDLE_MODE):
+#   release (the default) -- requires a COMPLETE, verified release dist/
+#     (platform archives, checksums.txt + valid signature, build-manifest,
+#     architecture-build-metadata, sbom, claims.yaml, test-summary,
+#     acceptance-summary, claims-verify-report, every test-evidence log,
+#     PASS overall results, zero production red-team skips, exact
+#     tag-and-commit match). A partial/incomplete dist/ FAILS LOUDLY with
+#     INCOMPLETE_RELEASE_EVIDENCE -- never "audit_bundle: OK".
+#   source-only -- invoked explicitly via AUDIT_BUNDLE_MODE=source-only.
+#     Skips every release-evidence requirement above; the bundle
+#     prominently declares NOT A RELEASE / NO EXECUTABLE ARTIFACT VERIFIED
+#     (a file written into the bundle AND printed to stderr).
+#
 # Output structure (Sol9 report's recommendation):
 #   source/        exact tracked tree at REF (git archive)
 #   dist/          scripts/release.sh's own output, verbatim, if present
@@ -27,6 +44,14 @@ ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$ROOT"
 
 REF=${REF:-HEAD}
+AUDIT_BUNDLE_MODE=${AUDIT_BUNDLE_MODE:-release}
+case "$AUDIT_BUNDLE_MODE" in
+  release|source-only) ;;
+  *)
+    echo "audit_bundle: unsupported AUDIT_BUNDLE_MODE=${AUDIT_BUNDLE_MODE} -- must be 'release' (default) or 'source-only'" >&2
+    exit 2
+    ;;
+esac
 # P1-6 (Sol10 rc4 Session 8): the bundle used to land inside the checkout
 # by default ("audit-bundle" resolves under $ROOT), which the report found
 # can misle source counts, get recursively packaged by a later step, or
@@ -67,12 +92,35 @@ fi
 # this script with OUT_DIR unset, twice, into the default location under the
 # repo root) must never recurse into itself.
 rm -rf "$OUT_DIR/dist/$(basename "$OUT_DIR")"
+# A prior release attempt's checkpoint state directory (scripts/
+# release_checkpoint.py, P1-5) is internal working state, not shipped
+# release evidence -- never part of an audit bundle.
+rm -rf "$OUT_DIR/dist/.checkpoints"
+
+if [ "$AUDIT_BUNDLE_MODE" = source-only ]; then
+  NOTICE="$OUT_DIR/NOT_A_RELEASE.txt"
+  {
+    echo "NOT A RELEASE"
+    echo "NO EXECUTABLE ARTIFACT VERIFIED"
+    echo
+    echo "This bundle was generated with AUDIT_BUNDLE_MODE=source-only. It carries"
+    echo "the tracked source tree at ${REF} and, if present, whatever release.sh"
+    echo "output happened to already exist in ${DIST_DIR} -- NONE of that dist/"
+    echo "content has been checked for completeness, and no cryptographic"
+    echo "signature, checksum, or test-evidence verification has run. Do not"
+    echo "treat any binary or archive in this bundle's dist/ as a verified"
+    echo "release artifact. For a verified release bundle, run this script"
+    echo "without AUDIT_BUNDLE_MODE set (or AUDIT_BUNDLE_MODE=release) against"
+    echo "a dist/ produced by a full, passing scripts/release.sh run."
+  } >"$NOTICE"
+  echo "audit_bundle: NOT A RELEASE / NO EXECUTABLE ARTIFACT VERIFIED -- AUDIT_BUNDLE_MODE=source-only, see ${NOTICE}" >&2
+fi
 
 # --- architecture/: the standalone doc + its build metadata ---------------
 if [ -f "$ARCHITECTURE_DOC" ]; then
   cp "$ARCHITECTURE_DOC" "$OUT_DIR/architecture/"
-  if ! python3 "$ROOT/scripts/check_architecture_doc.py" "$OUT_DIR/architecture/$(basename "$ARCHITECTURE_DOC")"; then
-    echo "audit_bundle: refusing to ship a bundle with a stale architecture doc (see above)" >&2
+  if ! python3 "$ROOT/scripts/check_architecture_doc.py" "$OUT_DIR/architecture/$(basename "$ARCHITECTURE_DOC")" --repo "$ROOT" --dist-dir "$OUT_DIR/dist"; then
+    echo "audit_bundle: refusing to ship a bundle with a stale/contradictory architecture doc (see above)" >&2
     exit 1
   fi
 else
@@ -80,6 +128,30 @@ else
 fi
 if [ -f "$OUT_DIR/dist/architecture-build-metadata.json" ]; then
   cp "$OUT_DIR/dist/architecture-build-metadata.json" "$OUT_DIR/architecture/"
+fi
+
+# --- release mode (P0-2, default): the dist/ tier just copied above must be
+# a COMPLETE, verified release -- not merely nonempty. A partial dist/
+# (e.g. only a truncated test-unit.log, the exact rc4 state this finding
+# was found against) fails LOUDLY here, before any further processing, with
+# INCOMPLETE_RELEASE_EVIDENCE naming exactly what's missing.
+if [ "$AUDIT_BUNDLE_MODE" = release ]; then
+  RELEASE_COMMIT=$(git rev-parse "$REF")
+  ARCH_DOC_FOR_VALIDATE=""
+  if [ -f "$OUT_DIR/architecture/$(basename "$ARCHITECTURE_DOC" 2>/dev/null || true)" ]; then
+    ARCH_DOC_FOR_VALIDATE="$OUT_DIR/architecture/$(basename "$ARCHITECTURE_DOC")"
+  fi
+  VALIDATE_ARGS=(--dist-dir "$OUT_DIR/dist" --repo "$ROOT" --release-commit "$RELEASE_COMMIT")
+  if [ -n "$ARCH_DOC_FOR_VALIDATE" ]; then
+    VALIDATE_ARGS+=(--architecture-doc "$ARCH_DOC_FOR_VALIDATE")
+  fi
+  if [ -f "$ROOT/docs/TRUSTED_SIGNING_KEYS.txt" ] && [ -d "$ROOT/docs/signing_keys" ]; then
+    VALIDATE_ARGS+=(--trusted-fingerprints-file "$ROOT/docs/TRUSTED_SIGNING_KEYS.txt" --trusted-public-keys-dir "$ROOT/docs/signing_keys")
+  fi
+  if ! python3 "$ROOT/scripts/audit_bundle_validate.py" "${VALIDATE_ARGS[@]}"; then
+    echo "audit_bundle: refusing to ship a release-mode bundle over incomplete/unverified release evidence -- set AUDIT_BUNDLE_MODE=source-only for an explicit, clearly-labeled source-only bundle instead" >&2
+    exit 1
+  fi
 fi
 
 # --- evidence/: release/test/acceptance evidence for this ref -------------
@@ -140,5 +212,5 @@ if [ "$CONTAMINATION_FOUND" = true ]; then
   exit 1
 fi
 
-echo "audit_bundle: OK — $OUT_DIR" >&2
+echo "audit_bundle: OK (mode=${AUDIT_BUNDLE_MODE}) — $OUT_DIR" >&2
 find "$OUT_DIR" -maxdepth 2 >&2

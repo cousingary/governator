@@ -116,9 +116,14 @@ print(m.group(1) if m else "")' "$ARCHITECTURE_DOC")
   # Sol9 P2-3: a Source-HEAD match doesn't catch a stale *narrative* inside
   # the doc (the audit found an accurate Status header sitting next to a
   # Remediation-history section that still described an older release as
-  # current). Check that separately.
-  if ! python3 "$ROOT/scripts/check_architecture_doc.py" "$ARCHITECTURE_DOC"; then
-    echo "release: refusing to release with a stale architecture doc narrative (see above)" >&2
+  # current). Sol11 P1-7 extends the same checker to also validate a
+  # front-matter-style doc's five contradiction categories (tag/commit,
+  # release_state without artifacts, manifest hash, live-deployment claims)
+  # when the doc carries that block -- --repo/--dist-dir are always passed;
+  # a prose-only doc (today's live doc) has no front matter, so those extra
+  # checks are simply inert for it.
+  if ! python3 "$ROOT/scripts/check_architecture_doc.py" "$ARCHITECTURE_DOC" --repo "$SOURCE_ROOT" --dist-dir "${OUT_DIR:-dist}"; then
+    echo "release: refusing to release with a stale/contradictory architecture doc (see above)" >&2
     exit 1
   fi
 fi
@@ -141,95 +146,192 @@ GO_TEST_PARALLELISM=${GO_TEST_PARALLELISM:-2}
 # toolchain needed for cross-compilation).
 PLATFORMS=${PLATFORMS:-"linux/amd64 linux/arm64 darwin/amd64 darwin/arm64"}
 ASSAYER_REPO=${ASSAYER_REPO:-/mnt/e/downloads/assayer}
+# P1-5: Assayer's commit is part of release IDENTITY (a checkpoint from a
+# release attempt built against a different Assayer checkout must never be
+# reused) -- computed here, before any test tier runs, rather than only
+# later when architecture-build-metadata.json is written.
+if [ -d "$ASSAYER_REPO" ]; then
+  ASSAYER_COMMIT=$(git -C "$ASSAYER_REPO" rev-parse HEAD 2>/dev/null || echo "unknown")
+else
+  ASSAYER_COMMIT="absent"
+fi
 
-# Every release starts from an EMPTY staging directory (audit finding #20:
-# "several outer ZIP ELF files stored without executable permission" and
-# stale snapshot archives sitting alongside a real production binary both
-# trace back to OUT_DIR accumulating across unrelated invocations).
+GO_SUM_HASH=$(sha256sum go.sum | awk '{print $1}')
+
+# ---------------------------------------------------------------------------
+# P1-5 (Sol11): release-attempt state machine identity + resumable
+# checkpoints. Every field below, if it changes between a crashed attempt
+# and a resuming one, invalidates every existing tier checkpoint -- a fresh
+# release_attempt_id is minted and OUT_DIR is wiped before any tier runs.
+# When every field matches, OUT_DIR (and its checkpoints) are left exactly
+# as the crashed attempt left them, and each tier below reuses its
+# checkpoint instead of re-running (scripts/release_tier_pipeline.sh).
+# ---------------------------------------------------------------------------
+TOOLCHAIN_HASH=$(printf '%s|%s\n' "$(go version)" "$(python3 --version 2>&1)" | sha256sum | awk '{print $1}')
+ENVIRONMENT_HASH=$(printf '%s|GOMAXPROCS=%s|parallelism=%s|platforms=%s\n' "$(uname -a)" "${GOMAXPROCS:-}" "$GO_TEST_PARALLELISM" "$PLATFORMS" | sha256sum | awk '{print $1}')
+RELEASE_TAG_FOR_IDENTITY=$(git tag --points-at HEAD 2>/dev/null | sort | head -1)
+
 OUT_DIR=${OUT_DIR:-dist}
-rm -rf "$OUT_DIR"
-mkdir -p "$OUT_DIR"
+CHECKPOINT_STATE_DIR="$OUT_DIR/.checkpoints"
+mkdir -p "$CHECKPOINT_STATE_DIR"
+CANDIDATE_IDENTITY=$(mktemp)
+python3 "$ROOT/scripts/release_checkpoint.py" identity \
+  --governator-commit "$COMMIT" --governator-tag "$RELEASE_TAG_FOR_IDENTITY" \
+  --assayer-commit "$ASSAYER_COMMIT" --go-sum-hash "$GO_SUM_HASH" \
+  --toolchain-hash "$TOOLCHAIN_HASH" --environment-hash "$ENVIRONMENT_HASH" \
+  --go-test-parallelism "$GO_TEST_PARALLELISM" >"$CANDIDATE_IDENTITY"
+PEEK=$(python3 "$ROOT/scripts/release_checkpoint.py" peek --state-dir "$CHECKPOINT_STATE_DIR" --identity-file "$CANDIDATE_IDENTITY")
+RESUMED=$(python3 -c "import json,sys; print(json.loads(sys.argv[1])['resumed'])" "$PEEK")
+if [ "$RESUMED" = True ]; then
+  RELEASE_ATTEMPT_ID=$(python3 -c "import json,sys; print(json.loads(sys.argv[1])['attempt_id'])" "$PEEK")
+  echo "release: RESUMING release_attempt_id=${RELEASE_ATTEMPT_ID} -- prior checkpoints in ${OUT_DIR} match this attempt's identity exactly and will be reused where possible" >&2
+else
+  # Every field above (Sol11 rc5 P0-2/P1-5) EMPTY staging directory
+  # requirement: any identity mismatch (different commit, toolchain,
+  # Assayer commit, go.sum, environment, or parallelism) OR a first-ever
+  # invocation both fall here -- start a brand-new, empty attempt so no
+  # stale evidence from a different attempt can ever be aggregated
+  # (corpus case 16: "mixed tier evidence from two release attempts").
+  RELEASE_ATTEMPT_ID=$(python3 -c "import uuid; print(uuid.uuid4())")
+  echo "release: starting a FRESH release_attempt_id=${RELEASE_ATTEMPT_ID} (no matching prior attempt identity) -- wiping ${OUT_DIR}" >&2
+  rm -rf "$OUT_DIR"
+  mkdir -p "$CHECKPOINT_STATE_DIR"
+fi
+IDENTITY_FILE="$CHECKPOINT_STATE_DIR/identity.json"
+python3 "$ROOT/scripts/release_checkpoint.py" init --state-dir "$CHECKPOINT_STATE_DIR" --identity-file "$CANDIDATE_IDENTITY" --attempt-id "$RELEASE_ATTEMPT_ID" >/dev/null
+rm -f "$CANDIDATE_IDENTITY"
+
+# ---------------------------------------------------------------------------
+# Stability preflight (Sol11 P1-5): record the exact host conditions this
+# attempt started under, before any tier runs -- so an abnormal termination
+# leaves a human enough evidence on disk to distinguish "the code is wrong"
+# from "the host ran out of $RESOURCE mid-run". Best-effort throughout: a
+# probe this host can't answer (no systemd, no Docker CLI, no Landlock
+# introspection) records "unknown", never blocks or fails the release.
+# ---------------------------------------------------------------------------
+python3 "$ROOT/scripts/release_preflight.py" --out "$OUT_DIR/preflight.json" \
+  --release-attempt-id "$RELEASE_ATTEMPT_ID" --go-test-parallelism "$GO_TEST_PARALLELISM" \
+  --platforms "$PLATFORMS" >&2
 
 TEST_RUN_ID="go-test-${COMMIT}"
 ACCEPTANCE_RUN_ID="version-self-check-${COMMIT}"
 LDFLAGS="-s -w -X main.version=${VERSION} -X main.sourceCommit=${COMMIT} -X main.buildTimestamp=${BUILD_TS} -X main.claimsHash=${CLAIMS_HASH} -X main.adapterProtocolVersion=${ADAPTER_PROTOCOL_VERSION}"
 
-echo "release: version=${VERSION} commit=${COMMIT} go=${GO_VERSION}" >&2
+echo "release: version=${VERSION} commit=${COMMIT} go=${GO_VERSION} release_attempt_id=${RELEASE_ATTEMPT_ID}" >&2
 
 # ---------------------------------------------------------------------------
 # Test tiers. No cached results, no skips (audit P2.3): every tier below runs
-# for real, this invocation, and its outcome is recorded in test-summary.json
-# rather than asserted from a prior log or from "the test function exists".
+# for real THIS ATTEMPT (unless reused from an exact-identity-matching prior
+# checkpoint of the SAME attempt -- see release_tier_pipeline.sh), and its
+# outcome is recorded in test-summary.json rather than asserted from a prior
+# log or from "the test function exists".
+#
+# P1-5 (Sol11): the six tiers below are driven through
+# scripts/release_tier_pipeline.sh as ONE fail-fast sequence backed by
+# scripts/release_checkpoint.py's atomic, identity-scoped checkpoints
+# (corpus case 19: "required tier fails and later tiers do not run" -- the
+# pipeline aborts immediately on the first FAIL and never invokes later
+# tiers in the spec). "fresh, uncached test evidence is mandatory... exact
+# commit, toolchain, dependency lock state, test command, start/end time,
+# exit status, log hash" (P0-7 / Sol redteam v4 S8) is exactly what each
+# checkpoint records; test-summary.json below reads it back out.
 # ---------------------------------------------------------------------------
-# Writes PASS/FAIL and elapsed seconds into the two caller-provided variable
-# names via `declare -g` rather than relying on the function's own exit code:
-# an earlier version of this script fed run_tier's result through
-# `read ... < <(run_tier ...) || tier_ok=false`, which is a real bash trap —
-# `read` reading from a process substitution reports its OWN exit status
-# (success, since it read two words fine), never the substituted command's,
-# so a failing tier was silently swallowed and the release packaged anyway.
-# Direct string comparison against an explicit global avoids that trap.
-# P0-7 (Sol redteam v4 S8): "fresh, uncached test evidence is mandatory...
-# recording exact commit, toolchain, dependency lock state, test command,
-# start/end time, exit status, log hash." start/end are now real ISO-8601
-# timestamps (not just an elapsed-seconds delta), and log_sha_var records the
-# sha256 of the tier's own captured output -- so test-summary.json's record
-# of "this tier passed" is bound to one specific, hashable transcript, not
-# just a PASS/FAIL word a later edit could quietly detach from the evidence.
-run_tier() {
-  local name=$1 log=$2 result_var=$3 seconds_var=$4 started_var=$5 ended_var=$6 log_sha_var=$7
-  shift 7
-  local start end started_at ended_at
-  start=$(date +%s)
-  started_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-  if "$@" >"$log" 2>&1; then
-    end=$(date +%s)
-    echo "release: tier ${name} PASS ($((end - start))s)" >&2
-    printf -v "$result_var" '%s' PASS
-  else
-    end=$(date +%s)
-    echo "release: tier ${name} FAIL ($((end - start))s) — see ${log}" >&2
-    cat "$log" >&2
-    printf -v "$result_var" '%s' FAIL
-  fi
-  ended_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-  printf -v "$seconds_var" '%s' "$((end - start))"
-  printf -v "$started_var" '%s' "$started_at"
-  printf -v "$ended_var" '%s' "$ended_at"
-  printf -v "$log_sha_var" '%s' "$(sha256sum "$log" | awk '{print $1}')"
+UNIT_LOG="$OUT_DIR/test-unit.log"
+RACE_LOG="$OUT_DIR/test-race.log"
+INTEGRATION_LOG="$OUT_DIR/test-integration.log"
+CORPUS_LOG="$OUT_DIR/test-corpus.log"
+REDTEAM_LOG="$OUT_DIR/test-redteam.log"
+REDTEAM_RACE_LOG="$OUT_DIR/test-redteam-race.log"
+
+MAIN_TIER_SPEC=$(mktemp)
+{
+  printf 'unit\t%s\tgo test -p %s -parallel %s -count=1 ./...\n' "$UNIT_LOG" "$GO_TEST_PARALLELISM" "$GO_TEST_PARALLELISM"
+  printf 'race\t%s\tgo test -race -timeout=30m -p %s -parallel %s -count=1 ./...\n' "$RACE_LOG" "$GO_TEST_PARALLELISM" "$GO_TEST_PARALLELISM"
+  printf 'integration\t%s\tgo test -tags integration -p %s -parallel %s -count=1 ./internal/assay/...\n' "$INTEGRATION_LOG" "$GO_TEST_PARALLELISM" "$GO_TEST_PARALLELISM"
+  # Sol redteam v6 S0 (P0-18, partial): the build-tagged internal/redteam/
+  # corpus was never actually compiled by any release or CI command --
+  # "black_box_corpus" here only runs Sol3-prefixed tests, which never
+  # triggers the `redteam` build tag. redteam/redteam_race below are the
+  # exact commands the v6 report requires.
+  printf 'corpus\t%s\tgo test -run '"'"'Sol3'"'"' -v -p %s -parallel %s -count=1 ./...\n' "$CORPUS_LOG" "$GO_TEST_PARALLELISM" "$GO_TEST_PARALLELISM"
+  printf 'redteam\t%s\tgo test -v -timeout=30m -tags redteam -p %s -parallel %s -count=1 ./...\n' "$REDTEAM_LOG" "$GO_TEST_PARALLELISM" "$GO_TEST_PARALLELISM"
+  printf 'redteam_race\t%s\tgo test -v -race -timeout=30m -tags redteam -p %s -parallel %s -count=1 ./...\n' "$REDTEAM_RACE_LOG" "$GO_TEST_PARALLELISM" "$GO_TEST_PARALLELISM"
+} >"$MAIN_TIER_SPEC"
+
+MAIN_TIER_JSONL="$OUT_DIR/.tier-pipeline-main.jsonl"
+MAIN_TIER_PIPELINE_OK=true
+if ! bash "$ROOT/scripts/release_tier_pipeline.sh" run --state-dir "$CHECKPOINT_STATE_DIR" --identity-file "$IDENTITY_FILE" --spec "$MAIN_TIER_SPEC" >"$MAIN_TIER_JSONL"; then
+  MAIN_TIER_PIPELINE_OK=false
+fi
+rm -f "$MAIN_TIER_SPEC"
+
+# tier_field NAME FIELD reads one field out of the tier's own JSON line
+# (the line whose "tier" key equals NAME) in $MAIN_TIER_JSONL. A tier that
+# never ran because an earlier required tier failed (fail-fast) has no line
+# at all -- tier_field then returns an empty string, and the FAIL default
+# below keeps that tier correctly reported as not-PASS rather than crashing
+# this script on a missing value.
+tier_field() {
+  python3 -c "
+import json, sys
+name, field = sys.argv[1], sys.argv[2]
+for line in open(sys.argv[3]):
+    line = line.strip()
+    if not line:
+        continue
+    obj = json.loads(line)
+    if obj.get('tier') == name:
+        print(obj.get(field, ''))
+        break
+" "$1" "$2" "$MAIN_TIER_JSONL"
 }
 
-GO_SUM_HASH=$(sha256sum go.sum | awk '{print $1}')
+UNIT_RESULT=$(tier_field unit result); UNIT_RESULT=${UNIT_RESULT:-FAIL}
+UNIT_SECONDS=$(tier_field unit duration_seconds); UNIT_SECONDS=${UNIT_SECONDS:-0}
+UNIT_STARTED=$(tier_field unit started)
+UNIT_ENDED=$(tier_field unit completed)
+UNIT_LOG_SHA=$(tier_field unit log_sha256)
 
-UNIT_LOG="$OUT_DIR/test-unit.log"
-run_tier unit "$UNIT_LOG" UNIT_RESULT UNIT_SECONDS UNIT_STARTED UNIT_ENDED UNIT_LOG_SHA go test -p "$GO_TEST_PARALLELISM" -parallel "$GO_TEST_PARALLELISM" -count=1 ./...
+RACE_RESULT=$(tier_field race result); RACE_RESULT=${RACE_RESULT:-FAIL}
+RACE_SECONDS=$(tier_field race duration_seconds); RACE_SECONDS=${RACE_SECONDS:-0}
+RACE_STARTED=$(tier_field race started)
+RACE_ENDED=$(tier_field race completed)
+RACE_LOG_SHA=$(tier_field race log_sha256)
 
-RACE_LOG="$OUT_DIR/test-race.log"
-run_tier race "$RACE_LOG" RACE_RESULT RACE_SECONDS RACE_STARTED RACE_ENDED RACE_LOG_SHA go test -race -timeout=30m -p "$GO_TEST_PARALLELISM" -parallel "$GO_TEST_PARALLELISM" -count=1 ./...
+INTEGRATION_RESULT=$(tier_field integration result); INTEGRATION_RESULT=${INTEGRATION_RESULT:-FAIL}
+INTEGRATION_SECONDS=$(tier_field integration duration_seconds); INTEGRATION_SECONDS=${INTEGRATION_SECONDS:-0}
+INTEGRATION_STARTED=$(tier_field integration started)
+INTEGRATION_ENDED=$(tier_field integration completed)
+INTEGRATION_LOG_SHA=$(tier_field integration log_sha256)
 
-INTEGRATION_LOG="$OUT_DIR/test-integration.log"
-run_tier integration "$INTEGRATION_LOG" INTEGRATION_RESULT INTEGRATION_SECONDS INTEGRATION_STARTED INTEGRATION_ENDED INTEGRATION_LOG_SHA go test -tags integration -p "$GO_TEST_PARALLELISM" -parallel "$GO_TEST_PARALLELISM" -count=1 ./internal/assay/...
+CORPUS_RESULT=$(tier_field corpus result); CORPUS_RESULT=${CORPUS_RESULT:-FAIL}
+CORPUS_SECONDS=$(tier_field corpus duration_seconds); CORPUS_SECONDS=${CORPUS_SECONDS:-0}
+CORPUS_STARTED=$(tier_field corpus started)
+CORPUS_ENDED=$(tier_field corpus completed)
+CORPUS_LOG_SHA=$(tier_field corpus log_sha256)
+CORPUS_TESTS_RUN=0
+CORPUS_TESTS_FAILED=0
+if [ -f "$CORPUS_LOG" ]; then
+  CORPUS_TESTS_RUN=$(grep -c '^--- PASS\|^--- FAIL' "$CORPUS_LOG" || true)
+  CORPUS_TESTS_FAILED=$(grep -c '^--- FAIL' "$CORPUS_LOG" || true)
+fi
 
-CORPUS_LOG="$OUT_DIR/test-corpus.log"
-run_tier black_box_corpus "$CORPUS_LOG" CORPUS_RESULT CORPUS_SECONDS CORPUS_STARTED CORPUS_ENDED CORPUS_LOG_SHA go test -run 'Sol3' -v -p "$GO_TEST_PARALLELISM" -parallel "$GO_TEST_PARALLELISM" -count=1 ./...
-CORPUS_TESTS_RUN=$(grep -c '^--- PASS\|^--- FAIL' "$CORPUS_LOG" || true)
-CORPUS_TESTS_FAILED=$(grep -c '^--- FAIL' "$CORPUS_LOG" || true)
+REDTEAM_RESULT=$(tier_field redteam result); REDTEAM_RESULT=${REDTEAM_RESULT:-FAIL}
+REDTEAM_SECONDS=$(tier_field redteam duration_seconds); REDTEAM_SECONDS=${REDTEAM_SECONDS:-0}
+REDTEAM_STARTED=$(tier_field redteam started)
+REDTEAM_ENDED=$(tier_field redteam completed)
+REDTEAM_LOG_SHA=$(tier_field redteam log_sha256)
 
-# Sol redteam v6 S0 (P0-18, partial): the build-tagged internal/redteam/
-# corpus was never actually compiled by any release or CI command —
-# "black_box_corpus" above only runs Sol3-prefixed tests, which never
-# triggers the `redteam` build tag. A release could report
-# black_box_corpus: PASS while every permanent red-team attack was excluded
-# from compilation. These two tiers are the exact commands the v6 report
-# requires. Skips are not failures here — the corpus's skip count is the
-# project burn-down (agents/governator-sol-upgrade6-plan.md). Full record
-# fields (discovered/run/skipped/failed counts as first-class release
-# evidence, and rejection of any *unexpected* skip) land in S8, not here.
-REDTEAM_LOG="$OUT_DIR/test-redteam.log"
-run_tier redteam "$REDTEAM_LOG" REDTEAM_RESULT REDTEAM_SECONDS REDTEAM_STARTED REDTEAM_ENDED REDTEAM_LOG_SHA go test -v -timeout=30m -tags redteam -p "$GO_TEST_PARALLELISM" -parallel "$GO_TEST_PARALLELISM" -count=1 ./...
+REDTEAM_RACE_RESULT=$(tier_field redteam_race result); REDTEAM_RACE_RESULT=${REDTEAM_RACE_RESULT:-FAIL}
+REDTEAM_RACE_SECONDS=$(tier_field redteam_race duration_seconds); REDTEAM_RACE_SECONDS=${REDTEAM_RACE_SECONDS:-0}
+REDTEAM_RACE_STARTED=$(tier_field redteam_race started)
+REDTEAM_RACE_ENDED=$(tier_field redteam_race completed)
+REDTEAM_RACE_LOG_SHA=$(tier_field redteam_race log_sha256)
 
-REDTEAM_RACE_LOG="$OUT_DIR/test-redteam-race.log"
-run_tier redteam_race "$REDTEAM_RACE_LOG" REDTEAM_RACE_RESULT REDTEAM_RACE_SECONDS REDTEAM_RACE_STARTED REDTEAM_RACE_ENDED REDTEAM_RACE_LOG_SHA go test -v -race -timeout=30m -tags redteam -p "$GO_TEST_PARALLELISM" -parallel "$GO_TEST_PARALLELISM" -count=1 ./...
+if [ "$MAIN_TIER_PIPELINE_OK" != true ]; then
+  echo "release: refusing to package -- a required test tier failed; scripts/release_tier_pipeline.sh halted the remaining tiers (fail-fast, P1-5). See ${MAIN_TIER_JSONL} for exactly which tier failed and which were never run." >&2
+  exit 1
+fi
 
 # Sol redteam v7 S7 (HS4): the old count-based gate (MIN_REDTEAM_TESTS /
 # EXPECTED_REDTEAM_SKIPS) validated skip *count*, not the exact identity or
@@ -454,8 +556,21 @@ else
   echo "$ASSAYER_VERSION_TAG_SUMMARY" >"$ASSAYER_VERSION_TAG_LOG"
 fi
 
+# The six main go-test tiers already fail-fast-exited above (P1-5) the
+# moment scripts/release_tier_pipeline.sh reported a non-PASS result, so
+# UNIT_RESULT..REDTEAM_RACE_RESULT are all guaranteed PASS here; this check
+# stays as belt-and-suspenders against a future edit reordering that exit.
 if [ "$UNIT_RESULT" != PASS ] || [ "$RACE_RESULT" != PASS ] || [ "$INTEGRATION_RESULT" != PASS ] || [ "$CORPUS_RESULT" != PASS ] || [ "$REDTEAM_RESULT" != PASS ] || [ "$REDTEAM_RACE_RESULT" != PASS ] || [ "$FUZZ_OK" != true ]; then
   echo "release: refusing to package — a required test tier failed" >&2
+  exit 1
+fi
+# P1-5: the final manifest may only aggregate checkpoint evidence that
+# belongs to THIS resolved release_attempt_id -- reject silently-mixed
+# evidence from an earlier, different attempt (corpus case 16) even if a
+# stale checkpoint file happens to still be sitting in $CHECKPOINT_STATE_DIR.
+if ! python3 "$ROOT/scripts/release_checkpoint.py" aggregate --state-dir "$CHECKPOINT_STATE_DIR" --identity-file "$IDENTITY_FILE" \
+  --required unit,race,integration,corpus,redteam,redteam_race >"$OUT_DIR/.checkpoint-aggregate.json"; then
+  echo "release: refusing to package — release_checkpoint.py aggregate rejected the tier checkpoints (incomplete or mixed release-attempt evidence); see above" >&2
   exit 1
 fi
 if [ "$REDTEAM_GATE_OK" != true ]; then
@@ -900,12 +1015,13 @@ PYARCH
 
 MANIFEST="$OUT_DIR/build-manifest.json"
 python3 - "$MANIFEST" "$VERSION" "$COMMIT" "$BUILD_TS" "$GO_VERSION" "$LDFLAGS" "$CLAIMS_HASH" "$ADAPTER_PROTOCOL_VERSION" "$ARTIFACTS_JSON" \
-  "$HOST_ARCHIVE_NAME" "$HOST_ARCHIVE_SHA" "$HOST_BIN_SHA" "$TEST_RUN_ID" "$TEST_SUMMARY" "$ACCEPTANCE_RUN_ID" "$ACCEPTANCE_RESULT" "$(basename "$ARCHITECTURE_METADATA")" <<'PYMANIFEST'
+  "$HOST_ARCHIVE_NAME" "$HOST_ARCHIVE_SHA" "$HOST_BIN_SHA" "$TEST_RUN_ID" "$TEST_SUMMARY" "$ACCEPTANCE_RUN_ID" "$ACCEPTANCE_RESULT" "$(basename "$ARCHITECTURE_METADATA")" "$RELEASE_ATTEMPT_ID" <<'PYMANIFEST'
 import json, pathlib, sys
 
 (manifest, version, commit, build_ts, go_version, build_flags, claims_hash,
  adapter_protocol_version, artifacts_path,
- host_archive_name, host_archive_sha, host_bin_sha, test_run_id, test_summary_path, acceptance_run_id, acceptance_result, architecture_metadata_path) = sys.argv[1:]
+ host_archive_name, host_archive_sha, host_bin_sha, test_run_id, test_summary_path, acceptance_run_id, acceptance_result, architecture_metadata_path,
+ release_attempt_id) = sys.argv[1:]
 
 artifacts = []
 for line in pathlib.Path(artifacts_path).read_text().splitlines():
@@ -937,6 +1053,11 @@ data = {
     "test_summary_path": pathlib.Path(test_summary_path).name,
     "acceptance_run_id": acceptance_run_id,
     "acceptance_result": acceptance_result,
+    # P1-5: the manifest names the exact release-attempt whose checkpoint
+    # evidence it aggregates -- a downstream verifier (audit_bundle.sh's
+    # release-mode check, Session 3) can confirm every piece of evidence it
+    # ships actually belongs to this one attempt.
+    "release_attempt_id": release_attempt_id,
 }
 key = pathlib.os.environ.get("GOV_RELEASE_HMAC_KEY", "")
 if key:
@@ -978,8 +1099,16 @@ rm -rf "$OUT_DIR"/stage-*
 # found ("checksums covering the stale snapshot archives but not the current
 # production binary").
 # ---------------------------------------------------------------------------
+# P1-5 evidence-object cleanup: dotfile working scratch (tier-pipeline JSONL
+# transcript, checkpoint-aggregate summary) is not itself shipped release
+# evidence -- the checkpoints it was derived from remain under
+# $CHECKPOINT_STATE_DIR (needed for a future resume) but these two ARE
+# regular top-level $OUT_DIR files release_policy.py's checksum-coverage
+# check (below) would otherwise flag as unlisted.
+rm -f "$MAIN_TIER_JSONL" "$OUT_DIR/.checkpoint-aggregate.json"
+
 CHECKSUMS="$OUT_DIR/checksums.txt"
-(cd "$OUT_DIR" && sha256sum -- *.tar.gz build-manifest.json architecture-build-metadata.json sbom.json claims.yaml test-summary.json acceptance-summary.json claims-verify-report.txt gov *.log.gz >"$(basename "$CHECKSUMS")")
+(cd "$OUT_DIR" && sha256sum -- *.tar.gz build-manifest.json architecture-build-metadata.json sbom.json claims.yaml test-summary.json acceptance-summary.json claims-verify-report.txt preflight.json gov *.log.gz >"$(basename "$CHECKSUMS")")
 
 # ---------------------------------------------------------------------------
 # checksums.txt.hmac — HMAC-SHA256 over checksums.txt, keyed by an
