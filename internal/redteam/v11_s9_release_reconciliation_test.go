@@ -143,7 +143,24 @@ func TestV11Case50ProductionManifestSkipOfAnyAttackFailsRelease(t *testing.T) {
 		}
 	}
 
-	caps := map[string]bool{"case8_hangfuse_extinction_fixture": false}
+	// Sol12 P0-3: capability evidence is tri-state, and the gate now requires
+	// every predicate the manifest references to be proven present/absent in
+	// the record (CAPABILITY_EVIDENCE_INCOMPLETE otherwise). Build a complete
+	// record: every manifest predicate proven present, except the one the
+	// skipped case authorizes on (case8_hangfuse_extinction_fixture → absent,
+	// since case 8's skip is sanctioned by proven absence under dev CI).
+	caps := map[string]redteamgate.CapabilityRecord{}
+	for _, c := range manifest.Cases {
+		if !c.Conditional || c.AllowedSkip == nil || c.AllowedSkip.Predicate == "" {
+			continue
+		}
+		pred := c.AllowedSkip.Predicate
+		state := redteamgate.CapabilityPresent
+		if c.Name == skippedCase {
+			state = redteamgate.CapabilityAbsent
+		}
+		caps[pred] = redteamgate.CapabilityRecord{State: state}
+	}
 
 	// Baseline: ordinary development CI authorizes exactly this skip via
 	// the manifest's own allowed_skip mechanism -- isolates the production

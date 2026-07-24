@@ -2032,17 +2032,24 @@ func claimsCmd(args []string) int {
 // identity-based release gate (report HS4) that replaces
 // scripts/release.sh's old MIN_REDTEAM_TESTS/EXPECTED_REDTEAM_SKIPS
 // count-based check. It loads internal/redteam/manifest.yaml (the single
-// source of truth for the 38-case mandatory final attack corpus) and a
-// captured `go test -v -tags redteam` log, and verifies exact test
-// identity — not just totals — via internal/redteamgate.
+// source of truth for the mandatory final attack corpus) and a captured
+// `go test -v -tags redteam` log, and verifies exact test identity — not
+// just totals — via internal/redteamgate.
+//
+// Sol12 rc5 Session 1 (P0-2/P0-3): --capabilities now carries tri-state
+// capability RECORDS (present/absent per predicate) rather than a bare
+// boolean map, and --inventory carries the authoritative red-team test
+// inventory release.sh discovers from //go:build redteam-tagged source —
+// every inventory test must be a manifest case or a documented exclusion.
 func redteamGateCmd(args []string) int {
-	usage := "usage: gov redteam-gate verify --manifest <path> --log <path> [--capabilities <json>] [--require-zero-skips]"
+	usage := "usage: gov redteam-gate verify --manifest <path> --log <path> [--capabilities <json>] [--inventory <path>] [--require-zero-skips]"
 	if len(args) < 1 || args[0] != "verify" {
 		return bad(usage)
 	}
 	manifestPath := ""
 	logPath := ""
 	capabilitiesJSON := ""
+	inventoryPath := ""
 	requireZeroSkips := false
 	rest := args[1:]
 	for len(rest) > 0 {
@@ -2064,6 +2071,17 @@ func redteamGateCmd(args []string) int {
 				return bad(usage)
 			}
 			capabilitiesJSON = rest[1]
+			rest = rest[2:]
+		case "--inventory":
+			// Sol12 P0-2: the authoritative red-team test inventory
+			// (one test name per line) discovered from //go:build
+			// redteam-tagged source. Every inventory test must be a
+			// manifest case or a documented exclusion, and every
+			// inventory test must appear in the log.
+			if len(rest) < 2 {
+				return bad(usage)
+			}
+			inventoryPath = rest[1]
 			rest = rest[2:]
 		case "--require-zero-skips":
 			// P1-3 (Sol10 rc4 Session 8): a production release must not
@@ -2090,14 +2108,25 @@ func redteamGateCmd(args []string) int {
 		fmt.Fprintln(os.Stderr, "redteam-gate:", err)
 		return 1
 	}
-	capabilities := map[string]bool{}
+	capabilities := map[string]redteamgate.CapabilityRecord{}
 	if capabilitiesJSON != "" {
 		if err := json.Unmarshal([]byte(capabilitiesJSON), &capabilities); err != nil {
 			fmt.Fprintln(os.Stderr, "redteam-gate: --capabilities:", err)
 			return 1
 		}
 	}
-	result := redteamgate.EvaluateWithOptions(manifest, string(logData), capabilities, redteamgate.Options{RequireZeroSkips: requireZeroSkips})
+	var discovered []string
+	if inventoryPath != "" {
+		discovered, err = readInventoryFile(inventoryPath)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "redteam-gate: --inventory:", err)
+			return 1
+		}
+	}
+	result := redteamgate.EvaluateWithOptions(manifest, string(logData), capabilities, redteamgate.Options{
+		RequireZeroSkips: requireZeroSkips,
+		DiscoveredTests:  discovered,
+	})
 	if err := json.NewEncoder(os.Stdout).Encode(result); err != nil {
 		fmt.Fprintln(os.Stderr, "redteam-gate:", err)
 		return 1
@@ -2106,6 +2135,27 @@ func redteamGateCmd(args []string) int {
 		return 1
 	}
 	return 0
+}
+
+// readInventoryFile reads the authoritative red-team test inventory (Sol12
+// P0-2): one test name per line, blank lines and '#' comments ignored. The
+// file is produced by scripts/release.sh from //go:build redteam-tagged
+// source discovery, so the gate compares the exact inventory rather than a
+// naming-convention regex.
+func readInventoryFile(path string) ([]string, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	var names []string
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		names = append(names, line)
+	}
+	return names, nil
 }
 
 // recoverDoctorGatedBreakers runs the backend doctor probes and closes any
@@ -2862,6 +2912,6 @@ Usage:
   gov doctor
   gov health [reset <backend>]
   gov claims verify [--file <path>] [--repo <path>] [--artifact <path>] [--manifest <path>] [--release] [--portable-release]
-  gov redteam-gate verify --manifest <path> --log <path> [--capabilities <json>] [--require-zero-skips]
+  gov redteam-gate verify --manifest <path> --log <path> [--capabilities <json>] [--inventory <path>] [--require-zero-skips]
   gov version`)
 }

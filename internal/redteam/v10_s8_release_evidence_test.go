@@ -149,12 +149,12 @@ func TestV10Case36ProductionReleaseWithOneSkippedRedteamTestFailsRelease(t *test
 	// exactly this skip via the manifest's own allowed_skip -- isolates the
 	// production-mode assertion below from a false positive baked into the
 	// fixture.
-	dev := redteamgate.Evaluate(manifest, log, map[string]bool{"case8_hangfuse_extinction_fixture": false})
+	dev := redteamgate.Evaluate(manifest, log, map[string]redteamgate.CapabilityRecord{"case8_hangfuse_extinction_fixture": {State: redteamgate.CapabilityAbsent}})
 	if !dev.OK {
 		t.Fatalf("expected the authorized skip to pass under the normal development-CI policy, got %+v", dev)
 	}
 
-	prod := redteamgate.EvaluateWithOptions(manifest, log, map[string]bool{"case8_hangfuse_extinction_fixture": false}, redteamgate.Options{RequireZeroSkips: true})
+	prod := redteamgate.EvaluateWithOptions(manifest, log, map[string]redteamgate.CapabilityRecord{"case8_hangfuse_extinction_fixture": {State: redteamgate.CapabilityAbsent}}, redteamgate.Options{RequireZeroSkips: true})
 	if prod.OK {
 		t.Fatalf("expected a production release (RequireZeroSkips) to refuse a release containing one skipped red-team test, even an authorized one: %+v", prod)
 	}

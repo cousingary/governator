@@ -33,17 +33,19 @@ func TestLoadManifestRejectsBlankName(t *testing.T) {
 
 // TestLoadManifestAcceptsRealManifest is a regression check that
 // internal/redteam/manifest.yaml (the actual release-gating manifest, not a
-// fixture) parses cleanly and reserves exactly 195 uniquely-named cases --
-// the corpus size after rc5 Session 9's terminal corpus-44/49 additions
-// (cases 194-195, Sol11 report corpus cases 44 and 49).
+// fixture) parses cleanly under the Sol12 strict decoder: exactly 205
+// uniquely-numbered, uniquely-named required cases (the rc5 upgrade-12
+// Session 1 corpus, cases 196-205, on top of upgrade-11's 195), plus the
+// documented non-production exclusions that let the authoritative inventory
+// account for every //go:build redteam-tagged security test (P0-2).
 func TestLoadManifestAcceptsRealManifest(t *testing.T) {
 	path := filepath.Join("..", "redteam", "manifest.yaml")
 	m, err := LoadManifest(path)
 	if err != nil {
 		t.Fatalf("LoadManifest(%s): %v", path, err)
 	}
-	if len(m.Cases) != 195 {
-		t.Fatalf("expected 195 cases in the mandatory final attack corpus, got %d", len(m.Cases))
+	if len(m.Cases) != 205 {
+		t.Fatalf("expected 205 cases in the mandatory final attack corpus, got %d", len(m.Cases))
 	}
 	seen := make(map[int]bool)
 	for _, c := range m.Cases {
@@ -55,9 +57,22 @@ func TestLoadManifestAcceptsRealManifest(t *testing.T) {
 			t.Fatalf("case %d (%s): every corpus case must be required (conditional skips are the only sanctioned exception, and are still required=true)", c.Case, c.Name)
 		}
 	}
-	for i := 1; i <= 50; i++ {
+	for i := 1; i <= 205; i++ {
 		if !seen[i] {
 			t.Fatalf("manifest is missing case number %d", i)
+		}
+	}
+	if len(m.Exclusions) == 0 {
+		t.Fatalf("manifest carries no exclusions: the authoritative red-team inventory cannot account for non-manifest security tests (Sol12 P0-2)")
+	}
+	exclSeen := make(map[string]bool)
+	for _, e := range m.Exclusions {
+		if exclSeen[e.Name] {
+			t.Fatalf("duplicate exclusion name %s", e.Name)
+		}
+		exclSeen[e.Name] = true
+		if e.Reason == "" {
+			t.Fatalf("exclusion %s has no documented reason", e.Name)
 		}
 	}
 }
@@ -102,15 +117,26 @@ func TestEvaluateFlagsFailureRegardlessOfNamePrefix(t *testing.T) {
 }
 
 func TestEvaluateFlagsUnmanifestedVersionedCaseAsDrift(t *testing.T) {
-	manifest := Manifest{Cases: []CaseEntry{{Case: 1, Name: "TestV7Case1Known", Required: true}}}
+	// Sol12 P0-2: the stale TestV(7|8)Case regex is gone. Drift is now
+	// detected from the AUTHORITATIVE INVENTORY supplied by the caller —
+	// release.sh discovers it from //go:build redteam-tagged source. A test
+	// in the inventory that is neither a manifest case nor a documented
+	// exclusion is unmanifested drift and blocks the gate, regardless of
+	// which version prefix its name happens to carry.
+	manifest := Manifest{
+		Cases:      []CaseEntry{{Case: 1, Name: "TestV7Case1Known", Required: true}},
+		Exclusions: []ExclusionEntry{},
+	}
 	log := "" +
 		"=== RUN   TestV7Case1Known\n" +
 		"--- PASS: TestV7Case1Known (0.00s)\n" +
 		"=== RUN   TestV8Case999Unmanifested\n" +
 		"--- PASS: TestV8Case999Unmanifested (0.00s)\n"
-	res := Evaluate(manifest, log, nil)
+	res := EvaluateWithOptions(manifest, log, nil, Options{
+		DiscoveredTests: []string{"TestV7Case1Known", "TestV8Case999Unmanifested"},
+	})
 	if res.OK {
-		t.Fatalf("expected an unmanifested TestV7Case*/TestV8Case* test to be flagged as drift: %+v", res)
+		t.Fatalf("expected an unmanifested inventory test to be flagged as drift: %+v", res)
 	}
 	if len(res.UnexpectedTests) != 1 || res.UnexpectedTests[0] != "TestV8Case999Unmanifested" {
 		t.Fatalf("expected UnexpectedTests to name TestV8Case999Unmanifested, got %+v", res)

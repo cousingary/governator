@@ -401,16 +401,61 @@ fi
 # name via the manifest's allowed_skip predicate+reason. See
 # agents/governator-sol-upgrade7-plan.md Session 7.
 REDTEAM_MANIFEST="internal/redteam/manifest.yaml"
+# Sol12 rc5 Session 1 (P0-3): capability evidence is tri-state (present |
+# absent | unknown). The gate now requires EVERY predicate the manifest
+# references to be proven present/absent in this record, or it refuses with
+# CAPABILITY_EVIDENCE_INCOMPLETE (a missing key no longer collapses to
+# "absent" and authorizes a conditional skip). Each record carries its probe,
+# host, platform, and timestamp so the evidence is self-describing; the
+# signed per-host capability attestations aggregated at release (Sessions
+# 5/6/9) carry the full evidence_hash/signature on top of this same schema.
 REDTEAM_CAPABILITIES_JSON=$(python3 -c "
-import json, os, platform
+import json, os, platform, shutil, datetime
+def env_flag(v): return os.environ.get(v, '') == '1'
+def rec(present, probe, result=''):
+    return {'state': 'present' if present else 'absent', 'probe': probe, 'result': result,
+            'host_identity': platform.node(),
+            'platform': '%s/%s' % (platform.system(), platform.machine()),
+            'timestamp': datetime.datetime.now().isoformat(timespec='seconds')}
+# has_systemd_user auto-detects from the live user bus unless the operator
+# pins it via GOV_REDTEAM_HAS_SYSTEMD_USER (the previous behavior).
+has_su = env_flag('GOV_REDTEAM_HAS_SYSTEMD_USER') or os.path.exists('/run/user/%d/bus' % os.getuid())
+proc1_unreadable = os.path.isdir('/proc/1') and not os.access('/proc/1/fd', os.R_OK)
 print(json.dumps({
-    'linux': platform.system().lower() == 'linux',
-    'has_systemd_user': os.environ.get('GOV_REDTEAM_HAS_SYSTEMD_USER', '') == '1',
-    'no_systemd_user': os.environ.get('GOV_REDTEAM_HAS_SYSTEMD_USER', '') != '1',
-    'has_second_uid': os.environ.get('GOV_REDTEAM_HAS_SECOND_UID', '') == '1',
-    'has_kernel_landlock_full_abi': os.environ.get('GOV_REDTEAM_HAS_LANDLOCK_FULL_ABI', '') == '1',
+    'linux': rec(platform.system()=='Linux', 'platform.system()', platform.system()),
+    'has_systemd_user': rec(has_su, 'env GOV_REDTEAM_HAS_SYSTEMD_USER or /run/user/<uid>/bus', str(has_su)),
+    'no_systemd_user': rec(not has_su, 'complement of has_systemd_user', str(not has_su)),
+    'has_second_uid': rec(env_flag('GOV_REDTEAM_HAS_SECOND_UID'), 'env GOV_REDTEAM_HAS_SECOND_UID'),
+    'has_kernel_landlock_full_abi': rec(env_flag('GOV_REDTEAM_HAS_LANDLOCK_FULL_ABI'), 'env GOV_REDTEAM_HAS_LANDLOCK_FULL_ABI'),
+    # case8's hangfuse fixture: Session 2 makes this path deterministic; until
+    # then the host where it does not reliably reach its blocking READ sets
+    # this absent so the manifest's conditional skip is honestly authorized.
+    'case8_hangfuse_extinction_fixture': rec(os.environ.get('GOV_REDTEAM_CASE8_HANGFUSE','0')=='1', 'env GOV_REDTEAM_CASE8_HANGFUSE'),
+    'git_trusted': rec(shutil.which('git') is not None, 'shutil.which(git)', shutil.which('git') or ''),
+    'proc1_fd_unreadable': rec(proc1_unreadable, 'os.access(/proc/1/fd, R_OK)', str(proc1_unreadable)),
 }))
 ")
+# Sol12 rc5 Session 1 (P0-2): the authoritative red-team test inventory,
+# discovered from //go:build redteam-tagged source. The gate compares this
+# exact set against the manifest (every inventory test must be a manifest
+# case or a documented exclusion), so an unmanifested V9/V10/V11 attack or a
+# non-versioned security test can no longer disappear from production
+# evidence by failing to match a naming regex.
+REDTEAM_INVENTORY="$OUT_DIR/.redteam-inventory.txt"
+python3 -c "
+import re, pathlib
+inv = set()
+for p in pathlib.Path('.').rglob('*_test.go'):
+    try:
+        txt = p.read_text()
+    except Exception:
+        continue
+    if not any(re.match(r'//go:build .*redteam', ln) for ln in txt.splitlines()[:6]):
+        continue
+    for m in re.finditer(r'^func\s+(Test\w+)\s*\(', txt, re.M):
+        inv.add(m.group(1))
+pathlib.Path('$REDTEAM_INVENTORY').write_text('\n'.join(sorted(inv)) + '\n')
+"
 # P1-3 (Sol10 rc4 Session 8): a production release (REQUIRE_TAG=1 -- the
 # one path .github/workflows/release.yml actually uses to ship) must not
 # rely on ANY red-team skip, even one the manifest's allowed_skip
@@ -427,7 +472,7 @@ if [ "$REQUIRE_ZERO_SKIPS" = 1 ]; then
   REDTEAM_GATE_EXTRA_ARGS+=(--require-zero-skips)
 fi
 REDTEAM_GATE_JSON="$OUT_DIR/.redteam-gate.json"
-if go run ./cmd/gov redteam-gate verify --manifest "$REDTEAM_MANIFEST" --log "$REDTEAM_LOG" --capabilities "$REDTEAM_CAPABILITIES_JSON" "${REDTEAM_GATE_EXTRA_ARGS[@]}" >"$REDTEAM_GATE_JSON" 2>"$OUT_DIR/.redteam-gate.stderr"; then
+if go run ./cmd/gov redteam-gate verify --manifest "$REDTEAM_MANIFEST" --log "$REDTEAM_LOG" --capabilities "$REDTEAM_CAPABILITIES_JSON" --inventory "$REDTEAM_INVENTORY" "${REDTEAM_GATE_EXTRA_ARGS[@]}" >"$REDTEAM_GATE_JSON" 2>"$OUT_DIR/.redteam-gate.stderr"; then
   REDTEAM_GATE_OK=true
 else
   REDTEAM_GATE_OK=false

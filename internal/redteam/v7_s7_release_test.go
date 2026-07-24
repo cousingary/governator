@@ -128,7 +128,7 @@ func TestV7Case34SubstitutedSkipAtConstantCountBlocksGate(t *testing.T) {
 		"=== RUN   TestV7Case904FixtureConditional\n" +
 		"    fixture_test.go:9: environment lacks the rare capability\n" +
 		"--- SKIP: TestV7Case904FixtureConditional (0.00s)\n"
-	if res := redteamgate.Evaluate(manifest, healthyLog, map[string]bool{"has_rare_capability": false}); !res.OK {
+	if res := redteamgate.Evaluate(manifest, healthyLog, map[string]redteamgate.CapabilityRecord{"has_rare_capability": {State: redteamgate.CapabilityAbsent}}); !res.OK {
 		t.Fatalf("gate rejected the healthy baseline it should accept: %+v", res)
 	}
 
@@ -138,7 +138,7 @@ func TestV7Case34SubstitutedSkipAtConstantCountBlocksGate(t *testing.T) {
 		"--- SKIP: TestV7Case903FixtureAlwaysRequired (0.00s)\n" +
 		"=== RUN   TestV7Case904FixtureConditional\n" +
 		"--- PASS: TestV7Case904FixtureConditional (0.01s)\n"
-	res := redteamgate.Evaluate(manifest, attackLog, map[string]bool{"has_rare_capability": false})
+	res := redteamgate.Evaluate(manifest, attackLog, map[string]redteamgate.CapabilityRecord{"has_rare_capability": {State: redteamgate.CapabilityAbsent}})
 	if res.OK {
 		t.Fatalf("gate accepted a substituted skip at constant run/skip/fail counts; result: %+v", res)
 	}

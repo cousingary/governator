@@ -1138,3 +1138,209 @@ cases:
     session: rc5-s9
     required: true
     status: implemented
+
+  # Sol12 rc5 Session 1 (P0-2, P0-3, P1-8): the release-truth foundation.
+  # The zero-skip gate no longer scopes "what is a corpus test" by a stale
+  # TestV(7|8)Case regex -- it compares the AUTHORITATIVE inventory of every
+  # //go:build redteam-tagged test (supplied via --inventory) against the
+  # manifest, so an unmanifested V9/V10/V11 attack, a non-versioned security
+  # test, or a skipped Docker attack outside the manifest can no longer
+  # disappear from production evidence (P0-2). Capability evidence is
+  # tri-state (present|absent|unknown): only proven absence authorizes a
+  # conditional skip, and any manifest predicate the capability record does
+  # not prove is CAPABILITY_EVIDENCE_INCOMPLETE (P0-3). The manifest itself
+  # decodes strictly (KnownFields, dupe-key, status/case-number/name
+  # uniqueness, known-predicate registry, conditional consistency, exclusion
+  # validation) (P1-8). Cases 196-202 prove the gate-level failures; cases
+  # 203-205 prove the strict-loader failures.
+  - case: 196
+    name: TestV12Case1UnmanifestedV9TestFailsGate
+    session: rc5-u12-s1
+    required: true
+    status: implemented
+  - case: 197
+    name: TestV12Case2UnmanifestedV10TestFailsGate
+    session: rc5-u12-s1
+    required: true
+    status: implemented
+  - case: 198
+    name: TestV12Case3UnmanifestedNonVersionedSecurityTestFailsGate
+    session: rc5-u12-s1
+    required: true
+    status: implemented
+  - case: 199
+    name: TestV12Case4SkippedDockerAttackOutsideManifestFailsGate
+    session: rc5-u12-s1
+    required: true
+    status: implemented
+  - case: 200
+    name: TestV12Case5MissingCapabilityPredicateFailsGate
+    session: rc5-u12-s1
+    required: true
+    status: implemented
+  - case: 201
+    name: TestV12Case6MisspelledCapabilityPredicateFailsGate
+    session: rc5-u12-s1
+    required: true
+    status: implemented
+  - case: 202
+    name: TestV12Case7UnknownCapabilityValueFailsGate
+    session: rc5-u12-s1
+    required: true
+    status: implemented
+  - case: 203
+    name: TestV12Case11ManifestDuplicateYAMLKeyFailsLoad
+    session: rc5-u12-s1
+    required: true
+    status: implemented
+  - case: 204
+    name: TestV12Case12ManifestUnknownFieldFailsLoad
+    session: rc5-u12-s1
+    required: true
+    status: implemented
+  - case: 205
+    name: TestV12Case13DuplicateCaseNumberFailsLoad
+    session: rc5-u12-s1
+    required: true
+    status: implemented
+
+# Exclusions (Sol12 P0-2): every //go:build redteam-tagged test that is NOT a
+# manifest corpus case must be explicitly classified here with a documented
+# reason, or the gate flags it as unmanifested drift and blocks the release.
+# This is what makes `require_zero_skips` literally mean zero *security-test*
+# skips: a security test can no longer vanish from production evidence by
+# failing to match a naming regex. Maintained alongside the inventory
+# (scripts/release.sh discovers tagged tests and passes them via --inventory).
+exclusions:
+  - name: TestAttack10FakeGitInjectedThroughPathIsRejected
+    reason: "legacy pre-manifest attack fixture superseded by the versioned manifest corpus"
+  - name: TestAttack11MutableDockerTagChangesBeforeReplay
+    reason: "legacy pre-manifest attack fixture superseded by the versioned manifest corpus"
+  - name: TestAttack12InContainerBackendDiffersFromHostAttestedBinary
+    reason: "legacy pre-manifest attack fixture superseded by the versioned manifest corpus"
+  - name: TestAttack13TwoAssayerWorkersReclaimOneExpiredLease
+    reason: "legacy pre-manifest attack fixture superseded by the versioned manifest corpus"
+  - name: TestAttack14DownstreamInsertSucceedsBeforeOutboxWorkerCrashes
+    reason: "legacy pre-manifest attack fixture superseded by the versioned manifest corpus"
+  - name: TestAttack15MalformedGateCheckInputFailsClosed
+    reason: "legacy pre-manifest attack fixture superseded by the versioned manifest corpus"
+  - name: TestAttack16InventedAssayerLanguagePasses
+    reason: "legacy pre-manifest attack fixture superseded by the versioned manifest corpus"
+  - name: TestAttack17DoctrineChangesBetweenEvaluationAndIdentity
+    reason: "legacy pre-manifest attack fixture superseded by the versioned manifest corpus"
+  - name: TestAttack18SecondOneShotApprovalConsumptionFails
+    reason: "legacy pre-manifest attack fixture superseded by the versioned manifest corpus"
+  - name: TestAttack19NewlinePathspecFilenameHandledLiterally
+    reason: "legacy pre-manifest attack fixture superseded by the versioned manifest corpus"
+  - name: TestAttack1HostilePreCommitHookNeverStagesForbiddenFile
+    reason: "legacy pre-manifest attack fixture superseded by the versioned manifest corpus"
+  - name: TestAttack20SpendSettleRacesExpiry
+    reason: "legacy pre-manifest attack fixture superseded by the versioned manifest corpus"
+  - name: TestAttack21HugeTimeoutCausesDurationOverflow
+    reason: "legacy pre-manifest attack fixture superseded by the versioned manifest corpus"
+  - name: TestAttack22SymlinkParentReplacedBetweenScanAndOpen
+    reason: "legacy pre-manifest attack fixture superseded by the versioned manifest corpus"
+  - name: TestAttack23NonGitMergeFailureHalfwayThrough
+    reason: "legacy pre-manifest attack fixture superseded by the versioned manifest corpus"
+  - name: TestAttack24ExtractedReleaseBinaryHasWrongMode
+    reason: "legacy pre-manifest attack fixture superseded by the versioned manifest corpus"
+  - name: TestAttack25ReleaseBinaryCommitDiffersFromSourceAndClaims
+    reason: "legacy pre-manifest attack fixture superseded by the versioned manifest corpus"
+  - name: TestAttack26DirtyReleaseBinaryReportsAContradictoryRelease
+    reason: "legacy pre-manifest attack fixture superseded by the versioned manifest corpus"
+  - name: TestAttack26FakeBashInjectedThroughPathIsRejected
+    reason: "legacy pre-manifest attack fixture superseded by the versioned manifest corpus"
+  - name: TestAttack27BackendExecutableWithUntrustedWritableParentIsQuarantined
+    reason: "legacy pre-manifest attack fixture superseded by the versioned manifest corpus"
+  - name: TestAttack2HostileGlobalHooksPathNeverStagesForbiddenFile
+    reason: "legacy pre-manifest attack fixture superseded by the versioned manifest corpus"
+  - name: TestAttack3PathspecMagicFilenameNeverStagesInternalPath
+    reason: "legacy pre-manifest attack fixture superseded by the versioned manifest corpus"
+  - name: TestAttack4CleanFilterNeverAltersCommittedContent
+    reason: "legacy pre-manifest attack fixture superseded by the versioned manifest corpus"
+  - name: TestAttack5FakeBackendBehavesSafelyOnlyDuringAttestation
+    reason: "legacy pre-manifest attack fixture superseded by the versioned manifest corpus"
+  - name: TestAttack6BackendReplacementBetweenHashAndLaunchIsDetected
+    reason: "legacy pre-manifest attack fixture superseded by the versioned manifest corpus"
+  - name: TestAttack7PathResolvedBinaryReplacedBetweenRuns
+    reason: "legacy pre-manifest attack fixture superseded by the versioned manifest corpus"
+  - name: TestAttack8DetachedSetsidChildCannotWriteAfterApproval
+    reason: "legacy pre-manifest attack fixture superseded by the versioned manifest corpus"
+  - name: TestAttack9GraphHelperCannotWriteOutsideRepository
+    reason: "legacy pre-manifest attack fixture superseded by the versioned manifest corpus"
+  - name: TestSnapshotVerifySucceedsWithoutTampering
+    reason: "non-attack positive helper exercising the snapshot-verify success path; not a release-blocking security attack (internal/assay v10_s4)"
+  - name: TestV11Case18BPositiveCompleteDistPassesValidation
+    reason: "companion positive/acceptance variant of manifest case 178 (TestV11Case18TruncatedTestLogFailsReleaseEvidenceValidation); proves the complete-dist success branch of the same fix, not a separately-gated attack (v11_s3_audit_bundle_evidence_test.go)"
+  - name: TestV6Case10PathPinnedToolReplacedWithDifferentContentIsRejected
+    reason: "legacy v6 corpus case superseded by the versioned v7+ manifest corpus; retained as historical regression coverage, not a release-blocking attack"
+  - name: TestV6Case11RegistryEntryMissingSHA256IsRejected
+    reason: "legacy v6 corpus case superseded by the versioned v7+ manifest corpus; retained as historical regression coverage, not a release-blocking attack"
+  - name: TestV6Case12DuplicateTrustedToolRegistryNamesRejected
+    reason: "legacy v6 corpus case superseded by the versioned v7+ manifest corpus; retained as historical regression coverage, not a release-blocking attack"
+  - name: TestV6Case13ConcurrentRegistryUpdatesDoNotLoseWrites
+    reason: "legacy v6 corpus case superseded by the versioned v7+ manifest corpus; retained as historical regression coverage, not a release-blocking attack"
+  - name: TestV6Case14GitObjectDirectoryRedirectionDoesNotEscapeRepository
+    reason: "legacy v6 corpus case superseded by the versioned v7+ manifest corpus; retained as historical regression coverage, not a release-blocking attack"
+  - name: TestV6Case15GitAlternateObjectDirectoriesRedirectionDoesNotEscapeRepository
+    reason: "legacy v6 corpus case superseded by the versioned v7+ manifest corpus; retained as historical regression coverage, not a release-blocking attack"
+  - name: TestV6Case16GitDirWorkTreeInjectionDoesNotRedirectApprovedCommit
+    reason: "legacy v6 corpus case superseded by the versioned v7+ manifest corpus; retained as historical regression coverage, not a release-blocking attack"
+  - name: TestV6Case17QuarantinePreCommitHookNeverFires
+    reason: "legacy v6 corpus case superseded by the versioned v7+ manifest corpus; retained as historical regression coverage, not a release-blocking attack"
+  - name: TestV6Case18QuarantineCleanFilterNeverRuns
+    reason: "legacy v6 corpus case superseded by the versioned v7+ manifest corpus; retained as historical regression coverage, not a release-blocking attack"
+  - name: TestV6Case19ShadowAllowNeverOverridesGoDeny
+    reason: "legacy v6 corpus case superseded by the versioned v7+ manifest corpus; retained as historical regression coverage, not a release-blocking attack"
+  - name: TestV6Case1LowRiskContractForbidsNetworkButBackendOpensSocket
+    reason: "legacy v6 corpus case superseded by the versioned v7+ manifest corpus; retained as historical regression coverage, not a release-blocking attack"
+  - name: TestV6Case20ShadowEmptyOutputNeverOverridesGoDeny
+    reason: "legacy v6 corpus case superseded by the versioned v7+ manifest corpus; retained as historical regression coverage, not a release-blocking attack"
+  - name: TestV6Case21ShadowScriptChangeBetweenReplaysIsDetected
+    reason: "legacy v6 corpus case superseded by the versioned v7+ manifest corpus; retained as historical regression coverage, not a release-blocking attack"
+  - name: TestV6Case22ConsumedArtifactChangeBeforeConsumerReplayInvalidatesReplay
+    reason: "legacy v6 corpus case superseded by the versioned v7+ manifest corpus; retained as historical regression coverage, not a release-blocking attack"
+  - name: TestV6Case24GraphProviderChangeBeforeReplayInvalidatesReplay
+    reason: "legacy v6 corpus case superseded by the versioned v7+ manifest corpus; retained as historical regression coverage, not a release-blocking attack"
+  - name: TestV6Case25BackendCannotReadUndeclaredHostSecretUnderLandlock
+    reason: "legacy v6 corpus case superseded by the versioned v7+ manifest corpus; retained as historical regression coverage, not a release-blocking attack"
+  - name: TestV6Case26BackendPathReplacedBeforeWrappedLaunchNeverRuns
+    reason: "legacy v6 corpus case superseded by the versioned v7+ manifest corpus; retained as historical regression coverage, not a release-blocking attack"
+  - name: TestV6Case27GovernatorPathReplacedBeforeSandboxReexecNeverRuns
+    reason: "legacy v6 corpus case superseded by the versioned v7+ manifest corpus; retained as historical regression coverage, not a release-blocking attack"
+  - name: TestV6Case28SystemdUnitNeverMaterializingFailsClosed
+    reason: "legacy v6 corpus case superseded by the versioned v7+ manifest corpus; retained as historical regression coverage, not a release-blocking attack"
+  - name: TestV6Case29PIDCheckEPERMIsNotTreatedAsExtinctionProof
+    reason: "legacy v6 corpus case superseded by the versioned v7+ manifest corpus; retained as historical regression coverage, not a release-blocking attack"
+  - name: TestV6Case2BackendOmitsNetworkEventFromTranscript
+    reason: "legacy v6 corpus case superseded by the versioned v7+ manifest corpus; retained as historical regression coverage, not a release-blocking attack"
+  - name: TestV6Case30LowRiskEffectfulJobStillGetsStrongDescendantContainment
+    reason: "legacy v6 corpus case superseded by the versioned v7+ manifest corpus; retained as historical regression coverage, not a release-blocking attack"
+  - name: TestV6Case31AssayerLeaseRenewedThroughSlowDownstreamCallPreventsDuplicate
+    reason: "legacy v6 corpus case superseded by the versioned v7+ manifest corpus; retained as historical regression coverage, not a release-blocking attack"
+  - name: TestV6Case32UnknownOutboxOperationIsDeadLettered
+    reason: "legacy v6 corpus case superseded by the versioned v7+ manifest corpus; retained as historical regression coverage, not a release-blocking attack"
+  - name: TestV6Case33AssayerPytestExitsCleanlyOnSupportedPythonVersions
+    reason: "legacy v6 corpus case superseded by the versioned v7+ manifest corpus; retained as historical regression coverage, not a release-blocking attack"
+  - name: TestV6Case34ReleaseWithoutRedteamTagIsRejected
+    reason: "legacy v6 corpus case superseded by the versioned v7+ manifest corpus; retained as historical regression coverage, not a release-blocking attack"
+  - name: TestV6Case35ReleaseTestCountBelowMinimumIsRejected
+    reason: "legacy v6 corpus case superseded by the versioned v7+ manifest corpus; retained as historical regression coverage, not a release-blocking attack"
+  - name: TestV6Case36UntaggedPostV1TagSourcePackagedAsV1IsRejected
+    reason: "legacy v6 corpus case superseded by the versioned v7+ manifest corpus; retained as historical regression coverage, not a release-blocking attack"
+  - name: TestV6Case3ValidatorSetsidDelayedWriterCannotWriteAfterApproval
+    reason: "legacy v6 corpus case superseded by the versioned v7+ manifest corpus; retained as historical regression coverage, not a release-blocking attack"
+  - name: TestV6Case4CleanupValidatorDetachedChildCannotWriteAfterApproval
+    reason: "legacy v6 corpus case superseded by the versioned v7+ manifest corpus; retained as historical regression coverage, not a release-blocking attack"
+  - name: TestV6Case5GraphProviderDetachedChildCannotWriteAfterApproval
+    reason: "legacy v6 corpus case superseded by the versioned v7+ manifest corpus; retained as historical regression coverage, not a release-blocking attack"
+  - name: TestV6Case6BashEnvControllerInjectionNeverExecutes
+    reason: "legacy v6 corpus case superseded by the versioned v7+ manifest corpus; retained as historical regression coverage, not a release-blocking attack"
+  - name: TestV6Case7LDPreloadControllerInjectionNeverExecutes
+    reason: "legacy v6 corpus case superseded by the versioned v7+ manifest corpus; retained as historical regression coverage, not a release-blocking attack"
+  - name: TestV6Case8FakeBashFirstInPathOnFreshHomeIsRejected
+    reason: "legacy v6 corpus case superseded by the versioned v7+ manifest corpus; retained as historical regression coverage, not a release-blocking attack"
+  - name: TestV6Case9FakeGitFirstInPathOnFreshHomeIsRejected
+    reason: "legacy v6 corpus case superseded by the versioned v7+ manifest corpus; retained as historical regression coverage, not a release-blocking attack"
+  - name: TestV7AssayerVersionTagPointsAtWrongCommitBlocksRelease
+    reason: "companion drift-isolation case for manifest case 37 (assayer tag!=commit); deliberately unenrolled -- isolates the tag-drift branch from the missing-tag branch (v7_s8_assayer_test.go)"
