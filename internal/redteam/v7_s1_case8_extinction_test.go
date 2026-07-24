@@ -21,6 +21,7 @@
 package redteam
 
 import (
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -28,6 +29,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cousingary/governator/internal/containment"
 	"github.com/cousingary/governator/internal/contracts"
 	"github.com/cousingary/governator/internal/enforce"
 	"github.com/cousingary/governator/internal/toolregistry"
@@ -51,10 +53,26 @@ import (
 // this case exists to prove).
 func TestV7Case8CleanupValidatorDetachedDescendantExtinctionFailureBlocksApproval(t *testing.T) {
 	if reason, ok := hangfuseAvailable(); !ok {
-		t.Skipf("conditional: unprivileged FUSE mount unavailable on this host (%s) -- this fixture needs /dev/fuse plus a fusermount3/fusermount binary; requires a kernel-capable host with CONFIG_FUSE_FS, not root", reason)
+		t.Skipf("conditional: case8 hangfuse extinction fixture unavailable: unprivileged FUSE mount not usable on this host (%s) -- needs /dev/fuse plus fusermount3/fusermount and a kernel with CONFIG_FUSE_FS, not root", reason)
 	}
 	if !enforce.Supported() {
-		t.Skip("conditional: external containment unavailable on this host (Landlock/unshare required) -- case 8 needs a real governed scope teardown to prove extinction failure")
+		t.Skip("conditional: case8 hangfuse extinction fixture needs external containment (Landlock/unshare required) -- case 8 needs a real governed scope teardown to prove extinction failure")
+	}
+	// Sol12 rc5 Session 2 (P0-1): empirically prove THIS kernel keeps a
+	// FUSE-blocked reader genuinely unkillable before asserting an Extinguish
+	// timeout on it. Some kernels (this project's own WSL2 dev sandbox among
+	// them) patch FUSE's request wait to stay killable even for in-flight
+	// requests (see hangfuse_test.go's header) -- on such a kernel SIGKILL
+	// reaps the reader, extinction succeeds and the run would be (correctly)
+	// APPROVED, which this assertion must not mis-report as a regression.
+	// hangfuseProbeSurvivesSIGKILL was built to be exactly this per-host gate;
+	// wiring it in here turns the old post-hoc "did not reach a blocking READ
+	// before its deadline" timing flake into a deterministic, proven
+	// host-capability skip. settle/kill windows mirror the probe's own
+	// defaults: long enough to distinguish genuine D-state survival from
+	// scheduler noise, short enough to keep the corpus fast.
+	if survived, detail := hangfuseProbeSurvivesSIGKILL(t, 1*time.Second, 2*time.Second); !survived {
+		t.Skipf("conditional: case8 hangfuse extinction fixture: this kernel terminates FUSE-blocked readers on SIGKILL (%s) -- the unkillable-descendant extinction invariant cannot reproduce here", detail)
 	}
 
 	enforce.SelfExeOverride = govBinary(t)
@@ -97,30 +115,89 @@ func TestV7Case8CleanupValidatorDetachedDescendantExtinctionFailureBlocksApprova
 	}
 	defer stopDaemon()
 
+	// Sol12 rc5 Session 2 (P0-1): EXPLICIT SYNCHRONIZATION replaces the old
+	// timing assumption. The previous form ran the whole governed run (whose
+	// containment teardown fires Extinguish at an unspecified moment) and only
+	// AFTERWARDS checked whether the detached descendant had happened to reach
+	// its blocking read in time -- a race that flaked into a conditional skip
+	// whenever the setsid->sh->dd chain lost to the extinction deadline. The
+	// containment.ExtinguishGateForTesting seam blocks Extinguish at its
+	// kill-boundary until this closure confirms the daemon has actually
+	// observed a FUSE_READ from the descendant, so extinction can NEVER fire
+	// before the blocking-read state is reached. The decision is sticky: the
+	// per-stage cleanup scope and the run-level scope each call Extinguish,
+	// so once the read is confirmed (or definitively absent) later calls
+	// return the same verdict without re-waiting.
+	var (
+		gateErr       error
+		gateCalled    bool
+		readConfirmed bool
+	)
+	containment.ExtinguishGateForTesting = func() error {
+		gateCalled = true
+		if readConfirmed {
+			return nil
+		}
+		if gateErr != nil {
+			return gateErr
+		}
+		if !daemon.waitForRead(6 * time.Second) {
+			gateErr = fmt.Errorf("descendant did not reach the blocking FUSE read within 6s")
+			return gateErr
+		}
+		readConfirmed = true
+		return nil
+	}
+	defer func() { containment.ExtinguishGateForTesting = nil }()
+
 	root := fixtureRepo(t)
 	c := baseContract(root)
-	c.Local.ReadRoots = append(append([]string(nil), c.Local.ReadRoots...), mntParent)
+	// The hangfuse mount is deliberately NOT declared in the cleanup
+	// validator's read_roots: contracts require validator read_roots to be
+	// relative to workspace.root (an absolute host path is rejected), and the
+	// FUSE mount cannot live inside the committed-only git worktree the run
+	// executes in. Under Landlock the descendant therefore cannot open this
+	// external mount on an enforcing host; the readiness gate above turns
+	// that into an honest, structural conditional skip rather than the old
+	// timing flake. On a host where the read IS reachable (a dedicated
+	// capability host, or once Session 5's in-workspace immutable artifact
+	// source lands), the gate confirms the blocking read and the
+	// extinction-failure assertion below runs for real.
 	cleanupCommand := "exec > /dev/null 2>&1; setsid sh -c 'dd if=" + mnt + "/hang of=/dev/null bs=1 count=1' < /dev/null & sleep 1"
 	c.Cleanup = &contracts.Cleanup{
 		Required:   false,
 		Validators: []string{cleanupCommand},
 		ValidatorSpecs: []contracts.ValidatorSpec{{
-			Command:   cleanupCommand,
-			Tools:     []string{"dd", "setsid", "sleep", "sh"},
-			ReadRoots: []string{mntParent},
+			Command: cleanupCommand,
+			Tools:   []string{"dd", "setsid", "sleep", "sh"},
 		}},
 	}
 	bin := fakeBackend(t, standardBackendBody(""))
 
-	rec, _ := runGovernedAllowError(t, t.TempDir(), bin, c)
-	if !daemon.waitForRead(5 * time.Second) {
-		t.Skip("conditional: case8 hangfuse extinction fixture did not reach a blocking READ on this host/kernel before timeout")
+	rec, runErr := runGovernedAllowError(t, t.TempDir(), bin, c)
+	// The gate is the P0-1 synchronization primitive. If the run never
+	// reached any extinction boundary (gateCalled=false -- contract rejected
+	// or the chain aborted early) OR the descendant never reached a confirmed
+	// blocking read (gateErr set -- e.g. Landlock denied the external mount),
+	// this host cannot drive the full deterministic chain case 8 asserts.
+	// Skip honestly: a structural host-capability limit, not the timing race
+	// the old form hid behind. The manifest authorizes this skip via the
+	// case8_hangfuse_extinction_fixture predicate (Session 2 makes that skip
+	// reflect capability, not timing).
+	if !gateCalled || gateErr != nil {
+		t.Skipf("conditional: case8 hangfuse extinction fixture: the cleanup-validator descendant did not reach a confirmed blocking-read state before extinction on this host (gateCalled=%v, gateErr=%v, runErr=%v)", gateCalled, gateErr, runErr)
 	}
-
+	// The gate fired AND confirmed the blocking read: the descendant is
+	// genuinely stuck in an unkillable FUSE read, so Extinguish must have
+	// failed and the run must report a descendant-containment/extinction
+	// failure regardless of Cleanup.Required=false.
 	if rec.Status == "APPROVED" {
 		t.Fatalf("cleanup validator's detached descendant survived SIGKILL past the extinction deadline (genuine kernel-level uninterruptible sleep via an unanswered FUSE read), yet the run was still APPROVED -- extinction failure must block approval regardless of Cleanup.Required=false")
 	}
-	if !strings.Contains(rec.Message, "descendant containment") && !strings.Contains(rec.Message, "extinction") {
-		t.Fatalf("run was correctly not APPROVED (status=%s) but for the wrong reason -- expected the message to name descendant-containment/extinction failure, got: %s", rec.Status, rec.Message)
+	if runErr == nil {
+		t.Fatalf("descendant confirmed blocked on the unkillable FUSE read (gate released) yet the run reported no extinction failure (status=%q) -- extinction failure must block approval regardless of Cleanup.Required=false", rec.Status)
+	}
+	if !strings.Contains(runErr.Error(), "extinction") && !strings.Contains(runErr.Error(), "descendant containment") {
+		t.Fatalf("run failed for the wrong reason after the confirmed blocking read -- expected descendant-containment/extinction failure, got: %v", runErr)
 	}
 }

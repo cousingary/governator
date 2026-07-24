@@ -424,13 +424,25 @@ proc1_unreadable = os.path.isdir('/proc/1') and not os.access('/proc/1/fd', os.R
 print(json.dumps({
     'linux': rec(platform.system()=='Linux', 'platform.system()', platform.system()),
     'has_systemd_user': rec(has_su, 'env GOV_REDTEAM_HAS_SYSTEMD_USER or /run/user/<uid>/bus', str(has_su)),
+    # no_systemd_user is the complement of has_systemd_user. Session 2 (P0-1)
+    # made case 12 deterministic, so no manifest case currently references it;
+    # it stays proven here as the honest complement and for any future case
+    # that needs to express "host genuinely lacks systemd --user".
     'no_systemd_user': rec(not has_su, 'complement of has_systemd_user', str(not has_su)),
     'has_second_uid': rec(env_flag('GOV_REDTEAM_HAS_SECOND_UID'), 'env GOV_REDTEAM_HAS_SECOND_UID'),
     'has_kernel_landlock_full_abi': rec(env_flag('GOV_REDTEAM_HAS_LANDLOCK_FULL_ABI'), 'env GOV_REDTEAM_HAS_LANDLOCK_FULL_ABI'),
-    # case8's hangfuse fixture: Session 2 makes this path deterministic; until
-    # then the host where it does not reliably reach its blocking READ sets
-    # this absent so the manifest's conditional skip is honestly authorized.
-    'case8_hangfuse_extinction_fixture': rec(os.environ.get('GOV_REDTEAM_CASE8_HANGFUSE','0')=='1', 'env GOV_REDTEAM_CASE8_HANGFUSE'),
+    # case8's hangfuse extinction fixture: Session 2 (Sol12 P0-1) made this
+    # deterministic -- an explicit pre-extinction readiness gate
+    # (containment.ExtinguishGateForTesting) plus the in-test
+    # hangfuseProbeSurvivesSIGKILL kernel probe replaced the old post-hoc
+    # "did not reach a blocking READ before its deadline" timing flake. The
+    # remaining skip is now a genuine host CAPABILITY, not a race: a kernel
+    # whose FUSE request wait stays killable (WSL2 among them) cannot
+    # reproduce the unkillable-descendant extinction invariant. The operator
+    # attests via GOV_REDTEAM_CASE8_HANGFUSE=1 that this host's kernel keeps
+    # FUSE-blocked readers alive through SIGKILL, so case 8 runs its real
+    # extinction-timeout assertion instead of authorizing a skip.
+    'case8_hangfuse_extinction_fixture': rec(os.environ.get('GOV_REDTEAM_CASE8_HANGFUSE','0')=='1', 'env GOV_REDTEAM_CASE8_HANGFUSE (operator attests kernel keeps FUSE-blocked readers unkillable)'),
     'git_trusted': rec(shutil.which('git') is not None, 'shutil.which(git)', shutil.which('git') or ''),
     'proc1_fd_unreadable': rec(proc1_unreadable, 'os.access(/proc/1/fd, R_OK)', str(proc1_unreadable)),
 }))

@@ -264,6 +264,40 @@ type Scope struct {
 // pattern of internal/enforce.SelfExeOverride and ForceUnsupported.
 var ForceDegradedScopeForTesting atomic.Bool
 
+// ScopeSelectionForceUnavailableForTesting is a TEST-ONLY seam (Sol12 rc5
+// Session 2, P0-1). When set, newSystemdUserScope returns a deterministic
+// "systemd user manager unavailable" error immediately after the nil-handle
+// check -- WITHOUT touching /run/systemd/system, the live user bus, or the
+// systemd-run probe -- so the scope-selection FAILURE path (and its
+// descriptor-leak invariant) can be exercised on every host, including one
+// that genuinely has a live systemd --user manager. Before this seam,
+// TestV10Case12 (report case 12) could only run where the host truly lacked
+// systemd --user, making it mutually exclusive with TestV10Case13 (the real
+// live-systemd acceptance test) on any single host -- so a correct single-host
+// zero-skip red-team run was structurally impossible. Production code MUST
+// NEVER set this; only _test.go code in this package and the redteam corpus
+// (behind the redteam build tag) flips it, exactly like
+// ForceDegradedScopeForTesting. The forced error fires at the same logical
+// point a genuinely-absent user bus would (after the borrowed handle is
+// confirmed non-nil, before any probe), so the borrow/ownership invariant
+// under test is the real one.
+var ScopeSelectionForceUnavailableForTesting atomic.Bool
+
+// ExtinguishGateForTesting is a TEST-ONLY synchronization seam (Sol12 rc5
+// Session 2, P0-1). When non-nil, Scope.Extinguish invokes it and blocks until
+// it returns BEFORE beginning any kill/freeze logic, so a red-team fixture can
+// PROVE a descendant reached an intended state (e.g. an uninterruptible
+// blocking read) BEFORE Governator begins extinction. This replaces the timing
+// assumption at the heart of TestV7Case8's original flake (report case 8:
+// "the timing fixture did not enter its expected blocking-read state before
+// its deadline"). If the gate returns a non-nil error, Extinguish returns that
+// error without killing -- the fixture uses this to surface a genuine
+// host-capability failure (a kernel that kills FUSE-blocked readers) as a
+// deterministic, reasoned refusal rather than a post-hoc timeout skip.
+// Production code MUST NEVER set this; only _test.go / redteam-corpus code
+// assigns it (and defers restoring nil), mirroring internal/enforce.SelfExeOverride.
+var ExtinguishGateForTesting func() error
+
 // NewScope selects the strongest descendant-owning primitive available on
 // this host, in the order the plan specifies: systemd --user transient
 // scope, then a directly managed cgroup v2 subtree, then a PID namespace.
@@ -328,6 +362,16 @@ func (s *Scope) IsStrong() bool { return s.method != scopeDegraded }
 func newSystemdUserScope(runID string, handle *toolregistry.Handle) (*Scope, error) {
 	if handle == nil {
 		return nil, fmt.Errorf("containment: systemd-run is not enrolled/resolvable in this run's frozen containment environment")
+	}
+	if ScopeSelectionForceUnavailableForTesting.Load() {
+		// Deterministic failure for the scope-selection leak invariant (Sol12
+		// rc5 Session 2, P0-1): a borrowed, non-nil handle is confirmed here,
+		// then this attempt fails exactly as a genuinely-absent user bus would
+		// -- without probing the host -- so TestV10Case12 (report case 12) can
+		// run on a host that has systemd --user instead of being its
+		// mutually-exclusive partner of TestV10Case13. handle is borrowed, so
+		// nothing here is closed (the invariant the test asserts).
+		return nil, fmt.Errorf("containment: systemd user manager unavailable (test-forced scope-selection failure)")
 	}
 	if _, err := os.Stat("/run/systemd/system"); err != nil {
 		return nil, fmt.Errorf("containment: systemd is not PID 1 (no /run/systemd/system): %w", err)
@@ -761,6 +805,20 @@ func (s *Scope) Extinguish(ctx context.Context, deadline time.Duration, workspac
 	}()
 	start := time.Now()
 	proof := Proof{Method: s.method, ProcessesObservedPeak: -1}
+
+	// Sol12 rc5 Session 2 (P0-1): test-only readiness gate. When set, block
+	// here until the fixture confirms a descendant reached the state this
+	// Extinguish is meant to act on (e.g. an uninterruptible blocking read),
+	// so extinction can never fire before that state is reached -- the
+	// explicit synchronization primitive that replaces TestV7Case8's timing
+	// assumption. A non-nil gate error propagates without killing, surfacing a
+	// genuine host-capability gap (a kernel that kills FUSE-blocked readers)
+	// as a deterministic refusal rather than a post-hoc timeout skip.
+	if gate := ExtinguishGateForTesting; gate != nil {
+		if err := gate(); err != nil {
+			return proof, fmt.Errorf("containment: pre-extinction readiness gate failed: %w", err)
+		}
+	}
 
 	// relevant scopes scanWorkspaceFD's post-extinction sweep (Sol11 P1-3)
 	// to processes this specific Extinguish call can actually attribute to

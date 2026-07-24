@@ -585,10 +585,18 @@ func v10s2CountOpenFDs(t *testing.T) int {
 // only ever borrows the already-open handle and never owns closing it) makes
 // this leak structurally impossible: repeated failed attempts here must
 // leak exactly zero descriptors.
+//
+// Sol12 rc5 Session 2 (P0-1): this case used to skip whenever a live systemd
+// --user bus was present, making it mutually exclusive with case 13 (the real
+// live-systemd launch) on any single host -- so a correct single-host
+// zero-skip red-team run was structurally impossible. The failure is now
+// injected deterministically through the ScopeSelectionForceUnavailableForTesting
+// seam, so the absent-systemd fallback's zero-descriptor invariant runs and
+// passes on EVERY host, including this systemd-enabled dev box. Case 13 stays
+// the real live-systemd acceptance test (host-gated, required-in-attestation).
 func TestV10Case12ScopeSelectionFailureLeaksZeroDescriptors(t *testing.T) {
-	if _, err := os.Stat(fmt.Sprintf("/run/user/%d/bus", os.Getuid())); err == nil {
-		t.Skip("a live systemd --user bus is present on this host -- this case needs the probe to fail on unavailability, not exercise a real launch")
-	}
+	ScopeSelectionForceUnavailableForTesting.Store(true)
+	t.Cleanup(func() { ScopeSelectionForceUnavailableForTesting.Store(false) })
 	t.Setenv("GOV_TOOLREGISTRY_FILE", filepath.Join(t.TempDir(), "tools.yaml"))
 	v10s2EnrollTamperableScript(t, "systemd-run", "#!/bin/sh\nexit 0\n")
 	registry, err := toolregistry.Load()
@@ -607,7 +615,7 @@ func TestV10Case12ScopeSelectionFailureLeaksZeroDescriptors(t *testing.T) {
 	before := v10s2CountOpenFDs(t)
 	for i := 0; i < 20; i++ {
 		if _, err := newSystemdUserScope("v10-case12", env.SystemdRun); err == nil {
-			t.Fatal("expected newSystemdUserScope to fail without a live systemd --user bus")
+			t.Fatal("expected newSystemdUserScope to fail under the forced scope-selection failure")
 		}
 	}
 	after := v10s2CountOpenFDs(t)

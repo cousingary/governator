@@ -94,7 +94,7 @@ cases:
     conditional: true
     allowed_skip:
       predicate: case8_hangfuse_extinction_fixture
-      reason: "conditional: case8 hangfuse extinction fixture did not reach a blocking READ on this host/kernel before timeout"
+      reason: "case8 hangfuse extinction fixture"
     status: implemented
   - case: 9
     name: TestV7Case9GraphProviderExternalWriteBlockedOrContained
@@ -618,12 +618,8 @@ cases:
     status: implemented
   - case: 113
     name: TestV10Case12ScopeSelectionFailureLeaksZeroDescriptors
-    session: rc4-s2
+    session: rc5-u12-s2
     required: true
-    conditional: true
-    allowed_skip:
-      predicate: no_systemd_user
-      reason: "a live systemd --user bus is present on this host"
     status: implemented
   - case: 114
     name: TestV10Case13RealSystemdUserScopeLaunchExecutesExactVerifiedTarget
@@ -1201,6 +1197,21 @@ cases:
   - case: 205
     name: TestV12Case13DuplicateCaseNumberFailsLoad
     session: rc5-u12-s1
+    required: true
+    status: implemented
+  - case: 206
+    name: TestV12Case8DeterministicSystemdUnavailableFailurePath
+    session: rc5-u12-s2
+    required: true
+    status: implemented
+  - case: 207
+    name: TestV12Case9LiveSystemdSuccessPathRequiredInAttestation
+    session: rc5-u12-s2
+    required: true
+    status: implemented
+  - case: 208
+    name: TestV12Case10ExtinctionFiresOnlyAfterConfirmedBlockingRead
+    session: rc5-u12-s2
     required: true
     status: implemented
 

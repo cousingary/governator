@@ -33,19 +33,20 @@ func TestLoadManifestRejectsBlankName(t *testing.T) {
 
 // TestLoadManifestAcceptsRealManifest is a regression check that
 // internal/redteam/manifest.yaml (the actual release-gating manifest, not a
-// fixture) parses cleanly under the Sol12 strict decoder: exactly 205
+// fixture) parses cleanly under the Sol12 strict decoder: exactly 208
 // uniquely-numbered, uniquely-named required cases (the rc5 upgrade-12
-// Session 1 corpus, cases 196-205, on top of upgrade-11's 195), plus the
-// documented non-production exclusions that let the authoritative inventory
-// account for every //go:build redteam-tagged security test (P0-2).
+// Session 1 corpus, cases 196-205, plus Session 2's cases 206-208, on top of
+// upgrade-11's 195), plus the documented non-production exclusions that let
+// the authoritative inventory account for every //go:build redteam-tagged
+// security test (P0-2).
 func TestLoadManifestAcceptsRealManifest(t *testing.T) {
 	path := filepath.Join("..", "redteam", "manifest.yaml")
 	m, err := LoadManifest(path)
 	if err != nil {
 		t.Fatalf("LoadManifest(%s): %v", path, err)
 	}
-	if len(m.Cases) != 205 {
-		t.Fatalf("expected 205 cases in the mandatory final attack corpus, got %d", len(m.Cases))
+	if len(m.Cases) != 208 {
+		t.Fatalf("expected 208 cases in the mandatory final attack corpus, got %d", len(m.Cases))
 	}
 	seen := make(map[int]bool)
 	for _, c := range m.Cases {
@@ -57,7 +58,7 @@ func TestLoadManifestAcceptsRealManifest(t *testing.T) {
 			t.Fatalf("case %d (%s): every corpus case must be required (conditional skips are the only sanctioned exception, and are still required=true)", c.Case, c.Name)
 		}
 	}
-	for i := 1; i <= 205; i++ {
+	for i := 1; i <= 208; i++ {
 		if !seen[i] {
 			t.Fatalf("manifest is missing case number %d", i)
 		}

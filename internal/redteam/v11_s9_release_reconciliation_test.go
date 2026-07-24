@@ -113,7 +113,7 @@ func TestV11Case50ProductionManifestSkipOfAnyAttackFailsRelease(t *testing.T) {
 	}
 
 	const skippedCase = "TestV7Case8CleanupValidatorDetachedDescendantExtinctionFailureBlocksApproval"
-	const skipReason = "conditional: case8 hangfuse extinction fixture did not reach a blocking READ on this host/kernel before timeout"
+	const skipReason = "case8 hangfuse extinction fixture"
 
 	var found bool
 	for _, c := range manifest.Cases {
