@@ -769,10 +769,7 @@ func TestV7Case27GitIdentityChangeInvalidatesReplay(t *testing.T) {
 	t.Setenv("GOV_TOOLREGISTRY_FILE", registryFile)
 	strictReplayEnrollControllerTools(t)
 
-	gitPath, err := exec.LookPath("git")
-	if err != nil {
-		t.Skip("git not available")
-	}
+	gitPath := resolveControllerToolPath(t, "git")
 	gitCopyA := copyToNewInode(t, gitPath)
 	if _, err := toolregistry.Enroll("git", gitCopyA); err != nil {
 		t.Fatal(err)

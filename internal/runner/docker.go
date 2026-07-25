@@ -2,6 +2,8 @@ package runner
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -52,35 +54,195 @@ type dockerImageInspect struct {
 	} `json:"Config"`
 }
 
-// ResolveImageIdentity inspects image (a tag or digest reference) and
-// returns its content-addressed identity. Fails closed -- never a
-// sentinel -- when the image cannot be inspected: not present locally,
-// daemon unreachable, or a malformed reference. Callers needing a
-// replay-safe identity must use ID/RepoDigests here, never Reference alone.
-func ResolveImageIdentity(ctx context.Context, image string, environments ...controllerenv.Frozen) (ImageIdentity, error) {
-	env := controllerenv.Freeze()
-	if len(environments) > 0 {
-		env = environments[0]
+// DockerDaemonIdentity captures the daemon's self-reported server identity,
+// folded into replay identity (Sol12 P0-7): the daemon controls mounts,
+// volumes, network policy, and lifecycle responses, so a substituted or
+// upgraded daemon between an attested run and a later replay must mint a
+// fresh identity rather than silently comparing equal.
+type DockerDaemonIdentity struct {
+	ServerVersion string
+	APIVersion    string
+	OSType        string
+	Architecture  string
+	KernelVersion string
+}
+
+// dockerVersionServer is the subset of `docker version --format '{{json
+// .Server}}'` ResolveDockerEnvironment reads to build a DockerDaemonIdentity.
+type dockerVersionServer struct {
+	APIVersion    string `json:"APIVersion"`
+	Version       string `json:"Version"`
+	Os            string `json:"Os"`
+	Arch          string `json:"Arch"`
+	KernelVersion string `json:"KernelVersion"`
+}
+
+// DockerEnvironment is the ONE frozen Docker execution environment a
+// governed run's whole container transaction launches through (Sol12
+// P0-7): the verified-open docker CLI handle, its identity, the daemon's
+// self-reported identity, the endpoint, and a policy hash binding them.
+// Resolved exactly once before replay-identity construction (by the runtime,
+// via ResolveDockerEnvironment against the run's frozen toolregistry) and
+// reused unchanged by every docker operation for the run's entire lifetime
+// -- image inspect, run, verify-started, stop, remove, extinction proof.
+// The trusted-tool registry is never reloaded during the transaction.
+//
+// Standalone callers (doctor, recovery, reconcile, tests) that do not run a
+// governed transaction keep using the package-level ResolveImageIdentity /
+// CheckDockerAvailable / RemoveContainer / inspectContainer entry points,
+// each of which resolves its own ephemeral handle via
+// resolveStandaloneDockerHandle; only the governed run path -- which must
+// bind one CLI + daemon identity into replay -- passes a *DockerEnvironment
+// through. A DockerRunner built without one (recovery.go) falls back to that
+// same standalone path, so recovery keeps working unchanged.
+type DockerEnvironment struct {
+	CLI            *toolregistry.Handle
+	CLIIdentity    toolregistry.Identity
+	DaemonIdentity DockerDaemonIdentity
+	Endpoint       string
+	PolicyHash     string
+}
+
+// Close releases the held CLI handle. The runtime owns one DockerEnvironment
+// per governed run and calls this once the run (including its synchronous
+// Destroy) has finished; recovery-constructed DockerRunners share a nil
+// DockerEnvironment and never reach this.
+func (de *DockerEnvironment) Close() error {
+	if de == nil {
+		return nil
 	}
-	if err := env.Validate(); err != nil {
-		return ImageIdentity{}, err
+	if de.CLI != nil {
+		err := de.CLI.Close()
+		de.CLI = nil
+		return err
 	}
+	return nil
+}
+
+// IdentitySummary is the replay-binding digest folded into ExecutionIdentity
+// via runnerConfig: CLI identity (canonical path + content hash), the daemon
+// identity, the endpoint, and the policy hash. Nil for non-docker runs.
+func (de *DockerEnvironment) IdentitySummary() any {
+	if de == nil {
+		return nil
+	}
+	return map[string]any{
+		"cli_path":         de.CLIIdentity.CanonicalPath,
+		"cli_sha256":       de.CLIIdentity.SHA256,
+		"daemon_server":    de.DaemonIdentity.ServerVersion,
+		"daemon_api":       de.DaemonIdentity.APIVersion,
+		"daemon_os":        de.DaemonIdentity.OSType,
+		"daemon_arch":      de.DaemonIdentity.Architecture,
+		"daemon_kernel":    de.DaemonIdentity.KernelVersion,
+		"endpoint":         de.Endpoint,
+		"environment_hash": de.PolicyHash,
+	}
+}
+
+// ResolveDockerEnvironment loads the trusted docker handle from the frozen
+// registry exactly once and queries the daemon for its self-reported
+// identity, returning the one DockerEnvironment a governed run's whole
+// container transaction must launch through. registry is the run's frozen
+// toolregistry (RunEnvironment.ToolRegistry) -- never reloaded here. The
+// daemon query doubles as the availability check: a reachable, responding
+// daemon is proven by construction, so a caller that passes the returned
+// environment into runner.New need not call CheckDockerAvailable separately.
+func ResolveDockerEnvironment(ctx context.Context, registry *toolregistry.Registry, frozen controllerenv.Frozen) (*DockerEnvironment, error) {
+	if registry == nil {
+		return nil, fmt.Errorf("resolve docker environment: controller tool registry is not frozen")
+	}
+	if err := frozen.Validate(); err != nil {
+		return nil, fmt.Errorf("resolve docker environment: %w", err)
+	}
+	handle, err := registry.ResolveHandle("docker", "docker", toolregistry.KindTrustedController)
+	if err != nil {
+		return nil, fmt.Errorf("resolve trusted docker handle: %w", err)
+	}
+	ok := false
+	defer func() {
+		if !ok {
+			_ = handle.Close()
+		}
+	}()
+	daemon, endpoint, err := queryDaemonIdentity(ctx, handle, frozen)
+	if err != nil {
+		return nil, err
+	}
+	de := &DockerEnvironment{
+		CLI:            handle,
+		CLIIdentity:    handle.Identity,
+		DaemonIdentity: daemon,
+		Endpoint:       endpoint,
+	}
+	de.PolicyHash = hashDockerEnvironmentPolicy(de)
+	ok = true
+	return de, nil
+}
+
+// queryDaemonIdentity runs `docker version --format '{{json .Server}}'`
+// through the already-held, verified CLI handle to capture the daemon's
+// self-reported server identity, and resolves the endpoint the CLI will
+// contact (DOCKER_HOST from the frozen environment, or the platform
+// default when unset). A daemon that fails to answer fails closed: no
+// DockerEnvironment is returned, so no governed docker run can proceed.
+func queryDaemonIdentity(ctx context.Context, handle *toolregistry.Handle, frozen controllerenv.Frozen) (DockerDaemonIdentity, string, error) {
+	queryCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	cmd, cerr := handle.Command(queryCtx, "version", "--format", "{{json .Server}}")
+	if cerr != nil {
+		return DockerDaemonIdentity{}, "", cerr
+	}
+	cmd.Env = append([]string(nil), frozen.Values...)
+	out, err := cmd.Output()
+	if err != nil {
+		return DockerDaemonIdentity{}, "", fmt.Errorf("docker daemon identity: %v: %s", err, trimmed(out))
+	}
+	var server dockerVersionServer
+	if jerr := json.Unmarshal(out, &server); jerr != nil {
+		return DockerDaemonIdentity{}, "", fmt.Errorf("docker daemon identity: parse server version: %w", jerr)
+	}
+	endpoint, _ := frozen.Lookup("DOCKER_HOST")
+	if strings.TrimSpace(endpoint) == "" {
+		endpoint = "unix:///var/run/docker.sock"
+	}
+	return DockerDaemonIdentity{
+		ServerVersion: server.Version,
+		APIVersion:    server.APIVersion,
+		OSType:        server.Os,
+		Architecture:  server.Arch,
+		KernelVersion: server.KernelVersion,
+	}, endpoint, nil
+}
+
+func hashDockerEnvironmentPolicy(de *DockerEnvironment) string {
+	if de == nil {
+		return ""
+	}
+	h := sha256.New()
+	fmt.Fprintf(h, "cli=%s|%s\ndaemon=%s|%s|%s|%s|%s\nendpoint=%s\n",
+		de.CLIIdentity.CanonicalPath, de.CLIIdentity.SHA256,
+		de.DaemonIdentity.ServerVersion, de.DaemonIdentity.APIVersion,
+		de.DaemonIdentity.OSType, de.DaemonIdentity.Architecture, de.DaemonIdentity.KernelVersion,
+		de.Endpoint)
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+// inspectImageWith runs `docker image inspect` through the provided,
+// already-verified, open CLI handle; the caller owns the handle's lifecycle
+// (governed: a frozen DockerEnvironment held for the whole transaction;
+// standalone: a freshly resolved handle ResolveImageIdentity closes itself).
+// Split out so the governed run path and the standalone entry point cannot
+// drift on what "inspect this image" means.
+func inspectImageWith(ctx context.Context, image string, env controllerenv.Frozen, handle *toolregistry.Handle) (ImageIdentity, error) {
 	if strings.TrimSpace(image) == "" {
 		return ImageIdentity{}, fmt.Errorf("resolve image identity: empty image reference")
 	}
-	handle, berr := resolveDockerHandle()
-	if berr != nil {
-		return ImageIdentity{}, fmt.Errorf("resolve image identity %q: %w", image, berr)
+	cmd, cerr := handle.Command(ctx, "image", "inspect", image, "--format", "{{json .}}")
+	if cerr != nil {
+		return ImageIdentity{}, cerr
 	}
-	defer handle.Close()
-	out, err := func() ([]byte, error) {
-		cmd, cerr := handle.Command(ctx, "image", "inspect", image, "--format", "{{json .}}")
-		if cerr != nil {
-			return nil, cerr
-		}
-		cmd.Env = append([]string(nil), env.Values...)
-		return cmd.Output()
-	}()
+	cmd.Env = append([]string(nil), env.Values...)
+	out, err := cmd.Output()
 	if err != nil {
 		return ImageIdentity{}, fmt.Errorf("resolve image identity %q: %w", image, err)
 	}
@@ -101,16 +263,62 @@ func ResolveImageIdentity(ctx context.Context, image string, environments ...con
 	}, nil
 }
 
-// resolveDocker resolves and verifies the docker CLI through the
-// trusted-tool registry (Session 2, post-v4 hardening plan item C) --
-// docker is the DockerRunner containment boundary itself, so every one of
-// its own invocations trusting a bare ambient "docker" argv0 would let a
-// PATH substitution defeat the containment DockerRunner exists to provide.
-// Resolved fresh at each call site rather than cached, matching every other
-// registry-backed call site in this codebase (gitplumb.TrustedGitPath,
-// enforce.NewPlan): callers must see the current trust state, not a stale
-// snapshot from earlier in the process's life.
-func resolveDockerHandle() (*toolregistry.Handle, error) {
+// InspectImage is the governed-run image identity path (Sol12 P0-7): it
+// inspects image through THIS DockerEnvironment's frozen CLI handle -- the
+// same handle every later docker operation (run/verify/stop/remove/extinct)
+// will use -- so replay identity describes the exact CLI that performs the
+// lifecycle, never a different one a per-op reload could have substituted.
+// The handle is transaction-held and not closed here.
+func (de *DockerEnvironment) InspectImage(ctx context.Context, image string, env controllerenv.Frozen) (ImageIdentity, error) {
+	if err := env.Validate(); err != nil {
+		return ImageIdentity{}, err
+	}
+	if de == nil || de.CLI == nil {
+		return ImageIdentity{}, fmt.Errorf("inspect image: docker environment is not frozen")
+	}
+	return inspectImageWith(ctx, image, env, de.CLI)
+}
+
+// ResolveImageIdentity inspects image (a tag or digest reference) and
+// returns its content-addressed identity. This is the STANDALONE entry point
+// (doctor, tests, non-governed callers): it resolves its own ephemeral CLI
+// handle per call via resolveStandaloneDockerHandle. Governed runs instead
+// resolve one DockerEnvironment before replay and call its InspectImage, so
+// image inspection and every later lifecycle op share one frozen CLI
+// identity (Sol12 P0-7). Fails closed -- never a sentinel -- when the image
+// cannot be inspected. Callers needing a replay-safe identity must use
+// ID/RepoDigests here, never Reference alone.
+func ResolveImageIdentity(ctx context.Context, image string, environments ...controllerenv.Frozen) (ImageIdentity, error) {
+	env := controllerenv.Freeze()
+	if len(environments) > 0 {
+		env = environments[0]
+	}
+	if err := env.Validate(); err != nil {
+		return ImageIdentity{}, err
+	}
+	handle, berr := resolveStandaloneDockerHandle()
+	if berr != nil {
+		return ImageIdentity{}, fmt.Errorf("resolve image identity %q: %w", image, berr)
+	}
+	defer handle.Close()
+	return inspectImageWith(ctx, image, env, handle)
+}
+
+// resolveStandaloneDockerHandle resolves and verifies the docker CLI through
+// the trusted-tool registry for STANDALONE (non-governed) callers only:
+// doctor, recovery, reconcile, tests, and the package-level entry points
+// (ResolveImageIdentity / CheckDockerAvailable / RemoveContainer /
+// inspectContainer) when no frozen DockerEnvironment was supplied. It is the
+// ONLY call site in this package that reloads the trusted-tool registry, and
+// it is deliberately not on the governed-run path: a governed run resolves
+// one DockerEnvironment before replay-identity construction (via
+// ResolveDockerEnvironment against the run's frozen toolregistry) and reuses
+// that single CLI handle for its whole container transaction, so the
+// registry is never reloaded mid-transaction (Sol12 P0-7). docker is the
+// DockerRunner containment boundary itself, so trusting a bare ambient
+// "docker" argv0 would let a PATH substitution defeat the containment
+// DockerRunner exists to provide.
+func resolveStandaloneDockerHandle() (*toolregistry.Handle, error) {
 	registry, err := toolregistry.Load()
 	if err != nil {
 		return nil, fmt.Errorf("load trusted-tool registry: %w", err)
@@ -122,10 +330,32 @@ func resolveDockerHandle() (*toolregistry.Handle, error) {
 	return handle, nil
 }
 
+// dockerHandleFor returns the frozen CLI handle from the first provided
+// DockerEnvironment when one is present (governed-run path: the caller must
+// NOT close it -- the transaction owns it), or resolves a fresh standalone
+// handle otherwise (recovery/test path: the returned cleanup func closes it
+// and must be deferred by the caller). Used by the package-level entry
+// points so they serve both paths without a per-call registry reload on the
+// governed path.
+func dockerHandleFor(dockerEnvs ...*DockerEnvironment) (handle *toolregistry.Handle, cleanup func(), err error) {
+	if len(dockerEnvs) > 0 && dockerEnvs[0] != nil && dockerEnvs[0].CLI != nil {
+		return dockerEnvs[0].CLI, func() {}, nil
+	}
+	h, rerr := resolveStandaloneDockerHandle()
+	if rerr != nil {
+		return nil, func() {}, rerr
+	}
+	return h, func() { _ = h.Close() }, nil
+}
+
 // CheckDockerAvailable reports whether a working `docker` CLI and a
 // reachable daemon exist, so New can fail closed: a contract that asks for
 // runner: docker without a usable Docker install must error, never silently
-// fall back to LocalWorktreeRunner.
+// fall back to LocalWorktreeRunner. This is the STANDALONE availability
+// check (doctor, tests, and runner.New when no frozen DockerEnvironment was
+// supplied); a governed run that already resolved a DockerEnvironment need
+// not call it -- the daemon query ResolveDockerEnvironment performs doubles
+// as the availability proof.
 func CheckDockerAvailable(environments ...controllerenv.Frozen) error {
 	env := controllerenv.Freeze()
 	if len(environments) > 0 {
@@ -134,7 +364,7 @@ func CheckDockerAvailable(environments ...controllerenv.Frozen) error {
 	if err := env.Validate(); err != nil {
 		return err
 	}
-	handle, err := resolveDockerHandle()
+	handle, err := resolveStandaloneDockerHandle()
 	if err != nil {
 		return err
 	}
@@ -182,9 +412,41 @@ type DockerRunner struct {
 	CredentialRoots       []string
 	ControllerEnvironment controllerenv.Frozen
 	ResolvedImage         *ImageIdentity
+	// Docker is the ONE frozen Docker execution environment this run's whole
+	// container transaction launches through (Sol12 P0-7): CLI handle,
+	// daemon identity, endpoint, all resolved once before replay and reused
+	// by every docker operation. nil for DockerRunners built outside the
+	// governed path (recovery.go), which fall back to the standalone
+	// per-op resolver via dockerHandle.
+	Docker *DockerEnvironment
+	// Registry is the run's frozen trusted-tool registry (Sol12 P0-6): the
+	// shell helper resolves git/bash from THIS rather than reloading the
+	// registry per call, so two shell calls in one transaction can never
+	// see different toolsets. nil on recovery-constructed runners, which
+	// then take the standalone resolver path.
+	Registry *toolregistry.Registry
 
 	mu    sync.Mutex
 	trunc truncationStats
+}
+
+// dockerHandle returns the frozen CLI handle when this runner carries a
+// DockerEnvironment (the governed path), or a freshly resolved standalone
+// handle otherwise (recovery-constructed runners). The returned cleanup
+// function is a no-op on the governed path (the transaction owns the handle)
+// and closes the handle on the standalone path; callers must always defer
+// it. This is the single seam through which every DockerRunner docker
+// invocation reaches the CLI, so the governed run uses one frozen CLI +
+// daemon identity for its whole transaction (Sol12 P0-7).
+func (d *DockerRunner) dockerHandle() (*toolregistry.Handle, func(), error) {
+	if d.Docker != nil && d.Docker.CLI != nil {
+		return d.Docker.CLI, func() {}, nil
+	}
+	handle, err := resolveStandaloneDockerHandle()
+	if err != nil {
+		return nil, func() {}, err
+	}
+	return handle, func() { _ = handle.Close() }, nil
 }
 
 func (d *DockerRunner) controllerEnvironment() controllerenv.Frozen {
@@ -215,7 +477,7 @@ var metadataSinkholeHosts = []string{
 }
 
 func (d *DockerRunner) Prepare(ctx context.Context, req PrepareRequest) (Workspace, error) {
-	ws, err := prepareWorktree(ctx, req.Root, req.Home, req.ID, req.Git, d.controllerEnvironment())
+	ws, err := prepareWorktree(ctx, req.Root, req.Home, req.ID, req.Git, d.controllerEnvironment(), d.Registry)
 	if err != nil {
 		return Workspace{}, err
 	}
@@ -242,11 +504,11 @@ func (d *DockerRunner) executor(ws Workspace) agents.Executor {
 		if err != nil {
 			return 0, false, false, err
 		}
-		dockerHandle, dberr := resolveDockerHandle()
+		dockerHandle, dockerCleanup, dberr := d.dockerHandle()
 		if dberr != nil {
 			return 0, false, false, dberr
 		}
-		defer dockerHandle.Close()
+		defer dockerCleanup()
 		// Sol9 P1-2: the docker CLI process launches with its own process
 		// group (Setpgid) so a same-uid kill signal issued after this
 		// package has already given up on it (below) reaches every process
@@ -458,6 +720,15 @@ func (d *DockerRunner) verifyStartedContainer(ctx context.Context, ws Workspace,
 		return nil
 	}
 	env := d.controllerEnvironment()
+	// Sol12 P0-7: resolve the frozen CLI handle once for the whole
+	// verification loop -- never reload the registry per poll, or a
+	// registry rotation between two iterations could inspect through a
+	// different CLI than the one that launched the container.
+	handle, cleanup, herr := d.dockerHandle()
+	if herr != nil {
+		return herr
+	}
+	defer cleanup()
 	deadline := time.Now().Add(DockerContainerObservationDeadline)
 	for {
 		// Sol9 P1-2: bound each poll's inspect call so a daemon that never
@@ -465,7 +736,7 @@ func (d *DockerRunner) verifyStartedContainer(ctx context.Context, ws Workspace,
 		// see waitDockerCLIBounded for the equivalent bound on the CLI's
 		// own shutdown wait.
 		inspectCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
-		insp, absent, err := inspectContainer(inspectCtx, ws.Container, env)
+		insp, absent, err := inspectContainerWith(inspectCtx, ws.Container, env, handle)
 		cancel()
 		if err == nil {
 			if insp.Image != d.ResolvedImage.ID {
@@ -506,7 +777,16 @@ func (d *DockerRunner) forceStopAndRemove(ctx context.Context, ws Workspace) err
 		return nil
 	}
 	rmCtx, rmCancel := context.WithTimeout(ctx, 10*time.Second)
-	rmErr := RemoveContainer(rmCtx, ws.Container, d.controllerEnvironment())
+	// Sol12 P0-7: remove through the same frozen CLI handle the transaction
+	// launched/inspected with, not a per-op registry reload.
+	rmHandle, rmCleanup, rmhErr := d.dockerHandle()
+	var rmErr error
+	if rmhErr != nil {
+		rmErr = rmhErr
+	} else {
+		rmErr = removeContainerWith(rmCtx, ws.Container, d.controllerEnvironment(), rmHandle)
+	}
+	rmCleanup()
 	rmCancel()
 	if rmErr != nil {
 		return errors.Join(fmt.Errorf("docker stop %s: %w", ws.Container, stopErr), rmErr)
@@ -559,7 +839,13 @@ func (d *DockerRunner) proveContainerExtinction(ctx context.Context, ws Workspac
 	}
 	inspectCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
-	insp, absent, err := inspectContainer(inspectCtx, ws.Container, d.controllerEnvironment())
+	// Sol12 P0-7: extinction proof through the transaction's frozen CLI handle.
+	handle, cleanup, herr := d.dockerHandle()
+	if herr != nil {
+		return false, fmt.Errorf("docker extinction proof: %w", herr)
+	}
+	defer cleanup()
+	insp, absent, err := inspectContainerWith(inspectCtx, ws.Container, d.controllerEnvironment(), handle)
 	if absent {
 		return true, nil
 	}
@@ -816,15 +1102,14 @@ func imageDigestSuffix(image string) string {
 	return image[idx:]
 }
 
-func inspectContainer(ctx context.Context, name string, frozen controllerenv.Frozen) (dockerInspect, bool, error) {
-	if err := frozen.Validate(); err != nil {
-		return dockerInspect{}, false, err
-	}
-	handle, err := resolveDockerHandle()
-	if err != nil {
-		return dockerInspect{}, false, err
-	}
-	defer handle.Close()
+// inspectContainerWith runs `docker inspect` through the provided,
+// already-verified CLI handle; the caller owns the handle's lifecycle
+// (governed: the frozen DockerEnvironment's handle; standalone: a freshly
+// resolved handle inspectContainer closes itself). Split out so the
+// governed path reuses its one frozen CLI for container inspection
+// (verify-started / extinction / observe) rather than reloading the
+// registry per op (Sol12 P0-7).
+func inspectContainerWith(ctx context.Context, name string, frozen controllerenv.Frozen, handle *toolregistry.Handle) (dockerInspect, bool, error) {
 	cmd, cerr := handle.Command(ctx, "inspect", name, "--format", "{{json .}}")
 	if cerr != nil {
 		return dockerInspect{}, false, cerr
@@ -842,6 +1127,22 @@ func inspectContainer(ctx context.Context, name string, frozen controllerenv.Fro
 		return dockerInspect{}, false, fmt.Errorf("docker inspect %s: parse inspect output: %w", name, err)
 	}
 	return insp, false, nil
+}
+
+// inspectContainer is the STANDALONE container-inspect entry point (tests,
+// recovery): resolves its own ephemeral CLI handle per call. Governed-run
+// methods call inspectContainerWith with their frozen DockerEnvironment
+// handle instead.
+func inspectContainer(ctx context.Context, name string, frozen controllerenv.Frozen) (dockerInspect, bool, error) {
+	if err := frozen.Validate(); err != nil {
+		return dockerInspect{}, false, err
+	}
+	handle, err := resolveStandaloneDockerHandle()
+	if err != nil {
+		return dockerInspect{}, false, err
+	}
+	defer handle.Close()
+	return inspectContainerWith(ctx, name, frozen, handle)
 }
 
 func stringSliceContains(list []string, want string) bool {
@@ -913,7 +1214,17 @@ func (d *DockerRunner) Observe(ctx context.Context, ws Workspace) (ObserveResult
 		}
 		return base, nil
 	}
-	insp, _, err := inspectContainer(ctx, ws.Container, d.controllerEnvironment())
+	// Sol12 P0-7: observe through the transaction's frozen CLI handle.
+	obsHandle, obsCleanup, oerr := d.dockerHandle()
+	if oerr != nil {
+		base.Notes = appendDockerNote(base.Notes, "docker_inspect_failed: "+oerr.Error())
+		if hardened {
+			return base, fmt.Errorf("docker hardened observation: inspect failed: %w", oerr)
+		}
+		return base, nil
+	}
+	defer obsCleanup()
+	insp, _, err := inspectContainerWith(ctx, ws.Container, d.controllerEnvironment(), obsHandle)
 	if err != nil {
 		base.Notes = appendDockerNote(base.Notes, "docker_inspect_failed: "+err.Error())
 		if hardened {
@@ -952,11 +1263,11 @@ func (d *DockerRunner) Stop(ctx context.Context, ws Workspace) error {
 	if ws.Container == "" {
 		return nil
 	}
-	handle, err := resolveDockerHandle()
+	handle, cleanup, err := d.dockerHandle()
 	if err != nil {
 		return err
 	}
-	defer handle.Close()
+	defer cleanup()
 	cmd, cerr := handle.Command(ctx, "stop", "-t", "5", ws.Container)
 	if cerr != nil {
 		return cerr
@@ -973,33 +1284,26 @@ func (d *DockerRunner) Stop(ctx context.Context, ws Workspace) error {
 // session exists to prevent.
 func (d *DockerRunner) Destroy(ctx context.Context, ws Workspace, approved bool) error {
 	if ws.Container != "" {
-		if err := RemoveContainer(ctx, ws.Container, d.controllerEnvironment()); err != nil {
-			return err
+		// Sol12 P0-7: remove through the transaction's frozen CLI handle.
+		dHandle, dCleanup, derr := d.dockerHandle()
+		if derr != nil {
+			return derr
+		}
+		rmErr := removeContainerWith(ctx, ws.Container, d.controllerEnvironment(), dHandle)
+		dCleanup()
+		if rmErr != nil {
+			return rmErr
 		}
 	}
-	return destroyWorktree(ctx, ws, approved, d.controllerEnvironment())
+	return destroyWorktree(ctx, ws, approved, d.controllerEnvironment(), d.Registry)
 }
 
-// RemoveContainer force-removes a container, tolerating only the
-// already-gone case: `docker rm -f` on a missing container exits nonzero
-// with "No such container", which for teardown purposes is success. Every
-// other failure is returned so callers (Destroy, `gov reconcile`'s
-// workspace-destroy retry) never mark a teardown done while the container
-// may still be alive. Exposed so internal/runtime's reconciler and this
-// runner cannot drift on what counts as tolerable.
-func RemoveContainer(ctx context.Context, name string, environments ...controllerenv.Frozen) error {
-	env := controllerenv.Freeze()
-	if len(environments) > 0 {
-		env = environments[0]
-	}
-	if err := env.Validate(); err != nil {
-		return err
-	}
-	handle, berr := resolveDockerHandle()
-	if berr != nil {
-		return berr
-	}
-	defer handle.Close()
+// removeContainerWith force-removes a container through the provided,
+// already-verified CLI handle; the caller owns the handle's lifecycle.
+// Tolerates only the already-gone case (Sol12 P0-7: governed Destroy /
+// forceStopAndRemove pass their frozen DockerEnvironment handle so the
+// removal uses the same CLI identity as the rest of the transaction).
+func removeContainerWith(ctx context.Context, name string, env controllerenv.Frozen, handle *toolregistry.Handle) error {
 	cmd, cerr := handle.Command(ctx, "rm", "-f", name)
 	if cerr != nil {
 		return cerr
@@ -1010,6 +1314,31 @@ func RemoveContainer(ctx context.Context, name string, environments ...controlle
 		return fmt.Errorf("docker rm -f %s: %v: %s", name, err, trimmed(out))
 	}
 	return nil
+}
+
+// RemoveContainer is the STANDALONE force-remove entry point (reconcile,
+// tests): resolves its own ephemeral CLI handle per call via
+// dockerHandleFor. Governed-run callers pass their frozen DockerEnvironment
+// so the removal shares the transaction's one CLI identity; that path goes
+// through removeContainerWith directly (see Destroy / forceStopAndRemove).
+// Tolerates only the already-gone case: `docker rm -f` on a missing
+// container exits nonzero with "No such container", which for teardown
+// purposes is success. Every other failure is returned so callers never mark
+// a teardown done while the container may still be alive.
+func RemoveContainer(ctx context.Context, name string, environments ...controllerenv.Frozen) error {
+	env := controllerenv.Freeze()
+	if len(environments) > 0 {
+		env = environments[0]
+	}
+	if err := env.Validate(); err != nil {
+		return err
+	}
+	handle, berr := resolveStandaloneDockerHandle()
+	if berr != nil {
+		return berr
+	}
+	defer handle.Close()
+	return removeContainerWith(ctx, name, env, handle)
 }
 
 // containerAlreadyGone reports whether docker rm's combined output indicates

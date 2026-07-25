@@ -1255,6 +1255,52 @@ cases:
     session: rc5-u12-s3
     required: true
     status: implemented
+  # Session 4 (P0-6/P0-7): frozen controller participants. shell()
+  # (internal/runtime, internal/runner) now takes the run's frozen
+  # *toolregistry.Registry as a parameter instead of reloading it per call,
+  # and its subprocess PATH is private to the sealed git+bash directories it
+  # already resolved and verified -- never the ambient base PATH, and never
+  # falling back to a self-loaded registry when the parameter is nil. Docker
+  # resolves ONE frozen DockerEnvironment (CLI handle, CLI identity, daemon
+  # identity, endpoint) before replay via ResolveDockerEnvironment, and every
+  # later docker operation -- inspect, launch, extinction -- reuses that
+  # exact object; the trusted-tool registry is never reloaded mid-transaction
+  # on the governed path.
+  - case: 215
+    name: TestV12Case20GitRegistryRotatedAfterRunFreezeHasNoEffect
+    session: rc5-u12-s4
+    required: true
+    status: implemented
+  - case: 216
+    name: TestV12Case21BashRegistryRotatedAfterRunFreezeHasNoEffect
+    session: rc5-u12-s4
+    required: true
+    status: implemented
+  - case: 217
+    name: TestV12Case22ShellRefusesToRunWithoutAFrozenRegistry
+    session: rc5-u12-s4
+    required: true
+    status: implemented
+  - case: 218
+    name: TestV12Case23ShellCommandStringCannotResolveAmbientTools
+    session: rc5-u12-s4
+    required: true
+    status: implemented
+  - case: 219
+    name: TestV12Case24DockerCLIRotatesBetweenInspectAndLaunchHasNoEffect
+    session: rc5-u12-s4
+    required: true
+    status: implemented
+  - case: 220
+    name: TestV12Case25DockerCLIRotatesBetweenLaunchAndExtinctionHasNoEffect
+    session: rc5-u12-s4
+    required: true
+    status: implemented
+  - case: 221
+    name: TestV12Case26DockerDaemonEndpointChangeDuringRunHasNoEffect
+    session: rc5-u12-s4
+    required: true
+    status: implemented
 
 # Exclusions (Sol12 P0-2): every //go:build redteam-tagged test that is NOT a
 # manifest corpus case must be explicitly classified here with a documented

@@ -118,9 +118,9 @@ func TestRunnerConfigHashesLocalConfig(t *testing.T) {
 	tightened := contracts.Contract{Local: &contracts.LocalRunnerConfig{RequireCompleteTranscript: true}}
 	capped := contracts.Contract{Local: &contracts.LocalRunnerConfig{OutputCapBytes: 1024}}
 
-	baseHash := hashJSON(runnerConfig(base, nil, ""))
-	tightenedHash := hashJSON(runnerConfig(tightened, nil, ""))
-	cappedHash := hashJSON(runnerConfig(capped, nil, ""))
+	baseHash := hashJSON(runnerConfig(base, nil, nil, ""))
+	tightenedHash := hashJSON(runnerConfig(tightened, nil, nil, ""))
+	cappedHash := hashJSON(runnerConfig(capped, nil, nil, ""))
 
 	if baseHash == tightenedHash {
 		t.Fatal("setting local.require_complete_transcript did not change runnerConfig's hash")
@@ -161,10 +161,7 @@ func TestReplayPositiveIdenticalEnvironmentReplays(t *testing.T) {
 	// just "test" -- an isolated registry file starts with none of the
 	// default entries' paths/hashes actually filled in.
 	for _, name := range []string{"git", "bash", "unshare", "test"} {
-		bin, err := exec.LookPath(name)
-		if err != nil {
-			t.Fatal(err)
-		}
+		bin := resolveTestTool(t, name)
 		if _, err := toolregistry.Enroll(name, bin); err != nil {
 			t.Fatal(err)
 		}
@@ -450,13 +447,13 @@ func TestComputeIdentityCapturesBackendBinary(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	idA := computeExecutionIdentity(config.BuiltIn(), c, agent, resA, agents.BackendIdentity{}, nil, "", "dead", "ch", pv, "attest-1", PolicyBundle{}, containment.ContainmentEnvironment{})
+	idA := computeExecutionIdentity(config.BuiltIn(), c, agent, resA, agents.BackendIdentity{}, nil, nil, "", "dead", "ch", pv, "attest-1", PolicyBundle{}, containment.ContainmentEnvironment{})
 	t.Setenv("GOV_CLAUDE_BIN", binB)
 	resB, err := agents.ResolvePath(agent)
 	if err != nil {
 		t.Fatal(err)
 	}
-	idB := computeExecutionIdentity(config.BuiltIn(), c, agent, resB, agents.BackendIdentity{}, nil, "", "dead", "ch", pv, "attest-1", PolicyBundle{}, containment.ContainmentEnvironment{})
+	idB := computeExecutionIdentity(config.BuiltIn(), c, agent, resB, agents.BackendIdentity{}, nil, nil, "", "dead", "ch", pv, "attest-1", PolicyBundle{}, containment.ContainmentEnvironment{})
 	if idA.BackendBinarySHA256 == idB.BackendBinarySHA256 {
 		t.Fatal("different backend binaries produced the same identity binary hash")
 	}
@@ -493,13 +490,13 @@ func TestComputeIdentityCapturesDockerImageIdentity(t *testing.T) {
 	imgA := &runner.ImageIdentity{Reference: "example/agent:latest", ID: "sha256:" + strings.Repeat("a", 64)}
 	imgB := &runner.ImageIdentity{Reference: "example/agent:latest", ID: "sha256:" + strings.Repeat("b", 64)}
 
-	idA := computeExecutionIdentity(config.BuiltIn(), c, agent, res, agents.BackendIdentity{}, imgA, "", "dead", "ch", pv, "attest-1", PolicyBundle{}, containment.ContainmentEnvironment{})
-	idB := computeExecutionIdentity(config.BuiltIn(), c, agent, res, agents.BackendIdentity{}, imgB, "", "dead", "ch", pv, "attest-1", PolicyBundle{}, containment.ContainmentEnvironment{})
+	idA := computeExecutionIdentity(config.BuiltIn(), c, agent, res, agents.BackendIdentity{}, imgA, nil, "", "dead", "ch", pv, "attest-1", PolicyBundle{}, containment.ContainmentEnvironment{})
+	idB := computeExecutionIdentity(config.BuiltIn(), c, agent, res, agents.BackendIdentity{}, imgB, nil, "", "dead", "ch", pv, "attest-1", PolicyBundle{}, containment.ContainmentEnvironment{})
 	if idA.Hash() == idB.Hash() {
 		t.Fatal("a different resolved Docker image ID (same configured tag) did not change the full identity hash")
 	}
 
-	idNone := computeExecutionIdentity(config.BuiltIn(), c, agent, res, agents.BackendIdentity{}, nil, "", "dead", "ch", pv, "attest-1", PolicyBundle{}, containment.ContainmentEnvironment{})
+	idNone := computeExecutionIdentity(config.BuiltIn(), c, agent, res, agents.BackendIdentity{}, nil, nil, "", "dead", "ch", pv, "attest-1", PolicyBundle{}, containment.ContainmentEnvironment{})
 	if idA.Hash() == idNone.Hash() {
 		t.Fatal("a resolved image identity vs. none (same tag) did not change the full identity hash")
 	}

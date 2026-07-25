@@ -12,7 +12,17 @@ import (
 
 	"github.com/cousingary/governator/internal/agents"
 	"github.com/cousingary/governator/internal/contracts"
+	"github.com/cousingary/governator/internal/toolregistry"
 )
+
+func testRegistry(t *testing.T) *toolregistry.Registry {
+	t.Helper()
+	registry, err := toolregistry.Load()
+	if err != nil {
+		t.Fatalf("load trusted-tool registry: %v", err)
+	}
+	return registry
+}
 
 func gitCmd(t *testing.T, dir string, args ...string) {
 	t.Helper()
@@ -95,7 +105,8 @@ func (f fakeAgent) Run(ctx context.Context, req agents.Request) (agents.Result, 
 func TestLocalWorktreeRunnerGitLifecycleApproved(t *testing.T) {
 	root := gitFixture(t)
 	home := t.TempDir()
-	r := &LocalWorktreeRunner{}
+	registry := testRegistry(t)
+	r := &LocalWorktreeRunner{Registry: registry}
 	ctx := context.Background()
 
 	ws, err := r.Prepare(ctx, PrepareRequest{Root: root, Home: home, ID: "run-1", Git: true})
@@ -133,7 +144,7 @@ func TestLocalWorktreeRunnerGitLifecycleApproved(t *testing.T) {
 	if _, err := os.Stat(ws.Path); !os.IsNotExist(err) {
 		t.Fatalf("worktree still exists after Destroy: %v", err)
 	}
-	_, out, _ := shell(ctx, root, "git branch --list "+shQuote(ws.Branch))
+	_, out, _ := shell(ctx, root, "git branch --list "+shQuote(ws.Branch), registry)
 	if out != "" {
 		t.Fatalf("branch %s should have been deleted (approved=true), git branch --list returned %q", ws.Branch, out)
 	}
@@ -142,7 +153,8 @@ func TestLocalWorktreeRunnerGitLifecycleApproved(t *testing.T) {
 func TestLocalWorktreeRunnerGitLifecycleQuarantinedKeepsBranch(t *testing.T) {
 	root := gitFixture(t)
 	home := t.TempDir()
-	r := &LocalWorktreeRunner{}
+	registry := testRegistry(t)
+	r := &LocalWorktreeRunner{Registry: registry}
 	ctx := context.Background()
 
 	ws, err := r.Prepare(ctx, PrepareRequest{Root: root, Home: home, ID: "run-2", Git: true})
@@ -155,7 +167,7 @@ func TestLocalWorktreeRunnerGitLifecycleQuarantinedKeepsBranch(t *testing.T) {
 	if _, err := os.Stat(ws.Path); !os.IsNotExist(err) {
 		t.Fatalf("worktree still exists after Destroy: %v", err)
 	}
-	_, out, _ := shell(ctx, root, "git branch --list "+shQuote(ws.Branch))
+	_, out, _ := shell(ctx, root, "git branch --list "+shQuote(ws.Branch), registry)
 	if out == "" {
 		t.Fatalf("branch %s should survive a quarantined (approved=false) Destroy", ws.Branch)
 	}
@@ -189,21 +201,21 @@ func TestLocalWorktreeRunnerNonGitCopy(t *testing.T) {
 }
 
 func TestNewDefaultsToLocal(t *testing.T) {
-	rn, err := New("", nil, nil, nil, nil)
+	rn, err := New("", nil, nil, nil, nil, nil, nil)
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
 	if _, ok := rn.(*LocalWorktreeRunner); !ok {
 		t.Fatalf("New(\"\", nil, nil) = %T, want *LocalWorktreeRunner", rn)
 	}
-	rn, err = New("local", nil, nil, nil, nil)
+	rn, err = New("local", nil, nil, nil, nil, nil, nil)
 	if err != nil || rn == nil {
 		t.Fatalf("New(\"local\", nil, nil): rn=%v err=%v", rn, err)
 	}
 }
 
 func TestNewUnknownModeErrors(t *testing.T) {
-	if _, err := New("bogus", nil, nil, nil, nil); err == nil {
+	if _, err := New("bogus", nil, nil, nil, nil, nil, nil); err == nil {
 		t.Fatal("want error for unknown runner mode")
 	}
 }
@@ -212,7 +224,7 @@ func TestNewUnknownModeErrors(t *testing.T) {
 // without a docker config block must error immediately, never silently run
 // locally instead.
 func TestNewDockerWithoutConfigFailsClosed(t *testing.T) {
-	if _, err := New("docker", nil, nil, nil, nil); err == nil {
+	if _, err := New("docker", nil, nil, nil, nil, nil, nil); err == nil {
 		t.Fatal("want error when runner: docker has no docker config")
 	}
 }
@@ -230,7 +242,7 @@ func TestNewDockerUnavailableFailsClosed(t *testing.T) {
 	}
 	t.Setenv("GOV_TOOLREGISTRY_FILE", registryFile)
 
-	_, err := New("docker", &contracts.DockerRunnerConfig{Image: "example/image:latest"}, nil, nil, nil)
+	_, err := New("docker", &contracts.DockerRunnerConfig{Image: "example/image:latest"}, nil, nil, nil, nil, nil)
 	if err == nil {
 		t.Fatal("want error when docker is unavailable")
 	}
@@ -241,7 +253,7 @@ func TestNewDockerUnavailableFailsClosed(t *testing.T) {
 // mirroring TestNewDockerUnavailableFailsClosed's config-threading coverage
 // on the Docker side.
 func TestNewThreadsLocalConfig(t *testing.T) {
-	rn, err := New("local", nil, &contracts.LocalRunnerConfig{OutputCapBytes: 7}, nil, nil)
+	rn, err := New("local", nil, &contracts.LocalRunnerConfig{OutputCapBytes: 7}, nil, nil, nil, nil)
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}

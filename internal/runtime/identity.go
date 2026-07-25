@@ -216,7 +216,7 @@ func (id ExecutionIdentity) Hash() string {
 // "pi" literally (via os.ReadFile, never through PATH) and always produced
 // the same "unreadable:pi" sentinel regardless of which binary that name
 // actually resolved to — a swapped executable never changed the identity.
-func computeExecutionIdentity(cfg config.Config, c contracts.Contract, agent agents.Agent, resolution agents.PathResolution, identity agents.BackendIdentity, dockerImage *runner.ImageIdentity, envPolicyHash, head, hash string, promptVer prompts.Version, capabilityAttestID string, bundle PolicyBundle, containmentEnv containment.ContainmentEnvironment, dynamicHashes ...string) ExecutionIdentity {
+func computeExecutionIdentity(cfg config.Config, c contracts.Contract, agent agents.Agent, resolution agents.PathResolution, identity agents.BackendIdentity, dockerImage *runner.ImageIdentity, dockerEnv *runner.DockerEnvironment, envPolicyHash, head, hash string, promptVer prompts.Version, capabilityAttestID string, bundle PolicyBundle, containmentEnv containment.ContainmentEnvironment, dynamicHashes ...string) ExecutionIdentity {
 	compiledPromptHash, consumedArtifactsHash, graphProviderHash, graphSnapshotHash, controllerEnvironmentHash, validatorToolsetHash := dynamicIdentityHashes(dynamicHashes...)
 	if validatorToolsetHash == "unknown" {
 		validatorToolsetHash = hashJSON(contractValidatorToolset(c))
@@ -259,7 +259,7 @@ func computeExecutionIdentity(cfg config.Config, c contracts.Contract, agent age
 		BackendIdentityKnown:         identity.Known(),
 		BackendDependencyClosureHash: resolution.DependencyClosureHash,
 		CapabilityAttestID:           capabilityAttestID,
-		RunnerConfigHash:             hashJSON(runnerConfig(c, dockerImage, envPolicyHash)),
+		RunnerConfigHash:             hashJSON(runnerConfig(c, dockerImage, dockerEnv.IdentitySummary(), envPolicyHash)),
 		GovernatorVersion:            governatorBuildID(),
 	}
 }
@@ -733,12 +733,17 @@ func adapterVersion(agent agents.Agent) string {
 // identity changing. Folding in the resolved content-addressed image ID
 // (and immutable repo digests, entrypoint/cmd/user) closes that gap: replay
 // binds to the image that will actually run, not the name that requested it.
+// dockerEnvSummary is the frozen DockerEnvironment's identity summary
+// (runner.DockerEnvironment.IdentitySummary, Sol12 P0-7): CLI identity +
+// daemon identity + endpoint + policy hash, so a substituted CLI or a
+// swapped/upgraded daemon between an attested run and a later replay mints a
+// fresh identity rather than silently comparing equal. nil for local runs.
 // envPolicyHash is agents.EnvPolicyHash(handle.AllowedEnv) for this run's
 // resolved backend (Sol P1-14) -- folding it in means a backend whose
 // declared allowed-environment variable set changes mints a new identity,
 // the same "changed trust-bearing input never silently replays" treatment
 // every other input here gets.
-func runnerConfig(c contracts.Contract, dockerImage *runner.ImageIdentity, envPolicyHash string) map[string]any {
+func runnerConfig(c contracts.Contract, dockerImage *runner.ImageIdentity, dockerEnvSummary any, envPolicyHash string) map[string]any {
 	out := map[string]any{"runner": c.EffectiveRunner()}
 	if c.Docker != nil {
 		out["docker"] = *c.Docker
@@ -746,6 +751,7 @@ func runnerConfig(c contracts.Contract, dockerImage *runner.ImageIdentity, envPo
 		out["docker"] = nil
 	}
 	out["docker_image_identity"] = dockerImage
+	out["docker_environment"] = dockerEnvSummary
 	out["env_policy_hash"] = envPolicyHash
 	if c.Local != nil {
 		out["local"] = *c.Local

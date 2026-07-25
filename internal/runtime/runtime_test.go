@@ -35,6 +35,34 @@ func git(t *testing.T, dir string, args ...string) {
 	}
 }
 
+// lookPathPreferCanonicalGit resolves name for toolregistry enrollment in
+// tests. git specifically prefers the canonical /usr/bin/git over
+// exec.LookPath: some dev hosts front PATH with a git wrapper (e.g. a
+// non-Governator safety guard) whose own shebang or body needs interpreters
+// (python3, etc.) that Sol12 P0-6's now-private git+bash-only shell() PATH
+// does not expose -- a real production git install is never such a wrapper,
+// so tests exercise against the canonical binary rather than whatever a
+// host's dev-convenience PATH shim happens to point at.
+func lookPathPreferCanonicalGit(name string) (string, error) {
+	if name == "git" {
+		if _, err := os.Stat("/usr/bin/git"); err == nil {
+			return "/usr/bin/git", nil
+		}
+	}
+	return exec.LookPath(name)
+}
+
+// resolveTestTool is lookPathPreferCanonicalGit for callers that want to
+// t.Fatal immediately on a missing tool instead of handling the error.
+func resolveTestTool(t *testing.T, name string) string {
+	t.Helper()
+	bin, err := lookPathPreferCanonicalGit(name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return bin
+}
+
 // govTestBinaryOnce/govTestBinaryPath/govTestBinaryErr/govTestBinary build
 // the real cmd/gov CLI exactly once per test process, mirroring
 // internal/redteam/harness_test.go's govBinary(t). Authority-derived
@@ -517,10 +545,7 @@ func TestApprovedReplayRedactionAndRollback(t *testing.T) {
 	// See TestReplayPositiveIdenticalEnvironmentReplays: an isolated registry
 	// needs git/bash/unshare enrolled too, not just "test".
 	for _, name := range []string{"git", "bash", "unshare", "test"} {
-		bin, err := exec.LookPath(name)
-		if err != nil {
-			t.Fatal(err)
-		}
+		bin := resolveTestTool(t, name)
 		if _, err := toolregistry.Enroll(name, bin); err != nil {
 			t.Fatal(err)
 		}
@@ -2020,7 +2045,12 @@ func TestGitControlFingerprintDetectsHookMutationThroughWorktree(t *testing.T) {
 	wt := filepath.Join(t.TempDir(), "wt")
 	git(t, root, "worktree", "add", wt, "-b", "gitctrl-test")
 
-	before, err := gitControlFingerprint(wt)
+	registry, rerr := toolregistry.Load()
+	if rerr != nil {
+		t.Fatal(rerr)
+	}
+
+	before, err := gitControlFingerprint(wt, registry)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2033,7 +2063,7 @@ func TestGitControlFingerprintDetectsHookMutationThroughWorktree(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	after, err := gitControlFingerprint(wt)
+	after, err := gitControlFingerprint(wt, registry)
 	if err != nil {
 		t.Fatal(err)
 	}

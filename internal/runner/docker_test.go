@@ -1084,12 +1084,12 @@ func TestResolveDockerHonorsRegistryPin(t *testing.T) {
 	}
 	t.Setenv("PATH", hostileDir+string(os.PathListSeparator)+os.Getenv("PATH"))
 
-	handle, err := resolveDockerHandle()
+	handle, err := resolveStandaloneDockerHandle()
 	if err != nil {
-		t.Fatalf("resolveDockerHandle: %v", err)
+		t.Fatalf("resolveStandaloneDockerHandle: %v", err)
 	}
 	defer handle.Close()
 	if handle.Identity.CanonicalPath != pinnedDocker {
-		t.Fatalf("resolveDockerHandle returned %q, want the registry-pinned %q (ambient PATH would have resolved the hostile one first)", handle.Identity.CanonicalPath, pinnedDocker)
+		t.Fatalf("resolveStandaloneDockerHandle returned %q, want the registry-pinned %q (ambient PATH would have resolved the hostile one first)", handle.Identity.CanonicalPath, pinnedDocker)
 	}
 }

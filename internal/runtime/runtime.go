@@ -631,13 +631,23 @@ func snapshotPathsUnderRoots(snap snapshot, roots []string) []string {
 	return out
 }
 
-func shell(ctx context.Context, dir, command string) (int, string, error) {
-	registry, rerr := toolregistry.Load()
-	if rerr != nil {
-		return -1, "", fmt.Errorf("load trusted-tool registry: %w", rerr)
+// shell runs a git porcelain command via bash -lc in dir, killing the
+// process group if ctx is done before it exits (recovery/revert only --
+// the commit/quarantine path uses a frozen gitplumb.Session).
+//
+// Sol12 P0-6: registry is the run's frozen trusted-tool registry
+// (RunEnvironment.ToolRegistry); shell resolves git/bash from it rather than
+// reloading the registry per call, so two shell calls in one transaction can
+// never see different toolsets after a registry rotation. PATH is private to
+// the one declared controller tool (the sealed git directory) alone — the
+// ambient base PATH is no longer appended, so the command string can only
+// resolve git and cannot accidentally invoke undeclared ambient tools the
+// report flags (grep/sed/cp/find/sort/awk). A nil registry fails closed.
+func shell(ctx context.Context, dir, command string, registry *toolregistry.Registry) (int, string, error) {
+	if registry == nil {
+		return -1, "", fmt.Errorf("controller tool registry is not frozen")
 	}
-	// Sol9 P0-6: every command this helper runs is a git invocation (or,
-	// in runner.go's copy, a plain cp — prepending is a no-op for it). The
+	// Sol9 P0-6: every command this helper runs is a git invocation. The
 	// prior fix (Sol report attack 10 / P0-5) resolved git through the
 	// trusted-tool registry but only ever handed bash a live PATH-directory
 	// string to resolve "git" against at call time — a same-uid swap of
@@ -673,6 +683,20 @@ func shell(ctx context.Context, dir, command string) (int, string, error) {
 		return -1, "", fmt.Errorf("resolve trusted bash handle: %w", berr)
 	}
 	defer bashHandle.Close()
+	// Sol12 P0-6 gap: the sealed git copy above may itself be a script (e.g.
+	// an `#!/usr/bin/env bash` wrapper some git installs use) whose shebang
+	// needs to find "bash" on PATH -- a bare sealed-git-only PATH leaves that
+	// lookup with nothing to find. bash is already a second declared,
+	// verified controller tool in this exact call, so sealing it too and
+	// adding its directory alongside git's keeps PATH limited to exactly the
+	// tools this transaction already resolved and verified -- never any
+	// wider ambient PATH -- while letting a script-shaped git resolve its
+	// own interpreter to the verified copy, not an ambient one.
+	sealedBash, berr := bashHandle.SealedExecutablePath()
+	if berr != nil {
+		return -1, "", fmt.Errorf("seal trusted bash: %w", berr)
+	}
+	defer sealedBash.Close()
 	build := func(c context.Context, bin string, a []string) *exec.Cmd {
 		if scope, ok := containment.ScopeFromContext(c); ok {
 			return scope.Command(c, bin, a, dir)
@@ -687,17 +711,23 @@ func shell(ctx context.Context, dir, command string) (int, string, error) {
 		return -1, "", err
 	}
 	frozen := controllerenv.Freeze()
-	pathValue := filepath.Dir(sealedGit.Path)
-	if basePath, ok := frozen.Lookup("PATH"); ok && basePath != "" {
-		pathValue += string(os.PathListSeparator) + basePath
-	}
+	// Sol12 P0-6: PATH is private to the declared controller tools this call
+	// already resolved and verified -- the sealed git and bash directories
+	// alone; the ambient base PATH is deliberately NOT appended, so the git
+	// porcelain command string (and any shebang interpreter lookup a
+	// script-shaped sealed tool needs) cannot accidentally resolve
+	// undeclared ambient tools (grep/sed/cp/find/sort/awk).
+	pathValue := filepath.Dir(sealedGit.Path) + string(os.PathListSeparator) + filepath.Dir(sealedBash.Path)
 	cmd.Env = frozen.With(map[string]string{"PATH": pathValue}).Values
-	// Sol9 P1-4: re-verify the sealed git copy immediately before it can be
+	// Sol9 P1-4: re-verify the sealed copies immediately before they can be
 	// found through PATH below -- a private read-only copy is not
 	// kernel-immutable, so this is the last point Governator can catch a
 	// same-UID tamper before launch.
 	if verr := sealedGit.Verify(); verr != nil {
 		return -1, "", fmt.Errorf("verify sealed git before launch: %w", verr)
+	}
+	if verr := sealedBash.Verify(); verr != nil {
+		return -1, "", fmt.Errorf("verify sealed bash before launch: %w", verr)
 	}
 	var out []byte
 	if scope, ok := containment.ScopeFromContext(ctx); ok {
@@ -876,8 +906,8 @@ func localReadRoots(cfg *contracts.LocalRunnerConfig) []string {
 	return append([]string(nil), cfg.ReadRoots...)
 }
 
-func gitHead(root string) (string, error) {
-	c, o, e := shell(context.Background(), root, "git rev-parse HEAD")
+func gitHead(root string, registry *toolregistry.Registry) (string, error) {
+	c, o, e := shell(context.Background(), root, "git rev-parse HEAD", registry)
 	if e == nil && c == 0 {
 		return strings.TrimSpace(o), nil
 	}
@@ -916,8 +946,8 @@ func gitHeadFromFiles(root string) (string, error) {
 	}
 	return value, nil
 }
-func isGit(root string) bool {
-	c, _, _ := shell(context.Background(), root, "git rev-parse --is-inside-work-tree")
+func isGit(root string, registry *toolregistry.Registry) bool {
+	c, _, _ := shell(context.Background(), root, "git rev-parse --is-inside-work-tree", registry)
 	if c == 0 {
 		return true
 	}
@@ -1162,7 +1192,7 @@ func cleanupCanary(path string) error {
 	return first
 }
 
-func gitControlFingerprint(root string) (snapshot, error) {
+func gitControlFingerprint(root string, registry *toolregistry.Registry) (snapshot, error) {
 	out := snapshot{}
 	addFile := func(label, path string) error {
 		info, err := os.Lstat(path)
@@ -1200,7 +1230,7 @@ func gitControlFingerprint(root string) (snapshot, error) {
 	// nothing and let a hook mutation in the real (shared) .git/hooks pass
 	// undetected. --git-common-dir always resolves to the shared root,
 	// from either the main worktree or a linked one.
-	code, gitDir, err := shell(context.Background(), root, "git rev-parse --git-common-dir")
+	code, gitDir, err := shell(context.Background(), root, "git rev-parse --git-common-dir", registry)
 	if err != nil || code != 0 {
 		return out, nil
 	}
@@ -1307,7 +1337,7 @@ func validateFinalWorktreeShape(root string) error {
 	})
 }
 
-func finalValidationMeasurement(ctx context.Context, home, root, work, runID string, git bool, c contracts.Contract, protectedPatterns []string, workBefore, liveBefore, protectedBefore, gitControlBefore snapshot) (finalStateMeasurement, []string) {
+func finalValidationMeasurement(ctx context.Context, home, root, work, runID string, git bool, c contracts.Contract, protectedPatterns []string, workBefore, liveBefore, protectedBefore, gitControlBefore snapshot, registry *toolregistry.Registry) (finalStateMeasurement, []string) {
 	var m finalStateMeasurement
 	var violations []string
 	if err := validateFinalWorktreeShape(work); err != nil {
@@ -1316,7 +1346,7 @@ func finalValidationMeasurement(ctx context.Context, home, root, work, runID str
 	workAfter, werr := fingerprint(work)
 	liveAfter, lerr := fingerprint(root)
 	protectedAfter, perr := protectedFingerprint(protectedPatterns)
-	gitControlAfter, gcerr := gitControlFingerprint(work)
+	gitControlAfter, gcerr := gitControlFingerprint(work, registry)
 	if werr != nil {
 		violations = append(violations, "final barrier worktree fingerprint: "+werr.Error())
 	}
@@ -1368,7 +1398,7 @@ func finalValidationMeasurement(ctx context.Context, home, root, work, runID str
 	if len(m.deleted) > c.Budget.MaxDeleted {
 		violations = append(violations, "final barrier max_deleted exceeded")
 	}
-	metrics := measureDiff(root, work, git, workBefore, m.changed, m.deleted)
+	metrics := measureDiff(root, work, git, workBefore, m.changed, m.deleted, registry)
 	if metrics.Lines > c.Budget.MaxLinesChanged {
 		violations = append(violations, fmt.Sprintf("final barrier max_lines_changed exceeded: %d > %d", metrics.Lines, c.Budget.MaxLinesChanged))
 	}
@@ -1389,7 +1419,7 @@ func finalValidationMeasurement(ctx context.Context, home, root, work, runID str
 			}
 		}
 	}
-	m.diff = workspaceDiff(root, work, git, m.changed, m.deleted)
+	m.diff = workspaceDiff(root, work, git, m.changed, m.deleted, registry)
 	return m, violations
 }
 
@@ -1675,8 +1705,8 @@ func preserveQuarantineWorktree(ctx context.Context, work, head, runID string) (
 	return commit, nil
 }
 
-func rollbackLiveRoot(ctx context.Context, root, previousHead string, before snapshot, mergePaths []string) error {
-	if code, out, err := shell(ctx, root, "git reset --hard "+shQuote(previousHead)); err != nil || code != 0 {
+func rollbackLiveRoot(ctx context.Context, root, previousHead string, before snapshot, mergePaths []string, registry *toolregistry.Registry) error {
+	if code, out, err := shell(ctx, root, "git reset --hard "+shQuote(previousHead), registry); err != nil || code != 0 {
 		return fmt.Errorf("rollback reset --hard: %s", strings.TrimSpace(out))
 	}
 	seen := map[string]bool{}
@@ -1687,7 +1717,7 @@ func rollbackLiveRoot(ctx context.Context, root, previousHead string, before sna
 		seen[p] = true
 		// Clean only the paths this Governator merge was about to land; never
 		// run a broad git clean over the operator's repository.
-		_, _, _ = shell(ctx, root, "git clean -fd -- "+shQuote(p))
+		_, _, _ = shell(ctx, root, "git clean -fd -- "+shQuote(p), registry)
 	}
 	entries, err := gitplumb.StatusPorcelainV2(ctx, root)
 	if err != nil {
@@ -1708,10 +1738,30 @@ func rollbackLiveRoot(ctx context.Context, root, previousHead string, before sna
 
 func shQuote(s string) string { return "'" + strings.ReplaceAll(s, "'", "'\"'\"'") + "'" }
 
-func workspaceDiff(root, work string, git bool, changed, deleted []string) string {
+func workspaceDiff(root, work string, git bool, changed, deleted []string, registry *toolregistry.Registry) string {
 	if git {
-		_, o, _ := shell(context.Background(), work, "git diff --binary --no-ext-diff HEAD; git ls-files --others --exclude-standard | grep -v '^.codegraph/' | sed 's/^/UNTRACKED /'")
-		return o
+		// Sol12 P0-6: the prior implementation shelled out a single pipeline
+		// `git diff ...; git ls-files ... | grep -v '^.codegraph/' | sed ...`,
+		// which reached ambient-PATH grep/sed the private controller PATH no
+		// longer exposes. Split into two pure-git shell() calls (each
+		// resolvable through the sealed git copy alone) and do the
+		// .codegraph filtering + UNTRACKED prefixing in-process Go, so no
+		// undeclared ambient tool can affect the diff evidence.
+		var b strings.Builder
+		if _, diffOut, derr := shell(context.Background(), work, "git diff --binary --no-ext-diff HEAD", registry); derr == nil {
+			b.WriteString(diffOut)
+		}
+		if _, lsOut, lerr := shell(context.Background(), work, "git ls-files --others --exclude-standard", registry); lerr == nil {
+			for _, line := range strings.Split(lsOut, "\n") {
+				if line == "" || strings.HasPrefix(line, ".codegraph/") {
+					continue
+				}
+				b.WriteString("UNTRACKED ")
+				b.WriteString(line)
+				b.WriteString("\n")
+			}
+		}
+		return b.String()
 	}
 	var b strings.Builder
 	for _, p := range changed {
@@ -2359,10 +2409,10 @@ func parseNumstat(output string) int {
 	return total
 }
 
-func measureDiff(root, work string, git bool, before snapshot, changed, deleted []string) diffMetrics {
+func measureDiff(root, work string, git bool, before snapshot, changed, deleted []string, registry *toolregistry.Registry) diffMetrics {
 	metrics := diffMetrics{}
 	if git {
-		_, output, _ := shell(context.Background(), work, "git diff --numstat HEAD")
+		_, output, _ := shell(context.Background(), work, "git diff --numstat HEAD", registry)
 		metrics.Lines = parseNumstat(output)
 	}
 	for _, name := range changed {
@@ -2370,7 +2420,7 @@ func measureDiff(root, work string, git bool, before snapshot, changed, deleted 
 			if !git {
 				oldPath := filepath.Join(root, filepath.FromSlash(name))
 				newPath := filepath.Join(work, filepath.FromSlash(name))
-				_, output, _ := shell(context.Background(), work, "git diff --no-index --numstat -- "+shQuote(oldPath)+" "+shQuote(newPath))
+				_, output, _ := shell(context.Background(), work, "git diff --no-index --numstat -- "+shQuote(oldPath)+" "+shQuote(newPath), registry)
 				metrics.Lines += parseNumstat(output)
 			}
 			continue
@@ -2653,22 +2703,40 @@ func (r *Runner) runOnce(ctx context.Context, c contracts.Contract) (RunRecord, 
 	if err := policy.Enforce(preflight, c); err != nil {
 		return RunRecord{}, err
 	}
-	// Sol P1-1/P1-2: resolve the docker image identity before any
-	// lock/workspace/quota side effect, then hand that exact resolved object
-	// to DockerRunner so launch uses and verifies the same image replay hashed.
+	// Sol P1-1/P1-2 + Sol12 P0-7: resolve the ONE frozen Docker execution
+	// environment before any lock/workspace/quota side effect, then hand
+	// that exact object to DockerRunner so every docker operation for the
+	// run's whole transaction -- image inspect, run, verify-started, stop,
+	// remove, extinction proof -- launches through the same verified CLI
+	// handle and binds the same daemon identity into replay. The daemon
+	// query ResolveDockerEnvironment performs doubles as the availability
+	// check, so runner.New skips CheckDockerAvailable when this is non-nil.
 	var dockerImage *runner.ImageIdentity
+	var dockerEnv *runner.DockerEnvironment
 	if c.EffectiveRunner() == "docker" && c.Docker != nil {
-		img, ierr := runner.ResolveImageIdentity(ctx, c.Docker.Image, env.Controller)
+		de, derr := runner.ResolveDockerEnvironment(ctx, env.ToolRegistry, env.Controller)
+		if derr != nil {
+			return RunRecord{}, derr
+		}
+		img, ierr := de.InspectImage(ctx, c.Docker.Image, env.Controller)
 		if ierr != nil {
+			_ = de.Close()
 			return RunRecord{}, ierr
 		}
 		dockerImage = &img
+		dockerEnv = de
+	}
+	if dockerEnv != nil {
+		defer func() { _ = dockerEnv.Close() }()
 	}
 	// Runner resolution (Phase 5) happens before any lock/workspace/quota side
 	// effect: a docker request Governator can't satisfy must fail closed with
 	// a clear error here, never silently fall back to LocalWorktreeRunner and
-	// never leave a partially-acquired lock or reservation behind.
-	rn, err := runner.New(c.EffectiveRunner(), c.Docker, c.Local, env.CredentialRoots, dockerImage, env.Controller)
+	// never leave a partially-acquired lock or reservation behind. registry +
+	// dockerEnv are the run's frozen controller participants (Sol12 P0-6/P0-7):
+	// every shell() and docker op the runner performs reuses them rather than
+	// reloading the trusted-tool registry mid-transaction.
+	rn, err := runner.New(c.EffectiveRunner(), c.Docker, c.Local, env.CredentialRoots, dockerImage, env.ToolRegistry, dockerEnv, env.Controller)
 	if err != nil {
 		return RunRecord{}, err
 	}
@@ -2692,10 +2760,10 @@ func (r *Runner) runOnce(ctx context.Context, c contracts.Contract) (RunRecord, 
 	if err != nil {
 		return RunRecord{}, err
 	}
-	git := isGit(root)
+	git := isGit(root, env.ToolRegistry)
 	head := "non-git"
 	if git {
-		head, err = gitHead(root)
+		head, err = gitHead(root, env.ToolRegistry)
 		if err != nil {
 			return RunRecord{}, err
 		}
@@ -3026,7 +3094,7 @@ func (r *Runner) runOnce(ctx context.Context, c contracts.Contract) (RunRecord, 
 	compiledPromptForIdentity += minimalismAnnotation
 	compiledPromptHash := hashJSON(map[string]string{"prompt": compiledPromptForIdentity})
 	graphSnapshotHash := hashJSON(preReplayGraph)
-	identity := computeExecutionIdentity(cfg, c, agent, handle.PathResolution, handle.Identity, dockerImage, agents.EnvPolicyHash(handle.AllowedEnv), head, hash, promptVersion, capabilityAttestID, policyBundle, env.Containment, compiledPromptHash, consumedArtifactsHash(consumedIdentities), contextgraph.ProviderIdentityHash(graphStatus), graphSnapshotHash, env.Controller.Hash, validatorToolsetHash)
+	identity := computeExecutionIdentity(cfg, c, agent, handle.PathResolution, handle.Identity, dockerImage, dockerEnv, agents.EnvPolicyHash(handle.AllowedEnv), head, hash, promptVersion, capabilityAttestID, policyBundle, env.Containment, compiledPromptHash, consumedArtifactsHash(consumedIdentities), contextgraph.ProviderIdentityHash(graphStatus), graphSnapshotHash, env.Controller.Hash, validatorToolsetHash)
 	identity.ProtectedManifestHash = hashJSON(env.ProtectedPatterns)
 	// Sol9 P0-4: build the Assayer execution snapshot HERE, before replay
 	// identity is calculated, and thread the one returned *assay.Snapshot
@@ -3068,7 +3136,16 @@ func (r *Runner) runOnce(ctx context.Context, c contracts.Contract) (RunRecord, 
 		identity.Participants[role] = part
 	}
 	if dockerImage != nil {
-		identity.Participants["docker_daemon"] = ExecutableIdentity{Role: "docker_daemon", SHA256: hashJSON(dockerImage), Known: true}
+		// Sol12 P0-7: the docker participant binds the frozen CLI + daemon
+		// identity (not just the image) into replay, so a substituted CLI or
+		// swapped daemon between an attested run and a later replay is
+		// detected. dockerEnv is nil for the rare non-governed resolution
+		// path; the image identity alone is the fallback there.
+		dockerDaemonSHA := hashJSON(dockerImage)
+		if dockerEnv != nil {
+			dockerDaemonSHA = hashJSON([]any{dockerImage, dockerEnv.IdentitySummary()})
+		}
+		identity.Participants["docker_daemon"] = ExecutableIdentity{Role: "docker_daemon", SHA256: dockerDaemonSHA, Known: true}
 	}
 	if len(c.Success.Validators) > 0 && len(c.Success.ValidatorSpecs) == 0 {
 		identity.Participants["validator_tools"] = ExecutableIdentity{Role: "validator_tools", Known: false}
@@ -3269,7 +3346,7 @@ func (r *Runner) runOnce(ctx context.Context, c contracts.Contract) (RunRecord, 
 	if err != nil {
 		return rec, err
 	}
-	gitControlBefore, err := gitControlFingerprint(work)
+	gitControlBefore, err := gitControlFingerprint(work, env.ToolRegistry)
 	if err != nil {
 		return rec, err
 	}
@@ -3589,7 +3666,7 @@ func (r *Runner) runOnce(ctx context.Context, c contracts.Contract) (RunRecord, 
 	workAfter, werr := fingerprint(work)
 	liveAfter, lerr := fingerprint(root)
 	protectedAfter, perr := protectedFingerprint(transaction.ProtectedPatterns)
-	gitControlAfter, gcerr := gitControlFingerprint(work)
+	gitControlAfter, gcerr := gitControlFingerprint(work, env.ToolRegistry)
 	violations := append([]string{}, audit.Violations...)
 	violations = appendRuntimePathScanViolation(violations, "after agent execution", work)
 	violations = append(violations, telemetryViolations(c, audit)...)
@@ -3715,7 +3792,7 @@ func (r *Runner) runOnce(ctx context.Context, c contracts.Contract) (RunRecord, 
 	if len(deleted) > c.Budget.MaxDeleted {
 		violations = append(violations, "max_deleted exceeded")
 	}
-	metrics := measureDiff(root, work, git, workBefore, changed, deleted)
+	metrics := measureDiff(root, work, git, workBefore, changed, deleted, env.ToolRegistry)
 	if metrics.Lines > c.Budget.MaxLinesChanged {
 		violations = append(violations, fmt.Sprintf("max_lines_changed exceeded: %d > %d", metrics.Lines, c.Budget.MaxLinesChanged))
 	}
@@ -3993,7 +4070,7 @@ func (r *Runner) runOnce(ctx context.Context, c contracts.Contract) (RunRecord, 
 	var approvedFinal finalStateMeasurement
 	if len(violations) == 0 {
 		var finalViolations []string
-		approvedFinal, finalViolations = finalValidationMeasurement(ctx, r.Home, root, work, id, git, c, env.ProtectedPatterns, workBefore, liveBefore, protectedBefore, gitControlBefore)
+		approvedFinal, finalViolations = finalValidationMeasurement(ctx, r.Home, root, work, id, git, c, env.ProtectedPatterns, workBefore, liveBefore, protectedBefore, gitControlBefore, env.ToolRegistry)
 		// Preserve the final barrier's remeasured evidence even when that
 		// measurement produces a quarantining violation. Artifact schema failures,
 		// for example, must still ledger the recollected artifact with
@@ -4013,7 +4090,7 @@ func (r *Runner) runOnce(ctx context.Context, c contracts.Contract) (RunRecord, 
 		runAssayStep(ctx, db, cfg, c, id, hash, rec.Agent, artifactRecords, &violations, assaySnapshot)
 	}
 	if len(violations) == 0 {
-		finalAfterAssay, finalViolations := finalValidationMeasurement(ctx, r.Home, root, work, id, git, c, env.ProtectedPatterns, workBefore, liveBefore, protectedBefore, gitControlBefore)
+		finalAfterAssay, finalViolations := finalValidationMeasurement(ctx, r.Home, root, work, id, git, c, env.ProtectedPatterns, workBefore, liveBefore, protectedBefore, gitControlBefore, env.ToolRegistry)
 		changed = finalAfterAssay.changed
 		deleted = finalAfterAssay.deleted
 		artifactRecords = finalAfterAssay.artifactRecords
@@ -4032,7 +4109,7 @@ func (r *Runner) runOnce(ctx context.Context, c contracts.Contract) (RunRecord, 
 		}
 	}
 	if rec.Diff == "" {
-		rec.Diff = workspaceDiff(root, work, git, changed, deleted)
+		rec.Diff = workspaceDiff(root, work, git, changed, deleted, env.ToolRegistry)
 	}
 	// Sol11 P0-4: a run executed under the development-only
 	// local_effectful_tiering: "off" compatibility mode ran effectful local
@@ -4111,7 +4188,7 @@ func (r *Runner) runOnce(ctx context.Context, c contracts.Contract) (RunRecord, 
 				}
 			}
 			if len(violations) > 0 {
-				if err := rollbackLiveRoot(ctx, root, head, liveBefore, mergePaths); err != nil {
+				if err := rollbackLiveRoot(ctx, root, head, liveBefore, mergePaths, env.ToolRegistry); err != nil {
 					violations = append(violations, "merge rollback: "+err.Error())
 				}
 			}
@@ -4251,7 +4328,7 @@ func (r *Runner) runOnce(ctx context.Context, c contracts.Contract) (RunRecord, 
 	}
 	approved := head
 	if rec.Status == "APPROVED" && git {
-		approved, _ = gitHead(root)
+		approved, _ = gitHead(root, env.ToolRegistry)
 	}
 	// Finalize the ExecutionIdentity's ApprovedHead to the post-merge HEAD for
 	// an approved git run (mirroring the approved_head column): a subsequent
@@ -4552,7 +4629,14 @@ func Rollback(ctx context.Context, id string) (RunRecord, error) {
 		return r, err
 	}
 	defer release()
-	code, out, e := shell(ctx, r.Root, "git revert --no-edit "+shQuote(r.Commit))
+	// Rollback is a CLI-driven revert, not a governed run: load the registry
+	// once here (the standalone path) so shell() resolves git/bash from a
+	// frozen toolset rather than reloading per call (Sol12 P0-6).
+	rollbackRegistry, rerr := toolregistry.Load()
+	if rerr != nil {
+		return r, fmt.Errorf("rollback: load trusted-tool registry: %w", rerr)
+	}
+	code, out, e := shell(ctx, r.Root, "git revert --no-edit "+shQuote(r.Commit), rollbackRegistry)
 	if e != nil || code != 0 {
 		return r, fmt.Errorf("git revert: %s", out)
 	}

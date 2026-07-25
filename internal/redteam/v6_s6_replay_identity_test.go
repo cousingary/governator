@@ -27,12 +27,31 @@ import (
 	"github.com/cousingary/governator/internal/toolregistry"
 )
 
-func s6EnrollControllerTool(t *testing.T, name string) {
+// resolveControllerToolPath resolves name for toolregistry enrollment. git
+// specifically prefers the canonical /usr/bin/git over exec.LookPath: some
+// dev hosts front PATH with a git wrapper (e.g. a non-Governator safety
+// guard) whose own body needs interpreters (python3, etc.) that Sol12
+// P0-6's now-private git+bash-only shell() PATH does not expose -- a real
+// production git install is never such a wrapper, so tests exercise against
+// the canonical binary rather than whatever a host's dev-convenience PATH
+// shim happens to point at.
+func resolveControllerToolPath(t *testing.T, name string) string {
 	t.Helper()
+	if name == "git" {
+		if _, err := os.Stat("/usr/bin/git"); err == nil {
+			return "/usr/bin/git"
+		}
+	}
 	path, err := exec.LookPath(name)
 	if err != nil {
 		t.Fatal(err)
 	}
+	return path
+}
+
+func s6EnrollControllerTool(t *testing.T, name string) {
+	t.Helper()
+	path := resolveControllerToolPath(t, name)
 	if _, err := toolregistry.Enroll(name, path); err != nil {
 		t.Fatal(err)
 	}

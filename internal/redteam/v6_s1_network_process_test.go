@@ -259,10 +259,7 @@ func TestV6Case30LowRiskEffectfulJobStillGetsStrongDescendantContainment(t *test
 
 	root := fixtureRepo(t)
 	registryFile := filepath.Join(t.TempDir(), "tools.yaml")
-	realGit, err := exec.LookPath("git")
-	if err != nil {
-		t.Fatal(err)
-	}
+	realGit := resolveControllerToolPath(t, "git")
 	if canonical, everr := filepath.EvalSymlinks(realGit); everr == nil {
 		realGit = canonical
 	}

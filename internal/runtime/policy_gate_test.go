@@ -446,7 +446,7 @@ func TestPolicyBundleSharedBetweenGateAndIdentityIgnoresLaterDoctrineEdit(t *tes
 	// object a gate call would already have evaluated against — never a
 	// fresh load. Its ProjectDoctrineHash must reflect v1, not the v2 that is
 	// now on disk.
-	identity := computeExecutionIdentity(cfg, c, agent, res, agents.BackendIdentity{}, nil, "", "dead", "ch", pv, "attest-1", bundleAtGateTime, containment.ContainmentEnvironment{})
+	identity := computeExecutionIdentity(cfg, c, agent, res, agents.BackendIdentity{}, nil, nil, "", "dead", "ch", pv, "attest-1", bundleAtGateTime, containment.ContainmentEnvironment{})
 	if identity.ProjectDoctrineHash != hashJSON(bundleAtGateTime.ProjectRules) {
 		t.Fatal("identity's project doctrine hash did not match the bundle it was given")
 	}

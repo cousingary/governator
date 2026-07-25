@@ -242,7 +242,7 @@ func TestV9Case15PythonRegistryRotationAfterSnapshotHasNoEffect(t *testing.T) {
 	// same registry, not just the primary python3 executable -- an isolated
 	// registry starts with none of the default entries' paths filled in.
 	for _, name := range []string{"git", "bash", "unshare", "python3"} {
-		bin, err := exec.LookPath(name)
+		bin, err := lookPathPreferCanonicalGit(name)
 		if err != nil {
 			if name == "python3" {
 				t.Skip("python3 not available")
@@ -329,7 +329,7 @@ func TestV9Case16SnapshotReadRootsExcludeLiveRepoUnderRealLandlock(t *testing.T)
 	toolsReg := filepath.Join(t.TempDir(), "tools.yaml")
 	t.Setenv("GOV_TOOLREGISTRY_FILE", toolsReg)
 	for _, name := range []string{"git", "bash", "python3"} {
-		bin, err := exec.LookPath(name)
+		bin, err := lookPathPreferCanonicalGit(name)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -406,7 +406,7 @@ func TestV9Case19DirtyAssayerCheckoutDisablesStrictReplay(t *testing.T) {
 	toolsReg := filepath.Join(t.TempDir(), "tools.yaml")
 	t.Setenv("GOV_TOOLREGISTRY_FILE", toolsReg)
 	for _, name := range []string{"git", "bash", "unshare", "test", "python3"} {
-		bin, err := exec.LookPath(name)
+		bin, err := lookPathPreferCanonicalGit(name)
 		if err != nil {
 			t.Fatal(err)
 		}

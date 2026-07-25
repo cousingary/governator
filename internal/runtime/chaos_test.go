@@ -2,6 +2,7 @@ package runtime
 
 import (
 	"context"
+	"os/exec"
 	"strconv"
 	"sync"
 	"testing"
@@ -9,6 +10,7 @@ import (
 
 	"github.com/cousingary/governator/internal/lifecycle"
 	"github.com/cousingary/governator/internal/observability"
+	"github.com/cousingary/governator/internal/toolregistry"
 )
 
 // This file covers Sol redteam v4 S9's "chaos/concurrency suite" bullets not
@@ -102,19 +104,31 @@ func TestChaos_ConcurrentLifecycleRecordersUnderRealSQLiteContention(t *testing.
 }
 
 // TestChaos_HungValidatorKilledAtContextDeadline is the "validator hangs"
-// chaos scenario. A success/cleanup validator command that never returns
-// (a genuine hang, not a slow-but-finite command) must not hang the run
-// past its own remaining budget — shell() launches every validator via
-// exec.CommandContext and kills the whole process group on ctx cancellation
+// chaos scenario. A command that never returns (a genuine hang, not a
+// slow-but-finite command) must not hang the run past its own remaining
+// budget — shell() kills the whole process group on ctx cancellation
 // (runtime.go:606-612); this test proves that against a real `sleep`
 // subprocess rather than trusting the context-plumbing by inspection.
+// Actual validators run through shellStage, not shell() directly (Sol12
+// P0-6 scoped shell() to git porcelain alone, with PATH private to the
+// sealed git+bash directories); an absolute path sidesteps that PATH
+// restriction since this test is proving the ctx-kill mechanism, not
+// PATH-based tool resolution.
 func TestChaos_HungValidatorKilledAtContextDeadline(t *testing.T) {
 	dir := t.TempDir()
+	registry, rerr := toolregistry.Load()
+	if rerr != nil {
+		t.Fatalf("load trusted-tool registry: %v", rerr)
+	}
+	sleepBin, lerr := exec.LookPath("sleep")
+	if lerr != nil {
+		t.Fatalf("look up sleep: %v", lerr)
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
 	defer cancel()
 
 	start := time.Now()
-	code, out, err := shell(ctx, dir, "sleep 30")
+	code, out, err := shell(ctx, dir, shQuote(sleepBin)+" 30", registry)
 	elapsed := time.Since(start)
 
 	if elapsed > 5*time.Second {

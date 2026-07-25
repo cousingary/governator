@@ -105,7 +105,17 @@ type Runner interface {
 // Credentials.Roots itself at credential-mount time, independently of
 // whatever the rest of the run had already frozen. Ignored for mode "local"
 // (LocalWorktreeRunner never mounts credentials).
-func New(mode string, dockerCfg *contracts.DockerRunnerConfig, localCfg *contracts.LocalRunnerConfig, credentialRoots []string, resolvedImage *ImageIdentity, controllerEnvironments ...controllerenv.Frozen) (Runner, error) {
+//
+// registry is the run's frozen trusted-tool registry (RunEnvironment.ToolRegistry,
+// Sol12 P0-6): both runners store it and thread it into their shell() calls
+// so git/bash are resolved from the same frozen toolset across the whole
+// transaction instead of reloading the registry per call. dockerEnv is the
+// run's one frozen DockerEnvironment (Sol12 P0-7), required for mode
+// "docker" on the governed path; when non-nil its daemon query already
+// proved availability, so CheckDockerAvailable is skipped. A nil dockerEnv
+// (recovery-constructed callers) falls back to the standalone availability
+// check + per-op resolver.
+func New(mode string, dockerCfg *contracts.DockerRunnerConfig, localCfg *contracts.LocalRunnerConfig, credentialRoots []string, resolvedImage *ImageIdentity, registry *toolregistry.Registry, dockerEnv *DockerEnvironment, controllerEnvironments ...controllerenv.Frozen) (Runner, error) {
 	frozen := controllerenv.Freeze()
 	if len(controllerEnvironments) > 0 {
 		frozen = controllerEnvironments[0]
@@ -119,18 +129,23 @@ func New(mode string, dockerCfg *contracts.DockerRunnerConfig, localCfg *contrac
 		if localCfg != nil {
 			cfg = *localCfg
 		}
-		return &LocalWorktreeRunner{Config: cfg, ControllerEnvironment: frozen}, nil
+		return &LocalWorktreeRunner{Config: cfg, ControllerEnvironment: frozen, Registry: registry}, nil
 	case "docker":
 		if dockerCfg == nil {
 			return nil, fmt.Errorf("runner: docker requested but no docker config was supplied")
 		}
-		if err := CheckDockerAvailable(frozen); err != nil {
-			return nil, fmt.Errorf("runner: docker requested but unavailable: %w", err)
+		// Sol12 P0-7: a frozen DockerEnvironment already proved the daemon
+		// is reachable (ResolveDockerEnvironment's version query); only the
+		// standalone/recovery path (no dockerEnv) re-checks availability here.
+		if dockerEnv == nil {
+			if err := CheckDockerAvailable(frozen); err != nil {
+				return nil, fmt.Errorf("runner: docker requested but unavailable: %w", err)
+			}
 		}
 		if resolvedImage == nil || strings.TrimSpace(resolvedImage.ID) == "" {
 			return nil, fmt.Errorf("runner: docker requested but no resolved image identity was supplied for %q", dockerCfg.Image)
 		}
-		return &DockerRunner{Config: *dockerCfg, CredentialRoots: credentialRoots, ControllerEnvironment: frozen, ResolvedImage: resolvedImage}, nil
+		return &DockerRunner{Config: *dockerCfg, CredentialRoots: credentialRoots, ControllerEnvironment: frozen, ResolvedImage: resolvedImage, Docker: dockerEnv, Registry: registry}, nil
 	default:
 		return nil, fmt.Errorf("runner: unknown mode %q", mode)
 	}
@@ -140,7 +155,17 @@ func New(mode string, dockerCfg *contracts.DockerRunnerConfig, localCfg *contrac
 // is done before it exits. Copied verbatim from internal/runtime's identical
 // helper — both packages need the same "run a git plumbing command, honor
 // ctx cancellation" primitive, and runner must not import runtime.
-func shell(ctx context.Context, dir, command string, environments ...controllerenv.Frozen) (int, string, error) {
+//
+// Sol12 P0-6: registry is the run's frozen trusted-tool registry (stored on
+// each Runner by New); shell resolves git/bash from it rather than reloading
+// the registry per call, so two shell calls in one transaction can never see
+// different toolsets after a registry rotation. PATH is private to the
+// declared controller tool (the sealed git directory) alone — the ambient
+// base PATH is no longer appended, so undeclared tools (grep/sed/cp/find/
+// sort/awk) the command string might otherwise resolve through PATH cannot
+// affect the transaction. The recovery path (recovery.go) loads a one-shot
+// registry and passes it in; a nil registry fails closed.
+func shell(ctx context.Context, dir, command string, registry *toolregistry.Registry, environments ...controllerenv.Frozen) (int, string, error) {
 	frozen := controllerenv.Freeze()
 	if len(environments) > 0 {
 		frozen = environments[0]
@@ -148,9 +173,8 @@ func shell(ctx context.Context, dir, command string, environments ...controllere
 	if err := frozen.Validate(); err != nil {
 		return -1, "", err
 	}
-	registry, rerr := toolregistry.Load()
-	if rerr != nil {
-		return -1, "", fmt.Errorf("load trusted-tool registry: %w", rerr)
+	if registry == nil {
+		return -1, "", fmt.Errorf("controller tool registry is not frozen")
 	}
 	// Sol9 P0-6: see internal/runtime's identical helper for the full
 	// rationale. The prior fix (Sol report attack 10 / P0-5) prepended the
@@ -183,6 +207,18 @@ func shell(ctx context.Context, dir, command string, environments ...controllere
 		return -1, "", fmt.Errorf("resolve trusted bash handle: %w", berr)
 	}
 	defer bashHandle.Close()
+	// Sol12 P0-6 gap (mirrors internal/runtime's identical helper): the
+	// sealed git copy may itself be a script (e.g. an `#!/usr/bin/env bash`
+	// wrapper some git installs use) whose shebang needs to find "bash" on
+	// PATH. bash is already a second declared, verified controller tool in
+	// this exact call, so sealing it too and adding its directory alongside
+	// git's keeps PATH limited to exactly the tools this transaction already
+	// resolved and verified.
+	sealedBash, berr := bashHandle.SealedExecutablePath()
+	if berr != nil {
+		return -1, "", fmt.Errorf("seal trusted bash: %w", berr)
+	}
+	defer sealedBash.Close()
 	build := func(c context.Context, bin string, a []string) *exec.Cmd {
 		cc := exec.CommandContext(c, bin, a...) // govratchet:exec-allow(production_launch_factory) -- bin is bashHandle's verified/sealed path, substituted by the caller
 		cc.Dir = dir
@@ -193,17 +229,25 @@ func shell(ctx context.Context, dir, command string, environments ...controllere
 	if err != nil {
 		return -1, "", err
 	}
-	pathValue := filepath.Dir(sealedGit.Path)
-	if basePath, ok := frozen.Lookup("PATH"); ok && basePath != "" {
-		pathValue += string(os.PathListSeparator) + basePath
-	}
+	// Sol12 P0-6: PATH is private to the declared controller tools this call
+	// already resolved and verified — the sealed git and bash directories
+	// alone. The ambient base PATH is deliberately NOT appended, so the
+	// command string (and any shebang interpreter lookup a script-shaped
+	// sealed tool needs) cannot accidentally invoke undeclared ambient tools
+	// (grep/sed/cp/find/sort/awk) the way the prior sealedGitDir + base PATH
+	// formulation let it. Every non-git file operation this package performs
+	// goes through in-process Go (copyWorkspace) instead of shelling out.
+	pathValue := filepath.Dir(sealedGit.Path) + string(os.PathListSeparator) + filepath.Dir(sealedBash.Path)
 	cmd.Env = frozen.With(map[string]string{"PATH": pathValue}).Values
-	// Sol9 P1-4: re-verify the sealed git copy immediately before it can be
+	// Sol9 P1-4: re-verify the sealed copies immediately before they can be
 	// found through PATH below -- a private read-only copy is not
 	// kernel-immutable, so this is the last point Governator can catch a
 	// same-UID tamper before launch.
 	if verr := sealedGit.Verify(); verr != nil {
 		return -1, "", fmt.Errorf("verify sealed git before launch: %w", verr)
+	}
+	if verr := sealedBash.Verify(); verr != nil {
+		return -1, "", fmt.Errorf("verify sealed bash before launch: %w", verr)
 	}
 	out, err := cmd.CombinedOutput()
 	if ctx.Err() != nil && cmd.Process != nil {
@@ -223,16 +267,20 @@ func shell(ctx context.Context, dir, command string, environments ...controllere
 func shQuote(s string) string { return "'" + strings.ReplaceAll(s, "'", "'\"'\"'") + "'" }
 
 // prepareWorktree creates the disposable workspace shared by every Runner: a
-// git worktree off root (git == true) or a plain reflink copy (git == false).
-// Copied verbatim from internal/runtime's prior createWorkspace.
-func prepareWorktree(ctx context.Context, root, home, id string, git bool, frozen controllerenv.Frozen) (Workspace, error) {
+// git worktree off root (git == true) or an in-process recursive copy
+// (git == false). Copied from internal/runtime's prior createWorkspace and
+// adapted for Sol12 P0-6: the non-git copy is now a pure-Go recursive copy
+// rather than `cp -a --reflink=auto`, so this helper never depends on an
+// ambient-PATH coreutils binary the private-PATH shell() launch would not
+// resolve. registry is the run's frozen trusted-tool registry (Sol12 P0-6).
+func prepareWorktree(ctx context.Context, root, home, id string, git bool, frozen controllerenv.Frozen, registry *toolregistry.Registry) (Workspace, error) {
 	p := filepath.Join(home, "worktrees", id)
 	if err := os.MkdirAll(filepath.Dir(p), 0700); err != nil {
 		return Workspace{}, err
 	}
 	branch := "gov/job/" + id
 	if git {
-		c, o, e := shell(ctx, root, fmt.Sprintf("git worktree add -b %s %s HEAD", shQuote(branch), shQuote(p)), frozen)
+		c, o, e := shell(ctx, root, fmt.Sprintf("git worktree add -b %s %s HEAD", shQuote(branch), shQuote(p)), registry, frozen)
 		if e != nil || c != 0 {
 			return Workspace{}, fmt.Errorf("git worktree: %v: %s", e, o)
 		}
@@ -241,9 +289,8 @@ func prepareWorktree(ctx context.Context, root, home, id string, git bool, froze
 	if err := os.MkdirAll(p, 0700); err != nil {
 		return Workspace{}, err
 	}
-	c, o, e := shell(ctx, root, fmt.Sprintf("cp -a --reflink=auto ./. %s", shQuote(p)), frozen)
-	if e != nil || c != 0 {
-		return Workspace{}, fmt.Errorf("copy workspace: %v: %s", e, o)
+	if err := copyWorkspace(root, p); err != nil {
+		return Workspace{}, fmt.Errorf("copy workspace: %w", err)
 	}
 	return Workspace{Path: p, Root: root}, nil
 }
@@ -251,18 +298,83 @@ func prepareWorktree(ctx context.Context, root, home, id string, git bool, froze
 // destroyWorktree tears down a workspace prepareWorktree created. approved
 // controls whether the git branch is deleted: a quarantined run keeps its
 // branch around for inspection, exactly as before Phase 5 extracted this
-// logic out of internal/runtime's runOnce tail.
-func destroyWorktree(ctx context.Context, ws Workspace, approved bool, frozen controllerenv.Frozen) error {
+// logic out of internal/runtime's runOnce tail. registry is the run's frozen
+// trusted-tool registry (Sol12 P0-6).
+func destroyWorktree(ctx context.Context, ws Workspace, approved bool, frozen controllerenv.Frozen, registry *toolregistry.Registry) error {
 	if ws.Git {
-		if _, o, e := shell(ctx, ws.Root, "git worktree remove --force "+shQuote(ws.Path), frozen); e != nil {
+		if _, o, e := shell(ctx, ws.Root, "git worktree remove --force "+shQuote(ws.Path), registry, frozen); e != nil {
 			return fmt.Errorf("git worktree remove: %s", o)
 		}
 		if approved {
-			_, _, _ = shell(ctx, ws.Root, "git branch -D "+shQuote(ws.Branch), frozen)
+			_, _, _ = shell(ctx, ws.Root, "git branch -D "+shQuote(ws.Branch), registry, frozen)
 		}
 		return nil
 	}
 	return os.RemoveAll(ws.Path)
+}
+
+// copyWorkspace is the in-process recursive copy of root into dst, replacing
+// the prior `cp -a --reflink=auto` shell call (Sol12 P0-6): a pure-Go copy
+// has no dependency on an ambient-PATH coreutils binary, so the private-PATH
+// shell() launch this package uses for git porcelain never has to expose cp
+// (or any other undeclared tool) to a command string. Mode bits and symlink
+// shape are preserved the way `cp -a` preserved them; reflink (CoW) is not —
+// correctness of the isolation boundary is not worth a host-filesystem
+// optimization this codebase never asserted.
+func copyWorkspace(root, dst string) error {
+	root = filepath.Clean(root)
+	dst = filepath.Clean(dst)
+	return filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		rel, rerr := filepath.Rel(root, path)
+		if rerr != nil {
+			return rerr
+		}
+		target := filepath.Join(dst, rel)
+		mode := info.Mode()
+		switch {
+		case mode&os.ModeSymlink != 0:
+			link, lerr := os.Readlink(path)
+			if lerr != nil {
+				return lerr
+			}
+			return os.Symlink(link, target)
+		case mode.IsDir():
+			if path == root {
+				return nil
+			}
+			return os.MkdirAll(target, mode.Perm())
+		case mode.IsRegular():
+			if cerr := copyFileMode(path, target, mode.Perm()); cerr != nil {
+				return cerr
+			}
+			if rel == "." {
+				return nil
+			}
+			return nil
+		default:
+			return fmt.Errorf("copy workspace: skipping non-regular file %q (mode %s)", path, mode)
+		}
+	})
+}
+
+func copyFileMode(src, dst string, mode os.FileMode) error {
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+	out, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, mode)
+	if err != nil {
+		return err
+	}
+	if _, err := io.Copy(out, in); err != nil {
+		_ = out.Close()
+		return err
+	}
+	return out.Close()
 }
 
 // LocalWorktreeRunner is the pre-Phase-5 execution path: the agent runs as a
@@ -277,6 +389,11 @@ func destroyWorktree(ctx context.Context, ws Workspace, approved bool, frozen co
 type LocalWorktreeRunner struct {
 	Config                contracts.LocalRunnerConfig
 	ControllerEnvironment controllerenv.Frozen
+	// Registry is the run's frozen trusted-tool registry (Sol12 P0-6):
+	// shell() resolves git/bash from this rather than reloading the registry
+	// per call. nil on recovery-constructed runners, which load a one-shot
+	// registry into destroyWorktree themselves.
+	Registry *toolregistry.Registry
 
 	mu    sync.Mutex
 	trunc truncationStats
@@ -292,7 +409,7 @@ func (r *LocalWorktreeRunner) controllerEnvironment() controllerenv.Frozen {
 }
 
 func (r *LocalWorktreeRunner) Prepare(ctx context.Context, req PrepareRequest) (Workspace, error) {
-	return prepareWorktree(ctx, req.Root, req.Home, req.ID, req.Git, r.controllerEnvironment())
+	return prepareWorktree(ctx, req.Root, req.Home, req.ID, req.Git, r.controllerEnvironment(), r.Registry)
 }
 
 // Launch itself adds no host containment beyond what the worktree provides
@@ -410,5 +527,5 @@ func (r *LocalWorktreeRunner) Observe(context.Context, Workspace) (ObserveResult
 func (r *LocalWorktreeRunner) Stop(context.Context, Workspace) error { return nil }
 
 func (r *LocalWorktreeRunner) Destroy(ctx context.Context, ws Workspace, approved bool) error {
-	return destroyWorktree(ctx, ws, approved, r.controllerEnvironment())
+	return destroyWorktree(ctx, ws, approved, r.controllerEnvironment(), r.Registry)
 }
