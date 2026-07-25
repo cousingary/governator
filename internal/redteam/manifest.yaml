@@ -1301,6 +1301,45 @@ cases:
     session: rc5-u12-s4
     required: true
     status: implemented
+  # Session 5 (P0-8 / P2 "Docker tests need a real release host"): the
+  # docker-backend consumed-artifact source is now an immutable Docker
+  # volume (internal/runner/docker_consumed_volume.go's
+  # ProvisionConsumedVolume/VerifyConsumedVolume), populated and re-verified
+  # entirely through `docker cp` tar streaming -- no host directory entry is
+  # ever created for the bytes. Cases 27-30 exercise this against a fake
+  # docker CLI script (no live daemon required, mirroring Session 4's fake
+  # docker pattern); case 31 is the real-daemon acceptance test and is
+  # authorized to skip only when has_docker_daemon is proven absent (this
+  # dev host's dockerd is not running).
+  - case: 222
+    name: TestV12Case27DockerVolumeMutationDuringReadDetected
+    session: rc5-u12-s5
+    required: true
+    status: implemented
+  - case: 223
+    name: TestV12Case28DockerVolumeMutationCaughtAtCheckpointThenRestoredVerifiesClean
+    session: rc5-u12-s5
+    required: true
+    status: implemented
+  - case: 224
+    name: TestV12Case29PreexistingVolumeContentNotTrustedOnProvision
+    session: rc5-u12-s5
+    required: true
+    status: implemented
+  - case: 225
+    name: TestV12Case30DockerVolumeContentReplacementDetected
+    session: rc5-u12-s5
+    required: true
+    status: implemented
+  - case: 226
+    name: TestV12Case31RealDockerDaemonConsumedArtifactVolumeRoundTrip
+    session: rc5-u12-s5
+    required: true
+    conditional: true
+    allowed_skip:
+      predicate: has_docker_daemon
+      reason: "no reachable docker daemon on this host"
+    status: implemented
 
 # Exclusions (Sol12 P0-2): every //go:build redteam-tagged test that is NOT a
 # manifest corpus case must be explicitly classified here with a documented

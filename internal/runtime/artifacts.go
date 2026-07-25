@@ -1,6 +1,7 @@
 package runtime
 
 import (
+	"context"
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
@@ -18,9 +19,11 @@ import (
 	"golang.org/x/sys/unix"
 
 	"github.com/cousingary/governator/internal/contracts"
+	"github.com/cousingary/governator/internal/controllerenv"
 	"github.com/cousingary/governator/internal/enforce"
 	"github.com/cousingary/governator/internal/observability"
 	"github.com/cousingary/governator/internal/pathsafe"
+	"github.com/cousingary/governator/internal/runner"
 )
 
 type stagedArtifact struct {
@@ -124,29 +127,29 @@ const ConsumedArtifactMutated = "CONSUMED_ARTIFACT_MUTATED"
 // tmpfs at launch time (enforce.Plan.WithConsumedArtifacts) with no host
 // directory entry ever created for the landlock boundary.
 //
-// This directory is retained ONLY for the Docker-backend sub-case
-// (Workspace.ConsumedDir's docker :ro mount): the Docker daemon is a wholly
-// separate process, never a descendant of any private mount namespace
-// Governator establishes, so it needs a real host path it can resolve a
-// bind-mount source from -- and Governator has no privilege (no
-// CAP_SYS_ADMIN in the host mount namespace, no CAP_LINUX_IMMUTABLE) to make
-// that path itself immutable the way the memfd projection does for
-// everything else. This remains an honestly-labelled, open residual: fully
-// closing it needs either a root-owned dedicated-service-UID store or
-// fs-verity enabled out of band, neither available at Governator's own
-// runtime privilege level. Docker-backend runs still get the existing
-// hash-reverification detection layer (verifyConsumedArtifacts) as their
-// only boundary against this specific gap.
+// Sol12 P0-8 closed the Docker-backend sub-case this directory used to
+// serve: the docker consumed-artifact source is now an immutable Docker
+// volume (docker_consumed_volume.go's ProvisionConsumedVolume), populated
+// directly from sealed bytes via `docker cp` with no host directory entry
+// ever created. Nothing currently calls this function to stage into it --
+// the mode-bits-degraded fallback stages into the legacy in-workspace
+// <work>/.governator/consumed location instead (stageDir in runOnce), never
+// this external home-rooted path. The function itself is retained only
+// because v11_s6_consumed_artifact_immutability_test.go asserts the path it
+// computes was never created on disk under the landlock boundary -- a
+// property that (as of Sol12 P0-8) now holds universally, for every runner
+// kind, not just local.
 func consumedArtifactStoreDir(home, runID string) string {
 	return filepath.Join(home, "consumed", runID)
 }
 
-// stageConsumedArtifacts writes every sealed artifact into dir (either
-// consumedArtifactStoreDir's external private store, or -- only when local
-// host containment is not active for this run, see runOnce -- the legacy
-// <work>/.governator/consumed location) with mode 0400. Mode 0400 remains a
-// courtesy against accidental same-process overwrite, never the actual
-// immutability boundary; see consumedArtifactStoreDir's doc comment.
+// stageConsumedArtifacts writes every sealed artifact into dir -- as of
+// Sol12 P0-8, only the mode-bits-degraded fallback's legacy in-workspace
+// <work>/.governator/consumed location (see runOnce) -- with mode 0400.
+// Mode 0400 remains a courtesy against accidental same-process overwrite,
+// never a real immutability boundary; that fallback is only reached when
+// the operator has disabled local host containment entirely, an
+// already-accepted reduced posture.
 func stageConsumedArtifacts(dir string, artifacts []stagedArtifact) ([]stagedArtifact, error) {
 	if len(artifacts) == 0 {
 		return nil, nil
@@ -300,17 +303,52 @@ func verifySealedConsumedArtifacts(sealed []sealedConsumedArtifact) error {
 
 // verifyConsumedArtifactsAll re-verifies every consumed-artifact identity
 // this run staged, across every mechanism actually in play for this run's
-// consumedBoundary (Sol11 P0-7): the plain host directory (Docker's own
-// container mount, or the legacy in-workspace mode-bits-degraded path) when
-// plainStaged is true, and the sealed memfd content whenever any was
-// sealed. Called at all four Sol10 P0-1 checkpoints.
-func verifyConsumedArtifactsAll(stageDir string, plainStaged bool, sealed []sealedConsumedArtifact, artifacts []stagedArtifact) error {
+// consumedBoundary: the plain host directory (the legacy in-workspace
+// mode-bits-degraded path) when plainStaged is true, the sealed memfd
+// content whenever any was sealed, and the immutable Docker volume (Sol12
+// P0-8) when docker is non-nil. Called at all four Sol10 P0-1 checkpoints.
+func verifyConsumedArtifactsAll(ctx context.Context, stageDir string, plainStaged bool, sealed []sealedConsumedArtifact, artifacts []stagedArtifact, docker *consumedDockerVolume) error {
 	if plainStaged {
 		if err := verifyConsumedArtifacts(stageDir, artifacts); err != nil {
 			return err
 		}
 	}
-	return verifySealedConsumedArtifacts(sealed)
+	if err := verifySealedConsumedArtifacts(sealed); err != nil {
+		return err
+	}
+	if docker != nil {
+		if err := runner.VerifyConsumedVolume(ctx, docker.env, docker.frozen, docker.image, docker.volumeName, toConsumedArtifactContents(artifacts)); err != nil {
+			return fmt.Errorf("%s: %w", ConsumedArtifactMutated, err)
+		}
+	}
+	return nil
+}
+
+// consumedDockerVolume bundles the docker-specific state
+// verifyConsumedArtifactsAll needs to re-verify a Sol12 P0-8 immutable
+// consumed-artifact volume: which frozen DockerEnvironment/environment to
+// use, the run's own verified image reference (the same one the seed
+// container was created from), and the volume's deterministic name. nil
+// whenever this run's consumedBoundary is not docker-ro-volume-mount.
+type consumedDockerVolume struct {
+	env        *runner.DockerEnvironment
+	frozen     controllerenv.Frozen
+	image      string
+	volumeName string
+}
+
+// toConsumedArtifactContents converts the runtime package's already-verified
+// stagedArtifact records into the runner package's transport type, so the
+// runner package never has to import runtime's ledger/sealing logic.
+func toConsumedArtifactContents(artifacts []stagedArtifact) []runner.ConsumedArtifactContent {
+	if len(artifacts) == 0 {
+		return nil
+	}
+	out := make([]runner.ConsumedArtifactContent, len(artifacts))
+	for i, a := range artifacts {
+		out[i] = runner.ConsumedArtifactContent{Name: a.Name, SHA256: a.SHA256, Bytes: a.Bytes, Data: a.data}
+	}
+	return out
 }
 
 // consumedArtifactFDs converts sealed artifacts into the form

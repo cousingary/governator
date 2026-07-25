@@ -43,9 +43,11 @@ type EnforcementRecord struct {
 	// ConsumedArtifactBoundary is the mechanism actually used to make this
 	// run's consumed artifacts read-only to the backend (Sol10 P0-1):
 	// "landlock-mount-namespace-ro-bind" (local runner, host containment
-	// active), "docker-ro-bind-mount" (docker runner), "mode-bits-degraded"
-	// (host containment disabled by operator config -- a courtesy, not a
-	// boundary), or "" when the run declared no consumed artifacts at all.
+	// active), "docker-ro-volume-mount" (docker runner: an immutable Docker
+	// volume, Sol12 P0-8 -- no host directory path backs it),
+	// "mode-bits-degraded" (host containment disabled by operator config --
+	// a courtesy, not a boundary), or "" when the run declared no consumed
+	// artifacts at all.
 	// Applied enforcement evidence, like Method -- what was actually
 	// configured, not merely requested.
 	ConsumedArtifactBoundary string

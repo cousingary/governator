@@ -594,29 +594,23 @@ func (d *DockerRunner) runArgs(ws Workspace, bin string, args []string) ([]strin
 	out := []string{"run", "--name", ws.Container, "-v", wsPath + ":/workspace", "-w", "/workspace"}
 	// Sol10 P0-1: a second, more specific bind mount layered read-only over
 	// the writable /workspace mount above -- standard docker/mount-layering
-	// behavior, the more specific mount path wins for paths beneath it. The
-	// consumed-artifact store lives outside the host worktree entirely (see
-	// runtime.consumedArtifactStoreDir); mounting it here, instead of
-	// relying on the workspace bind's own permission bits, means even a
-	// container running as root (the common non-remapped-userns default)
+	// behavior, the more specific mount path wins for paths beneath it. Even
+	// a container running as root (the common non-remapped-userns default)
 	// cannot write through this path without first defeating the mount
 	// itself, which requires CAP_SYS_ADMIN -- absent from Docker's default
 	// capability set and never added by this config.
 	//
-	// Sol11 P0-7: this closes overwrite THROUGH the mounted path, but the
-	// underlying host directory ws.ConsumedDir names is still an ordinary
-	// same-UID-writable directory on the host -- another process running as
-	// Governator's own user (not the container) can still alter it there and
-	// restore it before the next hash check. The local backend's own launch
-	// and every validator no longer use this directory at all (they read a
-	// sealed, kernel-write-sealed memfd projected into a private tmpfs
-	// instead -- see runtime.sealConsumedArtifacts), but Docker's daemon is
-	// a wholly separate process that needs a real host path to bind from,
-	// and Governator has no privilege to make that path itself immutable.
-	// This remains an honestly-labelled residual gap; see
-	// runtime.consumedArtifactStoreDir's doc comment.
-	if ws.ConsumedDir != "" {
-		out = append(out, "-v", filepath.Clean(ws.ConsumedDir)+":/workspace/.governator/consumed:ro")
+	// Sol12 P0-8: the mount source is ws.ConsumedVolume, an immutable Docker
+	// volume (docker_consumed_volume.go's ProvisionConsumedVolume) populated
+	// directly from sealed bytes via `docker cp` -- never a host directory
+	// path. Sol11 P0-7 had already closed overwrite THROUGH the mounted
+	// path; this closes the remaining gap that report explicitly left open
+	// (the underlying host directory itself was still same-UID-writable).
+	// With no host filesystem path backing the artifact source at all, only
+	// Docker daemon authority -- already bound into replay identity via
+	// DockerEnvironment.DaemonIdentity -- can reach it.
+	if ws.ConsumedVolume != "" {
+		out = append(out, "-v", ws.ConsumedVolume+":/workspace/.governator/consumed:ro")
 	}
 	if d.Config.MemoryLimit != "" {
 		out = append(out, "--memory", d.Config.MemoryLimit)

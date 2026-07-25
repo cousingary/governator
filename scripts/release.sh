@@ -410,7 +410,7 @@ REDTEAM_MANIFEST="internal/redteam/manifest.yaml"
 # signed per-host capability attestations aggregated at release (Sessions
 # 5/6/9) carry the full evidence_hash/signature on top of this same schema.
 REDTEAM_CAPABILITIES_JSON=$(python3 -c "
-import json, os, platform, shutil, datetime
+import json, os, platform, shutil, datetime, subprocess
 def env_flag(v): return os.environ.get(v, '') == '1'
 def rec(present, probe, result=''):
     return {'state': 'present' if present else 'absent', 'probe': probe, 'result': result,
@@ -421,6 +421,19 @@ def rec(present, probe, result=''):
 # pins it via GOV_REDTEAM_HAS_SYSTEMD_USER (the previous behavior).
 has_su = env_flag('GOV_REDTEAM_HAS_SYSTEMD_USER') or os.path.exists('/run/user/%d/bus' % os.getuid())
 proc1_unreadable = os.path.isdir('/proc/1') and not os.access('/proc/1/fd', os.R_OK)
+# has_docker_daemon (Session 5, Sol12 P0-8/P2): a real \`docker info\` round
+# trip against a live daemon, not merely the CLI binary being on PATH -- this
+# dev host has the docker CLI installed but no running daemon, which is
+# exactly the absent case case 31's real-daemon test needs proven.
+def docker_daemon_reachable():
+    docker_bin = shutil.which('docker')
+    if not docker_bin:
+        return False
+    try:
+        return subprocess.run([docker_bin, 'info'], capture_output=True, timeout=5).returncode == 0
+    except Exception:
+        return False
+has_docker = docker_daemon_reachable()
 print(json.dumps({
     'linux': rec(platform.system()=='Linux', 'platform.system()', platform.system()),
     'has_systemd_user': rec(has_su, 'env GOV_REDTEAM_HAS_SYSTEMD_USER or /run/user/<uid>/bus', str(has_su)),
@@ -445,6 +458,7 @@ print(json.dumps({
     'case8_hangfuse_extinction_fixture': rec(os.environ.get('GOV_REDTEAM_CASE8_HANGFUSE','0')=='1', 'env GOV_REDTEAM_CASE8_HANGFUSE (operator attests kernel keeps FUSE-blocked readers unkillable)'),
     'git_trusted': rec(shutil.which('git') is not None, 'shutil.which(git)', shutil.which('git') or ''),
     'proc1_fd_unreadable': rec(proc1_unreadable, 'os.access(/proc/1/fd, R_OK)', str(proc1_unreadable)),
+    'has_docker_daemon': rec(has_docker, 'docker info (5s timeout)', str(has_docker)),
 }))
 ")
 # Sol12 rc5 Session 1 (P0-2): the authoritative red-team test inventory,

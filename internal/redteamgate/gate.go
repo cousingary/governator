@@ -121,6 +121,11 @@ var KnownPredicates = map[string]bool{
 	"case8_hangfuse_extinction_fixture": true,
 	"git_trusted":                       true,
 	"proc1_fd_unreadable":               true,
+	// has_docker_daemon: Session 5 (Sol12 P0-8/P2 "Docker tests need a real
+	// release host"). True only when a `docker info` round trip against a
+	// live daemon succeeds; case 31's real-daemon consumed-artifact-volume
+	// acceptance test is authorized to skip only when this is proven absent.
+	"has_docker_daemon": true,
 }
 
 // allowedStatusValues enumerates the only status: values a manifest case may

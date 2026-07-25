@@ -3285,16 +3285,17 @@ func (r *Runner) runOnce(ctx context.Context, c contracts.Contract) (RunRecord, 
 	externalConsumedStore := false
 	plainConsumedStaged := false
 	var sealedConsumed []sealedConsumedArtifact
+	var dockerConsumed *consumedDockerVolume
 	if len(transaction.Artifacts) > 0 {
 		switch {
 		case c.EffectiveRunner() == "docker":
-			consumedBoundary = "docker-ro-bind-mount"
+			consumedBoundary = "docker-ro-volume-mount"
 		case requiresEnforcementWrap:
 			consumedBoundary = "landlock-mount-namespace-ro-bind"
 		default:
 			consumedBoundary = "mode-bits-degraded"
 		}
-		externalConsumedStore = consumedBoundary == "docker-ro-bind-mount" || consumedBoundary == "landlock-mount-namespace-ro-bind"
+		externalConsumedStore = consumedBoundary == "docker-ro-volume-mount" || consumedBoundary == "landlock-mount-namespace-ro-bind"
 		if externalConsumedStore {
 			// The workspace-relative mount point .governator/consumed must
 			// already exist, empty, before any of the docker :ro -v, the
@@ -3310,20 +3311,31 @@ func (r *Runner) runOnce(ctx context.Context, c contracts.Contract) (RunRecord, 
 		}
 		// Sol11 P0-7: the local backend's own launch and every validator
 		// (both runner kinds) read consumed artifacts exclusively through
-		// sealed memfd content from here on -- see
-		// consumedArtifactStoreDir's doc comment for why a real host
-		// directory (stageConsumedArtifacts below) is still populated for
-		// the docker-backend and mode-bits-degraded sub-cases specifically.
+		// sealed memfd content from here on. Sol12 P0-8: the docker-backend
+		// sub-case now gets an immutable Docker volume (below) instead of a
+		// host directory; only the mode-bits-degraded fallback still stages
+		// into a real (in-workspace, same-UID-writable) directory.
 		var sealErr error
 		sealedConsumed, sealErr = sealConsumedArtifacts(transaction.Artifacts)
 		if sealErr != nil {
 			return RunRecord{}, sealErr
 		}
-		if consumedBoundary == "docker-ro-bind-mount" {
-			stageDir = consumedArtifactStoreDir(r.Home, id)
-			ws.ConsumedDir = stageDir
-		}
-		if consumedBoundary == "docker-ro-bind-mount" || consumedBoundary == "mode-bits-degraded" {
+		switch consumedBoundary {
+		case "docker-ro-volume-mount":
+			if dockerEnv == nil {
+				return RunRecord{}, fmt.Errorf("consumed artifacts declared for a docker run but no docker environment was resolved")
+			}
+			image := ""
+			if dockerImage != nil {
+				image = dockerImage.Reference
+			}
+			volumeName := runner.ConsumedVolumeName(id)
+			if err := runner.ProvisionConsumedVolume(ctx, dockerEnv, env.Controller, image, volumeName, toConsumedArtifactContents(transaction.Artifacts)); err != nil {
+				return RunRecord{}, fmt.Errorf("provision consumed-artifact volume: %w", err)
+			}
+			ws.ConsumedVolume = volumeName
+			dockerConsumed = &consumedDockerVolume{env: dockerEnv, frozen: env.Controller, image: image, volumeName: volumeName}
+		case "mode-bits-degraded":
 			plainConsumedStaged = true
 			if _, err := stageConsumedArtifacts(stageDir, transaction.Artifacts); err != nil {
 				return RunRecord{}, err
@@ -3331,6 +3343,11 @@ func (r *Runner) runOnce(ctx context.Context, c contracts.Contract) (RunRecord, 
 		}
 	}
 	defer closeSealedConsumedArtifacts(sealedConsumed)
+	defer func() {
+		if dockerConsumed != nil {
+			_ = runner.RemoveConsumedVolume(context.Background(), dockerConsumed.env, dockerConsumed.frozen, dockerConsumed.volumeName)
+		}
+	}()
 	if err = observability.RecordIdentity(db, c.JobID, c.JobType, resolved.Agent, rec.Created); err != nil {
 		return rec, err
 	}
@@ -3465,7 +3482,7 @@ func (r *Runner) runOnce(ctx context.Context, c contracts.Contract) (RunRecord, 
 		// Sol10 P0-1 checkpoint 1/4: verify every consumed artifact
 		// immediately before the untrusted backend actually starts.
 		if len(transaction.Artifacts) > 0 {
-			if verr := verifyConsumedArtifactsAll(stageDir, plainConsumedStaged, sealedConsumed, transaction.Artifacts); verr != nil {
+			if verr := verifyConsumedArtifactsAll(ctx, stageDir, plainConsumedStaged, sealedConsumed, transaction.Artifacts, dockerConsumed); verr != nil {
 				return RunRecord{}, verr
 			}
 		}
@@ -3531,7 +3548,7 @@ func (r *Runner) runOnce(ctx context.Context, c contracts.Contract) (RunRecord, 
 	// Sol10 P0-1 checkpoint 2/4: verify every consumed artifact immediately
 	// after the backend's own descendant tree is kernel-confirmed extinct.
 	if len(transaction.Artifacts) > 0 {
-		if verr := verifyConsumedArtifactsAll(stageDir, plainConsumedStaged, sealedConsumed, transaction.Artifacts); verr != nil {
+		if verr := verifyConsumedArtifactsAll(ctx, stageDir, plainConsumedStaged, sealedConsumed, transaction.Artifacts, dockerConsumed); verr != nil {
 			return RunRecord{}, verr
 		}
 	}
@@ -3817,7 +3834,7 @@ func (r *Runner) runOnce(ctx context.Context, c contracts.Contract) (RunRecord, 
 	// Sol10 P0-1 checkpoint 3/4: verify every consumed artifact immediately
 	// before the validator phase a validator that reads it might run in.
 	if len(transaction.Artifacts) > 0 {
-		if verr := verifyConsumedArtifactsAll(stageDir, plainConsumedStaged, sealedConsumed, transaction.Artifacts); verr != nil {
+		if verr := verifyConsumedArtifactsAll(ctx, stageDir, plainConsumedStaged, sealedConsumed, transaction.Artifacts, dockerConsumed); verr != nil {
 			violations = append(violations, verr.Error())
 		}
 	}
@@ -4063,7 +4080,7 @@ func (r *Runner) runOnce(ctx context.Context, c contracts.Contract) (RunRecord, 
 	// Assay) has run, immediately before the final structural barrier and
 	// merge decision below.
 	if len(violations) == 0 && len(transaction.Artifacts) > 0 {
-		if verr := verifyConsumedArtifactsAll(stageDir, plainConsumedStaged, sealedConsumed, transaction.Artifacts); verr != nil {
+		if verr := verifyConsumedArtifactsAll(ctx, stageDir, plainConsumedStaged, sealedConsumed, transaction.Artifacts, dockerConsumed); verr != nil {
 			violations = append(violations, verr.Error())
 		}
 	}
