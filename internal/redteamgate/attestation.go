@@ -1,6 +1,13 @@
 package redteamgate
 
-import "fmt"
+import (
+	"encoding/json"
+	"fmt"
+	"os"
+	"path/filepath"
+	"sort"
+	"strings"
+)
 
 // Attestation categories for the rc5 release (Sol12 P0-2/P0-3, Session 1
 // W3). Each category names a differently-capable host whose environment a
@@ -78,6 +85,12 @@ type CapabilityAttestation struct {
 	// must cover every manifest case (Session 9).
 	CoveredTests []string `yaml:"covered_tests,omitempty" json:"covered_tests,omitempty"`
 
+	// NonApproving declares that this attestation's category does not claim
+	// production approval for this release (Session 6: Darwin non-approving).
+	// Tests covered exclusively by a non-approving category are not gaps —
+	// the release simply does not claim that platform.
+	NonApproving bool `yaml:"non_approving,omitempty" json:"non_approving,omitempty"`
+
 	// Signature over the canonical (sorted-key) JSON of every field above
 	// except Signature itself. Minisign (upgrade-11 Session 1) is the
 	// release signature scheme; this field carries the detached signature.
@@ -107,4 +120,111 @@ func BindingConsistent(atts []CapabilityAttestation) (bool, string) {
 		}
 	}
 	return true, ""
+}
+
+// AggregationResult is the outcome of verifying and aggregating a set of
+// capability-host attestations for one release (Session 9).
+type AggregationResult struct {
+	OK       bool     `json:"ok"`
+	Problems []string `json:"problems,omitempty"`
+
+	// CoveredTests is the union of every test name that ran and passed
+	// across all attestations.
+	CoveredTests map[string]bool `json:"-"`
+
+	// NonApprovingCategories are categories that explicitly do not claim
+	// production approval (Darwin for rc5). Tests whose ONLY coverage is a
+	// non-approving category are not gaps — the release does not claim that
+	// platform.
+	NonApprovingCategories map[string]bool `json:"-"`
+
+	// CategoriesPresent lists which required categories have attestations.
+	CategoriesPresent []string `json:"categories_present"`
+}
+
+// AggregateAndVerify checks a set of capability-host attestations against the
+// required categories and binding consistency (Session 9). It returns the
+// aggregated coverage set the gate uses to decide whether a skip under
+// --require-zero-skips is accounted for.
+func AggregateAndVerify(atts []CapabilityAttestation, requiredCategories []string) AggregationResult {
+	var res AggregationResult
+	res.CoveredTests = make(map[string]bool)
+	res.NonApprovingCategories = make(map[string]bool)
+
+	if len(atts) == 0 {
+		res.Problems = append(res.Problems, "no capability attestations supplied")
+		return res
+	}
+
+	if ok, msg := BindingConsistent(atts); !ok {
+		res.Problems = append(res.Problems, msg)
+		return res
+	}
+
+	present := make(map[string]bool)
+	for _, a := range atts {
+		present[a.Category] = true
+		res.CategoriesPresent = append(res.CategoriesPresent, a.Category)
+		if a.NonApproving {
+			res.NonApprovingCategories[a.Category] = true
+		}
+		for _, t := range a.CoveredTests {
+			res.CoveredTests[t] = true
+		}
+	}
+	sort.Strings(res.CategoriesPresent)
+
+	for _, cat := range requiredCategories {
+		if !present[cat] {
+			res.Problems = append(res.Problems, fmt.Sprintf("required attestation category %q is missing from the supplied set", cat))
+		}
+	}
+
+	res.OK = len(res.Problems) == 0
+	return res
+}
+
+// SkipCoveredByAttestations reports whether a skipped test is accounted for
+// by the aggregated attestation set: the test ran and passed on another host,
+// or its only coverage is a non-approving platform declaration, or its
+// capability predicate is proven absent (the scenario is platform-inapplicable).
+func SkipCoveredByAttestations(testName string, agg AggregationResult, capabilities map[string]CapabilityRecord, caseEntry CaseEntry) bool {
+	if agg.CoveredTests[testName] {
+		return true
+	}
+	if caseEntry.Conditional && caseEntry.AllowedSkip != nil && caseEntry.AllowedSkip.Predicate != "" {
+		rec, ok := capabilities[caseEntry.AllowedSkip.Predicate]
+		if ok && rec.State == CapabilityAbsent {
+			return true
+		}
+	}
+	return false
+}
+
+// LoadAttestations reads all .json attestation files from a directory and
+// returns the parsed set (Session 9 aggregation input).
+func LoadAttestations(dir string) ([]CapabilityAttestation, error) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, fmt.Errorf("attestation dir: %w", err)
+	}
+	var atts []CapabilityAttestation
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".json") {
+			continue
+		}
+		data, err := os.ReadFile(filepath.Join(dir, e.Name()))
+		if err != nil {
+			return nil, fmt.Errorf("attestation %s: %w", e.Name(), err)
+		}
+		var a CapabilityAttestation
+		if err := json.Unmarshal(data, &a); err != nil {
+			return nil, fmt.Errorf("attestation %s: %w", e.Name(), err)
+		}
+		if a.Category == "" {
+			return nil, fmt.Errorf("attestation %s: missing category", e.Name())
+		}
+		atts = append(atts, a)
+	}
+	return atts, nil
 }

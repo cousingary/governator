@@ -2042,7 +2042,7 @@ func claimsCmd(args []string) int {
 // inventory release.sh discovers from //go:build redteam-tagged source —
 // every inventory test must be a manifest case or a documented exclusion.
 func redteamGateCmd(args []string) int {
-	usage := "usage: gov redteam-gate verify --manifest <path> --log <path> [--capabilities <json>] [--inventory <path>] [--require-zero-skips]"
+	usage := "usage: gov redteam-gate verify --manifest <path> --log <path> [--capabilities <json>] [--inventory <path>] [--attestations <dir>] [--require-zero-skips]"
 	if len(args) < 1 || args[0] != "verify" {
 		return bad(usage)
 	}
@@ -2050,6 +2050,7 @@ func redteamGateCmd(args []string) int {
 	logPath := ""
 	capabilitiesJSON := ""
 	inventoryPath := ""
+	attestationsDir := ""
 	requireZeroSkips := false
 	rest := args[1:]
 	for len(rest) > 0 {
@@ -2082,6 +2083,12 @@ func redteamGateCmd(args []string) int {
 				return bad(usage)
 			}
 			inventoryPath = rest[1]
+			rest = rest[2:]
+		case "--attestations":
+			if len(rest) < 2 {
+				return bad(usage)
+			}
+			attestationsDir = rest[1]
 			rest = rest[2:]
 		case "--require-zero-skips":
 			// P1-3 (Sol10 rc4 Session 8): a production release must not
@@ -2123,9 +2130,26 @@ func redteamGateCmd(args []string) int {
 			return 1
 		}
 	}
+	var aggResult *redteamgate.AggregationResult
+	if attestationsDir != "" {
+		atts, err := redteamgate.LoadAttestations(attestationsDir)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "redteam-gate: --attestations:", err)
+			return 1
+		}
+		agg := redteamgate.AggregateAndVerify(atts, redteamgate.RequiredAttestationCategories)
+		if !agg.OK {
+			for _, p := range agg.Problems {
+				fmt.Fprintln(os.Stderr, "redteam-gate: attestation aggregation:", p)
+			}
+			return 1
+		}
+		aggResult = &agg
+	}
 	result := redteamgate.EvaluateWithOptions(manifest, string(logData), capabilities, redteamgate.Options{
 		RequireZeroSkips: requireZeroSkips,
 		DiscoveredTests:  discovered,
+		Attestations:     aggResult,
 	})
 	if err := json.NewEncoder(os.Stdout).Encode(result); err != nil {
 		fmt.Fprintln(os.Stderr, "redteam-gate:", err)

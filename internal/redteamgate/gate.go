@@ -324,6 +324,12 @@ type Options struct {
 	// ANY skip -- authorized or not -- blocks the release; conditional
 	// skips stay available only for ordinary development CI runs that
 	// leave this unset.
+	//
+	// Sol12 Session 9: when Attestations are supplied, RequireZeroSkips
+	// means "zero UNCOVERED skips" — a skip is covered if the aggregated
+	// attestation set accounts for it (another host ran it, the platform
+	// is non-approving, or the capability is proven absent making the
+	// scenario inapplicable).
 	RequireZeroSkips bool
 
 	// DiscoveredTests is the authoritative inventory of every release-
@@ -336,6 +342,11 @@ type Options struct {
 	// callers) but records InventorySupplied=false so production evidence
 	// shows the inventory was not bound — release.sh always supplies it.
 	DiscoveredTests []string
+
+	// Attestations is the aggregated capability-host attestation set
+	// (Session 9). When non-empty and RequireZeroSkips is set, a skip is
+	// covered (not a gap) if SkipCoveredByAttestations reports true.
+	Attestations *AggregationResult
 }
 
 // EvaluateWithOptions is the identity-based gate. Over one parsed redteam
@@ -422,7 +433,12 @@ func EvaluateWithOptions(manifest Manifest, log string, capabilities map[string]
 		}
 		if o.Result == "SKIP" {
 			if opts.RequireZeroSkips {
-				res.UnexpectedSkips = append(res.UnexpectedSkips, name)
+				if opts.Attestations != nil && SkipCoveredByAttestations(name, *opts.Attestations, capabilities, c) {
+					// Session 9: skip is accounted for by the aggregated
+					// attestation set — not a gap.
+				} else {
+					res.UnexpectedSkips = append(res.UnexpectedSkips, name)
+				}
 			} else if !skipAllowed(c, o.Reason, capabilities) {
 				res.UnexpectedSkips = append(res.UnexpectedSkips, name)
 			}

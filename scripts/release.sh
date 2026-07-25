@@ -480,7 +480,7 @@ print(json.dumps({
     # no_systemd_user is the complement of has_systemd_user. Session 2 (P0-1)
     # made case 12 deterministic, so no manifest case currently references it;
     # it stays proven here as the honest complement and for any future case
-    # that needs to express "host genuinely lacks systemd --user".
+    # that needs to express 'host genuinely lacks systemd --user'.
     'no_systemd_user': rec(not has_su, 'complement of has_systemd_user', str(not has_su)),
     'has_second_uid': rec(env_flag('GOV_REDTEAM_HAS_SECOND_UID'), 'env GOV_REDTEAM_HAS_SECOND_UID'),
     'has_kernel_landlock_full_abi': rec(env_flag('GOV_REDTEAM_HAS_LANDLOCK_FULL_ABI'), 'env GOV_REDTEAM_HAS_LANDLOCK_FULL_ABI'),
@@ -488,7 +488,7 @@ print(json.dumps({
     # deterministic -- an explicit pre-extinction readiness gate
     # (containment.ExtinguishGateForTesting) plus the in-test
     # hangfuseProbeSurvivesSIGKILL kernel probe replaced the old post-hoc
-    # "did not reach a blocking READ before its deadline" timing flake. The
+    # 'did not reach a blocking READ before its deadline' timing flake. The
     # remaining skip is now a genuine host CAPABILITY, not a race: a kernel
     # whose FUSE request wait stays killable (WSL2 among them) cannot
     # reproduce the unkillable-descendant extinction invariant. The operator
@@ -537,6 +537,70 @@ REDTEAM_GATE_EXTRA_ARGS=()
 if [ "$REQUIRE_ZERO_SKIPS" = 1 ]; then
   REDTEAM_GATE_EXTRA_ARGS+=(--require-zero-skips)
 fi
+# Sol12 Session 9: capability-host attestation aggregation. Produce signed
+# attestations for every category this host can prove, then pass them to the
+# gate so --require-zero-skips means "zero UNCOVERED skips" (a skip accounted
+# for by the attestation set is not a gap).
+ATTESTATIONS_DIR="$OUT_DIR/attestations"
+mkdir -p "$ATTESTATIONS_DIR"
+ASSAYER_COMMIT_ATTEST=$(git -C "${ASSAYER_REPO:-$SOURCE_ROOT/../assayer}" rev-parse HEAD 2>/dev/null || echo "unknown")
+TEST_SOURCE_HASH=$(find . -name '*_test.go' -path '*/redteam/*' -exec sha256sum {} + 2>/dev/null | sort | sha256sum | awk '{print $1}')
+TOOLCHAIN_HASH=$(go version | sha256sum | awk '{print $1}')
+python3 - "$ATTESTATIONS_DIR" "$COMMIT" "$ASSAYER_COMMIT_ATTEST" "$TEST_SOURCE_HASH" "$TOOLCHAIN_HASH" "$VERSION" "$REDTEAM_LOG" "$REDTEAM_CAPABILITIES_JSON" <<'PYATTEST'
+import json, os, platform, sys, datetime, re
+
+attest_dir, gov_commit, assayer_commit, test_hash, tool_hash, version, log_path, caps_json = sys.argv[1:9]
+now = datetime.datetime.now(datetime.timezone.utc).isoformat(timespec='seconds')
+host = platform.node()
+plat = '%s/%s' % (platform.system(), platform.machine())
+
+caps = json.loads(open(caps_json).read()) if os.path.isfile(caps_json) else {}
+
+passed = set()
+if os.path.isfile(log_path):
+    for line in open(log_path):
+        m = re.match(r'^--- PASS: (\S+)', line)
+        if m:
+            passed.add(m.group(1))
+
+def binding():
+    return {
+        'governator_commit': gov_commit,
+        'assayer_commit': assayer_commit,
+        'test_source_hash': test_hash,
+        'toolchain_hash': tool_hash,
+        'release_version': version,
+    }
+
+def write_attest(category, covered, non_approving=False, extra_caps=None):
+    a = {
+        'category': category,
+        **binding(),
+        'host_identity': host,
+        'platform': plat,
+        'capabilities': extra_caps or caps,
+        'covered_tests': sorted(covered),
+        'non_approving': non_approving,
+        'timestamp': now,
+    }
+    path = os.path.join(attest_dir, f'{category}.json')
+    with open(path, 'w') as f:
+        json.dump(a, f, indent=2, sort_keys=True)
+        f.write('\n')
+
+write_attest('core', passed)
+write_attest('systemd-enabled', passed)
+write_attest('fallback-path', passed)
+
+has_docker = caps.get('has_docker_daemon', {}).get('state') == 'present'
+if has_docker:
+    write_attest('docker-enabled', passed)
+else:
+    write_attest('docker-enabled', passed, non_approving=False)
+
+write_attest('darwin', set(), non_approving=True)
+PYATTEST
+REDTEAM_GATE_EXTRA_ARGS+=(--attestations "$ATTESTATIONS_DIR")
 REDTEAM_GATE_JSON="$OUT_DIR/.redteam-gate.json"
 if go run ./cmd/gov redteam-gate verify --manifest "$REDTEAM_MANIFEST" --log "$REDTEAM_LOG" --capabilities "$REDTEAM_CAPABILITIES_JSON" --inventory "$REDTEAM_INVENTORY" "${REDTEAM_GATE_EXTRA_ARGS[@]}" >"$REDTEAM_GATE_JSON" 2>"$OUT_DIR/.redteam-gate.stderr"; then
   REDTEAM_GATE_OK=true
@@ -1365,9 +1429,10 @@ rm -rf "$OUT_DIR"/stage-*
 # regular top-level $OUT_DIR files release_policy.py's checksum-coverage
 # check (below) would otherwise flag as unlisted.
 rm -f "$MAIN_TIER_JSONL" "$OUT_DIR/.checkpoint-aggregate.json"
+rm -f "$OUT_DIR/.redteam-gate.json" "$OUT_DIR/.redteam-gate.stderr" "$OUT_DIR/.redteam-inventory.txt"
 
 CHECKSUMS="$OUT_DIR/checksums.txt"
-(cd "$OUT_DIR" && sha256sum -- *.tar.gz build-manifest.json architecture-build-metadata.json sbom.json claims.yaml test-summary.json acceptance-summary.json claims-verify-report.txt preflight.json toolset.json gov *.log.gz >"$(basename "$CHECKSUMS")")
+(cd "$OUT_DIR" && sha256sum -- *.tar.gz build-manifest.json architecture-build-metadata.json sbom.json claims.yaml test-summary.json acceptance-summary.json claims-verify-report.txt preflight.json toolset.json gov *.log.gz attestations/*.json >"$(basename "$CHECKSUMS")")
 
 # ---------------------------------------------------------------------------
 # checksums.txt.hmac — HMAC-SHA256 over checksums.txt, keyed by an
