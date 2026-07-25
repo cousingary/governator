@@ -47,24 +47,32 @@ func s3TierPipelineScript(t *testing.T) string {
 }
 
 type s3Identity struct {
-	GovernatorCommit  string
-	GovernatorTag     string
-	AssayerCommit     string
-	GoSumHash         string
-	ToolchainHash     string
-	EnvironmentHash   string
-	GoTestParallelism string
+	GovernatorCommit    string
+	GovernatorTag       string
+	AssayerCommit       string
+	GoSumHash           string
+	ToolchainHash       string
+	EnvironmentHash     string
+	GoTestParallelism   string
+	RequestedVersion    string
+	ExpectedExactTag    string
+	ReleaseMode         string
+	DistributionAllowed string
 }
 
 func s3DefaultIdentity() s3Identity {
 	return s3Identity{
-		GovernatorCommit:  "c0ffee00c0ffee00c0ffee00c0ffee00c0ffee0",
-		GovernatorTag:     "v1.0.2-rc5-test",
-		AssayerCommit:     "a55a11a55a11a55a11a55a11a55a11a55a11a55",
-		GoSumHash:         "gosum-hash-1",
-		ToolchainHash:     "toolchain-hash-1",
-		EnvironmentHash:   "environment-hash-1",
-		GoTestParallelism: "2",
+		GovernatorCommit:    "c0ffee00c0ffee00c0ffee00c0ffee00c0ffee0",
+		GovernatorTag:       "v1.0.2-rc5-test",
+		AssayerCommit:       "a55a11a55a11a55a11a55a11a55a11a55a11a55",
+		GoSumHash:           "gosum-hash-1",
+		ToolchainHash:       "toolchain-hash-1",
+		EnvironmentHash:     "environment-hash-1",
+		GoTestParallelism:   "2",
+		RequestedVersion:    "1.0.2-rc5-test",
+		ExpectedExactTag:    "v1.0.2-rc5-test",
+		ReleaseMode:         "production",
+		DistributionAllowed: "true",
 	}
 }
 
@@ -80,6 +88,10 @@ func s3WriteIdentityFile(t *testing.T, path string, id s3Identity) {
 		"--toolchain-hash", id.ToolchainHash,
 		"--environment-hash", id.EnvironmentHash,
 		"--go-test-parallelism", id.GoTestParallelism,
+		"--requested-version", id.RequestedVersion,
+		"--expected-exact-tag", id.ExpectedExactTag,
+		"--release-mode", id.ReleaseMode,
+		"--distribution-allowed", id.DistributionAllowed,
 	)
 	out, err := cmd.Output()
 	if err != nil {

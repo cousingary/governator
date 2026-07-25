@@ -92,15 +92,54 @@ def record_tool(name: str) -> dict:
     }
 
 
+def verify_toolset(toolset_path: pathlib.Path) -> int:
+    """Re-hash every tool recorded in a prior toolset.json and confirm none
+    changed. Returns 0 if all match, 1 if any tool's path or SHA-256
+    differs (a mid-attempt substitution). Sol12 P1-4 (rc5 Session 7)."""
+    doc = json.loads(toolset_path.read_text(encoding="utf-8"))
+    mismatches = []
+    for rec in doc.get("tools", []):
+        name = rec["name"]
+        expected_path = rec.get("path")
+        expected_sha = rec.get("sha256", "")
+        if expected_path is None:
+            raw = shutil.which(name)
+            if raw is not None:
+                mismatches.append(f"{name}: was absent at preflight, now resolves to {raw}")
+            continue
+        if not pathlib.Path(expected_path).is_file():
+            mismatches.append(f"{name}: recorded path {expected_path} no longer exists")
+            continue
+        actual_sha = sha256_file(pathlib.Path(expected_path))
+        if actual_sha != expected_sha:
+            mismatches.append(f"{name}: SHA-256 changed ({expected_sha[:12]}... -> {actual_sha[:12]}...)")
+    if mismatches:
+        for m in mismatches:
+            print(f"TOOLSET_VERIFICATION_FAILED: {m}", file=sys.stderr)
+        return 1
+    return 0
+
+
 def main(argv: list[str]) -> int:
     p = argparse.ArgumentParser()
-    p.add_argument("--out", required=True, help="path to write toolset.json")
+    p.add_argument("--out", help="path to write toolset.json")
     p.add_argument(
         "--tools",
         default=",".join(DEFAULT_TOOLS),
         help="comma-separated tool names (default: the seven P1-6 tools)",
     )
+    p.add_argument(
+        "--verify",
+        metavar="TOOLSET_JSON",
+        help="verify a prior toolset.json: re-hash every tool and fail if any changed (Sol12 P1-4)",
+    )
     args = p.parse_args(argv)
+
+    if args.verify:
+        return verify_toolset(pathlib.Path(args.verify))
+
+    if not args.out:
+        p.error("--out is required when not using --verify")
 
     tool_names = [t.strip() for t in args.tools.split(",") if t.strip()]
     records = [record_tool(name) for name in tool_names]

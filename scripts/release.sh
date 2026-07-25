@@ -62,52 +62,58 @@ if [ -z "${VERSION:-}" ]; then
   fi
 fi
 
-# P1-8 (Sol11 rc5 Session 8): auto-detect release mode from HEAD's own tag
-# state, not a caller-set env var. When HEAD carries an exact v* tag and
-# VERSION matches it, this run is unambiguously a production release --
-# REQUIRE_TAG (and everything that derives from it: REQUIRE_ZERO_SKIPS,
-# the architecture-doc/signature evidence gates) defaults ON without the
-# operator remembering to set REQUIRE_TAG=1. The rc4 failure mode the
-# report names ("tagged release semantics still depend on caller-supplied
-# environment") was a manual invocation from a tagged rc commit that got
-# weaker semantics unless the caller remembered the env var. Local dev
-# candidates (local-candidate-*, an explicit VERSION from an untagged
-# tree) keep their existing weaker defaults.
+# Sol12 P1-3 (rc5 Session 7): release strictness is derived from the VERSION
+# string itself, not from caller-settable environment variables. For any
+# version matching vX.Y.Z or vX.Y.Z-rcN (i.e. a real distribution candidate),
+# the following are ALWAYS enforced and CANNOT be weakened by env vars:
+#   - exact tag at HEAD matching v${VERSION}
+#   - zero production security-test skips
+#   - asymmetric cryptographic signature
+#   - clean source tree
+#   - complete evidence
+# Development builds use the unmistakable identity local-candidate-<commit>
+# and are marked non-publishable; they keep weaker defaults.
+#
+# This closes the Sol12 P1-3 defect: REQUIRE_TAG=0 / REQUIRE_ZERO_SKIPS=0
+# could previously build an rc as a signed but non-tag-strict candidate.
 EXACT_TAG_AT_HEAD=$(git describe --tags --exact-match HEAD 2>/dev/null || true)
-AUTO_RELEASE_MODE=0
-if [ -n "$EXACT_TAG_AT_HEAD" ] && [ "v${VERSION}" = "$EXACT_TAG_AT_HEAD" ]; then
-  AUTO_RELEASE_MODE=1
-fi
-# P0-7 (Sol redteam v4 S8): "build releases only from a clean, tagged
-# commit." REQUIRE_TAG defaults to AUTO_RELEASE_MODE (P1-8 above) so a
-# tagged HEAD enters strict release mode without any env var; an operator
-# can still force it off (REQUIRE_TAG=0) for a local dry-run of a tagged
-# commit, or force it on (REQUIRE_TAG=1) on an untagged tree.
-REQUIRE_TAG=${REQUIRE_TAG:-$AUTO_RELEASE_MODE}
-if [ "$REQUIRE_TAG" = 1 ]; then
+RELEASE_MODE=""
+case "$VERSION" in
+  local-candidate-*)
+    RELEASE_MODE="development"
+    ;;
+  *)
+    if printf '%s' "$VERSION" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+(-rc[0-9]+)?$'; then
+      RELEASE_MODE="production"
+    else
+      RELEASE_MODE="development"
+    fi
+    ;;
+esac
+DISTRIBUTION_ALLOWED=false
+if [ "$RELEASE_MODE" = "production" ]; then
+  DISTRIBUTION_ALLOWED=true
+  REQUIRE_TAG=1
+  REQUIRE_ZERO_SKIPS=1
+  REQUIRE_ASYMMETRIC_SIGNATURE=1
   TAG_AT_HEAD=$(git tag --points-at HEAD | grep -x "v${VERSION}" || true)
   if [ -z "$TAG_AT_HEAD" ]; then
-    echo "release: REQUIRE_TAG=1 but HEAD is not tagged v${VERSION}" >&2
+    echo "release: version ${VERSION} is a production release (vX.Y.Z / vX.Y.Z-rcN) -- HEAD MUST be tagged v${VERSION} (strictness is version-derived and cannot be disabled by environment variables, Sol12 P1-3)" >&2
     exit 1
   fi
 else
-  case "$VERSION" in
-    local-candidate-*|*-candidate*|*-rc*|*+*) ;;
-    *)
-      TAG_AT_HEAD=$(git tag --points-at HEAD | grep -x "v${VERSION}" || true)
-      if [ -z "$TAG_AT_HEAD" ]; then
-        echo "release: refusing ambiguous untagged version ${VERSION}; use a local-candidate/rc version or set REQUIRE_TAG=1 on a matching tag" >&2
-        exit 1
-      fi
-      ;;
-  esac
-fi
-
-if [ -z "${REQUIRE_ASYMMETRIC_SIGNATURE:-}" ]; then
-  case "$VERSION" in
-    local-candidate-*|*-candidate*|*+*) REQUIRE_ASYMMETRIC_SIGNATURE=0 ;;
-    *) REQUIRE_ASYMMETRIC_SIGNATURE=1 ;;
-  esac
+  REQUIRE_TAG=${REQUIRE_TAG:-0}
+  REQUIRE_ZERO_SKIPS=${GOV_RELEASE_REQUIRE_ZERO_SKIPS:-0}
+  if [ -z "${REQUIRE_ASYMMETRIC_SIGNATURE:-}" ]; then
+    REQUIRE_ASYMMETRIC_SIGNATURE=0
+  fi
+  if [ "$REQUIRE_TAG" = 1 ]; then
+    TAG_AT_HEAD=$(git tag --points-at HEAD | grep -x "v${VERSION}" || true)
+    if [ -z "$TAG_AT_HEAD" ]; then
+      echo "release: REQUIRE_TAG=1 but HEAD is not tagged v${VERSION}" >&2
+      exit 1
+    fi
+  fi
 fi
 
 ARCHITECTURE_DOC=${GOV_ARCHITECTURE_DOC:-$SOURCE_ROOT/../agents/governator_architecture.md}
@@ -243,7 +249,10 @@ TOOLSET_HASH=$(python3 "$ROOT/scripts/release_toolset.py" --out "$TOOLSET_JSON_T
 # is correctly invalidated.
 TOOLCHAIN_HASH=$(printf '%s|%s|%s\n' "$(go version)" "$(python3 --version 2>&1)" "$TOOLSET_HASH" | sha256sum | awk '{print $1}')
 ENVIRONMENT_HASH=$(printf '%s|GOMAXPROCS=%s|parallelism=%s|platforms=%s\n' "$(uname -a)" "${GOMAXPROCS:-}" "$GO_TEST_PARALLELISM" "$PLATFORMS" | sha256sum | awk '{print $1}')
-RELEASE_TAG_FOR_IDENTITY=$(git tag --points-at HEAD 2>/dev/null | sort | head -1)
+# Sol12 P1-5 (rc5 Session 7): use the expected v${VERSION} tag directly
+# rather than the first sorted tag at HEAD -- multiple tags on one commit
+# must bind to the exact expected tag, not an arbitrary one.
+RELEASE_TAG_FOR_IDENTITY="v${VERSION}"
 
 OUT_DIR=${OUT_DIR:-dist}
 CHECKPOINT_STATE_DIR="$OUT_DIR/.checkpoints"
@@ -253,7 +262,9 @@ python3 "$ROOT/scripts/release_checkpoint.py" identity \
   --governator-commit "$COMMIT" --governator-tag "$RELEASE_TAG_FOR_IDENTITY" \
   --assayer-commit "$ASSAYER_COMMIT" --go-sum-hash "$GO_SUM_HASH" \
   --toolchain-hash "$TOOLCHAIN_HASH" --environment-hash "$ENVIRONMENT_HASH" \
-  --go-test-parallelism "$GO_TEST_PARALLELISM" >"$CANDIDATE_IDENTITY"
+  --go-test-parallelism "$GO_TEST_PARALLELISM" \
+  --requested-version "$VERSION" --expected-exact-tag "v${VERSION}" \
+  --release-mode "$RELEASE_MODE" --distribution-allowed "$DISTRIBUTION_ALLOWED" >"$CANDIDATE_IDENTITY"
 PEEK=$(python3 "$ROOT/scripts/release_checkpoint.py" peek --state-dir "$CHECKPOINT_STATE_DIR" --identity-file "$CANDIDATE_IDENTITY")
 RESUMED=$(python3 -c "import json,sys; print(json.loads(sys.argv[1])['resumed'])" "$PEEK")
 if [ "$RESUMED" = True ]; then
@@ -339,6 +350,14 @@ MAIN_TIER_SPEC=$(mktemp)
 
 MAIN_TIER_JSONL="$OUT_DIR/.tier-pipeline-main.jsonl"
 MAIN_TIER_PIPELINE_OK=true
+# Sol12 P1-4 (rc5 Session 7): verify no release tool was substituted between
+# preflight (toolset.json creation) and the first tier execution. A same-UID
+# process could swap a tool binary after the hash was recorded; this check
+# catches it before any tier evidence is produced with a different tool.
+if ! python3 "$ROOT/scripts/release_toolset.py" --verify "$OUT_DIR/toolset.json"; then
+  echo "release: refusing to run test tiers -- a release tool changed identity since preflight (Sol12 P1-4)" >&2
+  exit 1
+fi
 if ! bash "$ROOT/scripts/release_tier_pipeline.sh" run --state-dir "$CHECKPOINT_STATE_DIR" --identity-file "$IDENTITY_FILE" --spec "$MAIN_TIER_SPEC" >"$MAIN_TIER_JSONL"; then
   MAIN_TIER_PIPELINE_OK=false
 fi
@@ -509,17 +528,11 @@ for p in pathlib.Path('.').rglob('*_test.go'):
         inv.add(m.group(1))
 pathlib.Path('$REDTEAM_INVENTORY').write_text('\n'.join(sorted(inv)) + '\n')
 "
-# P1-3 (Sol10 rc4 Session 8): a production release (REQUIRE_TAG=1 -- the
-# one path .github/workflows/release.yml actually uses to ship) must not
-# rely on ANY red-team skip, even one the manifest's allowed_skip
-# mechanism would otherwise authorize (report: "a production release
-# should not rely on a kernel-dependent skip" for a security-sensitive
-# invariant). Ordinary local dry-runs keep the normal conditional-skip
-# policy. GOV_RELEASE_REQUIRE_ZERO_SKIPS lets an operator opt a local run
-# into the stricter policy explicitly (e.g. on the designated host where
-# case 8's fixture reaches its required blocking state) without waiting
-# for REQUIRE_TAG.
-REQUIRE_ZERO_SKIPS=${GOV_RELEASE_REQUIRE_ZERO_SKIPS:-$REQUIRE_TAG}
+# Sol12 P1-3 (rc5 Session 7): REQUIRE_ZERO_SKIPS is already set by the
+# version-derived strictness block above (production versions always get 1,
+# development versions default to 0 but the operator can opt in via
+# GOV_RELEASE_REQUIRE_ZERO_SKIPS). Do NOT re-derive it here from env vars --
+# that was the old P1-3 defect (REQUIRE_ZERO_SKIPS=0 could weaken a v* release).
 REDTEAM_GATE_EXTRA_ARGS=()
 if [ "$REQUIRE_ZERO_SKIPS" = 1 ]; then
   REDTEAM_GATE_EXTRA_ARGS+=(--require-zero-skips)
@@ -744,7 +757,14 @@ fi
 
 # ---------------------------------------------------------------------------
 # Build every platform into the same empty staging directory.
+# Sol12 P1-4: re-verify toolset identity before the build phase -- a tool
+# substituted between test tiers and the build would produce artifacts whose
+# toolset_hash claim is a lie.
 # ---------------------------------------------------------------------------
+if ! python3 "$ROOT/scripts/release_toolset.py" --verify "$OUT_DIR/toolset.json"; then
+  echo "release: refusing to build -- a release tool changed identity since preflight (Sol12 P1-4)" >&2
+  exit 1
+fi
 HOST_PLATFORM_ID="$(go env GOOS)_$(go env GOARCH)"
 HOST_ARCHIVE_NAME=""
 HOST_ARCHIVE_SHA=""

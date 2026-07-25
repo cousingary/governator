@@ -42,6 +42,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -329,6 +330,13 @@ func TestV12Case31RealDockerDaemonConsumedArtifactVolumeRoundTrip(t *testing.T) 
 	requireDocker(t)
 	registryFile := filepath.Join(t.TempDir(), "tools.yaml")
 	t.Setenv("GOV_TOOLREGISTRY_FILE", registryFile)
+	dockerPath, err := exec.LookPath("docker")
+	if err != nil {
+		t.Fatalf("docker on PATH: %v", err)
+	}
+	if _, err := toolregistry.Enroll("docker", dockerPath); err != nil {
+		t.Fatal(err)
+	}
 	registry, err := toolregistry.Load()
 	if err != nil {
 		t.Fatal(err)

@@ -63,6 +63,10 @@ IDENTITY_FIELDS = (
     "toolchain_hash",
     "environment_hash",
     "go_test_parallelism",
+    "requested_version",
+    "expected_exact_tag",
+    "release_mode",
+    "distribution_allowed",
 )
 
 # Fields (beyond the six pure-identity ones) that must ALSO match for a

@@ -1390,6 +1390,31 @@ cases:
     session: rc5-u12-s6
     required: true
     status: implemented
+  - case: 232
+    name: TestV12Case37RCVersionRequireTagZeroStillStrict
+    session: rc5-u12-s7
+    required: true
+    status: implemented
+  - case: 233
+    name: TestV12Case38RCVersionRequireZeroSkipsZeroStillStrict
+    session: rc5-u12-s7
+    required: true
+    status: implemented
+  - case: 234
+    name: TestV12Case39ReleaseToolReplacedAfterPreflightFails
+    session: rc5-u12-s7
+    required: true
+    status: implemented
+  - case: 235
+    name: TestV12Case40CheckpointReusedUnderAnotherVersionRejected
+    session: rc5-u12-s7
+    required: true
+    status: implemented
+  - case: 236
+    name: TestV12Case41MultipleTagsOnOneCommitBindToExpectedExactTag
+    session: rc5-u12-s7
+    required: true
+    status: implemented
 
 # Exclusions (Sol12 P0-2): every //go:build redteam-tagged test that is NOT a
 # manifest corpus case must be explicitly classified here with a documented
