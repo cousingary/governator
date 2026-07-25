@@ -594,6 +594,8 @@ import pathlib, sys
 pathlib.Path(sys.argv[1]).write_text("[]\n")
 PY
   ASSAYER_RESULT=PASS
+  ASSAYER_VENV_BASE="$OUT_DIR/assayer-venvs"
+  mkdir -p "$ASSAYER_VENV_BASE"
   for ASSAYER_PY in 3.10 3.11 3.12 3.13; do
     ASSAYER_BIN="python${ASSAYER_PY}"
     ASSAYER_CASE_LOG="$OUT_DIR/test-assayer-py${ASSAYER_PY}.log"
@@ -601,6 +603,7 @@ PY
     ASSAYER_CASE_START_EPOCH=$(date +%s)
     ASSAYER_EXIT_CODE=0
     ASSAYER_TIMEOUT=false
+    ASSAYER_WHEEL_HASHES=""
     # P1-1 (Sol10 rc4 Session 8): the matrix used to record only the
     # requested minor version (e.g. "3.13"), which is what let a release
     # evidence file claim a clean run on "3.13" while the audit's actual
@@ -610,14 +613,54 @@ PY
     ASSAYER_PY_FULL=""
     if command -v "$ASSAYER_BIN" >/dev/null 2>&1; then
       ASSAYER_PY_FULL=$("$ASSAYER_BIN" -c 'import platform; print(platform.python_version())' 2>/dev/null || true)
-      if timeout 900s bash -lc "cd '$ASSAYER_REPO' && '$ASSAYER_BIN' -m pytest -q" >"$ASSAYER_CASE_LOG" 2>&1; then
-        ASSAYER_CASE_RESULT=PASS
-      else
-        ASSAYER_EXIT_CODE=$?
-        if [ "$ASSAYER_EXIT_CODE" -eq 124 ]; then
-          ASSAYER_TIMEOUT=true
+      # Sol12 P1-2: create a dedicated per-version venv and install from
+      # the hash-locked requirements-lock.txt. A clean GitHub runner is not
+      # guaranteed to provide pytest (or any Assayer dependency) in every
+      # installed interpreter; the venv isolates each matrix case from
+      # global runner packages and records exactly which wheels were
+      # installed, so the release evidence proves the dependency closure.
+      ASSAYER_VENV="$ASSAYER_VENV_BASE/py${ASSAYER_PY}"
+      ASSAYER_VENV_OK=true
+      if ! "$ASSAYER_BIN" -m venv "$ASSAYER_VENV" >>"$ASSAYER_CASE_LOG" 2>&1; then
+        ASSAYER_VENV_OK=false
+        echo "FAILED to create venv for $ASSAYER_BIN" >>"$ASSAYER_CASE_LOG"
+      fi
+      if [ "$ASSAYER_VENV_OK" = true ] && [ -f "$ASSAYER_REPO/requirements-lock.txt" ]; then
+        if ! "$ASSAYER_VENV/bin/pip" install --quiet --disable-pip-version-check \
+            -r "$ASSAYER_REPO/requirements-lock.txt" >>"$ASSAYER_CASE_LOG" 2>&1; then
+          ASSAYER_VENV_OK=false
+          echo "FAILED to install locked dependencies for $ASSAYER_BIN" >>"$ASSAYER_CASE_LOG"
         fi
+      elif [ "$ASSAYER_VENV_OK" = true ]; then
+        ASSAYER_VENV_OK=false
+        echo "requirements-lock.txt not found in $ASSAYER_REPO" >>"$ASSAYER_CASE_LOG"
+      fi
+      if [ "$ASSAYER_VENV_OK" = true ]; then
+        ASSAYER_WHEEL_HASHES=$("$ASSAYER_VENV/bin/python" -c "
+import hashlib, importlib.metadata, json, pathlib
+hashes = {}
+for dist in importlib.metadata.distributions():
+    name = dist.metadata['Name']
+    ver = dist.metadata['Version']
+    record = dist.read_text('RECORD')
+    if record:
+        hashes[f'{name}=={ver}'] = hashlib.sha256(record.encode()).hexdigest()
+print(json.dumps(hashes, sort_keys=True))
+" 2>/dev/null || echo "{}")
+        if timeout 900s bash -lc "cd '$ASSAYER_REPO' && '$ASSAYER_VENV/bin/python' -m pytest -q" >"$ASSAYER_CASE_LOG" 2>&1; then
+          ASSAYER_CASE_RESULT=PASS
+        else
+          ASSAYER_EXIT_CODE=$?
+          if [ "$ASSAYER_EXIT_CODE" -eq 124 ]; then
+            ASSAYER_TIMEOUT=true
+          fi
+          ASSAYER_CASE_RESULT=FAIL
+          ASSAYER_RESULT=FAIL
+          cat "$ASSAYER_CASE_LOG" >&2
+        fi
+      else
         ASSAYER_CASE_RESULT=FAIL
+        ASSAYER_EXIT_CODE=1
         ASSAYER_RESULT=FAIL
         cat "$ASSAYER_CASE_LOG" >&2
       fi
@@ -651,10 +694,16 @@ PY
     # alongside every other patch build in the same $OUT_DIR.
     ASSAYER_CASE_LOG_PATH="assayer-python${ASSAYER_PY_FULL//./}.log.gz"
     gzip -c "$ASSAYER_CASE_LOG" >"$OUT_DIR/$ASSAYER_CASE_LOG_PATH"
-    python3 - "$ASSAYER_MATRIX_JSON" "$ASSAYER_PY" "$ASSAYER_PY_FULL" "$ASSAYER_BIN" "$ASSAYER_CASE_RESULT" "$ASSAYER_EXIT_CODE" "$ASSAYER_TIMEOUT" "$ASSAYER_CASE_STARTED" "$ASSAYER_CASE_ENDED" "$((ASSAYER_CASE_END_EPOCH - ASSAYER_CASE_START_EPOCH))" "$ASSAYER_CASE_LOG_SHA" "$ASSAYER_CASE_SUMMARY" "$ASSAYER_CASE_LOG_PATH" <<'PY'
+    python3 - "$ASSAYER_MATRIX_JSON" "$ASSAYER_PY" "$ASSAYER_PY_FULL" "$ASSAYER_BIN" "$ASSAYER_CASE_RESULT" "$ASSAYER_EXIT_CODE" "$ASSAYER_TIMEOUT" "$ASSAYER_CASE_STARTED" "$ASSAYER_CASE_ENDED" "$((ASSAYER_CASE_END_EPOCH - ASSAYER_CASE_START_EPOCH))" "$ASSAYER_CASE_LOG_SHA" "$ASSAYER_CASE_SUMMARY" "$ASSAYER_CASE_LOG_PATH" "$ASSAYER_WHEEL_HASHES" <<'PY'
 import json, pathlib, sys
 path = pathlib.Path(sys.argv[1])
 data = json.loads(path.read_text())
+wheel_hashes = {}
+if len(sys.argv) > 14 and sys.argv[14].strip():
+    try:
+        wheel_hashes = json.loads(sys.argv[14])
+    except (json.JSONDecodeError, ValueError):
+        pass
 data.append({
     "python_version": sys.argv[3] or sys.argv[2],
     "python_version_requested": sys.argv[2],
@@ -669,6 +718,8 @@ data.append({
     "log_sha256": sys.argv[11],
     "log_path": sys.argv[13],
     "summary": sys.argv[12].strip(),
+    "wheel_hashes": wheel_hashes,
+    "isolated_venv": True,
 })
 path.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n")
 PY

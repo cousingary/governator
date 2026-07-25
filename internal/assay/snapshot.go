@@ -65,6 +65,13 @@ type SnapshotIdentity struct {
 	RuntimeHash    string
 	DependencyHash string
 	LockHash       string
+	// DependencyUnavailableReason is non-empty when DependencyHash could not
+	// be resolved (Sol12 P1-6). Binding it into identity ensures two
+	// different unknown dependency environments never compare equal: each
+	// carries its own distinct reason string. When this field is non-empty,
+	// strict replay is disabled and production approval is blocked -- an
+	// unknown dependency identity is never silently accepted.
+	DependencyUnavailableReason string
 	// InterpreterIdentityHash is Sol11 P1-1's addition: a sha256 over the
 	// isolated probe's own interpreter-identity JSON (sys.version,
 	// sys.implementation name/cache_tag, hexversion, abiflags, byteorder,
@@ -391,17 +398,18 @@ func BuildSnapshot(registry *toolregistry.Registry, cfg Config) (*Snapshot, erro
 		}
 	}
 	identity := SnapshotIdentity{
-		PackageHash:             packageHash,
-		PythonIdentity:          pythonHandle.Identity,
-		RuntimeHash:             runtimeManifest.RuntimeHash,
-		DependencyHash:          runtimeManifest.DependencyHash,
-		LockHash:                runtimeManifest.LockHash,
-		InterpreterIdentityHash: runtimeManifest.InterpreterIdentityHash,
-		ProfileHash:             profileHash,
-		ProtocolVersion:         SnapshotProtocolVersion,
-		GitCommit:               assayerCommit(cfg.Repo),
-		Dirty:                   cleanliness != CleanlinessClean,
-		Cleanliness:             cleanliness,
+		PackageHash:                 packageHash,
+		PythonIdentity:              pythonHandle.Identity,
+		RuntimeHash:                 runtimeManifest.RuntimeHash,
+		DependencyHash:              runtimeManifest.DependencyHash,
+		LockHash:                    runtimeManifest.LockHash,
+		DependencyUnavailableReason: runtimeManifest.DependencyUnavailableReason,
+		InterpreterIdentityHash:     runtimeManifest.InterpreterIdentityHash,
+		ProfileHash:                 profileHash,
+		ProtocolVersion:             SnapshotProtocolVersion,
+		GitCommit:                   assayerCommit(cfg.Repo),
+		Dirty:                       cleanliness != CleanlinessClean,
+		Cleanliness:                 cleanliness,
 	}
 
 	ok = true

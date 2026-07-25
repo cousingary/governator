@@ -7,6 +7,7 @@ import os
 import pathlib
 import re
 import shutil
+import stat as stat_mod
 import subprocess
 import sys
 
@@ -130,17 +131,51 @@ def verify_signature_cryptographically(
 _CHECKSUM_LINE = re.compile(r"^([0-9a-fA-F]{64})\s+\*?(\S.+?)\s*$")
 
 
+def _validate_checksum_name(name: str, checksums_path: pathlib.Path) -> str | None:
+    """Returns an error string if name is unsafe, else None (Sol12 P1-7)."""
+    if not name:
+        return f"release_policy: {checksums_path}: empty artifact name in checksum entry"
+    if name.startswith("/"):
+        return f"release_policy: {checksums_path}: absolute path in checksum entry: {name!r}"
+    if ".." in name.split("/") or ".." in name.split("\\"):
+        return f"release_policy: {checksums_path}: parent traversal in checksum entry: {name!r}"
+    normalized = pathlib.PurePosixPath(name)
+    if normalized != pathlib.PurePosixPath(*normalized.parts):
+        return f"release_policy: {checksums_path}: non-normalized path in checksum entry: {name!r}"
+    return None
+
+
 def parse_checksums(checksums_path: pathlib.Path) -> list[tuple[str, str]]:
-    """Parses sha256sum output lines into (sha256, filename) pairs."""
+    """Parses sha256sum output lines into (sha256, filename) pairs.
+
+    Sol12 P1-7: strict parsing. Every non-comment, non-empty line MUST match
+    the checksum format. Rejects: absolute paths, parent traversal (../),
+    empty names, duplicate entries, and malformed lines. A checksums file is
+    a release security policy -- permissive parsing lets an attacker inject
+    unsafe paths that escape the artifacts directory.
+    """
     entries: list[tuple[str, str]] = []
-    for line in checksums_path.read_text().splitlines():
+    seen_names: set[str] = set()
+    for lineno, line in enumerate(checksums_path.read_text().splitlines(), 1):
         line = line.strip()
         if not line or line.startswith("#"):
             continue
         m = _CHECKSUM_LINE.match(line)
         if not m:
-            continue
-        entries.append((m.group(1).lower(), m.group(2)))
+            raise ValueError(
+                f"release_policy: {checksums_path}:{lineno}: malformed checksum line "
+                f"(expected '<sha256> <filename>'): {line!r}"
+            )
+        name = m.group(2)
+        err = _validate_checksum_name(name, checksums_path)
+        if err:
+            raise ValueError(f"{err} (line {lineno})")
+        if name in seen_names:
+            raise ValueError(
+                f"release_policy: {checksums_path}:{lineno}: duplicate checksum entry for {name!r}"
+            )
+        seen_names.add(name)
+        entries.append((m.group(1).lower(), name))
     return entries
 
 
@@ -151,15 +186,28 @@ def verify_checksums_self_consistent(
     matches. Catches a release artifact (e.g. a platform archive) modified
     AFTER checksums.txt was generated, which a signature over checksums.txt
     alone would not detect -- the signed checksums.txt is unchanged, but it
-    no longer describes the bytes actually shipped (Sol11 corpus case 6)."""
-    entries = parse_checksums(checksums_path)
+    no longer describes the bytes actually shipped (Sol11 corpus case 6).
+
+    Sol12 P1-7: uses lstat (not is_file, which follows symlinks) to reject
+    symlinked artifacts. A release artifact that is a symlink is never
+    acceptable -- it could point outside the artifacts directory."""
+    try:
+        entries = parse_checksums(checksums_path)
+    except ValueError as exc:
+        return False, str(exc), []
     if not entries:
         return False, f"release_policy: {checksums_path} names no artifacts", entries
     base = checksums_path.parent
     for expected, name in entries:
         target = base / name
-        if not target.is_file():
+        try:
+            st = target.lstat()
+        except OSError:
             return False, f"release_policy: {name} is listed in {checksums_path} but is absent from the release", entries
+        if stat_mod.S_ISLNK(st.st_mode):
+            return False, f"release_policy: {name} is a symlink -- release artifacts must be regular files (Sol12 P1-7)", entries
+        if not stat_mod.S_ISREG(st.st_mode):
+            return False, f"release_policy: {name} is not a regular file (Sol12 P1-7)", entries
         actual = sha256_file(target)
         if actual != expected:
             return False, (
@@ -178,12 +226,24 @@ def verify_checksum_coverage(
     not the current production binary'). Every regular file in the staging
     directory except checksums.txt and its own .minisig/.hmac sidecars must
     appear in checksums.txt (Sol11 P0-1: 'checksums cover exact release
-    artifacts')."""
+    artifacts').
+
+    Sol12 P1-7: uses lstat to detect symlinks -- a symlinked artifact in the
+    release directory is rejected, not silently skipped or followed."""
     listed = {name for _, name in entries}
     excluded = {"checksums.txt", "checksums.txt.minisig", "checksums.txt.hmac"}
     unlisted = []
     for entry in sorted(artifacts_dir.iterdir()):
-        if not entry.is_file():
+        try:
+            st = entry.lstat()
+        except OSError:
+            continue
+        if stat_mod.S_ISLNK(st.st_mode):
+            return False, (
+                f"release_policy: {entry.name} in the artifacts directory is a symlink -- "
+                f"release artifacts must be regular files (Sol12 P1-7)"
+            )
+        if not stat_mod.S_ISREG(st.st_mode):
             continue
         if entry.name in excluded:
             continue

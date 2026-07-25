@@ -1415,6 +1415,46 @@ cases:
     session: rc5-u12-s7
     required: true
     status: implemented
+  - case: 237
+    name: TestV12Case42ChecksumPathTraversalRejected
+    session: rc5-u12-s8
+    required: true
+    status: implemented
+  - case: 238
+    name: TestV12Case43ChecksumAbsolutePathRejected
+    session: rc5-u12-s8
+    required: true
+    status: implemented
+  - case: 239
+    name: TestV12Case44SymlinkedReleaseArtifactRejected
+    session: rc5-u12-s8
+    required: true
+    status: implemented
+  - case: 240
+    name: TestV12Case45DuplicateChecksumEntryRejected
+    session: rc5-u12-s8
+    required: true
+    status: implemented
+  - case: 241
+    name: TestV12Case46MalformedChecksumLineRejected
+    session: rc5-u12-s8
+    required: true
+    status: implemented
+  - case: 242
+    name: TestV12Case47CleanRunnerWithoutGlobalPytestStillRunsViaVenv
+    session: rc5-u12-s8
+    required: true
+    status: implemented
+  - case: 243
+    name: TestV12Case48PerPythonLockedDependencyInstallation
+    session: rc5-u12-s8
+    required: true
+    status: implemented
+  - case: 244
+    name: TestV12Case49UnknownAssayerDependencyHashDisablesReplay
+    session: rc5-u12-s8
+    required: true
+    status: implemented
 
 # Exclusions (Sol12 P0-2): every //go:build redteam-tagged test that is NOT a
 # manifest corpus case must be explicitly classified here with a documented

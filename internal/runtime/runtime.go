@@ -3194,6 +3194,21 @@ func (r *Runner) runOnce(ctx context.Context, c contracts.Contract) (RunRecord, 
 		identity.StrictReplayEligible = false
 		identity.StrictReplayDisabledReason = "backend dependency closure could not be proven (frozen+hashed); strict replay disabled"
 	}
+	// Sol12 P1-6: an Assayer snapshot whose dependency identity could not be
+	// resolved due to a genuine hashing failure (DependencyHash empty,
+	// DependencyUnavailableReason indicates an error rather than the
+	// definitive "no site-packages" observation) cannot be reproduced against
+	// a specific verified dependency set by a later audit. Two different
+	// unknown dependency environments must never compare equal, and an
+	// unknown dependency identity must never silently approve -- strict replay
+	// is disabled and production approval blocked. The "no site-packages
+	// directory resolved" reason is a deterministic, reproducible observation
+	// (this python genuinely has no deps) and does NOT disable replay.
+	if assaySnapshot != nil && assaySnapshot.Identity.DependencyUnavailableReason != "" &&
+		!strings.HasPrefix(assaySnapshot.Identity.DependencyUnavailableReason, "no site-packages directory resolved") {
+		identity.StrictReplayEligible = false
+		identity.StrictReplayDisabledReason = "assayer dependency identity is unknown (" + assaySnapshot.Identity.DependencyUnavailableReason + "); strict replay disabled"
+	}
 	transaction := newTransactionSnapshot(hash, env.ConfigHash, env.ProtectedPatterns, graphSnapshotHash, compiledPromptForIdentity, env.Controller.Hash, identity.CredentialIdentityHash, identity.Participants, consumedIdentities)
 	if priorID, perr := replayMatch(db, func() string {
 		if identity.StrictReplayEligible {
