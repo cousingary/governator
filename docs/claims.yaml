@@ -910,7 +910,7 @@ claims:
           - TestBackendExecutionHandleLaunchRejectsFileSwap
           - TestBackendExecutionHandleFDLaunchRunsVerifiedContent
           - TestVerifyUnchangedDetectsSwap
-          - TestLaunchCommandWrapperPathRejectsSwap
+          - TestLaunchStagedWrapperPathRejectsSwap
           - TestBackendIdentityKnownRequiresProviderAndModelRevision
       - file: internal/redteam/backend_identity_test.go
         funcs:

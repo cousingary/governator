@@ -131,6 +131,15 @@ type ExecutionIdentity struct {
 	BackendSandboxMode   string
 	BackendIdentityHash  string
 	BackendIdentityKnown bool
+	// BackendDependencyClosureHash (Sol12 P0-5) binds the content-addressed
+	// hash of a Node-based backend's COMPLETE executable closure (entry
+	// script + package.json + lockfile + resolved node_modules tree + native
+	// addons), frozen into a private copy at resolution. Empty for a backend
+	// with no dependency closure (a compiled/shell backend IS its own closure
+	// -- BackendBinarySHA256 already binds it). A swapped JS dependency mints
+	// a different closure hash and thus a different replay key, so the run is
+	// attributed to the actually-executed closure, not the original entry.
+	BackendDependencyClosureHash string
 }
 
 // Hash returns the canonical SHA-256 digest of the full identity. This is the
@@ -175,6 +184,7 @@ func (id ExecutionIdentity) Hash() string {
 	fmt.Fprintf(&b, "backend_sandbox_mode=%s\n", id.BackendSandboxMode)
 	fmt.Fprintf(&b, "backend_identity_hash=%s\n", id.BackendIdentityHash)
 	fmt.Fprintf(&b, "backend_identity_known=%t\n", id.BackendIdentityKnown)
+	fmt.Fprintf(&b, "backend_dependency_closure_hash=%s\n", id.BackendDependencyClosureHash)
 	fmt.Fprintf(&b, "capability_attest_id=%s\n", id.CapabilityAttestID)
 	fmt.Fprintf(&b, "runner_config_hash=%s\n", id.RunnerConfigHash)
 	fmt.Fprintf(&b, "governator_version=%s\n", id.GovernatorVersion)
@@ -212,44 +222,45 @@ func computeExecutionIdentity(cfg config.Config, c contracts.Contract, agent age
 		validatorToolsetHash = hashJSON(contractValidatorToolset(c))
 	}
 	return ExecutionIdentity{
-		ContractHash:               hash,
-		ApprovedHead:               head,
-		ConfigHash:                 cfg.Hash(),
-		ProtectedManifestHash:      hashFileContent(cfg.ProtectedManifest),
-		OrgPolicyHash:              hashJSON(bundle.OrgRules),
-		ProjectDoctrineHash:        hashJSON(bundle.ProjectRules),
-		PromptVersion:              promptVer.ID,
-		PromptChecksum:             promptVer.Checksum,
-		CompiledPromptHash:         compiledPromptHash,
-		ValidatorSetHash:           hashJSON(contractValidatorSet(c)),
-		ValidatorToolsetHash:       validatorToolsetHash,
-		ControllerToolsetHash:      hashJSON(map[string]string{"backend_path": resolution.CanonicalPath, "backend_sha256": resolution.SHA256}),
-		ControllerEnvironmentHash:  controllerEnvironmentHash,
-		ContainmentEnvironmentHash: containmentEnvironmentHash(containmentEnv),
-		AssayerEnvironmentHash:     hashJSON(assayerInputs(cfg, c)),
-		ConsumedArtifactsHash:      consumedArtifactsHash,
-		GraphProviderHash:          graphProviderHash,
-		GraphSnapshotHash:          graphSnapshotHash,
-		GovernatorSelfSHA256:       governatorSelfSHA256(),
-		AssayerProfileHash:         hashJSON(assayerInputs(cfg, c)),
-		BackendAdapter:             agent.Name(),
-		BackendAdapterVersion:      adapterVersion(agent),
-		BackendBinaryPath:          resolution.CanonicalPath,
-		BackendBinarySHA256:        resolution.SHA256,
-		ModelID:                    agent.Name(),
-		BackendProvider:            identity.Provider,
-		BackendAccountID:           identity.AccountID,
-		BackendOrgID:               identity.OrgID,
-		BackendModelRevision:       identity.ModelRevision,
-		BackendEndpoint:            identity.Endpoint,
-		BackendReasoningMode:       identity.ReasoningMode,
-		BackendApprovalMode:        identity.ApprovalMode,
-		BackendSandboxMode:         identity.SandboxMode,
-		BackendIdentityHash:        identity.ConfigHash,
-		BackendIdentityKnown:       identity.Known(),
-		CapabilityAttestID:         capabilityAttestID,
-		RunnerConfigHash:           hashJSON(runnerConfig(c, dockerImage, envPolicyHash)),
-		GovernatorVersion:          governatorBuildID(),
+		ContractHash:                 hash,
+		ApprovedHead:                 head,
+		ConfigHash:                   cfg.Hash(),
+		ProtectedManifestHash:        hashFileContent(cfg.ProtectedManifest),
+		OrgPolicyHash:                hashJSON(bundle.OrgRules),
+		ProjectDoctrineHash:          hashJSON(bundle.ProjectRules),
+		PromptVersion:                promptVer.ID,
+		PromptChecksum:               promptVer.Checksum,
+		CompiledPromptHash:           compiledPromptHash,
+		ValidatorSetHash:             hashJSON(contractValidatorSet(c)),
+		ValidatorToolsetHash:         validatorToolsetHash,
+		ControllerToolsetHash:        hashJSON(map[string]string{"backend_path": resolution.CanonicalPath, "backend_sha256": resolution.SHA256}),
+		ControllerEnvironmentHash:    controllerEnvironmentHash,
+		ContainmentEnvironmentHash:   containmentEnvironmentHash(containmentEnv),
+		AssayerEnvironmentHash:       hashJSON(assayerInputs(cfg, c)),
+		ConsumedArtifactsHash:        consumedArtifactsHash,
+		GraphProviderHash:            graphProviderHash,
+		GraphSnapshotHash:            graphSnapshotHash,
+		GovernatorSelfSHA256:         governatorSelfSHA256(),
+		AssayerProfileHash:           hashJSON(assayerInputs(cfg, c)),
+		BackendAdapter:               agent.Name(),
+		BackendAdapterVersion:        adapterVersion(agent),
+		BackendBinaryPath:            resolution.CanonicalPath,
+		BackendBinarySHA256:          resolution.SHA256,
+		ModelID:                      agent.Name(),
+		BackendProvider:              identity.Provider,
+		BackendAccountID:             identity.AccountID,
+		BackendOrgID:                 identity.OrgID,
+		BackendModelRevision:         identity.ModelRevision,
+		BackendEndpoint:              identity.Endpoint,
+		BackendReasoningMode:         identity.ReasoningMode,
+		BackendApprovalMode:          identity.ApprovalMode,
+		BackendSandboxMode:           identity.SandboxMode,
+		BackendIdentityHash:          identity.ConfigHash,
+		BackendIdentityKnown:         identity.Known(),
+		BackendDependencyClosureHash: resolution.DependencyClosureHash,
+		CapabilityAttestID:           capabilityAttestID,
+		RunnerConfigHash:             hashJSON(runnerConfig(c, dockerImage, envPolicyHash)),
+		GovernatorVersion:            governatorBuildID(),
 	}
 }
 

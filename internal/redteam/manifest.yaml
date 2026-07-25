@@ -1214,6 +1214,47 @@ cases:
     session: rc5-u12-s2
     required: true
     status: implemented
+  # Session 3 (P0-4/P0-5): descriptor-backed backend launch + frozen Node
+  # dependency closure. No governed backend reaches the kernel through a
+  # mutable pathname after final identity verification -- LaunchStaged now
+  # composes the held descriptor (or, for a Node backend, the frozen closure
+  # entry) through the same shared FDAllocator as the scope primitive and
+  # plan self-exec/unshare layers (stage.ComposeHandleLaunch machinery). The
+  # live node_modules symlink is gone: a Node backend's complete closure
+  # (entry + package.json + lockfile + resolved node_modules tree + native
+  # addons) is frozen into a private, content-addressed copy whose hash is
+  # bound into ExecutionIdentity, and strict replay is disabled whenever the
+  # closure cannot be proven.
+  - case: 209
+    name: TestV12Case14ReplaceBackendPathAfterVerifyUsesHeldDescriptor
+    session: rc5-u12-s3
+    required: true
+    status: implemented
+  - case: 210
+    name: TestV12Case15ModifyNodeDependencyAfterReplayIdentityIsolated
+    session: rc5-u12-s3
+    required: true
+    status: implemented
+  - case: 211
+    name: TestV12Case16RestoreBeforeMeasurementUnnecessaryClosureFrozen
+    session: rc5-u12-s3
+    required: true
+    status: implemented
+  - case: 212
+    name: TestV12Case17AlterNativeNodeAddonIncludedInClosure
+    session: rc5-u12-s3
+    required: true
+    status: implemented
+  - case: 213
+    name: TestV12Case18BackendDependencyTreeUnavailableDisablesStrictReplay
+    session: rc5-u12-s3
+    required: true
+    status: implemented
+  - case: 214
+    name: TestV12Case19StructuredBackendExecutionBindsDescriptorIdentity
+    session: rc5-u12-s3
+    required: true
+    status: implemented
 
 # Exclusions (Sol12 P0-2): every //go:build redteam-tagged test that is NOT a
 # manifest corpus case must be explicitly classified here with a documented

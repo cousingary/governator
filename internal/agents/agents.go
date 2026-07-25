@@ -116,7 +116,7 @@ func defaultExecutor(ctx context.Context, bin string, args []string, workdir str
 	// construct a Scope. Nothing to prove extinguished, so descendantsGone
 	// is trivially true (matches Executor's documented "or when there was
 	// nothing to prove" case).
-	cmd, err := LaunchCommand(ctx, handle, bin, args, nil)
+	cmd, err := LaunchCommand(ctx, handle, bin, args)
 	if err != nil {
 		return 0, false, true, err
 	}

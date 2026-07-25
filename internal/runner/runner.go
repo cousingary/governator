@@ -337,7 +337,7 @@ func (r *LocalWorktreeRunner) executor() agents.Executor {
 			r.mu.Unlock()
 			return code, timedOut, descendantsGone, runErr
 		}
-		cmd, launchErr := agents.LaunchCommand(runCtx, handle, bin, args, nil)
+		cmd, launchErr := agents.LaunchCommand(runCtx, handle, bin, args)
 		if launchErr != nil {
 			return 0, false, true, launchErr
 		}

@@ -3107,6 +3107,16 @@ func (r *Runner) runOnce(ctx context.Context, c contracts.Contract) (RunRecord, 
 		identity.StrictReplayEligible = false
 		identity.StrictReplayDisabledReason = "development containment mode (containment.local_effectful_tiering: off) is non-approving; strict replay disabled"
 	}
+	// Sol12 P0-5: a Node-based backend whose dependency closure could not be
+	// frozen+hashed at resolution (the tree was unreadable/incomplete) cannot
+	// be reproduced against a specific verified closure by a later audit, so
+	// strict replay is disabled for it -- exactly like a dirty Assayer
+	// checkout. Non-Node backends are always closure-proven (the executable
+	// IS its own closure, bound by BackendBinarySHA256).
+	if !handle.PathResolution.DependencyClosureProven {
+		identity.StrictReplayEligible = false
+		identity.StrictReplayDisabledReason = "backend dependency closure could not be proven (frozen+hashed); strict replay disabled"
+	}
 	transaction := newTransactionSnapshot(hash, env.ConfigHash, env.ProtectedPatterns, graphSnapshotHash, compiledPromptForIdentity, env.Controller.Hash, identity.CredentialIdentityHash, identity.Participants, consumedIdentities)
 	if priorID, perr := replayMatch(db, func() string {
 		if identity.StrictReplayEligible {

@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"hash"
 	"io"
 	"os"
 	"os/exec"
@@ -19,6 +20,7 @@ import (
 	"github.com/cousingary/governator/internal/controllerenv"
 	"github.com/cousingary/governator/internal/enforce"
 	"github.com/cousingary/governator/internal/stage"
+	"github.com/cousingary/governator/internal/toolregistry"
 )
 
 // BackendIdentity is the operator-declared model/provider identity behind a
@@ -117,8 +119,24 @@ type BackendExecutionHandle struct {
 	Mode           os.FileMode
 	ParentWritable bool
 
-	file      *os.File
-	sealedDir string
+	file *os.File
+	// closureRoot (Sol12 P0-5) is the private, content-addressed directory
+	// holding a Node backend's FROZEN executable closure (entry script +
+	// package.json + lockfile + resolved node_modules tree), built once at
+	// resolution so the launch reads a verified tree instead of a live,
+	// same-UID-mutable node_modules symlink. Empty for a non-Node backend
+	// (it launches its own held descriptor directly -- the executable IS the
+	// whole closure). Cleaned up on Close.
+	closureRoot string
+	// launchPath is the pathname actually launched when a pathname launch is
+	// unavoidable: a Node backend must be launched by pathname (Node module
+	// resolution walks up from the running script's own directory, so the
+	// /proc/self/fd/<n> fd-launch a compiled backend uses breaks it). Empty
+	// for a non-Node backend (fd-launched via file above). VerifyUnchanged
+	// re-hashes this path immediately before launch to close the
+	// verify-then-swap-then-exec window for the frozen entry the same way it
+	// does for a compiled backend's CanonicalPath.
+	launchPath string
 }
 
 // ResolveHandle resolves agent's configured backend binary exactly once into
@@ -202,6 +220,12 @@ func ResolveHandle(ctx context.Context, cfg config.Config, agent Agent) (h *Back
 		file:           f,
 	}
 
+	// Sol12 P0-5: freeze+hash a Node backend's dependency closure into a
+	// private copy (replacing the pre-P0-5 live node_modules symlink) and
+	// bind its hash into PathResolution for replay identity. Non-Node
+	// backends are marked closure-proven (the executable is its own closure).
+	h.freezeNodeDependencyClosure()
+
 	closeOnErr = false
 	return h, nil
 }
@@ -230,11 +254,11 @@ func (h *BackendExecutionHandle) Close() error {
 		err = h.file.Close()
 		h.file = nil
 	}
-	if h.sealedDir != "" {
-		if rerr := os.RemoveAll(h.sealedDir); err == nil && rerr != nil {
+	if h.closureRoot != "" {
+		if rerr := os.RemoveAll(h.closureRoot); err == nil && rerr != nil {
 			err = rerr
 		}
-		h.sealedDir = ""
+		h.closureRoot = ""
 	}
 	return err
 }
@@ -254,6 +278,22 @@ func (h *BackendExecutionHandle) Resolution() Resolution {
 	}
 }
 
+// File returns the handle's held, already-verified backend executable
+// descriptor for a caller that must compose it into a launch chain with more
+// than one descriptor-backed layer of its own (Sol12 P0-4's descriptor-backed
+// backend launch, the direct analog of toolregistry.Handle.File for controller
+// tools). The handle retains ownership: callers must not close the returned
+// file directly (use Close), and must not use it after Close. Returns nil for
+// a Node backend (launchPath set) -- those launch their frozen entry by
+// pathname because Node module resolution requires it, so no held executable
+// descriptor participates in the launch.
+func (h *BackendExecutionHandle) File() *os.File {
+	if h == nil {
+		return nil
+	}
+	return h.file
+}
+
 // fdLaunchArgs returns the pseudo-path and ExtraFiles needed to exec h's
 // already-open, already-hashed executable directly via its file descriptor,
 // when that's available on this platform. ok is false when unavailable
@@ -271,70 +311,250 @@ func (h *BackendExecutionHandle) fdLaunchArgs() (path string, extraFiles []*os.F
 	return "/proc/self/fd/3", []*os.File{h.file}, true
 }
 
-// sealedExecutablePath copies the already-open, already-hashed backend
-// executable into a private, mode-0500 directory and returns that immutable
-// launch path for wrapper-based execution. Scope wrappers such as unshare or
-// systemd-run cannot reliably receive our backend fd all the way to the final
-// exec, so the S7-safe fallback is an object copied from the verified fd into
-// a directory the backend does not know or control, never the mutable original
-// pathname.
-func (h *BackendExecutionHandle) sealedExecutablePath() (string, error) {
-	if h == nil || h.file == nil {
-		return "", fmt.Errorf("backend identity: no open executable handle available for sealed launch")
+// freezeNodeDependencyClosure (Sol12 P0-5) builds a private, content-addressed
+// copy of a Node-based backend's COMPLETE executable closure -- entry script,
+// package.json, lockfile, and the resolved node_modules dependency tree
+// (including native addons) -- and binds its content hash into h.PathResolution
+// so the run's replay identity describes the exact bytes the backend imports,
+// not just the entry script it started from. The frozen copy REPLACES the live
+// node_modules symlink the pre-P0-5 sealed-launch path used: that symlink left
+// the whole dependency tree live, unverified, and same-UID-mutable after replay
+// identity construction, so a swapped JS dependency executed under the
+// original backend's identity (directly relevant to Node-based Codex/OpenCode).
+//
+// h.closureRoot/launchPath are populated for composeBackendLaunch to launch
+// from; DependencyClosureHash/DependencyClosureProven flow into PathResolution
+// (and thus ExecutionIdentity) for replay binding and the strict-replay gate.
+// On any failure the closure is left unproven (DependencyClosureProven=false)
+// and runtime.computeExecutionIdentity disables strict replay for the run.
+//
+// Non-Node backends are their own closure (SHA256 already binds the whole
+// executable), so this just marks them proven and returns.
+func (h *BackendExecutionHandle) freezeNodeDependencyClosure() {
+	if h == nil {
+		return
 	}
-	if h.sealedDir != "" {
-		return filepath.Join(h.sealedDir, "backend"), nil
+	if !isNodeExecutable(h.CanonicalPath) {
+		h.DependencyClosureProven = true
+		return
 	}
-	dir, err := os.MkdirTemp("", "governator-backend-exec-*")
+	root, hash, err := buildFrozenNodeClosure(h.CanonicalPath, h.file)
 	if err != nil {
-		return "", fmt.Errorf("backend identity: create sealed exec dir: %w", err)
+		// Honest failure: closure unprovable -> strict replay disabled by the
+		// identity gate. Leave closureRoot empty so the launch falls back to
+		// the held executable descriptor; DependencyClosureProven stays false.
+		h.DependencyClosureHash = ""
+		h.DependencyClosureProven = false
+		return
 	}
-	outPath := filepath.Join(dir, "backend")
-	out, err := os.OpenFile(outPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0500)
+	h.closureRoot = root
+	h.launchPath = filepath.Join(root, "entry")
+	h.DependencyClosureHash = hash
+	h.DependencyClosureProven = true
+}
+
+// buildFrozenNodeClosure creates a private mode-0500 directory, copies the
+// entry script, package.json, lockfiles, and the resolved node_modules tree
+// into it (content-hashing every byte under its relative path), and returns
+// the directory + the closure hash. entryFile is the already-verified,
+// already-open descriptor of the original entry script; it is rewound and
+// copied rather than re-reading the live path. The tree is built writable
+// (0700) and locked down to read/execute-only (0500/0400) in a final pass so
+// every file can be created before the directories that contain them go
+// read-only.
+func buildFrozenNodeClosure(canonicalEntry string, entryFile *os.File) (root, hash string, err error) {
+	dir, merr := os.MkdirTemp("", "governator-node-closure-*")
+	if merr != nil {
+		return "", "", fmt.Errorf("create root: %w", merr)
+	}
+	cleanup := true
+	defer func() {
+		if cleanup {
+			_ = os.RemoveAll(dir)
+		}
+	}()
+
+	hasher := sha256.New()
+	entrySHA, err := copyVerifiedFD(entryFile, filepath.Join(dir, "entry"), 0500)
 	if err != nil {
-		_ = os.RemoveAll(dir)
-		return "", fmt.Errorf("backend identity: create sealed exec copy: %w", err)
+		return "", "", fmt.Errorf("freeze entry: %w", err)
 	}
-	if _, err := h.file.Seek(0, io.SeekStart); err != nil {
-		_ = out.Close()
-		_ = os.RemoveAll(dir)
-		return "", fmt.Errorf("backend identity: rewind verified executable fd: %w", err)
+	fmt.Fprintf(hasher, "entry::%s\n", entrySHA)
+
+	srcDir := filepath.Dir(canonicalEntry)
+	for _, name := range []string{"package.json", "package-lock.json", "yarn.lock", "pnpm-lock.yaml"} {
+		if cerr := copyMetaHashed(filepath.Join(srcDir, name), filepath.Join(dir, name), name, hasher); cerr != nil {
+			return "", "", fmt.Errorf("freeze %s: %w", name, cerr)
+		}
 	}
-	_, copyErr := io.Copy(out, h.file)
+	if nm := nearestNodeModules(canonicalEntry); nm != "" {
+		if cerr := copyTreeHashed(nm, filepath.Join(dir, "node_modules"), "node_modules", hasher); cerr != nil {
+			return "", "", fmt.Errorf("freeze node_modules: %w", cerr)
+		}
+	}
+	// Best-effort lockdown: read/execute-only for the owner so a
+	// non-same-UID process cannot mutate the frozen tree. Same-UID mutation
+	// is the residual boundary the closure hash + VerifyUnchanged cover
+	// (cross-run) and that memfd/seals would be needed to close in-run; this
+	// chmod mirrors the pre-P0-5 sealed-launch dir's hygiene without being
+	// the security boundary itself.
+	lockdownFrozenTree(dir)
+	cleanup = false
+	return dir, hex.EncodeToString(hasher.Sum(nil)), nil
+}
+
+// lockdownFrozenTree chmods every file beneath root to 0400 and every
+// directory (including root) to 0500, best-effort. filepath.Walk visits a
+// directory before its contents, and 0500 retains the execute bit needed to
+// traverse into it, so the post-lockdown walk ordering stays consistent.
+func lockdownFrozenTree(root string) {
+	_ = filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return nil
+		}
+		if info.IsDir() {
+			_ = os.Chmod(path, 0500)
+		} else {
+			_ = os.Chmod(path, 0400)
+		}
+		return nil
+	})
+}
+
+// copyVerifiedFD rewinds the already-verified open descriptor src, copies its
+// bytes into an O_EXCL private file at dst with the given mode, and returns the
+// SHA256 of the bytes copied (which must match the descriptor's recorded hash).
+func copyVerifiedFD(src *os.File, dst string, mode os.FileMode) (string, error) {
+	if src == nil {
+		return "", fmt.Errorf("no open entry descriptor")
+	}
+	if _, err := src.Seek(0, io.SeekStart); err != nil {
+		return "", fmt.Errorf("rewind entry: %w", err)
+	}
+	out, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_EXCL, mode)
+	if err != nil {
+		return "", err
+	}
+	sum := sha256.New()
+	_, copyErr := io.Copy(io.MultiWriter(out, sum), src)
 	closeErr := out.Close()
 	if copyErr != nil {
-		_ = os.RemoveAll(dir)
-		return "", fmt.Errorf("backend identity: copy verified executable: %w", copyErr)
+		return "", copyErr
 	}
 	if closeErr != nil {
-		_ = os.RemoveAll(dir)
-		return "", fmt.Errorf("backend identity: close sealed exec copy: %w", closeErr)
+		return "", closeErr
 	}
-	if err := os.Chmod(outPath, 0500); err != nil {
-		_ = os.RemoveAll(dir)
-		return "", fmt.Errorf("backend identity: chmod sealed exec copy: %w", err)
+	if err := os.Chmod(dst, mode); err != nil {
+		return "", err
 	}
-	// Node-based backends (codex, opencode, ...) resolve sibling npm
-	// dependencies -- e.g. codex's own optional platform-native package --
-	// via node_modules lookups that walk up from the running script's own
-	// directory. The sealed copy above is deliberately isolated from its
-	// original directory tree for integrity, which breaks that lookup for
-	// any backend that needs it (observed: codex's findCodexExecutable()
-	// throwing "Missing optional dependency @openai/codex-linux-x64").
-	// Restore just the dependency-discovery path via a symlink -- it is not
-	// re-verified/immutable, the same trust boundary the pre-sealing exec
-	// path always had for the whole executable -- while the sealed backend
-	// file itself stays the verified, immutable copy. Skipped silently for
-	// non-Node backends that have no node_modules to find.
-	if nm := nearestNodeModules(h.CanonicalPath); nm != "" {
-		_ = os.Symlink(nm, filepath.Join(dir, "node_modules"))
+	return hex.EncodeToString(sum.Sum(nil)), nil
+}
+
+// copyMetaHashed copies a single metadata file (package.json/lockfile) from src
+// to dst if it exists, writing its content hash under relKey to hasher. A
+// missing file (os.IsNotExist) is a no-op -- not every Node package has every
+// lockfile.
+func copyMetaHashed(src, dst, relKey string, hasher hash.Hash) error {
+	in, err := os.Open(src)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
 	}
-	if err := os.Chmod(dir, 0500); err != nil {
-		_ = os.RemoveAll(dir)
-		return "", fmt.Errorf("backend identity: chmod sealed exec dir: %w", err)
+	defer in.Close()
+	out, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0400)
+	if err != nil {
+		return err
 	}
-	h.sealedDir = dir
-	return outPath, nil
+	sum := sha256.New()
+	_, copyErr := io.Copy(io.MultiWriter(out, sum), in)
+	closeErr := out.Close()
+	if copyErr != nil {
+		return copyErr
+	}
+	if closeErr != nil {
+		return closeErr
+	}
+	fmt.Fprintf(hasher, "%s::%s\n", relKey, hex.EncodeToString(sum.Sum(nil)))
+	return nil
+}
+
+// copyTreeHashed recursively copies the dependency tree rooted at src into dst,
+// content-hashing every regular file under relPrefix/<relpath> and recording
+// every symlink's target under relPrefix/<relpath>::SYMLINK (mirroring
+// assay.hashPathTree, so a dependency retargeted at byte-identical content
+// elsewhere still mints a different closure hash). npm's node_modules uses
+// symlinks heavily, so preserving them as-is (not dereferencing into copies)
+// keeps the frozen tree structurally identical to the live one Node resolved.
+func copyTreeHashed(src, dst, relPrefix string, hasher hash.Hash) error {
+	return filepath.Walk(src, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		rel, rerr := filepath.Rel(src, path)
+		if rerr != nil {
+			return rerr
+		}
+		if rel == "." {
+			return nil
+		}
+		target := filepath.Join(dst, rel)
+		switch {
+		case info.IsDir():
+			return os.MkdirAll(target, 0700)
+		case info.Mode()&os.ModeSymlink != 0:
+			link, lerr := os.Readlink(path)
+			if lerr != nil {
+				return lerr
+			}
+			if cerr := copyTreeEnsureParent(target); cerr != nil {
+				return cerr
+			}
+			if lerr := os.Symlink(link, target); lerr != nil {
+				return lerr
+			}
+			fmt.Fprintf(hasher, "%s/%s::SYMLINK::%s\n", relPrefix, rel, link)
+			return nil
+		default:
+			return copyTreeFile(path, target, relPrefix+"/"+rel, hasher)
+		}
+	})
+}
+
+// copyTreeFile copies one regular dependency file and hashes its content.
+func copyTreeFile(src, dst, relKey string, hasher hash.Hash) error {
+	if cerr := copyTreeEnsureParent(dst); cerr != nil {
+		return cerr
+	}
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+	out, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0400)
+	if err != nil {
+		return err
+	}
+	sum := sha256.New()
+	_, copyErr := io.Copy(io.MultiWriter(out, sum), in)
+	closeErr := out.Close()
+	if copyErr != nil {
+		return copyErr
+	}
+	if closeErr != nil {
+		return closeErr
+	}
+	fmt.Fprintf(hasher, "%s::%s\n", relKey, hex.EncodeToString(sum.Sum(nil)))
+	return nil
+}
+
+func copyTreeEnsureParent(target string) error {
+	parent := filepath.Dir(target)
+	if parent == "." || parent == "" {
+		return nil
+	}
+	return os.MkdirAll(parent, 0700)
 }
 
 // nearestNodeModules walks up from executablePath's own directory looking
@@ -358,59 +578,84 @@ func nearestNodeModules(executablePath string) string {
 	return ""
 }
 
-// ExtendPlanForSealedLaunch grows plan's Landlock read closure to cover the
-// object that will ACTUALLY execute under a scope-wrapped launch, before
-// Wrap is called. LaunchCommand's scoped branch never execs handle's
-// original CanonicalPath -- it copies the verified bytes into a fresh
-// sealedExecutablePath() directory and execs that copy instead (scope
-// wrappers such as unshare/systemd-run reopen their argv[0] by path, so the
-// fd-passing trick fdLaunchArgs uses for the unscoped case cannot reach
-// them). A Plan built from CanonicalPath alone denies read/execute of that
-// sealed copy, so the wrapped process fails closed on every launch attempt
-// (verified: TestV6Case25 without this fix reaches QUARANTINED via "agent
-// exit code 1" / VALIDATION_FAILED, never via an actual blocked secret read
-// -- the backend never runs at all). Calling sealedExecutablePath() here is
-// safe to repeat: it caches h.sealedDir and LaunchCommand's own later call
-// returns the identical path, not a second copy. A no-op when plan is
-// inactive or handle is nil -- nothing to extend for a launch Wrap will
-// leave unchanged anyway.
-func (h *BackendExecutionHandle) ExtendPlanForSealedLaunch(plan enforce.Plan) (enforce.Plan, error) {
-	if h == nil || !plan.Active {
-		return plan, nil
+// composeBackendLaunch (Sol12 P0-4) is the descriptor-only launch composition
+// for a governed backend -- the direct analog of stage.ComposeHandleLaunch for
+// controller tools. It wires the backend's launch object into plan's own
+// self-exec/unshare layers and scope's own containment primitive, all through
+// one shared FDAllocator, and returns the fully-composed *exec.Cmd with
+// ExtraFiles populated, so no governed backend reaches the kernel through a
+// mutable pathname after final identity verification.
+//
+// Non-Node backend: the held, already-verified executable descriptor
+// (handle.File()) is the fd-backed final exec -- /proc/self/fd/<n>, the same
+// inode ResolveHandle opened and hashed, so a file replaced or repointed at
+// the same path after resolution cannot change what execs.
+//
+// Node backend (handle.closureRoot set): Node module resolution walks up from
+// the running script's own directory, so the entry cannot be fd-launched
+// (/proc/self/fd has no node_modules). It launches by pathname from the frozen
+// closure copy (handle.launchPath) -- the wrapper layers (scope primitive,
+// plan self-exec/unshare) stay descriptor-backed through the shared alloc, and
+// the frozen closure dir is the plan's read root. plan.Active must be true.
+func composeBackendLaunch(ctx context.Context, scope *containment.Scope, plan enforce.Plan, handle *BackendExecutionHandle, args []string, dir string) (*exec.Cmd, error) {
+	alloc := &toolregistry.FDAllocator{}
+	executable := handle.CanonicalPath
+	readRoot := filepath.Dir(handle.CanonicalPath)
+	var execBin string
+	var execFile *os.File
+	if handle.closureRoot != "" {
+		executable = handle.launchPath
+		readRoot = handle.closureRoot
+		execBin = handle.launchPath
+	} else {
+		execFile = handle.File()
 	}
-	sealed, err := h.sealedExecutablePath()
+	extended, err := plan.WithExecutableAndReadRoots(executable, readRoot)
 	if err != nil {
-		return enforce.Plan{}, err
+		return nil, err
 	}
-	return plan.WithExecutableAndReadRoots(sealed, filepath.Dir(sealed))
+	wb, wa := extended.WrapWith(alloc, execBin, execFile, args)
+	cmd := scope.CommandWith(ctx, alloc, wb, wa, dir)
+	cmd.ExtraFiles = append(cmd.ExtraFiles, alloc.Files()...)
+	return cmd, nil
 }
 
-// VerifyUnchanged re-stats and re-hashes h's canonical path RIGHT NOW and
-// fails closed if the file is missing or no longer matches what ResolveHandle
-// captured. Used on launch paths that must exec through a wrapper binary
-// (e.g. a containment.Scope launching via systemd-run/unshare, where the
-// governed backend is the wrapper's child rather than this process's direct
-// child, so the fd-passing trick in fdLaunchArgs cannot reach it) -- the plan's
-// explicit fallback for "where fexecve-style launch isn't available."
+// VerifyUnchanged re-stats and re-hashes the actually-launched object RIGHT
+// NOW and fails closed if it is missing or no longer matches what ResolveHandle
+// captured. For a non-Node backend that is h.CanonicalPath (the held
+// descriptor is exec'd directly, but a script's shebang still makes the kernel
+// re-open content, so the fresh re-hash is the only thing that catches an
+// in-place truncate+overwrite swap). For a Node backend it is h.launchPath --
+// the frozen entry the launch actually execs (CanonicalPath only feeds identity
+// there); the frozen entry's content is a copy of the original entry, so it
+// must still match h.SHA256. The dev/inode identity check applies only to the
+// original canonical path (the frozen entry has a fresh inode).
 func (h *BackendExecutionHandle) VerifyUnchanged() error {
-	info, err := os.Stat(h.CanonicalPath)
-	if err != nil {
-		return fmt.Errorf("backend identity re-verification: %s: %w", h.CanonicalPath, err)
+	target := h.CanonicalPath
+	wantSHA := h.SHA256
+	if h.launchPath != "" {
+		target = h.launchPath
 	}
-	if st, ok := info.Sys().(*syscall.Stat_t); ok {
-		wantIdent := h.FileIdentity
-		gotIdent := fmt.Sprintf("dev=%d ino=%d path=%s", st.Dev, st.Ino, h.CanonicalPath)
-		if wantIdent != "" && gotIdent != wantIdent {
-			return fmt.Errorf("backend identity re-verification: %s changed identity between resolution and launch (was %q, now %q)", h.CanonicalPath, wantIdent, gotIdent)
+	info, err := os.Stat(target)
+	if err != nil {
+		return fmt.Errorf("backend identity re-verification: %s: %w", target, err)
+	}
+	if h.launchPath == "" {
+		if st, ok := info.Sys().(*syscall.Stat_t); ok {
+			wantIdent := h.FileIdentity
+			gotIdent := fmt.Sprintf("dev=%d ino=%d path=%s", st.Dev, st.Ino, h.CanonicalPath)
+			if wantIdent != "" && gotIdent != wantIdent {
+				return fmt.Errorf("backend identity re-verification: %s changed identity between resolution and launch (was %q, now %q)", h.CanonicalPath, wantIdent, gotIdent)
+			}
 		}
 	}
-	data, err := os.ReadFile(h.CanonicalPath)
+	data, err := os.ReadFile(target)
 	if err != nil {
-		return fmt.Errorf("backend identity re-verification: read %s: %w", h.CanonicalPath, err)
+		return fmt.Errorf("backend identity re-verification: read %s: %w", target, err)
 	}
 	sum := sha256.Sum256(data)
-	if hex.EncodeToString(sum[:]) != h.SHA256 {
-		return fmt.Errorf("backend identity re-verification: %s content changed between resolution and launch", h.CanonicalPath)
+	if hex.EncodeToString(sum[:]) != wantSHA {
+		return fmt.Errorf("backend identity re-verification: %s content changed between resolution and launch", target)
 	}
 	return nil
 }
@@ -511,42 +756,37 @@ func HandleFromContext(ctx context.Context) (*BackendExecutionHandle, bool) {
 }
 
 // LaunchCommand builds the *exec.Cmd that will actually run a governed
-// backend, given the args already-projected by the adapter and the
-// containment posture in effect. It is the one place the launch decision is
-// made, shared by agents.defaultExecutor and runner.LocalWorktreeRunner's
-// executor so both host-launch call sites make the identical decision.
+// backend for callers WITHOUT a descendant-owning Scope (doctor probes, direct
+// adapter tests, and any governed launch whose executor left no scope in
+// context). The scope-bearing governed path composes its launch directly
+// inside LaunchStaged via composeBackendLaunch (Sol12 P0-4), launching through
+// /proc/self/fd/<held-fd>; this function is the fd-launch-or-path fallback for
+// everything else.
 //
-//   - No handle at all (Request.ResolvedBin was empty -- gov doctor probes,
-//     tests, or any caller outside a governed run): plain path launch,
-//     unchanged pre-Session-3 behavior.
-//   - Handle present: VerifyUnchanged runs UNCONDITIONALLY first, regardless
-//     of what follows. This is deliberate, not redundant: fdLaunchArgs'
-//     /proc/self/fd exec closes the classic TOCTOU for a compiled binary
-//     (holding the fd survives an unlink+recreate at the same path), but a
-//     script backend's "#!/bin/sh" line makes the KERNEL re-open the path
-//     itself to find the interpreter -- so an in-place truncate+overwrite
-//     swap (os.WriteFile, cp, a non-atomic editor save; the common case,
-//     and what report attack 6's fixture does) is invisible to the held fd
-//     and only VerifyUnchanged's fresh re-hash catches it. After that gate
-//     passes, fd-based exec is still used when available as additional
-//     hardening against a swap in the sub-millisecond window between this
-//     check and the actual execve.
-func LaunchCommand(ctx context.Context, handle *BackendExecutionHandle, bin string, args []string, scopeCmd func(context.Context, string, []string) *exec.Cmd) (*exec.Cmd, error) {
+// No handle at all (Request.ResolvedBin was empty -- gov doctor probes, tests,
+// or any caller outside a governed run): plain path launch. Handle present:
+// VerifyUnchanged runs UNCONDITIONALLY first. This is deliberate, not
+// redundant: fdLaunchArgs' /proc/self/fd exec closes the classic TOCTOU for a
+// compiled binary (holding the fd survives an unlink+recreate at the same
+// path), but a script backend's "#!/bin/sh" line makes the KERNEL re-open the
+// path itself to find the interpreter -- so an in-place truncate+overwrite
+// swap (os.WriteFile, cp, a non-atomic editor save; the common case, and what
+// report attack 6's fixture does) is invisible to the held fd and only
+// VerifyUnchanged's fresh re-hash catches it. After that gate passes, fd-based
+// exec is still used when available as additional hardening.
+func LaunchCommand(ctx context.Context, handle *BackendExecutionHandle, bin string, args []string) (*exec.Cmd, error) {
 	if handle == nil {
-		if scopeCmd != nil {
-			return scopeCmd(ctx, bin, args), nil
-		}
 		return exec.CommandContext(ctx, bin, args...), nil // govratchet:exec-allow(production_launch_factory) -- no handle means no governed-run verification context (test/non-governed caller)
 	}
 	if err := handle.VerifyUnchanged(); err != nil {
 		return nil, err
 	}
-	if scopeCmd != nil {
-		sealed, err := handle.sealedExecutablePath()
-		if err != nil {
-			return nil, err
-		}
-		return scopeCmd(ctx, sealed, args), nil
+	// A Node backend (frozen-closure launchPath set) cannot be fd-launched:
+	// Node module resolution walks up from the running script's directory.
+	// For the no-Scope path, launch the frozen entry by pathname (already
+	// re-verified by VerifyUnchanged above).
+	if handle.closureRoot != "" {
+		return exec.CommandContext(ctx, handle.launchPath, args...), nil // govratchet:exec-allow(production_launch_factory) -- post-VerifyUnchanged frozen closure entry
 	}
 	if path, extra, ok := handle.fdLaunchArgs(); ok {
 		cmd := exec.CommandContext(ctx, path, args...) // govratchet:exec-allow(production_launch_factory) -- path is the verified fd pseudo-path, not an attacker-controlled pathname
@@ -573,11 +813,15 @@ func LaunchCommand(ctx context.Context, handle *BackendExecutionHandle, bin stri
 // the run's single shared Scope the way the backend did before this
 // migration.
 //
-// The launch itself is still exactly LaunchCommand's existing
-// sealed-copy-or-fd logic (via a CommandFactory), including
-// ExtendPlanForSealedLaunch -- this migration is about WHERE the scope,
-// timeout, and extinction bookkeeping live, not about changing how the
-// process is actually built or confined.
+// Sol12 P0-4: the launch itself is descriptor-backed composition
+// (composeBackendLaunch), no longer the pre-P0-5 sealed-pathname copy. The
+// held backend descriptor (or, for a Node backend, the frozen closure entry)
+// is threaded through the same shared FDAllocator as the scope primitive and
+// plan self-exec/unshare layers, so no governed backend reaches the kernel
+// through a mutable pathname after final identity verification. This
+// migration is about WHERE the scope, timeout, and extinction bookkeeping
+// live, plus how the process is built/confined; the streaming-output and
+// descendant-extinction behavior is unchanged.
 //
 // scope's OWN RunID/IsStrong are reused to derive this stage's identity and
 // containment strength rather than threading a second copy of the run's
@@ -595,18 +839,42 @@ func LaunchStaged(ctx context.Context, handle *BackendExecutionHandle, bin strin
 	envValues := BuildAllowedEnv(allowedEnv)
 	factory := func(c context.Context, s *containment.Scope, p enforce.Plan, b string, a []string, d string) (*exec.Cmd, error) {
 		if handle != nil {
-			extended, eerr := handle.ExtendPlanForSealedLaunch(p)
-			if eerr != nil {
-				return nil, eerr
+			// VerifyUnchanged runs UNCONDITIONALLY first regardless of what
+			// follows (deliberate, not redundant -- a script backend's
+			// shebang makes the kernel re-open content, so an in-place
+			// truncate+overwrite swap is invisible to the held fd and only
+			// this fresh re-hash catches it).
+			if err := handle.VerifyUnchanged(); err != nil {
+				return nil, err
 			}
-			p = extended
+			if p.Active {
+				return composeBackendLaunch(c, s, p, handle, a, d)
+			}
+			// Plan inactive but scope present: launch the backend through
+			// the scope's own descriptor-backed primitive only (no
+			// __sandbox_exec wrap), one shared alloc. Non-Node: held fd;
+			// Node: frozen entry pathname.
+			alloc := &toolregistry.FDAllocator{}
+			var execArg string
+			if handle.closureRoot != "" {
+				execArg = handle.launchPath
+			} else {
+				execArg = alloc.Arg(handle.File())
+			}
+			cmd := s.CommandWith(c, alloc, execArg, a, d)
+			cmd.ExtraFiles = append(cmd.ExtraFiles, alloc.Files()...)
+			return cmd, nil
 		}
-		return LaunchCommand(c, handle, b, a, func(cc context.Context, launchBin string, launchArgs []string) *exec.Cmd {
-			wb, wa, wf := p.Wrap(launchBin, launchArgs)
-			cmd := s.Command(cc, wb, wa, d)
-			cmd.ExtraFiles = append(cmd.ExtraFiles, wf...)
-			return cmd
-		})
+		// No handle (doctor probes / non-governed caller reached a scope
+		// path): plain scope launch with the plan wrap, unchanged.
+		var wrapFiles []*os.File
+		bb, aa := b, a
+		if p.Active {
+			bb, aa, wrapFiles = p.Wrap(b, a)
+		}
+		cmd := s.Command(c, bb, aa, d)
+		cmd.ExtraFiles = append(cmd.ExtraFiles, wrapFiles...)
+		return cmd, nil
 	}
 	res, runErr := stage.NewExecutor().Run(ctx, stage.StageSpec{
 		RunID:            scope.RunID(),

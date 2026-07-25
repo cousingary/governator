@@ -37,6 +37,24 @@ type PathResolution struct {
 	CanonicalPath string // symlink-resolved absolute path; the file actually hashed and launched
 	FileIdentity  string // platform file identity (device/inode on Unix); diagnostic, "path=..." fallback
 	SHA256        string // content hash of CanonicalPath
+	// DependencyClosureHash (Sol12 P0-5) is the content-addressed hash of the
+	// COMPLETE executable closure a backend actually runs against -- for a
+	// Node-based backend (entry script + package.json + lockfile + resolved
+	// node_modules tree + native addons), frozen into a private copy at
+	// resolution time so the launch reads a verified tree rather than a live,
+	// same-UID-mutable symlink. Empty for backends with no dependency closure
+	// (a compiled or plain-shell backend IS its own closure: SHA256 above
+	// already binds it). Feeds ExecutionIdentity.BackendDependencyClosureHash.
+	DependencyClosureHash string
+	// DependencyClosureProven is false when this backend HAS a dependency
+	// closure (it is Node-based) but that closure could not be frozen+hashed
+	// (the tree was unreadable, incomplete, or otherwise unprovable). True for
+	// every non-Node backend and for every Node backend whose closure was
+	// successfully frozen. False disables strict replay for the run
+	// (runtime.computeExecutionIdentity) -- an unprovable closure cannot be
+	// reproduced against a specific verified tree by a later audit, exactly
+	// like a dirty Assayer checkout.
+	DependencyClosureProven bool
 }
 
 // Resolution is the full canonical resolution record: PathResolution plus the
@@ -83,14 +101,49 @@ func ResolvePath(agent Agent) (PathResolution, error) {
 	if err != nil {
 		return PathResolution{}, fmt.Errorf("resolve backend %q: hash executable %s: %w", agent.Name(), canonical, err)
 	}
+	// Sol12 P0-5: a non-Node backend IS its own closure (SHA256 above binds
+	// it), so its dependency closure is trivially proven. A Node-based
+	// backend's closure is only "proven" once ResolveHandle freezes+hashes
+	// the package tree into a private copy; ResolvePath does not freeze (it
+	// has no open descriptor and is not the production launch/identity path),
+	// so a Node backend reached through ResolvePath stays honestly unproven.
+	node := isNodeExecutable(canonical)
 	return PathResolution{
-		Backend:       agent.Name(),
-		Requested:     requested,
-		ResolvedPath:  abs,
-		CanonicalPath: canonical,
-		FileIdentity:  fileIdentity(canonical),
-		SHA256:        sha,
+		Backend:                 agent.Name(),
+		Requested:               requested,
+		ResolvedPath:            abs,
+		CanonicalPath:           canonical,
+		FileIdentity:            fileIdentity(canonical),
+		SHA256:                  sha,
+		DependencyClosureProven: !node,
 	}, nil
+}
+
+// isNodeExecutable reports whether the resolved backend executable is a
+// Node-based script: its shebang names the node interpreter, OR a sibling
+// package.json marks its directory as a Node package root (Sol12 P0-5). Such
+// backends resolve dependencies through a node_modules tree at run time, so
+// their executable closure is larger than the single hashed entry script and
+// must be frozen+hashed separately (ResolveHandle.freezeNodeDependencyClosure).
+// A compiled or plain-shell backend returns false: it is its own closure.
+func isNodeExecutable(canonicalPath string) bool {
+	f, err := os.Open(canonicalPath)
+	if err != nil {
+		return false
+	}
+	defer f.Close()
+	var head [256]byte
+	n, _ := f.Read(head[:])
+	if n >= 2 && head[0] == '#' && head[1] == '!' {
+		shebang := string(head[:n])
+		if strings.Contains(shebang, "node") || strings.Contains(shebang, "deno") {
+			return true
+		}
+	}
+	if info, err := os.Stat(filepath.Join(filepath.Dir(canonicalPath), "package.json")); err == nil && !info.IsDir() {
+		return true
+	}
+	return false
 }
 
 // Resolve extends ResolvePath with a bounded "--version" probe and static

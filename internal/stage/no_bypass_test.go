@@ -104,25 +104,26 @@ func TestNoRawProcessLaunchOutsideStageExecutor(t *testing.T) {
 		// runner.go above. Reclassified from migrationPending (S1/S4/S6
 		// gap-closure session, 2026-07-16).
 		"internal/runtime/runtime.go": 1,
-		// agents.LaunchCommand: the backend's sealed-copy-or-fd launch
-		// primitive, now the foundational mechanism agents.LaunchStaged
-		// plugs into stage.Executor.Run via a CommandFactory (Sol redteam
-		// v7 S1 gap-closure, 2026-07-16) -- deliberately reused rather than
-		// rewritten, exactly the same "foundational launch primitive a
-		// CommandFactory invokes, not a bypass of it" role internal/
-		// toolregistry/handle.go's entry above already has. 2 of the
-		// file's 5 raw calls are probeVersion (permanently-legitimate
-		// read-only version probes, same as agents/resolution.go above);
-		// the other 3 are LaunchCommand's own sealed/fd exec sites, invoked
-		// exclusively through stage.Executor.Run's CommandFactory when a
-		// Scope is present (agents.defaultExecutor / runner.
-		// LocalWorktreeRunner.executor both route through agents.
-		// LaunchStaged now) or directly for the no-Scope case (doctor
-		// probes, direct adapter tests -- nothing governed to route
-		// through StageExecutor). Reclassified from migrationPending
-		// (S1/S4/S6 gap-closure session, 2026-07-16): this was the last
-		// entry there, closing Category B.
-		"internal/agents/handle.go": 5,
+		// agents.LaunchCommand: the backend's fd/path launch primitive, now the
+		// foundational mechanism agents.LaunchStaged plugs into stage.Executor.Run
+		// via a CommandFactory (Sol redteam v7 S1 gap-closure, 2026-07-16;
+		// reworked Sol12 P0-4 to descriptor-backed composition) -- deliberately
+		// reused rather than rewritten, exactly the same "foundational launch
+		// primitive a CommandFactory invokes, not a bypass of it" role internal/
+		// toolregistry/handle.go's entry above already has. 2 of the file's 6
+		// raw calls are probeVersion (permanently-legitimate read-only version
+		// probes, same as agents/resolution.go above); the other 4 are
+		// LaunchCommand's own no-scope exec sites -- no-handle plain path, the
+		// frozen-closure entry path for a Node backend (Sol12 P0-5; module
+		// resolution requires a pathname, not the held fd), the held-fd
+		// /proc/self/fd/<n> path, and the post-VerifyUnchanged fallback -- all
+		// invoked directly only for the no-Scope case (doctor probes, direct
+		// adapter tests). The scope-bearing governed path no longer passes
+		// through LaunchCommand at all: LaunchStaged's factory composes the
+		// held descriptor (or frozen Node entry) through stage.ComposeHandleLaunch
+		// machinery (composeBackendLaunch), with no raw exec of its own. The
+		// pre-P0-4 sealed-copy-of-the-executable branch is gone.
+		"internal/agents/handle.go": 6,
 		// DockerRunner's executor (Sol9 P1-2, rc3 Session 6): the docker CLI
 		// invocation now launches through a CommandWith build callback (the
 		// same shape runner.go/runtime.go's shell() helpers use for bash)
