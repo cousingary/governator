@@ -33,6 +33,20 @@ func TestMain(m *testing.M) {
 	os.Exit(m.Run())
 }
 
+// fixtureRepo returns testdata/assayer_fixture's absolute path -- shared by
+// every test in this package that needs a real cli.py/assayer/*.py tree to
+// build a Snapshot from (moved here in rc5-upg12 Session 6 so it stays
+// available regardless of which platform-specific test files are compiled
+// in; see v10_s4_snapshot_immutability_test.go's `redteam && linux` tag).
+func fixtureRepo(t *testing.T) string {
+	t.Helper()
+	repo, err := filepath.Abs(filepath.Join("testdata", "assayer_fixture"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return repo
+}
+
 func requirePython3(t *testing.T) {
 	t.Helper()
 	if _, err := exec.LookPath("python3"); err != nil {

@@ -126,6 +126,12 @@ var KnownPredicates = map[string]bool{
 	// live daemon succeeds; case 31's real-daemon consumed-artifact-volume
 	// acceptance test is authorized to skip only when this is proven absent.
 	"has_docker_daemon": true,
+	// has_darwin_native_host: Session 6 (Sol12 P1-1 "Darwin production
+	// support is unproven"). True only when this host's own GOOS is
+	// literally darwin -- cases 34/35's real native containment/Assayer
+	// acceptance tests are authorized to skip only when this is proven
+	// absent (every host this project runs on today).
+	"has_darwin_native_host": true,
 }
 
 // allowedStatusValues enumerates the only status: values a manifest case may

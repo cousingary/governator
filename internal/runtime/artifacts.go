@@ -16,8 +16,6 @@ import (
 	"sort"
 	"strings"
 
-	"golang.org/x/sys/unix"
-
 	"github.com/cousingary/governator/internal/contracts"
 	"github.com/cousingary/governator/internal/controllerenv"
 	"github.com/cousingary/governator/internal/enforce"
@@ -195,13 +193,6 @@ func verifyConsumedArtifacts(dir string, artifacts []stagedArtifact) error {
 	return nil
 }
 
-// consumedArtifactSeals matches assay.packageSeals exactly (Sol11 P0-6's
-// precedent): once applied, the kernel refuses every write/truncate/
-// mmap-write against the memfd, for every process holding any descriptor to
-// it -- including this one -- never merely a permission bit a same-UID
-// chmod could undo.
-const consumedArtifactSeals = unix.F_SEAL_WRITE | unix.F_SEAL_SHRINK | unix.F_SEAL_GROW | unix.F_SEAL_SEAL
-
 // sealedConsumedArtifact is one consumed artifact's content, held only as a
 // sealed, unlinked memfd (Sol11 P0-7): unlike stageConsumedArtifacts, no
 // real host directory entry is ever created for it, so no same-UID process
@@ -238,26 +229,9 @@ func sealConsumedArtifacts(artifacts []stagedArtifact) ([]sealedConsumedArtifact
 		if hex.EncodeToString(sum[:]) != artifact.SHA256 || int64(len(artifact.data)) != artifact.Bytes {
 			return nil, fmt.Errorf("sealed consumed artifact %q identity mismatch", artifact.Name)
 		}
-		fd, merr := unix.MemfdCreate("governator-consumed-"+artifact.Name, unix.MFD_CLOEXEC|unix.MFD_ALLOW_SEALING)
+		f, merr := sealOneConsumedArtifact(artifact.Name, artifact.data)
 		if merr != nil {
-			return nil, fmt.Errorf("create sealed consumed-artifact memfd %q: %w", artifact.Name, merr)
-		}
-		f := os.NewFile(uintptr(fd), "governator-consumed-"+artifact.Name)
-		if _, werr := f.Write(artifact.data); werr != nil {
-			_ = f.Close()
-			return nil, fmt.Errorf("write sealed consumed-artifact memfd %q: %w", artifact.Name, werr)
-		}
-		// Seal immediately after writing, before this artifact is handed to
-		// any launch: from this point on the kernel refuses every mutation
-		// against this memfd, for every process holding any descriptor to it
-		// (Sol11 P0-7).
-		if _, serr := unix.FcntlInt(f.Fd(), unix.F_ADD_SEALS, consumedArtifactSeals); serr != nil {
-			_ = f.Close()
-			return nil, fmt.Errorf("seal consumed-artifact memfd %q: %w", artifact.Name, serr)
-		}
-		if _, serr := f.Seek(0, io.SeekStart); serr != nil {
-			_ = f.Close()
-			return nil, fmt.Errorf("rewind sealed consumed-artifact memfd %q: %w", artifact.Name, serr)
+			return nil, merr
 		}
 		out = append(out, sealedConsumedArtifact{Name: artifact.Name, SHA256: artifact.SHA256, Bytes: artifact.Bytes, file: f})
 	}

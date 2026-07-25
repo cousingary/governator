@@ -159,6 +159,27 @@ GO_TEST_PARALLELISM=${GO_TEST_PARALLELISM:-2}
 # platforms with CGO_ENABLED=0 (modernc.org/sqlite is pure Go, no cgo
 # toolchain needed for cross-compilation).
 PLATFORMS=${PLATFORMS:-"linux/amd64 linux/arm64 darwin/amd64 darwin/arm64"}
+# Sol12 P1-1 (rc5 Session 6): PLATFORMS is caller-controlled with no prior
+# validation -- an operator setting PLATFORMS="windows/amd64" would reach
+# the build loop below unchecked, and the per-artifact "approving" flag
+# further down defaulted true for anything that didn't literally start with
+# "darwin_", so an unsupported platform would have shipped silently marked
+# fully approving. Refuse outright instead: every requested platform's GOOS
+# must be exactly "linux" (fully approving) or "darwin" (explicitly
+# non-approving/degraded, never silently trusted) -- mirrors
+# internal/redteamgate.ApprovedPlatforms/ClassifyPlatform, the one Go-side
+# source of truth TestV12Case36 tests directly. Kept in sync by hand: this
+# script cannot import the Go package it is building.
+for platform in $PLATFORMS; do
+  platform_goos=${platform%/*}
+  case "$platform_goos" in
+    linux|darwin) ;;
+    *)
+      echo "release: refusing to build unsupported platform '${platform}' -- GOOS '${platform_goos}' is not in the approved set (linux: fully approving; darwin: explicitly non-approving/degraded). See docs/security.md's Session 6 closure entry (Sol12 P1-1) and internal/redteamgate.ClassifyPlatform." >&2
+      exit 1
+      ;;
+  esac
+done
 # P1-4 (Sol11 rc5 Session 8): ASSAYER_REPO defaults to the sibling checkout
 # for local runs; .github/workflows/release.yml sets it explicitly to the
 # path actions/checkout materialized Assayer at (the local default
@@ -459,6 +480,12 @@ print(json.dumps({
     'git_trusted': rec(shutil.which('git') is not None, 'shutil.which(git)', shutil.which('git') or ''),
     'proc1_fd_unreadable': rec(proc1_unreadable, 'os.access(/proc/1/fd, R_OK)', str(proc1_unreadable)),
     'has_docker_daemon': rec(has_docker, 'docker info (5s timeout)', str(has_docker)),
+    # has_darwin_native_host (Session 6, Sol12 P1-1, Darwin production
+    # support is unproven): true only when this host's own platform is
+    # literally Darwin -- cases 34/35's real native containment/Assayer
+    # acceptance tests are authorized to skip only when this is proven
+    # absent. This dev host is Linux, so it is always absent here.
+    'has_darwin_native_host': rec(platform.system()=='Darwin', 'platform.system()', platform.system()),
 }))
 ")
 # Sol12 rc5 Session 1 (P0-2): the authoritative red-team test inventory,
@@ -770,7 +797,17 @@ for platform in $PLATFORMS; do
   python3 -c "
 import json, sys
 platform_id = sys.argv[1]
-feature_limited = platform_id.startswith('darwin_')
+# Sol12 P1-1: explicit allow-list, not a 'darwin_ means limited, everything
+# else defaults approving' fallback -- the PLATFORMS validation loop above
+# already refuses any GOOS outside {linux, darwin} before this ever runs,
+# so an unrecognized platform_id here means that guard was bypassed; fail
+# loud rather than silently mislabeling it approving.
+if platform_id.startswith('linux_'):
+    feature_limited = False
+elif platform_id.startswith('darwin_'):
+    feature_limited = True
+else:
+    sys.exit('release: unrecognized platform_id %r reached artifact labeling despite the PLATFORMS guard (internal/redteamgate.ClassifyPlatform, Sol12 P1-1) -- refusing to default it to approving' % platform_id)
 print(json.dumps({
     'platform': platform_id,
     'archive_path': sys.argv[2],
@@ -1130,8 +1167,13 @@ metadata_path, version, commit, assayer_commit, assayer_version, platforms = sys
 platform_list = [p for p in platforms.split() if p]
 degraded = []
 for platform in platform_list:
+    # Sol12 P1-1: same explicit allow-list as the artifact-labeling block
+    # above -- the PLATFORMS guard already refuses anything outside
+    # {linux, darwin} before this runs.
     if platform.startswith('darwin/'):
         degraded.append({'platform': platform.replace('/', '_'), 'mode': 'non-approving'})
+    elif not platform.startswith('linux/'):
+        sys.exit('release: unrecognized platform %r reached architecture metadata despite the PLATFORMS guard (Sol12 P1-1) -- refusing' % platform)
 pathlib.Path(metadata_path).write_text(json.dumps({
     'version': version,
     'source_commit': commit,

@@ -1340,6 +1340,56 @@ cases:
       predicate: has_docker_daemon
       reason: "no reachable docker daemon on this host"
     status: implemented
+  # Session 6 (P1-1 "Darwin production support is unproven after Linux
+  # memfd changes"): internal/assay/snapshot.go and
+  # internal/runtime/artifacts.go used memfd_create/F_ADD_SEALS/F_SEAL_*
+  # unconditionally, so the project failed to cross-compile for
+  # darwin/amd64 or darwin/arm64 at all. Split into snapshot_linux.go/
+  # artifacts_linux.go (real implementation) plus their _other.go
+  # fail-closed stubs, mirroring internal/enforce/consumed_linux.go's
+  # pre-existing pattern. rc5 declares Darwin explicitly non-approving
+  # (internal/redteamgate.ClassifyPlatform) rather than claiming native
+  # support this session did not build. Case 32 (Linux-only, positive
+  # companion) proves the split didn't change Linux's real memfd
+  # behavior; case 33 proves the exact release build + full redteam test
+  # source cross-compile for darwin/amd64 and darwin/arm64; cases 34/35
+  # are real native-acceptance tests, authorized to skip only when
+  # has_darwin_native_host is proven absent (every host this project
+  # runs on today); case 36 proves an unsupported platform (outside
+  # {linux, darwin}) can never claim production approval.
+  - case: 227
+    name: TestV12Case32LinuxSealedMemfdRoundTripSucceeds
+    session: rc5-u12-s6
+    required: true
+    status: implemented
+  - case: 228
+    name: TestV12Case33DarwinCrossBuildSucceeds
+    session: rc5-u12-s6
+    required: true
+    status: implemented
+  - case: 229
+    name: TestV12Case34DarwinNativeContainmentNeverClaimsStrongScope
+    session: rc5-u12-s6
+    required: true
+    conditional: true
+    allowed_skip:
+      predicate: has_darwin_native_host
+      reason: "no Darwin acceptance host available for this run"
+    status: implemented
+  - case: 230
+    name: TestV12Case35DarwinNativeAssayerRefusesRatherThanDegrades
+    session: rc5-u12-s6
+    required: true
+    conditional: true
+    allowed_skip:
+      predicate: has_darwin_native_host
+      reason: "no Darwin acceptance host available for this run"
+    status: implemented
+  - case: 231
+    name: TestV12Case36UnsupportedPlatformRefusedProductionApproval
+    session: rc5-u12-s6
+    required: true
+    status: implemented
 
 # Exclusions (Sol12 P0-2): every //go:build redteam-tagged test that is NOT a
 # manifest corpus case must be explicitly classified here with a documented

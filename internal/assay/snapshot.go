@@ -16,8 +16,6 @@ import (
 	"strings"
 	"time"
 
-	"golang.org/x/sys/unix"
-
 	"github.com/cousingary/governator/internal/controllerenv"
 	"github.com/cousingary/governator/internal/toolregistry"
 )
@@ -207,11 +205,6 @@ func (s *Snapshot) Close() {
 	}
 }
 
-// packageSeals is the exact seal set BuildSnapshot applies to Package --
-// content can never again be written, shrunk, grown, or have further seals
-// added, for any process holding any descriptor to this memfd.
-const packageSeals = unix.F_SEAL_WRITE | unix.F_SEAL_SHRINK | unix.F_SEAL_GROW | unix.F_SEAL_SEAL
-
 // Verify re-checks Package's bytes and seal state against what
 // BuildSnapshot recorded. Sol11 P0-6 makes this defense-in-depth rather than
 // the load-bearing detection mechanism it was before this session (see
@@ -229,12 +222,8 @@ func (s *Snapshot) Verify() error {
 	if s.Package == nil {
 		return fmt.Errorf("%s: snapshot has no package descriptor", AssayerSnapshotMutated)
 	}
-	seals, err := unix.FcntlInt(s.Package.Fd(), unix.F_GET_SEALS, 0)
-	if err != nil {
-		return fmt.Errorf("%s: read package seal state: %w", AssayerSnapshotMutated, err)
-	}
-	if seals&packageSeals != packageSeals {
-		return fmt.Errorf("%s: package seal state changed (want at least %#o, got %#o)", AssayerSnapshotMutated, packageSeals, seals)
+	if err := verifyPackageSeals(s.Package); err != nil {
+		return fmt.Errorf("%s: %w", AssayerSnapshotMutated, err)
 	}
 	if _, err := s.Package.Seek(0, io.SeekStart); err != nil {
 		return fmt.Errorf("%s: rewind package descriptor: %w", AssayerSnapshotMutated, err)
@@ -367,31 +356,16 @@ func BuildSnapshot(registry *toolregistry.Registry, cfg Config) (*Snapshot, erro
 	packageSum := sha256.Sum256(zipBytes)
 	packageHash := hex.EncodeToString(packageSum[:])
 
-	fd, merr := unix.MemfdCreate("governator-assayer-package", unix.MFD_CLOEXEC|unix.MFD_ALLOW_SEALING)
+	pkg, merr := sealPackageMemfd(zipBytes)
 	if merr != nil {
-		return fail("create sealed package memfd: %s", merr)
+		return fail("%s", merr)
 	}
-	pkg := os.NewFile(uintptr(fd), "governator-assayer-package")
 	pkgOK := false
 	defer func() {
 		if !pkgOK {
 			_ = pkg.Close()
 		}
 	}()
-	if _, werr := pkg.Write(zipBytes); werr != nil {
-		return fail("write sealed package memfd: %s", werr)
-	}
-	// Seal immediately after writing, before this snapshot is handed to any
-	// caller: from this point on the kernel refuses every write/truncate/
-	// mmap-write against this memfd, for every process holding any
-	// descriptor to it (including this one) -- not merely a permission bit
-	// a same-UID chmod could undo. See Snapshot's doc comment.
-	if _, serr := unix.FcntlInt(pkg.Fd(), unix.F_ADD_SEALS, packageSeals); serr != nil {
-		return fail("seal package memfd: %s", serr)
-	}
-	if _, serr := pkg.Seek(0, io.SeekStart); serr != nil {
-		return fail("rewind sealed package memfd: %s", serr)
-	}
 
 	workDir, werr := os.MkdirTemp("", "governator-assayer-workdir-*")
 	if werr != nil {

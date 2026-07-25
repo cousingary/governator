@@ -1,4 +1,4 @@
-//go:build redteam
+//go:build redteam && linux
 
 // v10_s4_snapshot_immutability_test.go implements Sol10 P0-4's mandatory
 // red-team corpus (agents/governator-sol-upgrade10.md "P0-4: Assayer's
@@ -34,26 +34,21 @@
 // internal/runtime's real-sandbox corpus, not here -- these two prove the
 // same-UID tamper itself never takes effect, which is the property that
 // actually changed this session.
+//
+// rc5-upg12 Session 6 (Sol12 P1-1): build-tagged `redteam && linux` -- this
+// file directly exercises packageSeals/unix.FcntlInt(F_GET_SEALS), both
+// Linux-only (see snapshot_linux.go), so it has no darwin equivalent to
+// cross-compile.
 package assay
 
 import (
 	"fmt"
 	"os"
-	"path/filepath"
 	"strings"
 	"testing"
 
 	"golang.org/x/sys/unix"
 )
-
-func fixtureRepo(t *testing.T) string {
-	t.Helper()
-	repo, err := filepath.Abs(filepath.Join("testdata", "assayer_fixture"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	return repo
-}
 
 // TestV10Case21SameUIDChmodAndInPlaceOverwriteOfChecksPyDetectedBeforeVerdict
 // is case 21's Sol11 P0-6 update: the old attack (chmod the snapshot
