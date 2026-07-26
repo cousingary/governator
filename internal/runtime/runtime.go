@@ -871,6 +871,27 @@ func stagePathRoots(root string, paths []string) []string {
 	return out
 }
 
+// legacyValidatorApprovalViolations leaves string validators available for
+// development and migration diagnostics, but prevents them from becoming a
+// production approval. A command string cannot faithfully declare every
+// executable and semantic script it consumes, so its bytes cannot be bound
+// into the transaction identity.
+func legacyValidatorApprovalViolations(c contracts.Contract) []string {
+	stages := validatorStages(c)
+	var violations []string
+	for _, stage := range stages {
+		if len(stage.Validators) == 0 || len(stage.Specs) != 0 {
+			continue
+		}
+		for i, command := range stage.Validators {
+			violations = append(violations, fmt.Sprintf(
+				"LEGACY_VALIDATOR_NON_APPROVING: %s.validators[%d] uses legacy string %q; production approval and merge require a structured declaration:\n%s:\n  validators:\n    - command: %q\n      tools: [<every executable>]\n      files: [<every semantic script>]",
+				stage.Stage, i, command, stage.Stage, command))
+		}
+	}
+	return violations
+}
+
 func validatorAuthority(root string, spec *contracts.ValidatorSpec, writeable bool, requireStrong bool) stageexec.StageAuthority {
 	authority := stageexec.StageAuthority{
 		ReadRoots:          []string{root},
@@ -3194,6 +3215,10 @@ func (r *Runner) runOnce(ctx context.Context, c contracts.Contract) (RunRecord, 
 		identity.StrictReplayEligible = false
 		identity.StrictReplayDisabledReason = "backend dependency closure could not be proven (frozen+hashed); strict replay disabled"
 	}
+	if legacy := legacyValidatorApprovalViolations(c); len(legacy) > 0 {
+		identity.StrictReplayEligible = false
+		identity.StrictReplayDisabledReason = "legacy string validators are migration-only; strict replay disabled"
+	}
 	// Sol12 P1-6: an Assayer snapshot whose dependency identity could not be
 	// resolved due to a genuine hashing failure (DependencyHash empty,
 	// DependencyUnavailableReason indicates an error rather than the
@@ -3706,6 +3731,7 @@ func (r *Runner) runOnce(ctx context.Context, c contracts.Contract) (RunRecord, 
 	if !handle.PathResolution.DependencyClosureProven {
 		violations = append(violations, "NODE_DEPENDENCY_CLOSURE_UNPROVEN: backend dependency closure could not be frozen and hashed; production approval blocked")
 	}
+	violations = append(violations, legacyValidatorApprovalViolations(c)...)
 	violations = appendRuntimePathScanViolation(violations, "after agent execution", work)
 	violations = append(violations, telemetryViolations(c, audit)...)
 	violations = append(violations, effectLedgerViolations(handle)...)

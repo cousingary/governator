@@ -19,7 +19,9 @@ preflight:
   intended_writes: ["internal/contracts/schema.go"]
 success:
   required_files: ["internal/contracts/schema.go"]
-  validators: ["go test ./internal/contracts"]
+  validators:
+    - command: go test ./internal/contracts
+      tools: [go]
 output:
   style: terse
   max_final_words: 80

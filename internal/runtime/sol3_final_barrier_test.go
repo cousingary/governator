@@ -31,6 +31,10 @@ func TestSol3FinalBarrierQuarantinesValidatorCreatedUndeclaredFile(t *testing.T)
 	c := contract(root)
 	c.Budget.MaxNewFiles = 4
 	c.Success.Validators = []string{"test -f output/result.txt", "printf pwned > pwned.txt"}
+	c.Success.ValidatorSpecs = []contracts.ValidatorSpec{
+		{Command: "test -f output/result.txt", Tools: []string{"test"}},
+		{Command: "printf pwned > pwned.txt", Tools: []string{"bash"}},
+	}
 
 	r, err := New().Run(context.Background(), c)
 	if err != nil {
@@ -61,6 +65,10 @@ func TestSol3FinalBarrierQuarantinesValidatorProtectedPathMutation(t *testing.T)
 
 	c := contract(root)
 	c.Success.Validators = []string{"test -f output/result.txt", "printf leak > " + shQuote(protectedFile)}
+	c.Success.ValidatorSpecs = []contracts.ValidatorSpec{
+		{Command: "test -f output/result.txt", Tools: []string{"test"}},
+		{Command: "printf leak > " + shQuote(protectedFile), Tools: []string{"bash"}},
+	}
 
 	r, err := New().Run(context.Background(), c)
 	if err != nil {
@@ -102,6 +110,10 @@ func TestSol3FinalBarrierQuarantinesValidatorDeletesInScopeFile(t *testing.T) {
 	c := contract(root)
 	c.Budget.MaxFilesChanged = 6
 	c.Success.Validators = []string{"test -f output/result.txt", "rm output/keep.txt"}
+	c.Success.ValidatorSpecs = []contracts.ValidatorSpec{
+		{Command: "test -f output/result.txt", Tools: []string{"test"}},
+		{Command: "rm output/keep.txt", Tools: []string{"rm"}},
+	}
 
 	r, err := New().Run(context.Background(), c)
 	if err != nil {

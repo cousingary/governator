@@ -178,7 +178,7 @@ func panelExecContract(root, id, jobType, agent string, produces []contracts.Art
 		Budget:        contracts.Budget{MaxMinutes: 5, MaxCommands: 5, MaxFilesChanged: 1, MaxLinesChanged: 1, MaxNewFiles: 1, MaxTokens: 1000},
 		TelemetryMode: "estimated",
 		Preflight:     contracts.Preflight{IntendedWrites: []string{}},
-		Success:       contracts.Success{RequiredFiles: []string{}, Validators: validators},
+		Success:       contracts.Success{RequiredFiles: []string{}, Validators: validators, ValidatorSpecs: []contracts.ValidatorSpec{{Command: validators[0], Tools: []string{"test"}}}},
 		Produces:      produces, Consumes: consumes, DependsOn: dependsOn, ArtifactSources: artifactSources,
 		RiskClass: "", OnViolation: "quarantine",
 	}

@@ -112,6 +112,12 @@ func fixture(t *testing.T) (string, string) {
 		enforce.SelfExeOverride = govTestBinary(t)
 		t.Cleanup(func() { enforce.SelfExeOverride = "" })
 	}
+	t.Setenv("GOV_TOOLREGISTRY_FILE", filepath.Join(t.TempDir(), "tools.yaml"))
+	for _, name := range []string{"git", "bash", "unshare", "test", "printf", "rm", "sleep"} {
+		if _, err := toolregistry.Enroll(name, resolveTestTool(t, name)); err != nil {
+			t.Fatalf("enroll fixture tool %s: %v", name, err)
+		}
+	}
 	root := t.TempDir()
 	git(t, root, "init", "-b", "main")
 	git(t, root, "config", "user.email", "test@example.invalid")
@@ -184,12 +190,16 @@ func shellReadRootsForFixtures() []string {
 func contract(root string) contracts.Contract {
 	return contracts.Contract{
 		Task: "write deterministic test output", JobID: "phase1-test", JobType: "test", Agent: "claude-code", Mode: contracts.ModeSurgeon,
-		Workspace:   contracts.Workspace{Root: root, Worktree: "auto"},
-		Allowed:     contracts.Permissions{Read: []string{"**"}, Write: []string{"output/**"}, Execute: []string{"test"}},
-		Forbidden:   contracts.Forbidden{Paths: []string{".git/**"}, Commands: []string{"rm -rf"}, Behaviors: []string{"network"}},
-		Budget:      contracts.Budget{MaxMinutes: 1, MaxCommands: 5, MaxFilesChanged: 5, MaxLinesChanged: 20, MaxNewFiles: 2, MaxDeleted: 0},
-		Preflight:   contracts.Preflight{IntendedWrites: []string{"output/**"}},
-		Success:     contracts.Success{RequiredFiles: []string{"output/result.txt"}, Validators: []string{"test -f output/result.txt"}},
+		Workspace: contracts.Workspace{Root: root, Worktree: "auto"},
+		Allowed:   contracts.Permissions{Read: []string{"**"}, Write: []string{"output/**"}, Execute: []string{"test"}},
+		Forbidden: contracts.Forbidden{Paths: []string{".git/**"}, Commands: []string{"rm -rf"}, Behaviors: []string{"network"}},
+		Budget:    contracts.Budget{MaxMinutes: 1, MaxCommands: 5, MaxFilesChanged: 5, MaxLinesChanged: 20, MaxNewFiles: 2, MaxDeleted: 0},
+		Preflight: contracts.Preflight{IntendedWrites: []string{"output/**"}},
+		Success: contracts.Success{
+			RequiredFiles:  []string{"output/result.txt"},
+			Validators:     []string{"test -f output/result.txt"},
+			ValidatorSpecs: []contracts.ValidatorSpec{{Command: "test -f output/result.txt", Tools: []string{"test"}}},
+		},
 		OnViolation: "quarantine",
 		Local:       &contracts.LocalRunnerConfig{ReadRoots: shellReadRootsForFixtures()},
 	}
@@ -1274,6 +1284,9 @@ printf '{"type":"result","total_cost_usd":0.25}\n'
 			t.Fatal(err)
 		}
 	}
+	if _, err := toolregistry.Enroll("test", resolveTestTool(t, "test")); err != nil {
+		t.Fatal(err)
+	}
 
 	// Capturing the compiled prompt now costs a real new file + real diff
 	// lines against the confined workspace's own budget (it used to be an
@@ -1335,7 +1348,7 @@ func TestCleanupStageRecordsUnderItsOwnLedgerStage(t *testing.T) {
 	t.Setenv("GOV_CLAUDE_BIN", bin)
 
 	c := contract(root)
-	c.Cleanup = &contracts.Cleanup{Required: false, Validators: []string{"false"}}
+	c.Cleanup = &contracts.Cleanup{Required: false, Validators: []string{"false"}, ValidatorSpecs: []contracts.ValidatorSpec{{Command: "false", Tools: []string{"bash"}}}}
 	r, err := New().Run(context.Background(), c)
 	if err != nil {
 		t.Fatal(err)
@@ -1369,7 +1382,7 @@ func TestCleanupRequiredFailureQuarantines(t *testing.T) {
 	t.Setenv("GOV_CLAUDE_BIN", bin)
 
 	c := contract(root)
-	c.Cleanup = &contracts.Cleanup{Required: true, Validators: []string{"false"}}
+	c.Cleanup = &contracts.Cleanup{Required: true, Validators: []string{"false"}, ValidatorSpecs: []contracts.ValidatorSpec{{Command: "false", Tools: []string{"bash"}}}}
 	r, err := New().Run(context.Background(), c)
 	if err != nil {
 		t.Fatal(err)
@@ -2101,6 +2114,10 @@ func TestWallClockBudgetExhaustionQuarantinesSlowValidators(t *testing.T) {
 	// 2.5x the absolute slack in each direction.
 	c.Budget.MaxMinutes = 1
 	c.Success.Validators = []string{"sleep 20", "sleep 20"}
+	c.Success.ValidatorSpecs = []contracts.ValidatorSpec{
+		{Command: "sleep 20", Tools: []string{"sleep"}},
+		{Command: "sleep 20", Tools: []string{"sleep"}},
+	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()

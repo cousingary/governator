@@ -11,6 +11,7 @@ import (
 	"github.com/cousingary/governator/internal/breaker"
 	"github.com/cousingary/governator/internal/contracts"
 	"github.com/cousingary/governator/internal/observability"
+	"github.com/cousingary/governator/internal/toolregistry"
 )
 
 // assayProducerContract builds on artifactProducerContract (same fixture
@@ -275,6 +276,9 @@ func setAssayEnv(t *testing.T, repo string) {
 	t.Setenv("GOV_ASSAY_REPO", repo)
 	t.Setenv("GOV_ASSAY_PYTHON", "python3")
 	t.Setenv("GOV_ASSAY_TIMEOUT_SECONDS", "10")
+	if _, err := toolregistry.Enroll("python3", resolveTestTool(t, "python3")); err != nil {
+		t.Fatalf("enroll python3: %v", err)
+	}
 }
 
 // TestAssayNotConfiguredSkipsAndRecordsSkipped covers the plan's

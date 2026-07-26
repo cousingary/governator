@@ -1648,6 +1648,21 @@ cases:
     session: rc6-u13-s5
     required: true
     status: implemented
+  - case: 283
+    name: TestV13Case38LegacyStringValidatorCannotApproveInProduction
+    session: rc6-u13-s6
+    required: true
+    status: implemented
+  - case: 284
+    name: TestV13Case39AmbientPythonChangeUnderLegacyValidatorIsNonApproving
+    session: rc6-u13-s6
+    required: true
+    status: implemented
+  - case: 285
+    name: TestV13Case40ValidatorScriptChangeInvalidatesIdentity
+    session: rc6-u13-s6
+    required: true
+    status: implemented
   - case: 296
     name: TestWaitPIDGoneDoesNotTreatEPERMAsGone
     session: rc6-u13-s3-gap-closure

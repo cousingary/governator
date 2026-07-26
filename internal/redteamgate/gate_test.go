@@ -33,13 +33,14 @@ func TestLoadManifestRejectsBlankName(t *testing.T) {
 
 // TestLoadManifestAcceptsRealManifest is a regression check that
 // internal/redteam/manifest.yaml (the actual release-gating manifest, not a
-// fixture) parses cleanly under the Sol12 strict decoder: 282
+// fixture) parses cleanly under the Sol12 strict decoder: 285
 // uniquely-numbered, uniquely-named required cases (the rc5 upgrade-12
 // Session 1 corpus, cases 196-205, Session 2's cases 206-208, Session 3's
 // cases 209-214, Session 4's cases 215-221, Session 5's cases 222-226, and
 // Session 6's cases 227-231, and Sol13 S1-S2's cases 245-256, on top of
 // upgrade-11's 195), plus Sol13 Session 3's cases 257-264, Sol13 Session 4's
-// cases 266-272, Sol13 Session 5's cases 273-282, plus case 296 (a
+// cases 266-272, Sol13 Session 5's cases 273-282, Sol13 Session 6's cases
+// 283-285, plus case 296 (a
 // rc6-upg13 S3 exclusion-audit gap closure enrolling a pre-existing
 // internal/containment test that was never in the manifest -- deliberately
 // numbered outside 265-295, which stays reserved for Sol13 Sessions 4-8),
@@ -51,8 +52,8 @@ func TestLoadManifestAcceptsRealManifest(t *testing.T) {
 	if err != nil {
 		t.Fatalf("LoadManifest(%s): %v", path, err)
 	}
-	if len(m.Cases) != 282 {
-		t.Fatalf("expected 282 cases in the mandatory final attack corpus, got %d", len(m.Cases))
+	if len(m.Cases) != 285 {
+		t.Fatalf("expected 285 cases in the mandatory final attack corpus, got %d", len(m.Cases))
 	}
 	seen := make(map[int]bool)
 	for _, c := range m.Cases {

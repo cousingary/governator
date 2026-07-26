@@ -21,6 +21,10 @@ preflight:
 success:
   required_files: ["output/clipart/*.png"]
   validators:
-    - "python3 validators/image/check_transparency.py output/clipart"
-    - "python3 validators/image/check_min_resolution.py --min 2000 output/clipart"
+    - command: python3 validators/image/check_transparency.py output/clipart
+      tools: [python3]
+      files: [validators/image/check_transparency.py]
+    - command: python3 validators/image/check_min_resolution.py --min 2000 output/clipart
+      tools: [python3]
+      files: [validators/image/check_min_resolution.py]
 on_violation: quarantine
