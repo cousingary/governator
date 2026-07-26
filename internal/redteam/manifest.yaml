@@ -1563,6 +1563,20 @@ cases:
     session: rc6-u13-s3
     required: true
     status: implemented
+  - case: 296
+    name: TestWaitPIDGoneDoesNotTreatEPERMAsGone
+    session: rc6-u13-s3-gap-closure
+    required: true
+    status: implemented
+
+# Case 296 is not one of Sol13's original 51 findings (which occupy 245-295).
+# It closes a gap the rc6-upg13 S3 exclusion audit found: TestV6Case29's own
+# doc comment concedes it is a stand-in for a real white-box assertion
+# belonging in internal/containment's own tests. That assertion already
+# existed (internal/containment/descendants_test.go, pre-dating this session)
+# but was never enrolled, so V6Case29 could not cite it as a replacement.
+# Numbered 296 (not 265-295) specifically so it never collides with a future
+# S4-S8 case number from Sol13's reserved range.
 
 # Exclusions (Sol12 P0-2): every //go:build redteam-tagged test that is NOT a
 # manifest corpus case must be explicitly classified here with a documented
@@ -1573,134 +1587,219 @@ cases:
 # (scripts/release.sh discovers tagged tests and passes them via --inventory).
 exclusions:
   - name: TestAttack10FakeGitInjectedThroughPathIsRejected
-    reason: "legacy pre-manifest attack fixture superseded by the versioned manifest corpus"
+    status: superseded
+    replacement_tests:
+      - TestV9Case4EnrolledGitSwapAfterSessionOpenCannotChangeExecutedBytes
+      - TestV12Case20GitRegistryRotatedAfterRunFreezeHasNoEffect
+    reason: "Same 'hostile PATH/on-disk change cannot redirect trusted git execution' property, now proven by gitplumb.Session holding one verified descriptor for its whole lifetime (V9Case4, confirmed by reading v9_s5_sovereign_handle_launch_test.go) plus shell()'s frozen-registry object surviving a same-UID registry rotation (V12Case20, internal/runtime/v12_s4_frozen_shell_test.go) -- a strictly stronger attack than a bare PATH-prepend."
   - name: TestAttack11MutableDockerTagChangesBeforeReplay
-    reason: "legacy pre-manifest attack fixture superseded by the versioned manifest corpus"
+    reason: "OPEN GAP (investigated 2026-07-26, rc6-upg13 S3): no confirmed enrolled replacement test found for this legacy attack; the prior 'superseded by the versioned manifest corpus' claim was unverified and is retracted. See agents/governator-sol-upgrade13-s3-exclusion-audit.md. No enrolled case tests IMAGE tag/digest identity binding across replay. The nearest v12 docker cases (TestV12Case24/25/26 in internal/runner/v12_s4_frozen_docker_test.go) test docker CLI/daemon-endpoint rotation not affecting an already-resolved DockerEnvironment -- a related but distinct property (CLI/daemon identity, not image tag->digest identity). No clear replacement found; flag for human review."
   - name: TestAttack12InContainerBackendDiffersFromHostAttestedBinary
-    reason: "legacy pre-manifest attack fixture superseded by the versioned manifest corpus"
+    reason: "OPEN GAP (investigated 2026-07-26, rc6-upg13 S3): no confirmed enrolled replacement test found for this legacy attack; the prior 'superseded by the versioned manifest corpus' claim was unverified and is retracted. See agents/governator-sol-upgrade13-s3-exclusion-audit.md. Same search as Attack11 turned up nothing that binds in-container executed identity against host-side attestation independent of the host CLI. No clear replacement found; flag for human review."
   - name: TestAttack13TwoAssayerWorkersReclaimOneExpiredLease
-    reason: "legacy pre-manifest attack fixture superseded by the versioned manifest corpus"
+    reason: "OPEN GAP (investigated 2026-07-26, rc6-upg13 S3): no confirmed enrolled replacement test found for this legacy attack; the prior 'superseded by the versioned manifest corpus' claim was unverified and is retracted. See agents/governator-sol-upgrade13-s3-exclusion-audit.md. This Go test is only a cross-repo traceability check (assertAssayerTestFileContains) confirming a Python pytest fixture in the separate /mnt/e/downloads/assayer repo still exists; the actual outbox-lease security property is proven entirely in Python (tests/test_outbox.py), which this Go manifest cannot and does not enumerate. No Go-enrolled case exists for outbox/lease reclaim (grepped manifest cases for Outbox/Lease -- no hits). Genuine cross-repo coverage gap from this gate's perspective, not a forced match."
   - name: TestAttack14DownstreamInsertSucceedsBeforeOutboxWorkerCrashes
-    reason: "legacy pre-manifest attack fixture superseded by the versioned manifest corpus"
+    reason: "OPEN GAP (investigated 2026-07-26, rc6-upg13 S3): no confirmed enrolled replacement test found for this legacy attack; the prior 'superseded by the versioned manifest corpus' claim was unverified and is retracted. See agents/governator-sol-upgrade13-s3-exclusion-audit.md. Same cross-repo-pointer situation as Attack13 (same file, same assertAssayerTestFileContains pattern, same Python-only outbox idempotency property). No Go-enrolled replacement exists."
   - name: TestAttack15MalformedGateCheckInputFailsClosed
-    reason: "legacy pre-manifest attack fixture superseded by the versioned manifest corpus"
+    status: superseded
+    replacement_tests:
+      - TestGateDecideApplyPatchMissingCommandDenies
+      - TestGateDecideApplyPatchMalformedEnvelopeDenies
+    reason: "Same general principle (malformed gate protocol input must DENY, never be treated as no-decision) but a different code path: Attack15 fixed cmd/gov/main.go's generic `gov gate check` stdin-JSON parsing (denyGateProtocolError), while the enrolled cases test GateDecideApplyPatch's own apply_patch-specific protocol-error handling (internal/runtime/gate_applypatch_test.go). Attack15's own named real-fixture pointer (cmd/gov/main_test.go::TestAttack15GateCheckMalformedInputFailsClosed) is NOT in the manifest at all (grepped manifest.yaml directly, zero hits) -- the generic gate-check path may be a genuine gap even though the apply_patch-specific path is covered."
   - name: TestAttack16InventedAssayerLanguagePasses
-    reason: "legacy pre-manifest attack fixture superseded by the versioned manifest corpus"
+    reason: "OPEN GAP (investigated 2026-07-26, rc6-upg13 S3): no confirmed enrolled replacement test found for this legacy attack; the prior 'superseded by the versioned manifest corpus' claim was unverified and is retracted. See agents/governator-sol-upgrade13-s3-exclusion-audit.md. Cross-repo pointer test (assayer_test.go) for a Python-only fixture (tests/test_evaluate.py); no Go-enrolled equivalent exists or is possible for this specific language-allowlist property."
   - name: TestAttack17DoctrineChangesBetweenEvaluationAndIdentity
-    reason: "legacy pre-manifest attack fixture superseded by the versioned manifest corpus"
+    reason: "OPEN GAP (investigated 2026-07-26, rc6-upg13 S3): no confirmed enrolled replacement test found for this legacy attack; the prior 'superseded by the versioned manifest corpus' claim was unverified and is retracted. See agents/governator-sol-upgrade13-s3-exclusion-audit.md. Attack17 is itself just a same-package existence-check pointing at internal/runtime/policy_gate_test.go::TestPolicyBundleSharedBetweenGateAndIdentityIgnoresLaterDoctrineEdit -- confirmed by direct grep that this exact name does NOT appear anywhere in manifest.yaml. Real regression coverage exists as an ordinary (non-manifest-tracked) internal/runtime unit test; no black-box/enrolled case retests PolicyBundle consistency between policy evaluation and identity construction."
   - name: TestAttack18SecondOneShotApprovalConsumptionFails
-    reason: "legacy pre-manifest attack fixture superseded by the versioned manifest corpus"
+    reason: "OPEN GAP (investigated 2026-07-26, rc6-upg13 S3): no confirmed enrolled replacement test found for this legacy attack; the prior 'superseded by the versioned manifest corpus' claim was unverified and is retracted. See agents/governator-sol-upgrade13-s3-exclusion-audit.md. Same shape as Attack17: points at internal/observability/policy_checkpoints_test.go::TestConsumePolicyOverrideReservationsIsAllOrNothing, confirmed NOT present in manifest.yaml. Real coverage is an ordinary internal/observability unit test, untracked by this gate."
   - name: TestAttack19NewlinePathspecFilenameHandledLiterally
-    reason: "legacy pre-manifest attack fixture superseded by the versioned manifest corpus"
+    reason: "OPEN GAP (investigated 2026-07-26, rc6-upg13 S3): no confirmed enrolled replacement test found for this legacy attack; the prior 'superseded by the versioned manifest corpus' claim was unverified and is retracted. See agents/governator-sol-upgrade13-s3-exclusion-audit.md. Grepped all test files repo-wide for pathspec-magic/newline-filename handling; only pathspec_test.go (this file itself) and a shared-helper mention in harness_test.go touch this. No v7+ enrolled case retests git status --porcelain=v2 -z / literal-pathspec handling."
   - name: TestAttack1HostilePreCommitHookNeverStagesForbiddenFile
-    reason: "legacy pre-manifest attack fixture superseded by the versioned manifest corpus"
+    reason: "OPEN GAP (investigated 2026-07-26, rc6-upg13 S3): no confirmed enrolled replacement test found for this legacy attack; the prior 'superseded by the versioned manifest corpus' claim was unverified and is retracted. See agents/governator-sol-upgrade13-s3-exclusion-audit.md. Grepped repo-wide for pre-commit/hooksPath handling; only hooks_test.go (this file) and the equally-excluded v6_s5_git_isolation_test.go (TestV6Case17/18) touch hook neutralization. No enrolled v7+ case retests it -- this foundational S1-era git-plumbing fix appears to have never been re-verified by the mandatory corpus."
   - name: TestAttack20SpendSettleRacesExpiry
-    reason: "legacy pre-manifest attack fixture superseded by the versioned manifest corpus"
+    reason: "OPEN GAP (investigated 2026-07-26, rc6-upg13 S3): no confirmed enrolled replacement test found for this legacy attack; the prior 'superseded by the versioned manifest corpus' claim was unverified and is retracted. See agents/governator-sol-upgrade13-s3-exclusion-audit.md. Attack20 is a same-package existence-check pointing at internal/spend/sol3_reservation_test.go::TestSol3SettleGlobalRacingExpiryNeverSilentlyLosesSettlement, confirmed NOT in manifest.yaml. Real coverage is an ordinary internal/spend unit test, untracked by this gate."
   - name: TestAttack21HugeTimeoutCausesDurationOverflow
-    reason: "legacy pre-manifest attack fixture superseded by the versioned manifest corpus"
+    reason: "OPEN GAP (investigated 2026-07-26, rc6-upg13 S3): no confirmed enrolled replacement test found for this legacy attack; the prior 'superseded by the versioned manifest corpus' claim was unverified and is retracted. See agents/governator-sol-upgrade13-s3-exclusion-audit.md. The real fix (contracts.Validate rejecting an overflow-inducing budget.max_minutes) is tested by internal/contracts/schema_test.go::TestValidateRejectsBudgetMaxMinutesLargeEnoughToOverflowDuration -- confirmed NOT present anywhere in manifest.yaml. Real regression coverage exists but is an ordinary contracts-package unit test, not part of this gate's tracked corpus."
   - name: TestAttack22SymlinkParentReplacedBetweenScanAndOpen
-    reason: "legacy pre-manifest attack fixture superseded by the versioned manifest corpus"
+    status: superseded
+    replacement_tests:
+      - TestV9Case34ParentDirectoryBecomesSymlinkRefused
+      - TestV9Case36PathExchangedAfterEarlierValidationRefused
+    reason: "Read v9_s7_symlink_sealing_test.go in full: its header explicitly states every write-root/workspace path is now resolved via internal/pathsafe's openat2(RESOLVE_BENEATH|RESOLVE_NO_SYMLINKS|RESOLVE_NO_MAGICLINKS) -- the exact primitive Attack22's own doc comment names as the fix. Case34 drives a parent-component-becomes-a-symlink attack (Attack22's exact title) and Case36 drives a path-exchanged-after-earlier-validation TOCTOU (Attack22's exact 'between scan and open' framing), both through the real gov __sandbox_exec entry point."
   - name: TestAttack23NonGitMergeFailureHalfwayThrough
-    reason: "legacy pre-manifest attack fixture superseded by the versioned manifest corpus"
+    reason: "OPEN GAP (investigated 2026-07-26, rc6-upg13 S3): no confirmed enrolled replacement test found for this legacy attack; the prior 'superseded by the versioned manifest corpus' claim was unverified and is retracted. See agents/governator-sol-upgrade13-s3-exclusion-audit.md. Shares the underlying rollback primitive (captureRecall/restoreRecall) with TestV10Case17CleanupPartialWriteBeforeTimeoutRestoresPreCleanupState (internal/redteam/v10_s3_cleanup_ordering_test.go), but that case exercises CLEANUP-VALIDATOR partial-write rollback, not the main non-git mergeCopyChanged atomicity path Attack23 targets. Not confirmed equivalent; flag for human review rather than forcing the match."
   - name: TestAttack24ExtractedReleaseBinaryHasWrongMode
-    reason: "legacy pre-manifest attack fixture superseded by the versioned manifest corpus"
+    status: superseded
+    replacement_tests:
+      - TestV7Case35ArchiveModeStrippedBlocksGate
+    reason: "TestV7Case35's own doc comment states verbatim: 'Same underlying assertion as the pre-existing TestAttack24ExtractedReleaseBinaryHasWrongMode (report P0-7 attack 24); reserved under its own TestV7CaseN name.' Confirmed directly in source (internal/redteam/v7_s7_release_test.go)."
   - name: TestAttack25ReleaseBinaryCommitDiffersFromSourceAndClaims
-    reason: "legacy pre-manifest attack fixture superseded by the versioned manifest corpus"
+    reason: "OPEN GAP (investigated 2026-07-26, rc6-upg13 S3): no confirmed enrolled replacement test found for this legacy attack; the prior 'superseded by the versioned manifest corpus' claim was unverified and is retracted. See agents/governator-sol-upgrade13-s3-exclusion-audit.md. TestV7Case36InstalledHashMismatchBlocksGate's own doc comment explicitly disclaims this: 'must catch this independently of the commit-identity check TestAttack25 already covers' -- i.e. Case36 tests hash mismatch, NOT the source_commit-drift property Attack25 proves. No other enrolled case (checked V7Case31-38, V11Case28/49, V12 release cases) tests the archived binary's self-reported source_commit against build-manifest.json via `gov claims verify`. Genuine gap."
   - name: TestAttack26DirtyReleaseBinaryReportsAContradictoryRelease
-    reason: "legacy pre-manifest attack fixture superseded by the versioned manifest corpus"
+    status: superseded
+    replacement_tests:
+      - TestV8Case20DirtyReleaseArtifactRejected
+    reason: "Read both tests: TestV8Case20 in internal/redteam/v8_session4_release_test.go is a byte-for-byte reuse of the same buildReleaseFixtureDist/runReleaseVerify helpers with artifactDirty:true and the identical 'dirty=true' assertion, differing only in the fixture's commit constant."
   - name: TestAttack26FakeBashInjectedThroughPathIsRejected
-    reason: "legacy pre-manifest attack fixture superseded by the versioned manifest corpus"
+    status: superseded
+    replacement_tests:
+      - TestV9Case5EnrolledBashSwapAfterHandleOpenCannotChangeExecutedBytes
+      - TestV12Case21BashRegistryRotatedAfterRunFreezeHasNoEffect
+      - TestV12Case23ShellCommandStringCannotResolveAmbientTools
+    reason: "Same property (hostile PATH-shadowing bash must never execute in place of the registry-pinned real bash used by success.validators' shell()) now proven more strongly: V9Case5 (fd-backed handle survives a same-UID swap after open) and V12Case21/23 (shell()'s frozen registry survives an on-disk rotation, and cannot resolve any ambient-PATH tool at all, sealed private PATH)."
   - name: TestAttack27BackendExecutableWithUntrustedWritableParentIsQuarantined
-    reason: "legacy pre-manifest attack fixture superseded by the versioned manifest corpus"
+    reason: "OPEN GAP (investigated 2026-07-26, rc6-upg13 S3): no confirmed enrolled replacement test found for this legacy attack; the prior 'superseded by the versioned manifest corpus' claim was unverified and is retracted. See agents/governator-sol-upgrade13-s3-exclusion-audit.md. Searched for other consumers of agents.ResolveHandle's ParentWritable/effectLedgerViolations gate; found none besides this test itself. No enrolled case retests the parent-writable-ancestor quarantine gate."
   - name: TestAttack2HostileGlobalHooksPathNeverStagesForbiddenFile
-    reason: "legacy pre-manifest attack fixture superseded by the versioned manifest corpus"
+    reason: "OPEN GAP (investigated 2026-07-26, rc6-upg13 S3): no confirmed enrolled replacement test found for this legacy attack; the prior 'superseded by the versioned manifest corpus' claim was unverified and is retracted. See agents/governator-sol-upgrade13-s3-exclusion-audit.md. Same search as Attack1 (hooksPath/GIT_CONFIG_GLOBAL neutralization); only hooks_test.go and the equally-excluded v6_s5 file touch this. No enrolled replacement found."
   - name: TestAttack3PathspecMagicFilenameNeverStagesInternalPath
-    reason: "legacy pre-manifest attack fixture superseded by the versioned manifest corpus"
+    reason: "OPEN GAP (investigated 2026-07-26, rc6-upg13 S3): no confirmed enrolled replacement test found for this legacy attack; the prior 'superseded by the versioned manifest corpus' claim was unverified and is retracted. See agents/governator-sol-upgrade13-s3-exclusion-audit.md. Same search as Attack19; only pathspec_test.go touches literal-pathspec/.governator-directory-exclusion handling. No enrolled v7+ case retests it."
   - name: TestAttack4CleanFilterNeverAltersCommittedContent
-    reason: "legacy pre-manifest attack fixture superseded by the versioned manifest corpus"
+    reason: "OPEN GAP (investigated 2026-07-26, rc6-upg13 S3): no confirmed enrolled replacement test found for this legacy attack; the prior 'superseded by the versioned manifest corpus' claim was unverified and is retracted. See agents/governator-sol-upgrade13-s3-exclusion-audit.md. Same search as Attack1/2; only hooks_test.go and the equally-excluded v6_s5 file touch git clean-filter bypass (git hash-object --no-filters --literally). No enrolled replacement found."
   - name: TestAttack5FakeBackendBehavesSafelyOnlyDuringAttestation
-    reason: "legacy pre-manifest attack fixture superseded by the versioned manifest corpus"
+    reason: "OPEN GAP (investigated 2026-07-26, rc6-upg13 S3): no confirmed enrolled replacement test found for this legacy attack; the prior 'superseded by the versioned manifest corpus' claim was unverified and is retracted. See agents/governator-sol-upgrade13-s3-exclusion-audit.md. Attack5's specific property (a stored attestation claiming every probe passed must NOT authorize a run; only externally-enforced Landlock+netns counts) is not exactly retested. The nearest enrolled cases (TestV7Case1/2/3 in v7_s2_authority_test.go) test the opposite direction -- rejection when containment is entirely UNSUPPORTED/unavailable -- not 'containment available, backend lies via a planted attestation, kernel enforcement still catches the escape.' TestV11Case9/14 (force-degraded-env-has-no-effect) are also adjacent but test env/wrapper downgrade resistance, not attestation-lie resistance. No confirmed exact match."
   - name: TestAttack6BackendReplacementBetweenHashAndLaunchIsDetected
-    reason: "legacy pre-manifest attack fixture superseded by the versioned manifest corpus"
+    status: superseded
+    replacement_tests:
+      - TestV12Case14ReplaceBackendPathAfterVerifyUsesHeldDescriptor
+      - TestV12Case19StructuredBackendExecutionBindsDescriptorIdentity
+    reason: "CORRECTED 2026-07-26 (rc6-upg13 S3): an earlier pass of this audit missed internal/agents (it is untagged package-agents source, not under internal/redteam/internal/runtime/internal/runner/internal/assay/internal/containment) and wrongly called this an open gap. internal/agents/handle_v12_s3_test.go::TestV12Case14 (enrolled as manifest case 209) proves exactly this property: after ResolveHandle opens and hashes the backend executable, a same-UID unlink+recreate at the same pathname does NOT change what the held descriptor (h.file) reads, and a direct /proc/self/fd/<n> launch of that descriptor -- the identical primitive composeBackendLaunch uses via handle.File() for every non-Node backend launch, wrapped or direct -- still executes the pre-swap bytes. Case214 (TestV12Case19) additionally binds that held descriptor's content to the identity's BackendBinarySHA256. This is the structural guarantee Attack6 asks for, proven at the mechanism composeBackendLaunch actually depends on."
   - name: TestAttack7PathResolvedBinaryReplacedBetweenRuns
-    reason: "legacy pre-manifest attack fixture superseded by the versioned manifest corpus"
+    status: superseded
+    replacement_tests:
+      - TestV12Case14ReplaceBackendPathAfterVerifyUsesHeldDescriptor
+    reason: "CORRECTED 2026-07-26 (rc6-upg13 S3): same missed-package correction as Attack6 (see that entry). Attack7's 'path-resolved binary replaced between runs' is the same same-UID pathname-swap-after-resolution attack Attack6 names, just framed across separate runs rather than within one hash-to-launch window; TestV12Case14's held-descriptor proof covers both framings identically, since a fresh ResolveHandle per run always re-opens and re-hashes before holding."
   - name: TestAttack8DetachedSetsidChildCannotWriteAfterApproval
-    reason: "legacy pre-manifest attack fixture superseded by the versioned manifest corpus"
+    status: superseded
+    replacement_tests:
+      - TestV7Case8CleanupValidatorDetachedDescendantExtinctionFailureBlocksApproval
+    reason: "v7_s1_case8_extinction_test.go's own doc comment names this file's descendants_test.go test directly as a prior sibling of the same 'detached descendant' fixture class, and proves a STRICTLY STRONGER version: a genuinely kernel-unkillable descendant (via a custom minimal FUSE daemon) rather than a timing-race sleep, closing the exact same descendant-extinction gap with a harder adversary. NOTE (verified 2026-07-26): the replacement is itself case8_hangfuse_extinction_fixture-conditional -- on a host lacking unprivileged FUSE (e.g. this project's WSL dev host), case 8 authorized-skips and this exclusion's coverage is correspondingly unproven for that run too. This is intentional, not a defect: a host that cannot run case 8 cannot prove this property either way."
   - name: TestAttack9GraphHelperCannotWriteOutsideRepository
-    reason: "legacy pre-manifest attack fixture superseded by the versioned manifest corpus"
+    status: superseded
+    replacement_tests:
+      - TestV9Case11GraphProviderWriteOutsideCodegraphDenied
+      - TestV9Case12GraphReadOnlyOperationWriteDenied
+    reason: "Read v9_s2_graph_authority_test.go: Case11/12 use the identical GOV_GRAPH_MODE/GOV_GRAPH_PROVIDER/GOV_GRAPH_BIN config keys Attack9's own doc comment names, under real Landlock enforcement, and prove exactly 'a provider that tries to write outside .codegraph (mutating op) or at all (read-only op) is denied' -- the same property Attack9 targets, now enforced via contextgraph.scopedCommandOutput's real write-root scoping instead of trusted-tool-registry absence alone."
   - name: TestSnapshotVerifySucceedsWithoutTampering
-    reason: "non-attack positive helper exercising the snapshot-verify success path; not a release-blocking security attack (internal/assay v10_s4)"
+    status: non-production
+    replacement_tests: []
+    reason: "Confirmed by reading internal/assay/v10_s4_snapshot_immutability_test.go: its own doc comment calls it 'the negative companion proving Verify itself isn't just unconditionally failing' -- a positive-path sanity check for the file's real tamper-detection attacks, never itself an attack."
   - name: TestV11Case18BPositiveCompleteDistPassesValidation
-    reason: "companion positive/acceptance variant of manifest case 178 (TestV11Case18TruncatedTestLogFailsReleaseEvidenceValidation); proves the complete-dist success branch of the same fix, not a separately-gated attack (v11_s3_audit_bundle_evidence_test.go)"
+    status: non-production
+    replacement_tests: []
+    reason: "Confirmed by reading internal/redteam/v11_s3_audit_bundle_evidence_test.go: its own doc comment states it 'is not a numbered corpus case -- it proves s3BuildCompleteDist itself represents a genuinely PASSING release (isolating the three failing cases above from a fixture-construction bug).' Pure companion/acceptance helper."
   - name: TestV6Case10PathPinnedToolReplacedWithDifferentContentIsRejected
-    reason: "legacy v6 corpus case superseded by the versioned v7+ manifest corpus; retained as historical regression coverage, not a release-blocking attack"
+    status: superseded
+    replacement_tests:
+      - TestV9Case6SameUIDMutationOfSealedToolCopyDetectedOrIneffective
+    reason: "Same property (a registry-pinned tool's on-disk content swapped after pinning must be rejected, not trusted on path string alone), now implemented via SealedCopy.Verify (called before every launch) rather than toolregistry.Pin+Load+Resolve; V9Case6 explicitly tests both an in-place content overwrite and a directory-entry-swap variant of the same attack."
   - name: TestV6Case11RegistryEntryMissingSHA256IsRejected
-    reason: "legacy v6 corpus case superseded by the versioned v7+ manifest corpus; retained as historical regression coverage, not a release-blocking attack"
+    reason: "OPEN GAP (investigated 2026-07-26, rc6-upg13 S3): no confirmed enrolled replacement test found for this legacy attack; the prior 'superseded by the versioned manifest corpus' claim was unverified and is retracted. See agents/governator-sol-upgrade13-s3-exclusion-audit.md. Searched all versioned test files for tools.yaml loader validation (missing sha256, duplicate names, concurrent writes); found none. The registry mechanism evolved toward sealed-copy/frozen-registry-object architecture (V9Case6, V12Case20/21) but this specific loader-level input-validation property doesn't appear re-tested by an enrolled case."
   - name: TestV6Case12DuplicateTrustedToolRegistryNamesRejected
-    reason: "legacy v6 corpus case superseded by the versioned v7+ manifest corpus; retained as historical regression coverage, not a release-blocking attack"
+    reason: "OPEN GAP (investigated 2026-07-26, rc6-upg13 S3): no confirmed enrolled replacement test found for this legacy attack; the prior 'superseded by the versioned manifest corpus' claim was unverified and is retracted. See agents/governator-sol-upgrade13-s3-exclusion-audit.md. Same search as V6Case11. TestV12Case11ManifestDuplicateYAMLKeyFailsLoad/Case13DuplicateCaseNumberFailsLoad are for the REDTEAM MANIFEST's own YAML loader (redteamgate.Manifest), a different subsystem from the tools.yaml trusted-tool registry this test targets. No match found."
   - name: TestV6Case13ConcurrentRegistryUpdatesDoNotLoseWrites
-    reason: "legacy v6 corpus case superseded by the versioned v7+ manifest corpus; retained as historical regression coverage, not a release-blocking attack"
+    reason: "OPEN GAP (investigated 2026-07-26, rc6-upg13 S3): no confirmed enrolled replacement test found for this legacy attack; the prior 'superseded by the versioned manifest corpus' claim was unverified and is retracted. See agents/governator-sol-upgrade13-s3-exclusion-audit.md. Same search as V6Case11/12; no enrolled case retests toolregistry.Pin's concurrent-write safety specifically."
   - name: TestV6Case14GitObjectDirectoryRedirectionDoesNotEscapeRepository
-    reason: "legacy v6 corpus case superseded by the versioned v7+ manifest corpus; retained as historical regression coverage, not a release-blocking attack"
+    reason: "OPEN GAP (investigated 2026-07-26, rc6-upg13 S3): no confirmed enrolled replacement test found for this legacy attack; the prior 'superseded by the versioned manifest corpus' claim was unverified and is retracted. See agents/governator-sol-upgrade13-s3-exclusion-audit.md. Grepped repo-wide for GIT_OBJECT_DIRECTORY/GIT_ALTERNATE_OBJECT_DIRECTORIES/GIT_DIR/GIT_WORK_TREE handling; only v6_s5_git_isolation_test.go (this file, entirely excluded) touches these. No v7+ case retests git-isolation env-var redirection."
   - name: TestV6Case15GitAlternateObjectDirectoriesRedirectionDoesNotEscapeRepository
-    reason: "legacy v6 corpus case superseded by the versioned v7+ manifest corpus; retained as historical regression coverage, not a release-blocking attack"
+    reason: "OPEN GAP (investigated 2026-07-26, rc6-upg13 S3): no confirmed enrolled replacement test found for this legacy attack; the prior 'superseded by the versioned manifest corpus' claim was unverified and is retracted. See agents/governator-sol-upgrade13-s3-exclusion-audit.md. Same search and same conclusion as V6Case14 (same file, sibling attack)."
   - name: TestV6Case16GitDirWorkTreeInjectionDoesNotRedirectApprovedCommit
-    reason: "legacy v6 corpus case superseded by the versioned v7+ manifest corpus; retained as historical regression coverage, not a release-blocking attack"
+    reason: "OPEN GAP (investigated 2026-07-26, rc6-upg13 S3): no confirmed enrolled replacement test found for this legacy attack; the prior 'superseded by the versioned manifest corpus' claim was unverified and is retracted. See agents/governator-sol-upgrade13-s3-exclusion-audit.md. Same search and same conclusion as V6Case14/15 (same file, sibling attack)."
   - name: TestV6Case17QuarantinePreCommitHookNeverFires
-    reason: "legacy v6 corpus case superseded by the versioned v7+ manifest corpus; retained as historical regression coverage, not a release-blocking attack"
+    reason: "OPEN GAP (investigated 2026-07-26, rc6-upg13 S3): no confirmed enrolled replacement test found for this legacy attack; the prior 'superseded by the versioned manifest corpus' claim was unverified and is retracted. See agents/governator-sol-upgrade13-s3-exclusion-audit.md. Same search as Attack1 (pre-commit hook neutralization during quarantine specifically); no enrolled replacement found anywhere in v7+."
   - name: TestV6Case18QuarantineCleanFilterNeverRuns
-    reason: "legacy v6 corpus case superseded by the versioned v7+ manifest corpus; retained as historical regression coverage, not a release-blocking attack"
+    reason: "OPEN GAP (investigated 2026-07-26, rc6-upg13 S3): no confirmed enrolled replacement test found for this legacy attack; the prior 'superseded by the versioned manifest corpus' claim was unverified and is retracted. See agents/governator-sol-upgrade13-s3-exclusion-audit.md. Same search as Attack4 (clean-filter bypass during quarantine specifically); no enrolled replacement found."
   - name: TestV6Case19ShadowAllowNeverOverridesGoDeny
-    reason: "legacy v6 corpus case superseded by the versioned v7+ manifest corpus; retained as historical regression coverage, not a release-blocking attack"
+    reason: "OPEN GAP (investigated 2026-07-26, rc6-upg13 S3): no confirmed enrolled replacement test found for this legacy attack; the prior 'superseded by the versioned manifest corpus' claim was unverified and is retracted. See agents/governator-sol-upgrade13-s3-exclusion-audit.md. Grepped repo-wide for 'shadow'/'Shadow' outside this file; only unrelated hits (/etc/shadow path string, an unrelated 'shadowing' code comment). No enrolled case retests the shadow-Python-never-overrides-Go-deny property; possible the shadow-parity CLI feature itself was removed in a later architecture, which would need separate confirmation against cmd/gov/main.go's current hookCmd."
   - name: TestV6Case1LowRiskContractForbidsNetworkButBackendOpensSocket
-    reason: "legacy v6 corpus case superseded by the versioned v7+ manifest corpus; retained as historical regression coverage, not a release-blocking attack"
+    reason: "OPEN GAP (investigated 2026-07-26, rc6-upg13 S3): no confirmed enrolled replacement test found for this legacy attack; the prior 'superseded by the versioned manifest corpus' claim was unverified and is retracted. See agents/governator-sol-upgrade13-s3-exclusion-audit.md. The v7 corpus generalized this exact httptest-server-receipt pattern to VALIDATOR/GRAPH/ASSAYER stages (TestV7Case6/10/12's own doc comments say they 'mirror TestV6Case1's httptest-server receipt check but from a success validator/graph provider/assayer instead of the backend') but no case retests the BACKEND itself opening a socket despite an explicit network prohibition. TestV7Case1-3 test a different scenario (rejection when containment is entirely unavailable). Real gap for the backend-specific case."
   - name: TestV6Case20ShadowEmptyOutputNeverOverridesGoDeny
-    reason: "legacy v6 corpus case superseded by the versioned v7+ manifest corpus; retained as historical regression coverage, not a release-blocking attack"
+    reason: "OPEN GAP (investigated 2026-07-26, rc6-upg13 S3): no confirmed enrolled replacement test found for this legacy attack; the prior 'superseded by the versioned manifest corpus' claim was unverified and is retracted. See agents/governator-sol-upgrade13-s3-exclusion-audit.md. Same search and conclusion as V6Case19 (same file, sibling shadow-authority attack)."
   - name: TestV6Case21ShadowScriptChangeBetweenReplaysIsDetected
-    reason: "legacy v6 corpus case superseded by the versioned v7+ manifest corpus; retained as historical regression coverage, not a release-blocking attack"
+    reason: "OPEN GAP (investigated 2026-07-26, rc6-upg13 S3): no confirmed enrolled replacement test found for this legacy attack; the prior 'superseded by the versioned manifest corpus' claim was unverified and is retracted. See agents/governator-sol-upgrade13-s3-exclusion-audit.md. Same search and conclusion as V6Case19/20 (same file, sibling shadow-authority attack)."
   - name: TestV6Case22ConsumedArtifactChangeBeforeConsumerReplayInvalidatesReplay
-    reason: "legacy v6 corpus case superseded by the versioned v7+ manifest corpus; retained as historical regression coverage, not a release-blocking attack"
+    status: superseded
+    replacement_tests:
+      - TestV7Case23ConsumedArtifactChangeBetweenHashAndStagingInvalidatesReplay
+    reason: "TestV7Case23's own doc comment states verbatim: 'Reuses TestV6Case22's producer/consumer contract shapes (this file's own package)' -- direct source confirmation of the succession, strengthened to attack the ledger-stored artifact file directly rather than a legitimate producer re-run."
   - name: TestV6Case24GraphProviderChangeBeforeReplayInvalidatesReplay
-    reason: "legacy v6 corpus case superseded by the versioned v7+ manifest corpus; retained as historical regression coverage, not a release-blocking attack"
+    status: superseded
+    replacement_tests:
+      - TestV9Case9GraphProviderRotatedAfterFreezeCannotExecute
+      - TestV9Case10FrozenRegistryObjectImmuneToOnDiskRegistryChange
+    reason: "v9_s2_graph_authority_test.go's own header states 'TestV9Case9/10 prove provider identity is pinned across a frozen Status/Registry, not re-trusted by name' -- exactly V6Case24's property (the graph PROVIDER program itself changing must invalidate replay/re-trust), now enforced via a frozen registry object rather than re-checking a bare identity string."
   - name: TestV6Case25BackendCannotReadUndeclaredHostSecretUnderLandlock
-    reason: "legacy v6 corpus case superseded by the versioned v7+ manifest corpus; retained as historical regression coverage, not a release-blocking attack"
+    status: superseded
+    replacement_tests:
+      - TestV7Case4LowRiskHostSecretUnreadableUnderNarrowLandlock
+    reason: "Read both tests side by side: identical fixture (fakeHome/.ssh/id_rsa secret marker, backend cats it into output/result.txt, asserts the marker never reaches committed output under Landlock) -- V7Case4 differs only in its secret-marker string and default risk_class instead of an explicit 'high' override."
   - name: TestV6Case26BackendPathReplacedBeforeWrappedLaunchNeverRuns
-    reason: "legacy v6 corpus case superseded by the versioned v7+ manifest corpus; retained as historical regression coverage, not a release-blocking attack"
+    status: superseded
+    replacement_tests:
+      - TestV12Case14ReplaceBackendPathAfterVerifyUsesHeldDescriptor
+    reason: "CORRECTED 2026-07-26 (rc6-upg13 S3): same missed-package correction as Attack6/Attack7 (see those entries). This test's own doc comment says it mirrors TestAttack6's synchronization strategy against the WRAPPED (unshare, high-risk) launch path specifically, rather than direct execution. composeBackendLaunch (internal/agents/handle.go:600) does not branch by risk class for how it obtains the backend's exec object -- every non-Node launch, wrapped or direct, threads the exact same handle.File() held descriptor into plan.WrapWith. TestV12Case14 proves that held descriptor is immune to a same-UID pathname swap; since the wrapped path consumes the identical object, the property this test raced for holds structurally, not just for the direct-exec case."
   - name: TestV6Case27GovernatorPathReplacedBeforeSandboxReexecNeverRuns
-    reason: "legacy v6 corpus case superseded by the versioned v7+ manifest corpus; retained as historical regression coverage, not a release-blocking attack"
+    status: superseded
+    replacement_tests:
+      - TestV9Case3GovernatorOnDiskSwapAfterProcessStartCannotChangeSandboxHelperIdentity
+    reason: "Read v9_s1_wrapper_composition_test.go: V9Case3's own doc comment describes exactly this scenario (Governator's own on-disk binary renamed after the parent process has already exec'd, proving /proc/self/exe pins to the pre-swap inode and the production self-exec into __sandbox_exec is immune) -- the identical property this test approximates via SelfExeOverride and a private copy."
   - name: TestV6Case28SystemdUnitNeverMaterializingFailsClosed
-    reason: "legacy v6 corpus case superseded by the versioned v7+ manifest corpus; retained as historical regression coverage, not a release-blocking attack"
+    reason: "OPEN GAP (investigated 2026-07-26, rc6-upg13 S3): no confirmed enrolled replacement test found for this legacy attack; the prior 'superseded by the versioned manifest corpus' claim was unverified and is retracted. See agents/governator-sol-upgrade13-s3-exclusion-audit.md. Nearest candidates (TestV10Case12ScopeSelectionFailureLeaksZeroDescriptors, TestV10Case13RealSystemdUserScopeLaunchExecutesExactVerifiedTarget, TestV12Case8DeterministicSystemdUnavailableFailurePath in internal/containment) are white-box tests of newSystemdUserScope's fd-leak/selection-determinism behavior, not the black-box 'a high-risk run must never reach APPROVED without a confirmable systemd unit' assertion this test makes. Related domain, not a confirmed equivalent."
   - name: TestV6Case29PIDCheckEPERMIsNotTreatedAsExtinctionProof
-    reason: "legacy v6 corpus case superseded by the versioned v7+ manifest corpus; retained as historical regression coverage, not a release-blocking attack"
+    status: superseded
+    replacement_tests:
+      - TestWaitPIDGoneDoesNotTreatEPERMAsGone
+    reason: "This test's own doc comment already concedes it's a stand-in ('this test process reaching this point stands in for a white-box assertion, which belongs in internal/containment's own _test.go'). That white-box test already existed -- internal/containment/descendants_test.go::TestWaitPIDGoneDoesNotTreatEPERMAsGone directly calls waitPIDGone and confirms EPERM is not treated as extinction -- it simply was not enrolled in the manifest, so it could not be cited as a replacement. Enrolled 2026-07-26 (rc6-upg13 S3 gap closure) as manifest case 296."
   - name: TestV6Case2BackendOmitsNetworkEventFromTranscript
-    reason: "legacy v6 corpus case superseded by the versioned v7+ manifest corpus; retained as historical regression coverage, not a release-blocking attack"
+    reason: "OPEN GAP (investigated 2026-07-26, rc6-upg13 S3): no confirmed enrolled replacement test found for this legacy attack; the prior 'superseded by the versioned manifest corpus' claim was unverified and is retracted. See agents/governator-sol-upgrade13-s3-exclusion-audit.md. Same investigation as V6Case1 (sibling attack, same file): the backend-specific 'verdict from Governator's own observation, not the backend's self-report' network property has no confirmed v7+ replacement; only the validator/graph/assayer generalizations exist."
   - name: TestV6Case30LowRiskEffectfulJobStillGetsStrongDescendantContainment
-    reason: "legacy v6 corpus case superseded by the versioned v7+ manifest corpus; retained as historical regression coverage, not a release-blocking attack"
+    reason: "OPEN GAP (investigated 2026-07-26, rc6-upg13 S3): no confirmed enrolled replacement test found for this legacy attack; the prior 'superseded by the versioned manifest corpus' claim was unverified and is retracted. See agents/governator-sol-upgrade13-s3-exclusion-audit.md. No enrolled case confirmed that specifically forces the systemd-run/unshare PATH-starve scenario and reads back containment.Proof to assert a low-risk-but-effectful job still gets a non-degraded descendant-owning scope. TestV7Case1/2 (rejection when containment is entirely unsupported) is adjacent but tests a different condition (no containment infra at all, vs. containment infra present but degraded due to a missing specific primitive)."
   - name: TestV6Case31AssayerLeaseRenewedThroughSlowDownstreamCallPreventsDuplicate
-    reason: "legacy v6 corpus case superseded by the versioned v7+ manifest corpus; retained as historical regression coverage, not a release-blocking attack"
+    reason: "OPEN GAP (investigated 2026-07-26, rc6-upg13 S3): no confirmed enrolled replacement test found for this legacy attack; the prior 'superseded by the versioned manifest corpus' claim was unverified and is retracted. See agents/governator-sol-upgrade13-s3-exclusion-audit.md. Cross-repo pointer test (assertAssayerTestFileContains against tests/test_outbox.py's Sol6OutboxLeaseHeartbeatTests), same class as Attack13/14/16 -- no Go-enrolled equivalent is possible."
   - name: TestV6Case32UnknownOutboxOperationIsDeadLettered
-    reason: "legacy v6 corpus case superseded by the versioned v7+ manifest corpus; retained as historical regression coverage, not a release-blocking attack"
+    reason: "OPEN GAP (investigated 2026-07-26, rc6-upg13 S3): no confirmed enrolled replacement test found for this legacy attack; the prior 'superseded by the versioned manifest corpus' claim was unverified and is retracted. See agents/governator-sol-upgrade13-s3-exclusion-audit.md. Same cross-repo-pointer situation as V6Case31 (tests/test_outbox.py's Sol6OutboxUnknownOperationTests); no Go-enrolled equivalent."
   - name: TestV6Case33AssayerPytestExitsCleanlyOnSupportedPythonVersions
-    reason: "legacy v6 corpus case superseded by the versioned v7+ manifest corpus; retained as historical regression coverage, not a release-blocking attack"
+    status: superseded
+    replacement_tests:
+      - TestV10Case30FullPython3135SuiteExitsCleanly
+    reason: "TestV10Case30's own doc comment states verbatim it is 'Sol10 report case 30 (P1-1): the full test suite printed a passing summary but the process remained alive' -- the identical process-hygiene concern V6Case33 raises (its own doc comment: '184 passed... process remaining alive until externally killed'), now proven with a bounded-deadline process-exit check AND a direct conftest.py clean-shutdown-hook thread-leak assertion, making it host-independent rather than needing the exact original hang to reproduce."
   - name: TestV6Case34ReleaseWithoutRedteamTagIsRejected
-    reason: "legacy v6 corpus case superseded by the versioned v7+ manifest corpus; retained as historical regression coverage, not a release-blocking attack"
+    status: superseded
+    replacement_tests:
+      - TestV7Case33MissingManifestTestBlocksGate
+    reason: "V6Case34 tests the OLD count/command-string-based claims.Verify() mechanism (evidence.redteam.command/test_count fields) that the manifest's own header comment says was explicitly replaced: 'the old count-based MIN_REDTEAM_TESTS/EXPECTED_REDTEAM_SKIPS gate, which validated skip count, not the exact identity/reason of each skip.' TestV7Case33 tests the NEW identity-based redteamgate.Evaluate mechanism this test's underlying concern (an untagged/subset test run masquerading as the full corpus) architecturally moved into. Not a byte-for-byte behavioral match (different verification path entirely), so flagged medium rather than high."
   - name: TestV6Case35ReleaseTestCountBelowMinimumIsRejected
-    reason: "legacy v6 corpus case superseded by the versioned v7+ manifest corpus; retained as historical regression coverage, not a release-blocking attack"
+    status: superseded
+    replacement_tests:
+      - TestV7Case33MissingManifestTestBlocksGate
+      - TestV7Case34SubstitutedSkipAtConstantCountBlocksGate
+    reason: "Same architectural migration as V6Case34: the old claims.redteam.test_count minimum check is superseded by the identity-based gate's exact per-case-name accounting (Case33: names a missing test; Case34: names a wrongly-skipped test even at constant totals) -- structurally a stronger fix for the same underlying worry ('how do we know the full corpus ran'), not the identical check."
   - name: TestV6Case36UntaggedPostV1TagSourcePackagedAsV1IsRejected
-    reason: "legacy v6 corpus case superseded by the versioned v7+ manifest corpus; retained as historical regression coverage, not a release-blocking attack"
+    reason: "OPEN GAP (investigated 2026-07-26, rc6-upg13 S3): no confirmed enrolled replacement test found for this legacy attack; the prior 'superseded by the versioned manifest corpus' claim was unverified and is retracted. See agents/governator-sol-upgrade13-s3-exclusion-audit.md. This is a claims.Verify()-level version/tag provenance check (binary_build_evidence.version vs. nearest reachable git tag), distinct from V6Case34/35's count-based mechanism. TestV11Case49TagRepointedAfterReleaseFailsAuditBundleValidation is adjacent (also about tag/commit provenance) but checks a different tool (audit_bundle_validate.py's tag-vs-source_commit resolution) against a different failure mode (tag moved AFTER a claimed release, not a version string claiming an earlier tag than HEAD's true position). No confirmed direct replacement."
   - name: TestV6Case3ValidatorSetsidDelayedWriterCannotWriteAfterApproval
-    reason: "legacy v6 corpus case superseded by the versioned v7+ manifest corpus; retained as historical regression coverage, not a release-blocking attack"
+    reason: "OPEN GAP (investigated 2026-07-26, rc6-upg13 S3): no confirmed enrolled replacement test found for this legacy attack; the prior 'superseded by the versioned manifest corpus' claim was unverified and is retracted. See agents/governator-sol-upgrade13-s3-exclusion-audit.md. Same 'detached descendant' class as Attack8/V6Case4, but for a plain SUCCESS validator (not cleanup). TestV7Case8 (the confirmed Attack8/V6Case4 replacement) is specifically a CLEANUP validator scenario; TestV7Case5ValidatorExternalWriteBlockedOrContained tests a validator's direct (non-detached) external write, not a detached/delayed grandchild. No case confirmed testing a plain success-validator's detached descendant specifically."
   - name: TestV6Case4CleanupValidatorDetachedChildCannotWriteAfterApproval
-    reason: "legacy v6 corpus case superseded by the versioned v7+ manifest corpus; retained as historical regression coverage, not a release-blocking attack"
+    status: superseded
+    replacement_tests:
+      - TestV7Case8CleanupValidatorDetachedDescendantExtinctionFailureBlocksApproval
+    reason: "Same underlying scenario (a cleanup validator's detached setsid'd descendant must not survive to write after APPROVED) -- V7Case8's own doc comment lists this exact test (v6_s1_network_process_test.go TestV6Case4) as a prior sibling fixture of the same class, then proves a strictly stronger version using a genuinely kernel-unkillable FUSE-blocked descendant instead of a timing-race sleep. NOTE (verified 2026-07-26): same host-dependency caveat as the Attack8 exclusion above -- this replacement is case8_hangfuse_extinction_fixture-conditional, so a host lacking unprivileged FUSE cannot prove this exclusion's coverage either. Intentional, not a defect."
   - name: TestV6Case5GraphProviderDetachedChildCannotWriteAfterApproval
-    reason: "legacy v6 corpus case superseded by the versioned v7+ manifest corpus; retained as historical regression coverage, not a release-blocking attack"
+    reason: "OPEN GAP (investigated 2026-07-26, rc6-upg13 S3): no confirmed enrolled replacement test found for this legacy attack; the prior 'superseded by the versioned manifest corpus' claim was unverified and is retracted. See agents/governator-sol-upgrade13-s3-exclusion-audit.md. Same 'detached descendant' class as V6Case3/4, applied to the graph provider specifically. TestV9Case11/12 (confirmed Attack9 replacement) test the graph provider writing DIRECTLY outside .codegraph or during a read-only op -- not a detached grandchild that outlives the run. No case confirmed testing the graph-provider detached-descendant variant specifically."
   - name: TestV6Case6BashEnvControllerInjectionNeverExecutes
-    reason: "legacy v6 corpus case superseded by the versioned v7+ manifest corpus; retained as historical regression coverage, not a release-blocking attack"
+    reason: "OPEN GAP (investigated 2026-07-26, rc6-upg13 S3): no confirmed enrolled replacement test found for this legacy attack; the prior 'superseded by the versioned manifest corpus' claim was unverified and is retracted. See agents/governator-sol-upgrade13-s3-exclusion-audit.md. Grepped all test files repo-wide for BASH_ENV; only this file uses it. No enrolled v7+ case retests controller-launch environment allowlisting against BASH_ENV injection, even though the underlying controllerenv package (used elsewhere, e.g. v12_s4_frozen_docker_test.go's controllerenv.Freeze()) appears to still exist architecturally."
   - name: TestV6Case7LDPreloadControllerInjectionNeverExecutes
-    reason: "legacy v6 corpus case superseded by the versioned v7+ manifest corpus; retained as historical regression coverage, not a release-blocking attack"
+    reason: "OPEN GAP (investigated 2026-07-26, rc6-upg13 S3): no confirmed enrolled replacement test found for this legacy attack; the prior 'superseded by the versioned manifest corpus' claim was unverified and is retracted. See agents/governator-sol-upgrade13-s3-exclusion-audit.md. Same search as V6Case6; only this file uses LD_PRELOAD. No enrolled replacement found for the LD_PRELOAD-injection-via-controller-launch variant."
   - name: TestV6Case8FakeBashFirstInPathOnFreshHomeIsRejected
-    reason: "legacy v6 corpus case superseded by the versioned v7+ manifest corpus; retained as historical regression coverage, not a release-blocking attack"
+    status: superseded
+    replacement_tests:
+      - TestV9Case5EnrolledBashSwapAfterHandleOpenCannotChangeExecutedBytes
+      - TestV12Case21BashRegistryRotatedAfterRunFreezeHasNoEffect
+      - TestV12Case23ShellCommandStringCannotResolveAmbientTools
+    reason: "Same underlying property as Attack26FakeBash (hostile PATH-first bash must never be trusted over the registry-pinned real bash) -- same replacement reasoning applies: the sealed-handle (V9Case5) and frozen-registry/sealed-PATH (V12Case21/23) mechanisms now cover this same-shaped attack, just via first-enrollment-on-a-fresh-home rather than post-enrollment PATH-shadowing."
   - name: TestV6Case9FakeGitFirstInPathOnFreshHomeIsRejected
-    reason: "legacy v6 corpus case superseded by the versioned v7+ manifest corpus; retained as historical regression coverage, not a release-blocking attack"
+    status: superseded
+    replacement_tests:
+      - TestV9Case4EnrolledGitSwapAfterSessionOpenCannotChangeExecutedBytes
+      - TestV12Case20GitRegistryRotatedAfterRunFreezeHasNoEffect
+    reason: "Same reasoning as V6Case8/Attack10 for git instead of bash: fresh-home-PATH-shadowing is the same class of attack the gitplumb.Session held-descriptor (V9Case4) and frozen-registry (V12Case20) mechanisms close."
   - name: TestV7AssayerVersionTagPointsAtWrongCommitBlocksRelease
-    reason: "companion drift-isolation case for manifest case 37 (assayer tag!=commit); deliberately unenrolled -- isolates the tag-drift branch from the missing-tag branch (v7_s8_assayer_test.go)"
+    reason: "OPEN GAP (investigated 2026-07-26, rc6-upg13 S3): no confirmed enrolled replacement test found for this legacy attack; the prior claim (companion drift-isolation case for manifest case 37) is only half-true. Verified case 37 exists in manifest.yaml cases: (status: implemented) and read both tests: Case37 covers only the MISSING-tag branch of assayer_verify.sh's fail-closed logic; this excluded test's own doc comment explicitly says it 'isolates the drift branch of the same fix from the missing-tag branch TestV7Case37 asserts' and explains it deliberately avoids the TestV7CaseN naming convention purely to dodge the gate's own name-drift detector. So Case37 does NOT cover the wrong-commit-drift branch this test proves -- the exclusion is architectural (avoiding a false name-drift failure), not because the drift property is redundant. See agents/governator-sol-upgrade13-s3-exclusion-audit.md."

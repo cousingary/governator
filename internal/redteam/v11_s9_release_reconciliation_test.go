@@ -112,8 +112,21 @@ func TestV11Case50ProductionManifestSkipOfAnyAttackFailsRelease(t *testing.T) {
 		t.Fatalf("LoadManifest(manifest.yaml): %v", err)
 	}
 
-	const skippedCase = "TestV7Case8CleanupValidatorDetachedDescendantExtinctionFailureBlocksApproval"
-	const skipReason = "case8 hangfuse extinction fixture"
+	// rc6-upg13 S3: this used to be TestV7Case8...BlocksApproval (case 8),
+	// but case 8 is now ALSO cited as the replacement_tests target for two
+	// retired exclusions (Attack8, V6Case4) -- skipping it here would
+	// correctly (not spuriously) also fail their replacement-coverage
+	// check, since a skipped replacement genuinely isn't a proven
+	// passing test for THIS run. That's a real, separate property from
+	// what this test exists to demonstrate, so it now uses a conditional
+	// case with no replacement_tests dependents AND a predicate no other
+	// conditional case shares (git_trusted is shared by V11Case41/43; the
+	// caps-building loop below sets one CapabilityRecord per predicate
+	// across ALL conditional cases, so a shared predicate would have its
+	// intended Absent state overwritten back to Present by the other case
+	// sharing it).
+	const skippedCase = "TestV11Case45FDScanIndeterminatePermissionDeniedFailsClosed"
+	const skipReason = "cannot exercise the permission-denied path on this host"
 
 	var found bool
 	for _, c := range manifest.Cases {
@@ -140,6 +153,33 @@ func TestV11Case50ProductionManifestSkipOfAnyAttackFailsRelease(t *testing.T) {
 			log.WriteString("--- SKIP: " + c.Name + " (0.00s)\n")
 		} else {
 			log.WriteString("--- PASS: " + c.Name + " (0.00s)\n")
+		}
+	}
+	// rc6-upg13 S3 (P1-5): a real `go test -tags redteam` run also executes
+	// every replacement test an exclusion cites -- those are ordinary
+	// redteam-tagged tests in this same package/repo, not synthetic. The
+	// gate now requires each cited replacement to appear as an inventoried
+	// PASS regardless of RequireZeroSkips, so a fixture log built only from
+	// manifest.Cases understates a real run. Add each unique replacement
+	// name once, matching what actually happens when the suite runs.
+	casesByName := make(map[string]bool, len(manifest.Cases))
+	for _, c := range manifest.Cases {
+		casesByName[c.Name] = true
+	}
+	seenReplacement := map[string]bool{}
+	for _, e := range manifest.Exclusions {
+		for _, r := range e.ReplacementTests {
+			// A replacement can itself be a manifest case (e.g. case 8's own
+			// name is cited by two Attack8/V6Case4 exclusions) -- that
+			// name's outcome was already written above, including the
+			// deliberate skippedCase scenario. Re-declaring it here would
+			// silently overwrite that intentional SKIP with a PASS.
+			if casesByName[r] || seenReplacement[r] {
+				continue
+			}
+			seenReplacement[r] = true
+			log.WriteString("=== RUN   " + r + "\n")
+			log.WriteString("--- PASS: " + r + " (0.00s)\n")
 		}
 	}
 

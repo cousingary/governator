@@ -485,7 +485,16 @@ func EvaluateWithOptions(manifest Manifest, log string, capabilities map[string]
 	for _, e := range manifest.Exclusions {
 		for _, replacement := range e.ReplacementTests {
 			outcome, inLog := outcomes[replacement]
-			if !inventory[replacement] || !inLog || outcome.Result != "PASS" {
+			// Requiring inventory[replacement] unconditionally would break
+			// the documented manifest-only backward-compat mode (no
+			// DiscoveredTests supplied) the instant ANY exclusion carries
+			// replacement_tests, regardless of what actually passed in the
+			// log -- res.InventorySupplied already records whether the
+			// stronger P0-2 membership guarantee applies; only enforce it
+			// then. Manifest-only callers still get the real guarantee that
+			// matters without an inventory: the replacement genuinely ran
+			// and passed.
+			if (res.InventorySupplied && !inventory[replacement]) || !inLog || outcome.Result != "PASS" {
 				res.Problems = append(res.Problems, fmt.Sprintf("exclusion %s replacement %s is not an inventoried passing test", e.Name, replacement))
 			}
 		}
