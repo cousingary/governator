@@ -1455,6 +1455,26 @@ cases:
     session: rc5-u12-s8
     required: true
     status: implemented
+  - case: 245
+    name: TestV13Case1RedteamTaggedTestOutsideRedteamDirChangesInvalidatesSourceHash
+    session: rc6-u13-s1
+    required: true
+    status: implemented
+  - case: 246
+    name: TestV13Case2ManifestChangeInvalidatesAttestationBinding
+    session: rc6-u13-s1
+    required: true
+    status: implemented
+  - case: 247
+    name: TestV13Case3CapabilityProbeChangeInvalidatesAttestationBinding
+    session: rc6-u13-s1
+    required: true
+    status: implemented
+  - case: 248
+    name: TestV13Case4CompiledRedteamTestBinaryChangeInvalidatesAttestationBinding
+    session: rc6-u13-s1
+    required: true
+    status: implemented
 
 # Exclusions (Sol12 P0-2): every //go:build redteam-tagged test that is NOT a
 # manifest corpus case must be explicitly classified here with a documented

@@ -63,12 +63,16 @@ type CapabilityAttestation struct {
 	Category string `yaml:"category" json:"category"`
 
 	// Binding: all attestations aggregated for one release must share these
-	// five identities, or they describe different releases and may not be
+	// six identities, or they describe different releases and may not be
 	// combined (report P0-2 "the final release gate may aggregate these
 	// attestations only when all are bound to").
 	GovernatorCommit string `yaml:"governator_commit" json:"governator_commit"`
 	AssayerCommit    string `yaml:"assayer_commit" json:"assayer_commit"`
 	TestSourceHash   string `yaml:"test_source_hash" json:"test_source_hash"`
+	// TestBinarySHA256 is the aggregate SHA-256 over the ordered compiled
+	// red-team test-binary set. It prevents a source-selection or compiler
+	// difference from being hidden behind a matching source hash.
+	TestBinarySHA256 string `yaml:"test_binary_sha256" json:"test_binary_sha256"`
 	ToolchainHash    string `yaml:"toolchain_hash" json:"toolchain_hash"`
 	ReleaseVersion   string `yaml:"release_version" json:"release_version"`
 
@@ -99,7 +103,7 @@ type CapabilityAttestation struct {
 }
 
 // BindingConsistent reports whether every attestation in the set is bound to
-// the same release identity (the same five binding fields), the prerequisite
+// the same release identity (the same six binding fields), the prerequisite
 // for aggregating differently-capable hosts into one release verdict. A
 // mismatched binding means two attestations describe different releases and
 // must not be combined (report P0-2).
@@ -112,10 +116,11 @@ func BindingConsistent(atts []CapabilityAttestation) (bool, string) {
 		if a.GovernatorCommit != base.GovernatorCommit ||
 			a.AssayerCommit != base.AssayerCommit ||
 			a.TestSourceHash != base.TestSourceHash ||
+			a.TestBinarySHA256 != base.TestBinarySHA256 ||
 			a.ToolchainHash != base.ToolchainHash ||
 			a.ReleaseVersion != base.ReleaseVersion {
 			return false, fmt.Sprintf(
-				"attestation %q binding differs from %q (governator/assayer/test-source/toolchain/version must all match)",
+				"attestation %q binding differs from %q (governator/assayer/test-source/test-binary/toolchain/version must all match)",
 				a.Category, base.Category)
 		}
 	}

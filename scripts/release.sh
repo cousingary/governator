@@ -449,85 +449,14 @@ REDTEAM_MANIFEST="internal/redteam/manifest.yaml"
 # host, platform, and timestamp so the evidence is self-describing; the
 # signed per-host capability attestations aggregated at release (Sessions
 # 5/6/9) carry the full evidence_hash/signature on top of this same schema.
-REDTEAM_CAPABILITIES_JSON=$(python3 -c "
-import json, os, platform, shutil, datetime, subprocess
-def env_flag(v): return os.environ.get(v, '') == '1'
-def rec(present, probe, result=''):
-    return {'state': 'present' if present else 'absent', 'probe': probe, 'result': result,
-            'host_identity': platform.node(),
-            'platform': '%s/%s' % (platform.system(), platform.machine()),
-            'timestamp': datetime.datetime.now().isoformat(timespec='seconds')}
-# has_systemd_user auto-detects from the live user bus unless the operator
-# pins it via GOV_REDTEAM_HAS_SYSTEMD_USER (the previous behavior).
-has_su = env_flag('GOV_REDTEAM_HAS_SYSTEMD_USER') or os.path.exists('/run/user/%d/bus' % os.getuid())
-proc1_unreadable = os.path.isdir('/proc/1') and not os.access('/proc/1/fd', os.R_OK)
-# has_docker_daemon (Session 5, Sol12 P0-8/P2): a real \`docker info\` round
-# trip against a live daemon, not merely the CLI binary being on PATH -- this
-# dev host has the docker CLI installed but no running daemon, which is
-# exactly the absent case case 31's real-daemon test needs proven.
-def docker_daemon_reachable():
-    docker_bin = shutil.which('docker')
-    if not docker_bin:
-        return False
-    try:
-        return subprocess.run([docker_bin, 'info'], capture_output=True, timeout=5).returncode == 0
-    except Exception:
-        return False
-has_docker = docker_daemon_reachable()
-print(json.dumps({
-    'linux': rec(platform.system()=='Linux', 'platform.system()', platform.system()),
-    'has_systemd_user': rec(has_su, 'env GOV_REDTEAM_HAS_SYSTEMD_USER or /run/user/<uid>/bus', str(has_su)),
-    # no_systemd_user is the complement of has_systemd_user. Session 2 (P0-1)
-    # made case 12 deterministic, so no manifest case currently references it;
-    # it stays proven here as the honest complement and for any future case
-    # that needs to express 'host genuinely lacks systemd --user'.
-    'no_systemd_user': rec(not has_su, 'complement of has_systemd_user', str(not has_su)),
-    'has_second_uid': rec(env_flag('GOV_REDTEAM_HAS_SECOND_UID'), 'env GOV_REDTEAM_HAS_SECOND_UID'),
-    'has_kernel_landlock_full_abi': rec(env_flag('GOV_REDTEAM_HAS_LANDLOCK_FULL_ABI'), 'env GOV_REDTEAM_HAS_LANDLOCK_FULL_ABI'),
-    # case8's hangfuse extinction fixture: Session 2 (Sol12 P0-1) made this
-    # deterministic -- an explicit pre-extinction readiness gate
-    # (containment.ExtinguishGateForTesting) plus the in-test
-    # hangfuseProbeSurvivesSIGKILL kernel probe replaced the old post-hoc
-    # 'did not reach a blocking READ before its deadline' timing flake. The
-    # remaining skip is now a genuine host CAPABILITY, not a race: a kernel
-    # whose FUSE request wait stays killable (WSL2 among them) cannot
-    # reproduce the unkillable-descendant extinction invariant. The operator
-    # attests via GOV_REDTEAM_CASE8_HANGFUSE=1 that this host's kernel keeps
-    # FUSE-blocked readers alive through SIGKILL, so case 8 runs its real
-    # extinction-timeout assertion instead of authorizing a skip.
-    'case8_hangfuse_extinction_fixture': rec(os.environ.get('GOV_REDTEAM_CASE8_HANGFUSE','0')=='1', 'env GOV_REDTEAM_CASE8_HANGFUSE (operator attests kernel keeps FUSE-blocked readers unkillable)'),
-    'git_trusted': rec(shutil.which('git') is not None, 'shutil.which(git)', shutil.which('git') or ''),
-    'proc1_fd_unreadable': rec(proc1_unreadable, 'os.access(/proc/1/fd, R_OK)', str(proc1_unreadable)),
-    'has_docker_daemon': rec(has_docker, 'docker info (5s timeout)', str(has_docker)),
-    # has_darwin_native_host (Session 6, Sol12 P1-1, Darwin production
-    # support is unproven): true only when this host's own platform is
-    # literally Darwin -- cases 34/35's real native containment/Assayer
-    # acceptance tests are authorized to skip only when this is proven
-    # absent. This dev host is Linux, so it is always absent here.
-    'has_darwin_native_host': rec(platform.system()=='Darwin', 'platform.system()', platform.system()),
-}))
-")
-# Sol12 rc5 Session 1 (P0-2): the authoritative red-team test inventory,
-# discovered from //go:build redteam-tagged source. The gate compares this
-# exact set against the manifest (every inventory test must be a manifest
-# case or a documented exclusion), so an unmanifested V9/V10/V11 attack or a
-# non-versioned security test can no longer disappear from production
-# evidence by failing to match a naming regex.
+REDTEAM_CAPABILITIES_JSON=$(python3 scripts/redteam_capabilities.py)
+# Sol13 rc6 Session 1 (P0-4): this one shared computation supplies the
+# tagged source inventory, source identity, and aggregate compiled-test-binary
+# identity. Directory names are never used to decide which attack source is
+# bound into a capability attestation.
+REDTEAM_SOURCE_IDENTITY="$OUT_DIR/redteam-source-identity.json"
 REDTEAM_INVENTORY="$OUT_DIR/.redteam-inventory.txt"
-python3 -c "
-import re, pathlib
-inv = set()
-for p in pathlib.Path('.').rglob('*_test.go'):
-    try:
-        txt = p.read_text()
-    except Exception:
-        continue
-    if not any(re.match(r'//go:build .*redteam', ln) for ln in txt.splitlines()[:6]):
-        continue
-    for m in re.finditer(r'^func\s+(Test\w+)\s*\(', txt, re.M):
-        inv.add(m.group(1))
-pathlib.Path('$REDTEAM_INVENTORY').write_text('\n'.join(sorted(inv)) + '\n')
-"
+python3 scripts/redteam_source_identity.py --repo-root . --out "$REDTEAM_SOURCE_IDENTITY" --inventory-out "$REDTEAM_INVENTORY"
 # Sol12 P1-3 (rc5 Session 7): REQUIRE_ZERO_SKIPS is already set by the
 # version-derived strictness block above (production versions always get 1,
 # development versions default to 0 but the operator can opt in via
@@ -544,12 +473,13 @@ fi
 ATTESTATIONS_DIR="$OUT_DIR/attestations"
 mkdir -p "$ATTESTATIONS_DIR"
 ASSAYER_COMMIT_ATTEST=$(git -C "${ASSAYER_REPO:-$SOURCE_ROOT/../assayer}" rev-parse HEAD 2>/dev/null || echo "unknown")
-TEST_SOURCE_HASH=$(find . -name '*_test.go' -path '*/redteam/*' -exec sha256sum {} + 2>/dev/null | sort | sha256sum | awk '{print $1}')
+TEST_SOURCE_HASH=$(python3 -c "import json; print(json.load(open('$REDTEAM_SOURCE_IDENTITY'))['test_source_hash'])")
+TEST_BINARY_SHA256=$(python3 -c "import json; print(json.load(open('$REDTEAM_SOURCE_IDENTITY'))['test_binary_sha256'])")
 TOOLCHAIN_HASH=$(go version | sha256sum | awk '{print $1}')
-python3 - "$ATTESTATIONS_DIR" "$COMMIT" "$ASSAYER_COMMIT_ATTEST" "$TEST_SOURCE_HASH" "$TOOLCHAIN_HASH" "$VERSION" "$REDTEAM_LOG" "$REDTEAM_CAPABILITIES_JSON" <<'PYATTEST'
+python3 - "$ATTESTATIONS_DIR" "$COMMIT" "$ASSAYER_COMMIT_ATTEST" "$TEST_SOURCE_HASH" "$TEST_BINARY_SHA256" "$TOOLCHAIN_HASH" "$VERSION" "$REDTEAM_LOG" "$REDTEAM_CAPABILITIES_JSON" <<'PYATTEST'
 import json, os, platform, sys, datetime, re
 
-attest_dir, gov_commit, assayer_commit, test_hash, tool_hash, version, log_path, caps_json = sys.argv[1:9]
+attest_dir, gov_commit, assayer_commit, test_hash, test_binary_hash, tool_hash, version, log_path, caps_json = sys.argv[1:10]
 now = datetime.datetime.now(datetime.timezone.utc).isoformat(timespec='seconds')
 host = platform.node()
 plat = '%s/%s' % (platform.system(), platform.machine())
@@ -568,6 +498,7 @@ def binding():
         'governator_commit': gov_commit,
         'assayer_commit': assayer_commit,
         'test_source_hash': test_hash,
+        'test_binary_sha256': test_binary_hash,
         'toolchain_hash': tool_hash,
         'release_version': version,
     }
@@ -1049,7 +980,7 @@ python3 - "$TEST_SUMMARY" "$COMMIT" "$GO_VERSION" "$BUILD_TS" "$GO_SUM_HASH" \
   "$INTEGRATION_RESULT" "$INTEGRATION_SECONDS" "$INTEGRATION_STARTED" "$INTEGRATION_ENDED" "$INTEGRATION_LOG_SHA" \
   "$CORPUS_RESULT" "$CORPUS_SECONDS" "$CORPUS_STARTED" "$CORPUS_ENDED" "$CORPUS_LOG_SHA" "$CORPUS_TESTS_RUN" "$CORPUS_TESTS_FAILED" \
   "$REDTEAM_RESULT" "$REDTEAM_SECONDS" "$REDTEAM_STARTED" "$REDTEAM_ENDED" "$REDTEAM_LOG_SHA" \
-  "$REDTEAM_TESTS_DISCOVERED" "$REDTEAM_TESTS_RUN" "$REDTEAM_TESTS_SKIPPED" "$REDTEAM_TESTS_FAILED" "$REDTEAM_GATE_OK" "$REDTEAM_GATE_JSON" "$REDTEAM_MANIFEST" \
+  "$REDTEAM_TESTS_DISCOVERED" "$REDTEAM_TESTS_RUN" "$REDTEAM_TESTS_SKIPPED" "$REDTEAM_TESTS_FAILED" "$REDTEAM_GATE_OK" "$REDTEAM_GATE_JSON" "$REDTEAM_MANIFEST" "$REDTEAM_SOURCE_IDENTITY" \
   "$REDTEAM_RACE_RESULT" "$REDTEAM_RACE_SECONDS" "$REDTEAM_RACE_STARTED" "$REDTEAM_RACE_ENDED" "$REDTEAM_RACE_LOG_SHA" \
   "$FUZZ_RESULTS_JSON" "$ASSAYER_RESULT" "$ASSAYER_SUMMARY" "$ASSAYER_MATRIX_JSON" "$ASSAYER_VERSION_TAG_RESULT" "$ASSAYER_VERSION_TAG_SUMMARY" "$GO_TEST_PARALLELISM" <<'PYTESTSUMMARY'
 import json, pathlib, sys
@@ -1060,7 +991,7 @@ import json, pathlib, sys
  integration_result, integration_seconds, integration_started, integration_ended, integration_log_sha,
  corpus_result, corpus_seconds, corpus_started, corpus_ended, corpus_log_sha, corpus_tests_run, corpus_tests_failed,
  redteam_result, redteam_seconds, redteam_started, redteam_ended, redteam_log_sha,
- redteam_tests_discovered, redteam_tests_run, redteam_tests_skipped, redteam_tests_failed, redteam_gate_ok, redteam_gate_json_path, redteam_manifest_path,
+ redteam_tests_discovered, redteam_tests_run, redteam_tests_skipped, redteam_tests_failed, redteam_gate_ok, redteam_gate_json_path, redteam_manifest_path, redteam_source_identity_path,
  redteam_race_result, redteam_race_seconds, redteam_race_started, redteam_race_ended, redteam_race_log_sha,
  fuzz_results_path, assayer_result, assayer_summary, assayer_matrix_path,
  assayer_version_tag_result, assayer_version_tag_summary, go_test_parallelism) = sys.argv[1:]
@@ -1068,6 +999,7 @@ import json, pathlib, sys
 par = f"-p {go_test_parallelism} -parallel {go_test_parallelism}"
 
 redteam_gate = json.loads(pathlib.Path(redteam_gate_json_path).read_text())
+redteam_source_identity = json.loads(pathlib.Path(redteam_source_identity_path).read_text())
 
 fuzz = []
 for line in pathlib.Path(fuzz_results_path).read_text().splitlines():
@@ -1125,6 +1057,7 @@ data = {
             # verdict -- exact missing/unexpected/failed/unexpected-skip test
             # names, not just totals.
             "manifest": redteam_manifest_path,
+            "source_identity": redteam_source_identity,
             "identity_gate": {**redteam_gate, "ok": redteam_gate_ok == "true"},
         },
         "redteam_race": {
