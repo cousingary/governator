@@ -3700,6 +3700,12 @@ func (r *Runner) runOnce(ctx context.Context, c contracts.Contract) (RunRecord, 
 	protectedAfter, perr := protectedFingerprint(transaction.ProtectedPatterns)
 	gitControlAfter, gcerr := gitControlFingerprint(work, env.ToolRegistry)
 	violations := append([]string{}, audit.Violations...)
+	// An unproven Node dependency closure means the backend may execute bytes
+	// that are absent from the transaction identity. This is a production
+	// approval failure, not merely a replay downgrade.
+	if !handle.PathResolution.DependencyClosureProven {
+		violations = append(violations, "NODE_DEPENDENCY_CLOSURE_UNPROVEN: backend dependency closure could not be frozen and hashed; production approval blocked")
+	}
 	violations = appendRuntimePathScanViolation(violations, "after agent execution", work)
 	violations = append(violations, telemetryViolations(c, audit)...)
 	violations = append(violations, effectLedgerViolations(handle)...)

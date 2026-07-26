@@ -480,13 +480,10 @@ func copyMetaHashed(src, dst, relKey string, hasher hash.Hash) error {
 	return nil
 }
 
-// copyTreeHashed recursively copies the dependency tree rooted at src into dst,
-// content-hashing every regular file under relPrefix/<relpath> and recording
-// every symlink's target under relPrefix/<relpath>::SYMLINK (mirroring
-// assay.hashPathTree, so a dependency retargeted at byte-identical content
-// elsewhere still mints a different closure hash). npm's node_modules uses
-// symlinks heavily, so preserving them as-is (not dereferencing into copies)
-// keeps the frozen tree structurally identical to the live one Node resolved.
+// copyTreeHashed recursively copies the dependency tree rooted at src into dst.
+// Symlinks are accepted only when their resolved target remains inside src and
+// can be resolved without a cycle. Escaping and broken links are rejected: a
+// frozen closure must never retain a pointer to mutable storage outside it.
 func copyTreeHashed(src, dst, relPrefix string, hasher hash.Hash) error {
 	return filepath.Walk(src, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
@@ -508,18 +505,86 @@ func copyTreeHashed(src, dst, relPrefix string, hasher hash.Hash) error {
 			if lerr != nil {
 				return lerr
 			}
+			resolved, rerr := filepath.EvalSymlinks(path)
+			if rerr != nil {
+				return fmt.Errorf("resolve symlink %s: %w", path, rerr)
+			}
+			inside, rerr := filepath.Rel(src, resolved)
+			if rerr != nil || inside == ".." || strings.HasPrefix(inside, ".."+string(filepath.Separator)) || filepath.IsAbs(inside) {
+				return fmt.Errorf("symlink %s escapes dependency closure to %s", path, resolved)
+			}
+			objectHash, rerr := hashFrozenNodeObject(resolved, map[string]bool{})
+			if rerr != nil {
+				return fmt.Errorf("hash symlink target %s: %w", path, rerr)
+			}
 			if cerr := copyTreeEnsureParent(target); cerr != nil {
 				return cerr
 			}
-			if lerr := os.Symlink(link, target); lerr != nil {
+			// Absolute links into the source tree would still point at the
+			// mutable source after freezing; rebase them into the copy.
+			frozenLink := link
+			if filepath.IsAbs(link) {
+				frozenLink, rerr = filepath.Rel(filepath.Dir(target), filepath.Join(dst, inside))
+				if rerr != nil {
+					return rerr
+				}
+			}
+			if lerr := os.Symlink(frozenLink, target); lerr != nil {
 				return lerr
 			}
-			fmt.Fprintf(hasher, "%s/%s::SYMLINK::%s\n", relPrefix, rel, link)
+			fmt.Fprintf(hasher, "%s/%s::SYMLINK::%s::TARGET::%s\n", relPrefix, rel, link, objectHash)
 			return nil
 		default:
 			return copyTreeFile(path, target, relPrefix+"/"+rel, hasher)
 		}
 	})
+}
+
+// hashFrozenNodeObject hashes the resolved object behind an internal symlink.
+// Following links here is deliberately cycle-detecting and rejects broken or
+// special files, so the target identity is bound to bytes, not just a link
+// spelling. The normal tree walk also hashes each object at its own path.
+func hashFrozenNodeObject(path string, active map[string]bool) (string, error) {
+	resolved, err := filepath.EvalSymlinks(path)
+	if err != nil {
+		return "", err
+	}
+	if active[resolved] {
+		return "", fmt.Errorf("symlink cycle at %s", path)
+	}
+	active[resolved] = true
+	defer delete(active, resolved)
+	info, err := os.Lstat(resolved)
+	if err != nil {
+		return "", err
+	}
+	sum := sha256.New()
+	if info.IsDir() {
+		entries, err := os.ReadDir(resolved)
+		if err != nil {
+			return "", err
+		}
+		for _, entry := range entries {
+			childHash, err := hashFrozenNodeObject(filepath.Join(resolved, entry.Name()), active)
+			if err != nil {
+				return "", err
+			}
+			fmt.Fprintf(sum, "%s::%s\n", entry.Name(), childHash)
+		}
+		return hex.EncodeToString(sum.Sum(nil)), nil
+	}
+	if !info.Mode().IsRegular() {
+		return "", fmt.Errorf("unsupported symlink target type %s", info.Mode())
+	}
+	f, err := os.Open(resolved)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	if _, err := io.Copy(sum, f); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(sum.Sum(nil)), nil
 }
 
 // copyTreeFile copies one regular dependency file and hashes its content.
