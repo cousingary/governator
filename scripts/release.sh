@@ -468,9 +468,10 @@ if [ "$REQUIRE_ZERO_SKIPS" = 1 ]; then
 fi
 # Sol13 rc6 Session 2: capability evidence is produced only by a real host
 # running `gov attest capability`. This release host never manufactures five
-# category labels from its one local log. S3 will decide whether verified,
-# category-aware remote evidence can satisfy skips; S2 keeps every skip
-# blocking even when an attestation directory is supplied.
+# category labels from its one local log. S3 permits a production skip only
+# when verified remote evidence records that exact test under the manifest's
+# matching capability category; unsigned, relabeled, non-approving, or local
+# capability-absence evidence cannot waive it.
 ATTESTATIONS_DIR="${GOV_ATTESTATIONS_DIR:-}"
 ASSAYER_COMMIT_ATTEST=$(git -C "${ASSAYER_REPO:-$SOURCE_ROOT/../assayer}" rev-parse HEAD 2>/dev/null || echo "unknown")
 TEST_SOURCE_HASH=$(python3 -c "import json; print(json.load(open('$REDTEAM_SOURCE_IDENTITY'))['test_source_hash'])")

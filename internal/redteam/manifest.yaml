@@ -50,6 +50,10 @@
 #                 case is still `required: true` — the gate will (correctly)
 #                 refuse to release while any required case is not passing,
 #                 regardless of this field.
+#   attestation_category
+#               - the sole signed capability-host category that may satisfy a
+#                 production skip for this case. An absent category means the
+#                 test may not be waived by an attestation.
 version: 1
 cases:
   - case: 1
@@ -629,6 +633,7 @@ cases:
     allowed_skip:
       predicate: has_systemd_user
       reason: "no live systemd --user bus on this host"
+    attestation_category: systemd-enabled
     status: implemented
   - case: 115
     name: TestV10Case14RealPIDNamespaceLaunchExecutesExactVerifiedTarget
@@ -1339,6 +1344,7 @@ cases:
     allowed_skip:
       predicate: has_docker_daemon
       reason: "no reachable docker daemon on this host"
+    attestation_category: docker-enabled
     status: implemented
   # Session 6 (P1-1 "Darwin production support is unproven after Linux
   # memfd changes"): internal/assay/snapshot.go and
@@ -1375,6 +1381,7 @@ cases:
     allowed_skip:
       predicate: has_darwin_native_host
       reason: "no Darwin acceptance host available for this run"
+    attestation_category: darwin
     status: implemented
   - case: 230
     name: TestV12Case35DarwinNativeAssayerRefusesRatherThanDegrades
@@ -1384,6 +1391,7 @@ cases:
     allowed_skip:
       predicate: has_darwin_native_host
       reason: "no Darwin acceptance host available for this run"
+    attestation_category: darwin
     status: implemented
   - case: 231
     name: TestV12Case36UnsupportedPlatformRefusedProductionApproval
@@ -1513,6 +1521,46 @@ cases:
   - case: 256
     name: TestV13Case12TestListedAsCoveredWithoutAppearingInSignedLogIsRejected
     session: rc6-u13-s2
+    required: true
+    status: implemented
+  - case: 257
+    name: TestV13Case13DockerCategoryFromHostWithoutDockerIsRejected
+    session: rc6-u13-s3
+    required: true
+    status: implemented
+  - case: 258
+    name: TestV13Case14SystemdCategoryFromHostWithoutSystemdIsRejected
+    session: rc6-u13-s3
+    required: true
+    status: implemented
+  - case: 259
+    name: TestV13Case15FallbackCategoryFromSystemdEnabledExecutionIsRejected
+    session: rc6-u13-s3
+    required: true
+    status: implemented
+  - case: 260
+    name: TestV13Case16EmptyCapabilityMapIsRejected
+    session: rc6-u13-s3
+    required: true
+    status: implemented
+  - case: 261
+    name: TestV13Case17MissingCapabilityProbeIsRejected
+    session: rc6-u13-s3
+    required: true
+    status: implemented
+  - case: 262
+    name: TestV13Case18SameEvidenceRelabeledUnderMultipleCategoriesIsRejected
+    session: rc6-u13-s3
+    required: true
+    status: implemented
+  - case: 263
+    name: TestV13Case19NonApprovingCategoryCannotCoverProductionTest
+    session: rc6-u13-s3
+    required: true
+    status: implemented
+  - case: 264
+    name: TestV13Case20SupersededTestWithoutPassingReplacementIsRejected
+    session: rc6-u13-s3
     required: true
     status: implemented
 

@@ -203,18 +203,18 @@ func BindingConsistent(atts []CapabilityAttestation) (bool, string) {
 }
 
 type AggregationResult struct {
-	OK                     bool            `json:"ok"`
-	Problems               []string        `json:"problems,omitempty"`
-	CoveredTests           map[string]bool `json:"-"`
-	NonApprovingCategories map[string]bool `json:"-"`
-	CategoriesPresent      []string        `json:"categories_present"`
+	OK                     bool                       `json:"ok"`
+	Problems               []string                   `json:"problems,omitempty"`
+	CoverageByCategory     map[string]map[string]bool `json:"-"`
+	NonApprovingCategories map[string]bool            `json:"-"`
+	CategoriesPresent      []string                   `json:"categories_present"`
 }
 
 // AggregateAndVerify accepts only attestations previously loaded through
-// LoadAttestations. S2 deliberately does not use coverage to waive a skip;
-// S3 will add category-aware, capability-proven coverage.
+// LoadAttestations. Coverage deliberately retains its category: a passing
+// core run cannot satisfy a Docker, systemd, or fallback-path requirement.
 func AggregateAndVerify(atts []CapabilityAttestation, requiredCategories []string) AggregationResult {
-	res := AggregationResult{CoveredTests: make(map[string]bool), NonApprovingCategories: make(map[string]bool)}
+	res := AggregationResult{CoverageByCategory: make(map[string]map[string]bool), NonApprovingCategories: make(map[string]bool)}
 	if len(atts) == 0 {
 		res.Problems = append(res.Problems, "no capability attestations supplied")
 		return res
@@ -232,14 +232,28 @@ func AggregateAndVerify(atts []CapabilityAttestation, requiredCategories []strin
 		return res
 	}
 	present := make(map[string]bool)
+	evidenceCategories := make(map[string]string)
 	for _, a := range atts {
+		if err := verifyCategoryCapabilityProof(a); err != nil {
+			res.Problems = append(res.Problems, fmt.Sprintf("attestation %q: %v", a.Category, err))
+			continue
+		}
+		evidenceID := a.HostIdentity + "\x00" + a.RawLogSHA256 + "\x00" + strings.Join(sortedCopy(a.PassedTests), "\x00")
+		if priorCategory, ok := evidenceCategories[evidenceID]; ok && priorCategory != a.Category {
+			res.Problems = append(res.Problems, fmt.Sprintf("attestations %q and %q relabel identical host log and passed-test evidence", priorCategory, a.Category))
+			continue
+		}
+		evidenceCategories[evidenceID] = a.Category
 		present[a.Category] = true
 		res.CategoriesPresent = append(res.CategoriesPresent, a.Category)
 		if a.NonApproving {
 			res.NonApprovingCategories[a.Category] = true
 		}
+		if res.CoverageByCategory[a.Category] == nil {
+			res.CoverageByCategory[a.Category] = make(map[string]bool)
+		}
 		for _, test := range a.PassedTests {
-			res.CoveredTests[test] = true
+			res.CoverageByCategory[a.Category][test] = true
 		}
 	}
 	sort.Strings(res.CategoriesPresent)
@@ -252,15 +266,82 @@ func AggregateAndVerify(atts []CapabilityAttestation, requiredCategories []strin
 	return res
 }
 
-// SkipCoveredByAttestations intentionally does not waive a mandatory skip in
-// S2. Cryptographically valid documents are necessary but not sufficient:
-// S3 supplies the test-to-category and capability-proof relationship.
-func SkipCoveredByAttestations(_ string, _ AggregationResult, capabilities map[string]CapabilityRecord, caseEntry CaseEntry) bool {
-	if caseEntry.Conditional && caseEntry.AllowedSkip != nil && caseEntry.AllowedSkip.Predicate != "" {
-		record, ok := capabilities[caseEntry.AllowedSkip.Predicate]
-		return ok && record.State == CapabilityAbsent
+// SkipCoveredByAttestations accepts a production skip only when the manifest
+// names a category and that exact category's signed, capability-proven host
+// recorded a pass for the exact test. Local absence evidence never replaces a
+// host execution in a zero-skip production release.
+func SkipCoveredByAttestations(test string, aggregation AggregationResult, caseEntry CaseEntry) bool {
+	if caseEntry.AttestationCategory == "" || aggregation.NonApprovingCategories[caseEntry.AttestationCategory] {
+		return false
 	}
-	return false
+	return aggregation.CoverageByCategory[caseEntry.AttestationCategory][test]
+}
+
+func verifyCategoryCapabilityProof(a CapabilityAttestation) error {
+	if a.Category == AttestationCategoryDarwin {
+		if !a.NonApproving {
+			return fmt.Errorf("darwin evidence must be explicitly non-approving")
+		}
+		if platformGOOS(a.Platform) != "darwin" {
+			return fmt.Errorf("darwin category requires a Darwin host, got %q", a.Platform)
+		}
+		return verifyCapabilityRecord(a, "has_darwin_native_host", CapabilityPresent)
+	}
+	if a.NonApproving {
+		return fmt.Errorf("only darwin may be marked non-approving")
+	}
+	switch a.Category {
+	case AttestationCategoryCore:
+		if platformGOOS(a.Platform) != "linux" {
+			return fmt.Errorf("core category requires an approving Linux host, got %q", a.Platform)
+		}
+		return verifyCapabilityRecord(a, "linux", CapabilityPresent)
+	case AttestationCategoryDockerEnabled:
+		return verifyCapabilityRecord(a, "has_docker_daemon", CapabilityPresent)
+	case AttestationCategorySystemdEnabled:
+		return verifyCapabilityRecord(a, "has_systemd_user", CapabilityPresent)
+	case AttestationCategoryFallbackHost:
+		if err := verifyCapabilityRecord(a, "has_systemd_user", CapabilityAbsent); err != nil {
+			return err
+		}
+		return verifyCapabilityRecord(a, "fallback_path_exercised", CapabilityPresent)
+	default:
+		return fmt.Errorf("unknown attestation category")
+	}
+}
+
+func verifyCapabilityRecord(a CapabilityAttestation, name string, expected CapabilityState) error {
+	record, ok := a.Capabilities[name]
+	if !ok {
+		return fmt.Errorf("missing required capability probe %q", name)
+	}
+	if record.State != expected {
+		return fmt.Errorf("capability probe %q is %q, want %q", name, record.State, expected)
+	}
+	if strings.TrimSpace(record.Probe) == "" || strings.TrimSpace(record.Result) == "" {
+		return fmt.Errorf("capability probe %q has no probe or result", name)
+	}
+	if record.HostIdentity != a.HostIdentity || !samePlatform(record.Platform, a.Platform) {
+		return fmt.Errorf("capability probe %q is not bound to attesting host and platform", name)
+	}
+	if _, err := time.Parse(time.RFC3339, record.Timestamp); err != nil {
+		return fmt.Errorf("capability probe %q has invalid timestamp: %w", name, err)
+	}
+	return nil
+}
+
+func platformGOOS(platform string) string {
+	return strings.ToLower(strings.SplitN(platform, "/", 2)[0])
+}
+
+func samePlatform(left, right string) bool {
+	return strings.EqualFold(strings.TrimSpace(left), strings.TrimSpace(right))
+}
+
+func sortedCopy(values []string) []string {
+	copyValues := append([]string(nil), values...)
+	sort.Strings(copyValues)
+	return copyValues
 }
 
 func LoadAttestations(dir string) ([]CapabilityAttestation, error) {

@@ -49,13 +49,14 @@ type Manifest struct {
 // CaseEntry describes one corpus case's identity and release-gating policy.
 // See manifest.yaml's header comment for the full field contract.
 type CaseEntry struct {
-	Case        int          `yaml:"case"`
-	Name        string       `yaml:"name"`
-	Session     string       `yaml:"session"`
-	Required    bool         `yaml:"required"`
-	Conditional bool         `yaml:"conditional"`
-	AllowedSkip *AllowedSkip `yaml:"allowed_skip,omitempty"`
-	Status      string       `yaml:"status,omitempty"`
+	Case                int          `yaml:"case"`
+	Name                string       `yaml:"name"`
+	Session             string       `yaml:"session"`
+	Required            bool         `yaml:"required"`
+	Conditional         bool         `yaml:"conditional"`
+	AllowedSkip         *AllowedSkip `yaml:"allowed_skip,omitempty"`
+	AttestationCategory string       `yaml:"attestation_category,omitempty"`
+	Status              string       `yaml:"status,omitempty"`
 }
 
 // AllowedSkip is the only sanctioned way a required case may be absent from
@@ -66,16 +67,14 @@ type AllowedSkip struct {
 	Reason    string `yaml:"reason"`
 }
 
-// ExclusionEntry is P0-2's "explicitly excluded as non-production with a
-// documented reason": a red-team test discovered in the authoritative
-// inventory that is not a manifest corpus case (a legacy series superseded
-// by the versioned corpus, a companion isolation variant of an enrolled
-// case, or a non-attack helper). A discovered test that is neither a case
-// nor an exclusion is unmanifested drift and blocks the gate; an exclusion
-// without a documented reason fails manifest load.
+// ExclusionEntry is P0-2's explicit classification for an inventoried test
+// outside the corpus. Superseded exclusions name the exact passing replacement
+// tests; non-production helpers may remain excluded with a documented reason.
 type ExclusionEntry struct {
-	Name   string `yaml:"name"`
-	Reason string `yaml:"reason"`
+	Name             string   `yaml:"name"`
+	Status           string   `yaml:"status,omitempty"`
+	ReplacementTests []string `yaml:"replacement_tests,omitempty"`
+	Reason           string   `yaml:"reason"`
 }
 
 // CapabilityState is the proven state of one environment capability. Only
@@ -131,7 +130,8 @@ var KnownPredicates = map[string]bool{
 	// literally darwin -- cases 34/35's real native containment/Assayer
 	// acceptance tests are authorized to skip only when this is proven
 	// absent (every host this project runs on today).
-	"has_darwin_native_host": true,
+	"has_darwin_native_host":  true,
+	"fallback_path_exercised": true,
 }
 
 // allowedStatusValues enumerates the only status: values a manifest case may
@@ -139,6 +139,19 @@ var KnownPredicates = map[string]bool{
 var allowedStatusValues = map[string]bool{
 	"implemented":         true,
 	"not_yet_implemented": true,
+}
+
+var allowedAttestationCategories = map[string]bool{
+	AttestationCategoryCore:           true,
+	AttestationCategorySystemdEnabled: true,
+	AttestationCategoryDockerEnabled:  true,
+	AttestationCategoryFallbackHost:   true,
+	AttestationCategoryDarwin:         true,
+}
+
+var allowedExclusionStatusValues = map[string]bool{
+	"superseded":     true,
+	"non-production": true,
 }
 
 // LoadManifest reads and strictly validates internal/redteam/manifest.yaml
@@ -190,6 +203,9 @@ func validateManifest(m Manifest) error {
 		if c.Status != "" && !allowedStatusValues[c.Status] {
 			return fmt.Errorf("redteamgate: manifest case %d (%s) has unknown status %q", c.Case, c.Name, c.Status)
 		}
+		if c.AttestationCategory != "" && !allowedAttestationCategories[c.AttestationCategory] {
+			return fmt.Errorf("redteamgate: manifest case %d (%s) has unknown attestation category %q", c.Case, c.Name, c.AttestationCategory)
+		}
 		if c.Conditional {
 			if c.AllowedSkip == nil {
 				return fmt.Errorf("redteamgate: manifest case %d (%s) is conditional without an allowed_skip", c.Case, c.Name)
@@ -216,6 +232,12 @@ func validateManifest(m Manifest) error {
 		seenExcl[e.Name] = true
 		if strings.TrimSpace(e.Reason) == "" {
 			return fmt.Errorf("redteamgate: manifest exclusion %s has no documented reason", e.Name)
+		}
+		if e.Status != "" && !allowedExclusionStatusValues[e.Status] {
+			return fmt.Errorf("redteamgate: manifest exclusion %s has unknown status %q", e.Name, e.Status)
+		}
+		if e.Status == "superseded" && len(e.ReplacementTests) == 0 {
+			return fmt.Errorf("redteamgate: superseded exclusion %s has no replacement_tests", e.Name)
 		}
 		// An exclusion must not shadow a real corpus case — that would be a
 		// way to silently retire an attack by reclassifying it as
@@ -325,11 +347,10 @@ type Options struct {
 	// skips stay available only for ordinary development CI runs that
 	// leave this unset.
 	//
-	// Sol12 Session 9: when Attestations are supplied, RequireZeroSkips
-	// means "zero UNCOVERED skips" — a skip is covered if the aggregated
-	// attestation set accounts for it (another host ran it, the platform
-	// is non-approving, or the capability is proven absent making the
-	// scenario inapplicable).
+	// Sol13 Session 3: when Attestations are supplied, RequireZeroSkips
+	// means "zero skips without a category-matched signed host pass". A
+	// non-approving category or local evidence that a capability is absent
+	// never substitutes for an execution on an appropriate host.
 	RequireZeroSkips bool
 
 	// DiscoveredTests is the authoritative inventory of every release-
@@ -356,11 +377,10 @@ type Options struct {
 //     manifest case or a documented exclusion (no unmanifested drift, no
 //     missing expected test) — P0-2;
 //   - zero FailedTests among manifest cases or inventory tests;
-//   - every SKIP is individually authorized: the manifest entry must be
-//     conditional with an allowed_skip whose predicate capability is
-//     explicitly proven ABSENT from the environment (tri-state, P0-3) and
-//     whose reason matches the observed skip text; and under RequireZeroSkips
-//     any skip at all blocks the release;
+//   - every SKIP is individually authorized: development CI requires a
+//     conditional manifest entry whose predicate is explicitly proven ABSENT;
+//     production requires an exact category-matched signed host pass; and
+//     whose reason matches the observed skip text;
 //   - every predicate any manifest case references is proven in the supplied
 //     capability record (present or absent); a missing/unknown predicate is
 //     CAPABILITY_EVIDENCE_INCOMPLETE and blocks the release — P0-3.
@@ -433,7 +453,7 @@ func EvaluateWithOptions(manifest Manifest, log string, capabilities map[string]
 		}
 		if o.Result == "SKIP" {
 			if opts.RequireZeroSkips {
-				if opts.Attestations != nil && SkipCoveredByAttestations(name, *opts.Attestations, capabilities, c) {
+				if opts.Attestations != nil && SkipCoveredByAttestations(name, *opts.Attestations, c) {
 					// Session 9: skip is accounted for by the aggregated
 					// attestation set — not a gap.
 				} else {
@@ -462,6 +482,14 @@ func EvaluateWithOptions(manifest Manifest, log string, capabilities map[string]
 			}
 		}
 	}
+	for _, e := range manifest.Exclusions {
+		for _, replacement := range e.ReplacementTests {
+			outcome, inLog := outcomes[replacement]
+			if !inventory[replacement] || !inLog || outcome.Result != "PASS" {
+				res.Problems = append(res.Problems, fmt.Sprintf("exclusion %s replacement %s is not an inventoried passing test", e.Name, replacement))
+			}
+		}
+	}
 
 	sort.Strings(res.UnexpectedTests)
 	sort.Strings(res.FailedTests)
@@ -473,7 +501,8 @@ func EvaluateWithOptions(manifest Manifest, log string, capabilities map[string]
 		len(res.UnexpectedTests) == 0 &&
 		len(res.FailedTests) == 0 &&
 		len(res.UnexpectedSkips) == 0 &&
-		len(res.IncompleteCapabilities) == 0
+		len(res.IncompleteCapabilities) == 0 &&
+		len(res.Problems) == 0
 
 	if len(res.MissingTests) > 0 {
 		res.Problems = append(res.Problems, fmt.Sprintf("missing required corpus test(s): %s", strings.Join(res.MissingTests, ", ")))

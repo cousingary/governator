@@ -21,7 +21,7 @@ def record(present: bool, probe: str, result: str = "") -> dict[str, str]:
         "probe": probe,
         "result": result,
         "host_identity": platform.node(),
-        "platform": f"{platform.system()}/{platform.machine()}",
+        "platform": f"{platform.system().lower()}/{go_arch()}",
         "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
     }
 
@@ -36,14 +36,27 @@ def docker_daemon_reachable() -> bool:
         return False
 
 
+def go_arch() -> str:
+    return {"x86_64": "amd64", "aarch64": "arm64"}.get(platform.machine().lower(), platform.machine().lower())
+
+
+def systemd_user_reachable() -> bool:
+    if not os.path.exists(f"/run/user/{os.getuid()}/bus"):
+        return False
+    try:
+        return subprocess.run(["systemctl", "--user", "show-environment"], capture_output=True, timeout=5).returncode == 0
+    except OSError:
+        return False
+
+
 def main() -> None:
-    has_systemd_user = env_flag("GOV_REDTEAM_HAS_SYSTEMD_USER") or os.path.exists(f"/run/user/{os.getuid()}/bus")
+    has_systemd_user = systemd_user_reachable()
     proc1_unreadable = os.path.isdir("/proc/1") and not os.access("/proc/1/fd", os.R_OK)
     system = platform.system()
     docker = docker_daemon_reachable()
     print(json.dumps({
         "linux": record(system == "Linux", "platform.system()", system),
-        "has_systemd_user": record(has_systemd_user, "env GOV_REDTEAM_HAS_SYSTEMD_USER or /run/user/<uid>/bus", str(has_systemd_user)),
+        "has_systemd_user": record(has_systemd_user, "systemctl --user show-environment with live /run/user/<uid>/bus (5s timeout)", str(has_systemd_user)),
         "no_systemd_user": record(not has_systemd_user, "complement of has_systemd_user", str(not has_systemd_user)),
         "has_second_uid": record(env_flag("GOV_REDTEAM_HAS_SECOND_UID"), "env GOV_REDTEAM_HAS_SECOND_UID"),
         "has_kernel_landlock_full_abi": record(env_flag("GOV_REDTEAM_HAS_LANDLOCK_FULL_ABI"), "env GOV_REDTEAM_HAS_LANDLOCK_FULL_ABI"),
