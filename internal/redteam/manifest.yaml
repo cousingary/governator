@@ -1663,6 +1663,21 @@ cases:
     session: rc6-u13-s6
     required: true
     status: implemented
+  - case: 286
+    name: TestV13Case286AssayerDependencyHashingFailureQuarantines
+    session: rc6-u13-s7
+    required: true
+    status: implemented
+  - case: 287
+    name: TestV13Case287UnknownDependencyIdentityCannotApprove
+    session: rc6-u13-s7
+    required: true
+    status: implemented
+  - case: 288
+    name: TestV13Case288SourceStringRegressionCannotSubstituteForRuntimeEnforcement
+    session: rc6-u13-s7
+    required: true
+    status: implemented
   - case: 296
     name: TestWaitPIDGoneDoesNotTreatEPERMAsGone
     session: rc6-u13-s3-gap-closure

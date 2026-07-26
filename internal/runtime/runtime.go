@@ -3731,6 +3731,10 @@ func (r *Runner) runOnce(ctx context.Context, c contracts.Contract) (RunRecord, 
 	if !handle.PathResolution.DependencyClosureProven {
 		violations = append(violations, "NODE_DEPENDENCY_CLOSURE_UNPROVEN: backend dependency closure could not be frozen and hashed; production approval blocked")
 	}
+	if assaySnapshot != nil && assaySnapshot.Identity.DependencyUnavailableReason != "" &&
+		!strings.HasPrefix(assaySnapshot.Identity.DependencyUnavailableReason, "no site-packages directory resolved") {
+		violations = append(violations, "ASSAYER_DEPENDENCY_IDENTITY_UNKNOWN: assayer dependency identity could not be resolved ("+assaySnapshot.Identity.DependencyUnavailableReason+"); production approval blocked")
+	}
 	violations = append(violations, legacyValidatorApprovalViolations(c)...)
 	violations = appendRuntimePathScanViolation(violations, "after agent execution", work)
 	violations = append(violations, telemetryViolations(c, audit)...)

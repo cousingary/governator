@@ -285,11 +285,16 @@ func TestV12Case48PerPythonLockedDependencyInstallation(t *testing.T) {
 	}
 }
 
-// TestV12Case49UnknownAssayerDependencyHashDisablesReplay proves that an
-// Assayer snapshot with an unknown dependency identity (DependencyHash empty,
-// DependencyUnavailableReason non-empty) disables strict replay and blocks
-// production approval (Sol12 P1-6). Two different unknown dependency
-// environments must never compare equal.
+// TestV12Case49UnknownAssayerDependencyHashDisablesReplay is a structural
+// documentation check only (Sol12 P1-6). DEMOTED by rc6-upg13 S7: the
+// authoritative proof that unknown dependency identity blocks approval is now
+// the end-to-end runtime test TestV13Case286/287/288 in
+// internal/runtime/v13_s7_dependency_identity_approval_test.go, which forces
+// dependency hashing to fail and proves the run cannot reach APPROVED. This
+// source-string test is retained for manifest continuity (enrolled as V12
+// case 49) but no longer constitutes the primary regression guard -- a
+// source-string assertion cannot distinguish "the code contains the right
+// words" from "the runtime actually enforces the invariant" (Sol13 #44).
 func TestV12Case49UnknownAssayerDependencyHashDisablesReplay(t *testing.T) {
 	repoRoot := s8RepoRoot(t)
 	runtimeGo := filepath.Join(repoRoot, "internal", "runtime", "runtime.go")
