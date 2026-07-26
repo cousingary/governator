@@ -96,13 +96,9 @@ jobs:
         with:
           python-version: '3.13'
 
-      # P1-6 (Sol11 rc5 Session 8): install minisign. release_toolset.py
-      # (run by release.sh) records the exact binary's SHA-256 in
-      # dist/toolset.json -- the authoritative per-release pin. ubuntu-latest's
-      # apt minisign is deterministic for that runner image's ubuntu version;
-      # for a fully immutable digest-pinned builder image, replace this step
-      # with a download verified against a pre-recorded SHA-256 (the toolset
-      # hash check then catches any substitution).
+      # Sol13 P0-2/P1-4: this provisioning step does not make the ambient
+      # package trusted. The reviewed policy check below must match its exact
+      # path and digest before a release can proceed.
       - name: Install Minisign
         run: |
           sudo apt-get update -qq
@@ -122,6 +118,15 @@ jobs:
             fi
             echo "$py: $("$py" -c 'import platform; print(platform.python_version())')"
           done
+
+      - name: Verify reviewed release-tool policy
+        # A GitHub runner whose executables do not exactly match the reviewed
+        # policy fails closed. Updating a tool requires policy review, never
+        # a fresh observed hash supplied by the runner itself.
+        run: |
+          python3 scripts/release_toolset.py \
+            --policy scripts/release_tool_policy.yaml \
+            --out "$RUNNER_TEMP/toolset-preflight.json"
 
       - name: Derive VERSION from the pushed tag
         run: echo "VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"

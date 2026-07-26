@@ -1,14 +1,13 @@
 #!/usr/bin/env python3
 import argparse
 import base64
+import binascii
 import hashlib
 import json
 import os
 import pathlib
 import re
-import shutil
 import stat as stat_mod
-import subprocess
 import sys
 
 
@@ -89,43 +88,128 @@ def sha256_file(path: pathlib.Path) -> str:
     return h.hexdigest()
 
 
-def resolve_minisign(preferred: str) -> tuple[str | None, str]:
-    """Resolves the minisign binary used for verification. --minisign-bin
-    (an absolute, operator-pinned path) takes precedence; otherwise fall
-    back to PATH lookup. Returns (path_or_None, sha256_of_binary_or_"")."""
-    candidates: list[str] = []
-    if preferred:
-        candidates.append(preferred)
-    candidates.append(shutil.which("minisign") or "")
-    for cand in candidates:
-        if cand and pathlib.Path(cand).is_file():
-            return cand, sha256_file(pathlib.Path(cand))
-    return None, ""
+_ED25519_Q = 2**255 - 19
+_ED25519_L = 2**252 + 27742317777372353535851937790883648493
+_ED25519_D = (-121665 * pow(121666, _ED25519_Q - 2, _ED25519_Q)) % _ED25519_Q
+_ED25519_I = pow(2, (_ED25519_Q - 1) // 4, _ED25519_Q)
+
+
+def _ed25519_xrecover(y: int) -> int:
+    xx = (y * y - 1) * pow(_ED25519_D * y * y + 1, _ED25519_Q - 2, _ED25519_Q) % _ED25519_Q
+    x = pow(xx, (_ED25519_Q + 3) // 8, _ED25519_Q)
+    if (x * x - xx) % _ED25519_Q:
+        x = x * _ED25519_I % _ED25519_Q
+    if (x * x - xx) % _ED25519_Q:
+        raise ValueError("invalid Ed25519 point")
+    return x
+
+
+def _ed25519_decode_point(encoded: bytes) -> tuple[int, int]:
+    if len(encoded) != 32:
+        raise ValueError("Ed25519 point must be 32 bytes")
+    value = int.from_bytes(encoded, "little")
+    sign = value >> 255
+    y = value & ((1 << 255) - 1)
+    if y >= _ED25519_Q:
+        raise ValueError("non-canonical Ed25519 point")
+    x = _ed25519_xrecover(y)
+    if x == 0 and sign:
+        raise ValueError("non-canonical Ed25519 point sign")
+    if x & 1 != sign:
+        x = _ED25519_Q - x
+    return x, y
+
+
+def _ed25519_add(left: tuple[int, int], right: tuple[int, int]) -> tuple[int, int]:
+    x1, y1 = left
+    x2, y2 = right
+    denominator_x = pow(1 + _ED25519_D * x1 * x2 * y1 * y2 % _ED25519_Q, _ED25519_Q - 2, _ED25519_Q)
+    denominator_y = pow(1 - _ED25519_D * x1 * x2 * y1 * y2 % _ED25519_Q, _ED25519_Q - 2, _ED25519_Q)
+    return (
+        ((x1 * y2 + x2 * y1) * denominator_x) % _ED25519_Q,
+        ((y1 * y2 + x1 * x2) * denominator_y) % _ED25519_Q,
+    )
+
+
+def _ed25519_scalar_mul(point: tuple[int, int], scalar: int) -> tuple[int, int]:
+    result = (0, 1)
+    while scalar:
+        if scalar & 1:
+            result = _ed25519_add(result, point)
+        point = _ed25519_add(point, point)
+        scalar >>= 1
+    return result
+
+
+def _ed25519_base_point() -> tuple[int, int]:
+    y = 4 * pow(5, _ED25519_Q - 2, _ED25519_Q) % _ED25519_Q
+    x = _ed25519_xrecover(y)
+    # RFC 8032's base point has an even x coordinate. xrecover may choose
+    # the other square root, which is the inverse point (-B).
+    if x & 1:
+        x = _ED25519_Q - x
+    return x, y
+
+
+def verify_ed25519_signature(public_key: bytes, message: bytes, signature: bytes) -> bool:
+    """Verify an Ed25519 signature without executing an external verifier.
+
+    Minisign's primary packet is a standard Ed25519 signature over the exact
+    message bytes. Cofactor multiplication rejects small-order point tricks.
+    """
+    if len(public_key) != 32 or len(signature) != 64:
+        return False
+    try:
+        point_r = _ed25519_decode_point(signature[:32])
+        point_a = _ed25519_decode_point(public_key)
+    except ValueError:
+        return False
+    scalar_s = int.from_bytes(signature[32:], "little")
+    if scalar_s >= _ED25519_L:
+        return False
+    scalar_h = int.from_bytes(hashlib.sha512(signature[:32] + public_key + message).digest(), "little") % _ED25519_L
+    left = _ed25519_scalar_mul(_ed25519_base_point(), scalar_s)
+    right = _ed25519_add(point_r, _ed25519_scalar_mul(point_a, scalar_h))
+    return _ed25519_scalar_mul(left, 8) == _ed25519_scalar_mul(right, 8)
+
+
+def minisign_public_key(pub_path: pathlib.Path) -> tuple[bytes, bytes]:
+    lines = pub_path.read_text().splitlines()
+    for line in lines:
+        line = line.strip()
+        if line and not line.startswith("untrusted"):
+            blob = base64.b64decode(line, validate=True)
+            if len(blob) != 42 or blob[:2] != b"Ed":
+                raise ValueError(f"{pub_path}: unsupported Minisign public-key packet")
+            return blob[2:10], blob[10:]
+    raise ValueError(f"{pub_path}: not a valid minisig public key")
 
 
 def verify_signature_cryptographically(
-    minisign_bin: str, pub_path: pathlib.Path, checksums: pathlib.Path, minisig: pathlib.Path
+    pub_path: pathlib.Path, checksums: pathlib.Path, minisig: pathlib.Path
 ) -> tuple[bool, str]:
-    """Runs `minisign -V -p <pub> -m <checksums> -x <minisig>` -- the real
-    Ed25519 verification over the exact checksums.txt bytes. A syntactically
-    valid .minisig whose signature does not actually cover checksums.txt
-    (a forged packet, a signature over a different file, or checksums.txt
-    modified after signing) fails here. This is the gate Sol11 P0-1 found
-    absent: previously the signer key ID was trusted without ever checking
-    the signature itself."""
-    proc = subprocess.run(
-        [minisign_bin, "-V", "-p", str(pub_path), "-m", str(checksums), "-x", str(minisig)],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-    )
-    if proc.returncode == 0:
-        return True, proc.stdout.strip()
-    detail = proc.stdout.strip()
-    return False, (
-        f"release_policy: cryptographic signature verification FAILED -- minisign -V rejected "
-        f"{minisig} over {checksums} (exit {proc.returncode}){': ' + detail if detail else ''}"
-    )
+    """Verify the Minisign primary packet in-process, never through PATH."""
+    try:
+        lines = minisig.read_text().splitlines()
+        if len(lines) < 2:
+            raise ValueError("signature file has too few lines")
+        packet = base64.b64decode(lines[1].strip(), validate=True)
+        key_id, public_key = minisign_public_key(pub_path)
+        if len(packet) != 74 or packet[:2] not in {b"Ed", b"ED"}:
+            raise ValueError("unsupported Minisign signature packet")
+        if packet[2:10] != key_id:
+            raise ValueError("signature packet key ID does not match pinned public key")
+        message = checksums.read_bytes()
+        # Minisign uses Ed for direct Ed25519 signatures and ED for the
+        # documented BLAKE2b-512-prehashed variant emitted by current tools.
+        if packet[:2] == b"ED":
+            message = hashlib.blake2b(message, digest_size=64).digest()
+        verified = verify_ed25519_signature(public_key, message, packet[10:])
+    except (OSError, ValueError, binascii.Error) as exc:
+        return False, f"release_policy: cryptographic signature verification FAILED -- {exc}"
+    if not verified:
+        return False, "release_policy: cryptographic signature verification FAILED -- in-process Ed25519 verification rejected the packet"
+    return True, ""
 
 
 _CHECKSUM_LINE = re.compile(r"^([0-9a-fA-F]{64})\s+\*?(\S.+?)\s*$")
@@ -269,16 +353,9 @@ def command_signature(argv: list[str]) -> int:
     # alongside it) must appear in this file -- the out-of-band-published
     # trust root, never bundled inside the release archive.
     p.add_argument("--trusted-fingerprints-file", default="")
-    # Sol11 P0-1: the signature gate previously accepted a forged .minisig
-    # because it only checked the signer key ID against this trust root and
-    # never verified the Ed25519 signature over checksums.txt. The three
-    # arguments below close that gap: --checksums is the exact file the
-    # signature must cover; --trusted-public-keys-dir is the release
-    # toolchain's PINNED copy of the verification public key(s), never a key
-    # discovered beside the release; --minisign-bin / --minisign-bin-hash
-    # pin the verifier itself (Sol11: 'The release minisign executable
-    # itself must be pinned by hash'), so a fake minisign on PATH cannot
-    # mint or accept a forged packet.
+    # Sol13 P0-2: verification is in-process. The deprecated verifier flags
+    # remain accepted for compatibility with historical audit fixtures, but
+    # are never executed and cannot affect the cryptographic decision.
     p.add_argument("--checksums", default="")
     p.add_argument("--trusted-public-keys-dir", default="")
     p.add_argument("--artifacts-dir", default="")
@@ -379,23 +456,20 @@ def command_signature(argv: list[str]) -> int:
     # this guards against a future where the dir and trust root drift).
     pub_path = pinned[actual]
 
-    minisign_bin, minisign_sha = resolve_minisign(args.minisign_bin)
-    if minisign_bin is None:
-        print(
-            "release_policy: minisign binary is not available -- a production release cannot be "
-            "cryptographically verified without it (Sol11 P0-1)",
-            file=sys.stderr,
-        )
-        return 1
+    if args.minisign_bin_hash and args.minisign_bin:
+        minisign_path = pathlib.Path(args.minisign_bin)
+        minisign_sha = sha256_file(minisign_path) if minisign_path.is_file() else ""
+    else:
+        minisign_sha = ""
     if args.minisign_bin_hash and args.minisign_bin_hash.lower() != minisign_sha.lower():
         print(
             f"release_policy: minisign binary hash mismatch -- pinned {args.minisign_bin_hash} but "
-            f"{minisign_bin} is {minisign_sha}; refusing to verify with a substituted verifier (Sol11 P0-1)",
+            f"{args.minisign_bin} is {minisign_sha}; refusing stale compatibility verifier metadata",
             file=sys.stderr,
         )
         return 1
 
-    ok, detail = verify_signature_cryptographically(minisign_bin, pub_path, checksums_path, pathlib.Path(args.minisig))
+    ok, detail = verify_signature_cryptographically(pub_path, checksums_path, pathlib.Path(args.minisig))
     if not ok:
         print(detail, file=sys.stderr)
         return 1
@@ -413,17 +487,18 @@ def command_signature(argv: list[str]) -> int:
             return 1
         coverage_verified = True
 
-    # Evidence: bind the verified signer, the pinned verifier, and the
-    # checksum coverage into a single machine-readable record the release
-    # pipeline can attach to build-manifest/test-summary identity.
+    # Evidence: Minisign's signer identity is recorded, while the signature
+    # itself was verified by this process's Ed25519 implementation. An
+    # ambient minisign executable is not part of this verification path.
     print(json.dumps({
         "release_policy": "signature",
         "version": args.version,
         "signer_fingerprint": actual,
         "verification_key": str(pub_path),
-        "minisign_binary": minisign_bin,
-        "minisign_sha256": minisign_sha,
-        "minisign_hash_pinned": bool(args.minisign_bin_hash),
+        "signature_verifier": "in-process-ed25519",
+        "minisign_binary": None,
+        "minisign_sha256": "",
+        "minisign_hash_pinned": False,
         "signature_verified": True,
         "checksum_entries": len(entries),
         "artifacts_dir": args.artifacts_dir,

@@ -52,14 +52,19 @@ anchor), and it is never discovered beside a release or via PATH lookup.
 From that commit forward, `scripts/release_policy.py signature` (wired into
 `scripts/release.sh`) refuses any `REQUIRE_ASYMMETRIC_SIGNATURE=1` release
 whose `checksums.txt.minisig` was not signed by an anchored key, AND
-cryptographically verifies (`minisign -V`) the signature over the exact
-`checksums.txt` bytes using that pinned public key — so a forged packet
+cryptographically verifies the Minisign Ed25519 packet in-process over the
+exact `checksums.txt` bytes using that pinned public key — so a forged packet
 carrying a trusted key ID, a signature over a different file, or checksums
 modified after signing is rejected. See `internal/redteam`'s
 `TestV10Case40ReleaseSignedWithNonproductionUnknownKeyFailsRelease` (rc4,
 unanchored-key refusal) and the `TestV11Case1`..`TestV11Case8` corpus
 (rc5, cryptographic-verification refusals), all run against ephemeral,
 non-production test key pairs.
+
+The Minisign executable used to sign is separately pinned in
+`scripts/release_tool_policy.yaml` with the other six release tools. It is
+not used to verify signatures, so an executable placed first on `PATH` cannot
+approve a forged release packet.
 
 ## 5. Sign releases
 

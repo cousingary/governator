@@ -1,171 +1,209 @@
 #!/usr/bin/env python3
-"""scripts/release_toolset.py -- Sol11 rc5 Session 8 (P1-6): record every
-release tool's absolute path + SHA-256 + version string into toolset.json,
-and print a combined toolset_hash that scripts/release.sh binds into
-build-manifest.json's release identity.
+"""Record and re-verify the independently approved release toolset.
 
-Before this existed, the release pipeline invoked ambient
-go/python3/sha256sum/tar/gzip/minisign/git resolved via PATH. The forged-
-signature result (Sol11 P0-1 / Session 1) demonstrated exactly why a
-substituted tool matters: a fake minisign on PATH could emit a syntactic
-packet and the release accepted it. This script makes every release tool's
-exact binary identity part of the release record: a downstream verifier
-can confirm the release was produced by the exact toolset the manifest
-claims, and a substituted tool (different SHA-256) is visible as a
-toolset_hash mismatch.
-
-Per the report (P1-6): "Run the release in either an immutable, digest-
-pinned builder image, a Nix/Guix-style declared environment, or a verified
-toolchain directory with every executable and dependency hashed. The exact
-release toolset hash must appear in the build manifest." This script
-delivers the verified-toolchain-directory record; the builder-image pinning
-itself is the workflow's responsibility (.github/workflows/release.yml's
-pinned Go/Python/Minisign setup, Session 8 P1-4).
-
-A tool that is not on PATH (e.g. minisign when asymmetric signing is not
-configured) is recorded honestly as absent -- path null, sha256 empty --
-rather than silently omitted. Its absence is itself part of the toolset
-identity this release was produced under.
-
-Usage:
-  release_toolset.py --out <toolset.json> [--tools go,python3,...]
-  Prints the combined toolset_hash to stdout (one line, 64 hex chars).
+The policy is the trust root. This script never resolves a release tool via
+PATH: it hashes only the exact path and digest security-reviewed in
+release_tool_policy.yaml, then records that approved identity beside the
+identity actually observed before the release command runs.
 """
 import argparse
 import hashlib
 import json
-import os
 import pathlib
-import shutil
+import re
 import subprocess
 import sys
 
 
-# The seven ambient executables the Sol11 P1-6 report names. Each is
-# resolved the same way scripts/release.sh resolves it (PATH lookup), then
-# hashed so a substituted binary of the same name is detected.
 DEFAULT_TOOLS = ["go", "python3", "sha256sum", "tar", "gzip", "minisign", "git"]
+SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 
 
 def sha256_file(path: pathlib.Path) -> str:
-    h = hashlib.sha256()
-    with path.open("rb") as f:
-        for chunk in iter(lambda: f.read(65536), b""):
-            h.update(chunk)
-    return h.hexdigest()
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(65536), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
-def tool_version(name: str, resolved: str) -> str:
-    """Best-effort version string for the resolved tool. Never raises --
-    a tool that won't report a version records an empty string, not a
-    crash."""
-    if not resolved:
-        return ""
-    for args in (["--version"], ["version"]):
-        try:
-            out = subprocess.run(
-                [resolved, *args],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                timeout=10,
-                text=True,
-            )
-            if out.returncode == 0 and out.stdout.strip():
-                return out.stdout.strip().splitlines()[0]
-        except (OSError, subprocess.SubprocessError):
+def load_policy(path: pathlib.Path) -> dict[str, dict[str, str]]:
+    """Parse the intentionally small, strict reviewed-policy YAML format."""
+    if not path.is_file():
+        raise ValueError(f"release-tool policy is absent: {path}")
+    tools: dict[str, dict[str, str]] = {}
+    current: str | None = None
+    saw_tools = False
+    for line_number, raw in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+        line = raw.split("#", 1)[0].rstrip()
+        if not line:
             continue
+        if line == "tools:":
+            if saw_tools:
+                raise ValueError(f"{path}:{line_number}: duplicate tools block")
+            saw_tools = True
+            continue
+        tool_match = re.fullmatch(r"  ([a-z0-9][a-z0-9_-]*):", line)
+        if tool_match:
+            if not saw_tools:
+                raise ValueError(f"{path}:{line_number}: tool outside tools block")
+            current = tool_match.group(1)
+            if current in tools:
+                raise ValueError(f"{path}:{line_number}: duplicate tool {current!r}")
+            tools[current] = {}
+            continue
+        field_match = re.fullmatch(r"    (path|sha256): (.+)", line)
+        if field_match and current:
+            field, value = field_match.groups()
+            if field in tools[current]:
+                raise ValueError(f"{path}:{line_number}: duplicate {field} for {current}")
+            tools[current][field] = value
+            continue
+        raise ValueError(f"{path}:{line_number}: unsupported policy syntax")
+    if not saw_tools or not tools:
+        raise ValueError(f"{path}: policy must declare tools")
+    for name, record in tools.items():
+        if set(record) != {"path", "sha256"}:
+            raise ValueError(f"{path}: {name} must declare exactly path and sha256")
+        if not pathlib.PurePath(record["path"]).is_absolute():
+            raise ValueError(f"{path}: {name} path must be absolute")
+        if not SHA256_RE.fullmatch(record["sha256"]):
+            raise ValueError(f"{path}: {name} sha256 must be 64 lowercase hexadecimal characters")
+    return tools
+
+
+def tool_version(path: pathlib.Path) -> str:
+    for args in (("--version",), ("version",)):
+        try:
+            result = subprocess.run(
+                [str(path), *args], stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, timeout=10, check=False,
+            )
+        except OSError:
+            continue
+        if result.returncode == 0 and result.stdout.strip():
+            return result.stdout.strip().splitlines()[0]
     return ""
 
 
-def record_tool(name: str) -> dict:
-    raw = shutil.which(name)
-    if not raw:
-        return {"name": name, "path": None, "sha256": "", "version": ""}
-    resolved = os.path.realpath(raw)
-    path_obj = pathlib.Path(resolved)
-    digest = sha256_file(path_obj) if path_obj.is_file() else ""
+def record_tool(name: str, approved: dict[str, str]) -> dict:
+    path = pathlib.Path(approved["path"])
+    if not path.is_file():
+        raise ValueError(f"{name}: approved path is not a regular file: {path}")
+    observed_hash = sha256_file(path)
+    if observed_hash != approved["sha256"]:
+        raise ValueError(
+            f"{name}: observed SHA-256 {observed_hash} differs from independently approved "
+            f"SHA-256 {approved['sha256']}"
+        )
     return {
         "name": name,
-        "path": resolved,
-        "sha256": digest,
-        "version": tool_version(name, resolved),
+        "approved": {"path": approved["path"], "sha256": approved["sha256"]},
+        "observed": {"path": str(path.resolve()), "sha256": observed_hash, "version": tool_version(path)},
     }
 
 
-def verify_toolset(toolset_path: pathlib.Path) -> int:
-    """Re-hash every tool recorded in a prior toolset.json and confirm none
-    changed. Returns 0 if all match, 1 if any tool's path or SHA-256
-    differs (a mid-attempt substitution). Sol12 P1-4 (rc5 Session 7)."""
-    doc = json.loads(toolset_path.read_text(encoding="utf-8"))
-    mismatches = []
-    for rec in doc.get("tools", []):
-        name = rec["name"]
-        expected_path = rec.get("path")
-        expected_sha = rec.get("sha256", "")
-        if expected_path is None:
-            raw = shutil.which(name)
-            if raw is not None:
-                mismatches.append(f"{name}: was absent at preflight, now resolves to {raw}")
+def selected_tools(value: str) -> list[str]:
+    names = [name.strip() for name in value.split(",") if name.strip()]
+    if not names or len(names) != len(set(names)):
+        raise ValueError("tool names must be nonempty and unique")
+    return names
+
+
+def write_toolset(policy_path: pathlib.Path, out_path: pathlib.Path, names: list[str]) -> str:
+    policy = load_policy(policy_path)
+    missing = [name for name in names if name not in policy]
+    if missing:
+        raise ValueError(f"release-tool policy has no approved entry for: {', '.join(missing)}")
+    records = [record_tool(name, policy[name]) for name in names]
+    canonical = json.dumps(records, sort_keys=True, separators=(",", ":"))
+    toolset_hash = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    document = {
+        "policy_path": str(policy_path.resolve()),
+        "policy_sha256": sha256_file(policy_path),
+        "required_tools": names,
+        "tools": records,
+        "toolset_hash": toolset_hash,
+        "note": "Approved identities come from release_tool_policy.yaml; observed identities must equal them.",
+    }
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(json.dumps(document, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    return toolset_hash
+
+
+def verify_toolset(toolset_path: pathlib.Path, policy_path: pathlib.Path, required_names: list[str]) -> int:
+    try:
+        policy = load_policy(policy_path)
+        document = json.loads(toolset_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        print(f"TOOLSET_VERIFICATION_FAILED: {exc}", file=sys.stderr)
+        return 1
+    mismatches: list[str] = []
+    if document.get("policy_path") != str(policy_path.resolve()):
+        mismatches.append("toolset records a different policy path")
+    if document.get("policy_sha256") != sha256_file(policy_path):
+        mismatches.append("release-tool policy changed after preflight")
+    if document.get("required_tools") != required_names:
+        mismatches.append("toolset required-tools inventory differs from this release command")
+    records = document.get("tools")
+    if not isinstance(records, list):
+        mismatches.append("toolset has no tools list")
+        records = []
+    record_names = []
+    for record in records:
+        if not isinstance(record, dict):
+            mismatches.append("toolset contains a non-object tool record")
             continue
-        if not pathlib.Path(expected_path).is_file():
-            mismatches.append(f"{name}: recorded path {expected_path} no longer exists")
+        name = record.get("name")
+        record_names.append(name)
+        approved = record.get("approved")
+        observed = record.get("observed")
+        if not isinstance(name, str) or name not in policy:
+            mismatches.append(f"unknown or unapproved tool record: {name!r}")
             continue
-        actual_sha = sha256_file(pathlib.Path(expected_path))
-        if actual_sha != expected_sha:
-            mismatches.append(f"{name}: SHA-256 changed ({expected_sha[:12]}... -> {actual_sha[:12]}...)")
+        if approved != policy[name]:
+            mismatches.append(f"{name}: recorded approved identity differs from policy")
+            continue
+        if not isinstance(observed, dict):
+            mismatches.append(f"{name}: missing observed identity")
+            continue
+        path = pathlib.Path(policy[name]["path"])
+        if str(path.resolve()) != observed.get("path"):
+            mismatches.append(f"{name}: observed path differs from approved path")
+            continue
+        if not path.is_file():
+            mismatches.append(f"{name}: approved path no longer exists")
+            continue
+        actual = sha256_file(path)
+        if actual != policy[name]["sha256"] or actual != observed.get("sha256"):
+            mismatches.append(f"{name}: SHA-256 changed or differs from approved identity")
+    if record_names != required_names:
+        mismatches.append("toolset records do not exactly cover the required-tools inventory")
     if mismatches:
-        for m in mismatches:
-            print(f"TOOLSET_VERIFICATION_FAILED: {m}", file=sys.stderr)
+        for mismatch in mismatches:
+            print(f"TOOLSET_VERIFICATION_FAILED: {mismatch}", file=sys.stderr)
         return 1
     return 0
 
 
 def main(argv: list[str]) -> int:
-    p = argparse.ArgumentParser()
-    p.add_argument("--out", help="path to write toolset.json")
-    p.add_argument(
-        "--tools",
-        default=",".join(DEFAULT_TOOLS),
-        help="comma-separated tool names (default: the seven P1-6 tools)",
-    )
-    p.add_argument(
-        "--verify",
-        metavar="TOOLSET_JSON",
-        help="verify a prior toolset.json: re-hash every tool and fail if any changed (Sol12 P1-4)",
-    )
-    args = p.parse_args(argv)
-
-    if args.verify:
-        return verify_toolset(pathlib.Path(args.verify))
-
-    if not args.out:
-        p.error("--out is required when not using --verify")
-
-    tool_names = [t.strip() for t in args.tools.split(",") if t.strip()]
-    records = [record_tool(name) for name in tool_names]
-
-    # Combined hash: sha256 of the sorted concatenation of each present
-    # tool's binary sha256. Sorting makes the hash order-independent; an
-    # absent tool (empty sha256) contributes nothing, so adding/removing
-    # minisign when signing is configured vs not is a visible identity
-    # change only when minisign is actually present in both attempts.
-    present = sorted(r["sha256"] for r in records if r["sha256"])
-    toolset_hash = hashlib.sha256("".join(present).encode()).hexdigest()
-
-    doc = {
-        "tools": records,
-        "toolset_hash": toolset_hash,
-        "note": (
-            "Every release tool's absolute path + SHA-256 + version. A "
-            "substituted binary of the same name (different SHA-256) is "
-            "detected as a toolset_hash mismatch. See Sol11 P1-6."
-        ),
-    }
-    out_path = pathlib.Path(args.out)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    out_path.write_text(json.dumps(doc, indent=2, sort_keys=True) + "\n")
-    print(toolset_hash)
-    return 0
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--policy", required=True, help="reviewed release-tool policy YAML")
+    parser.add_argument("--out", help="path to write toolset.json")
+    parser.add_argument("--tools", default=",".join(DEFAULT_TOOLS), help="comma-separated approved tool names")
+    parser.add_argument("--verify", metavar="TOOLSET_JSON", help="re-hash and compare prior evidence to policy")
+    args = parser.parse_args(argv)
+    policy_path = pathlib.Path(args.policy)
+    try:
+        if args.verify:
+            return verify_toolset(pathlib.Path(args.verify), policy_path, selected_tools(args.tools))
+        if not args.out:
+            parser.error("--out is required when not using --verify")
+        print(write_toolset(policy_path, pathlib.Path(args.out), selected_tools(args.tools)))
+        return 0
+    except ValueError as exc:
+        print(f"TOOLSET_POLICY_FAILED: {exc}", file=sys.stderr)
+        return 1
 
 
 if __name__ == "__main__":

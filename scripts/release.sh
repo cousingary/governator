@@ -19,6 +19,62 @@ set -euo pipefail
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$ROOT"
 
+# Sol13 P0-2/P1-4: the checked-in policy is the independent trust root for
+# every release tool. Parse its deliberately narrow YAML shape using bash
+# builtins, then execute the policy's Python directly to hash every approved
+# object before even asking Git whether the tree is clean. There is no PATH
+# lookup for go, python3, sha256sum, tar, gzip, minisign, or git below.
+RELEASE_TOOL_POLICY=${GOV_RELEASE_TOOL_POLICY:-"$ROOT/scripts/release_tool_policy.yaml"}
+release_tool_value() {
+  local wanted_tool=$1 wanted_field=$2 line active=0
+  while IFS= read -r line || [ -n "$line" ]; do
+    if [ "$line" = "  ${wanted_tool}:" ]; then
+      active=1
+      continue
+    fi
+    if [ "$active" = 1 ] && [ "$line" = "    ${wanted_field}: "* ]; then
+      printf '%s\n' "${line#"    ${wanted_field}: "}"
+      return 0
+    fi
+    if [ "$active" = 1 ] && [ "${line#  }" != "$line" ] && [ "${line#    }" = "$line" ]; then
+      return 1
+    fi
+  done <"$RELEASE_TOOL_POLICY"
+  return 1
+}
+
+for release_tool in go python3 sha256sum tar gzip minisign git; do
+  release_tool_path=$(release_tool_value "$release_tool" path) || {
+    echo "release: approved tool ${release_tool} is absent from ${RELEASE_TOOL_POLICY}" >&2
+    exit 1
+  }
+  case "$release_tool" in
+    go) GO_TOOL=$release_tool_path ;;
+    python3) PYTHON_TOOL=$release_tool_path ;;
+    sha256sum) SHA256SUM_TOOL=$release_tool_path ;;
+    tar) TAR_TOOL=$release_tool_path ;;
+    gzip) GZIP_TOOL=$release_tool_path ;;
+    minisign) MINISIGN_TOOL=$release_tool_path ;;
+    git) GIT_TOOL=$release_tool_path ;;
+  esac
+done
+
+BOOTSTRAP_TOOLSET=$(mktemp)
+if ! "$PYTHON_TOOL" "$ROOT/scripts/release_toolset.py" --policy "$RELEASE_TOOL_POLICY" --out "$BOOTSTRAP_TOOLSET" >/dev/null; then
+  rm -f "$BOOTSTRAP_TOOLSET"
+  echo "release: approved release-tool policy verification failed" >&2
+  exit 1
+fi
+rm -f "$BOOTSTRAP_TOOLSET"
+
+go() { "$GO_TOOL" "$@"; }
+python3() { "$PYTHON_TOOL" "$@"; }
+sha256sum() { "$SHA256SUM_TOOL" "$@"; }
+tar() { "$TAR_TOOL" "$@"; }
+gzip() { "$GZIP_TOOL" "$@"; }
+minisign() { "$MINISIGN_TOOL" "$@"; }
+git() { "$GIT_TOOL" "$@"; }
+
 require_clean_tree() {
   local stage=${1:-release}
   if [ -n "$(git status --porcelain --untracked-files=all)" ]; then
@@ -232,7 +288,7 @@ GO_SUM_HASH=$(sha256sum go.sum | awk '{print $1}')
 # attempt) and moved into place once OUT_DIR is settled.
 # ---------------------------------------------------------------------------
 TOOLSET_JSON_TEMP=$(mktemp)
-TOOLSET_HASH=$(python3 "$ROOT/scripts/release_toolset.py" --out "$TOOLSET_JSON_TEMP")
+TOOLSET_HASH=$(python3 "$ROOT/scripts/release_toolset.py" --policy "$RELEASE_TOOL_POLICY" --out "$TOOLSET_JSON_TEMP")
 
 # ---------------------------------------------------------------------------
 # P1-5 (Sol11): release-attempt state machine identity + resumable
@@ -301,7 +357,7 @@ mv "$TOOLSET_JSON_TEMP" "$OUT_DIR/toolset.json"
 # ---------------------------------------------------------------------------
 python3 "$ROOT/scripts/release_preflight.py" --out "$OUT_DIR/preflight.json" \
   --release-attempt-id "$RELEASE_ATTEMPT_ID" --go-test-parallelism "$GO_TEST_PARALLELISM" \
-  --platforms "$PLATFORMS" >&2
+  --platforms "$PLATFORMS" --go-bin "$GO_TOOL" >&2
 
 TEST_RUN_ID="go-test-${COMMIT}"
 ACCEPTANCE_RUN_ID="version-self-check-${COMMIT}"
@@ -354,7 +410,7 @@ MAIN_TIER_PIPELINE_OK=true
 # preflight (toolset.json creation) and the first tier execution. A same-UID
 # process could swap a tool binary after the hash was recorded; this check
 # catches it before any tier evidence is produced with a different tool.
-if ! python3 "$ROOT/scripts/release_toolset.py" --verify "$OUT_DIR/toolset.json"; then
+if ! python3 "$ROOT/scripts/release_toolset.py" --policy "$RELEASE_TOOL_POLICY" --verify "$OUT_DIR/toolset.json"; then
   echo "release: refusing to run test tiers -- a release tool changed identity since preflight (Sol12 P1-4)" >&2
   exit 1
 fi
@@ -760,7 +816,7 @@ fi
 # substituted between test tiers and the build would produce artifacts whose
 # toolset_hash claim is a lie.
 # ---------------------------------------------------------------------------
-if ! python3 "$ROOT/scripts/release_toolset.py" --verify "$OUT_DIR/toolset.json"; then
+if ! python3 "$ROOT/scripts/release_toolset.py" --policy "$RELEASE_TOOL_POLICY" --verify "$OUT_DIR/toolset.json"; then
   echo "release: refusing to build -- a release tool changed identity since preflight (Sol12 P1-4)" >&2
   exit 1
 fi
@@ -1289,7 +1345,7 @@ rm -f "$ARTIFACTS_JSON"
 # without --artifact/--manifest.
 # ---------------------------------------------------------------------------
 CLAIMS_VERIFY_REPORT="$OUT_DIR/claims-verify-report.txt"
-if ! "$ROOT/scripts/release_verify.sh" --out-dir "$OUT_DIR" --repo "$ROOT" --platform "$HOST_PLATFORM_ID" >"$CLAIMS_VERIFY_REPORT" 2>&1; then
+if ! "$ROOT/scripts/release_verify.sh" --out-dir "$OUT_DIR" --repo "$ROOT" --platform "$HOST_PLATFORM_ID" --python-bin "$PYTHON_TOOL" --tar-bin "$TAR_TOOL" >"$CLAIMS_VERIFY_REPORT" 2>&1; then
   echo "release: full claims verification FAILED — see ${CLAIMS_VERIFY_REPORT}" >&2
   cat "$CLAIMS_VERIFY_REPORT" >&2
   exit 1
@@ -1348,7 +1404,7 @@ HMAC_SIGNATURE="$OUT_DIR/checksums.txt.hmac"
 python3 "$ROOT/scripts/release_hmac_sign.py" --checksums "$CHECKSUMS" --out "$HMAC_SIGNATURE"
 
 MINISIG="$OUT_DIR/checksums.txt.minisig"
-if [ -n "${GOV_RELEASE_MINISIGN_KEY:-}" ] && command -v minisign >/dev/null 2>&1; then
+if [ -n "${GOV_RELEASE_MINISIGN_KEY:-}" ]; then
   if minisign -S -s "$GOV_RELEASE_MINISIGN_KEY" -m "$CHECKSUMS" -x "$MINISIG" -c "gov release ${VERSION} ${COMMIT}" </dev/null >&2; then
     echo "release: signed checksums.txt with minisign (asymmetric, publicly verifiable)" >&2
   else
@@ -1368,24 +1424,17 @@ fi
 #   2. docs/signing_keys/<fp>.pub    -- the release toolchain's PINNED copy
 #      of the Ed25519 verification public key. Its fingerprint must match
 #      root #1. A key ID alone cannot verify a signature; this is the key
-#      minisign -V actually uses.
-#   3. the minisign verifier itself, resolved to an absolute path and
-#      recorded by SHA-256 so a fake minisign on PATH cannot intercept
-#      verification (a forged packet is rejected by minisign -V regardless).
-#      Hash-anchoring against a pre-recorded expected value lands with the
-#      immutable builder image (S8 / P1-6); here the absolute-path pin +
-#      recorded hash is the minimum Sol11 P0-1 asks for.
+#      the in-process Ed25519 verifier actually uses.
+#   3. scripts/release_tool_policy.yaml -- the separately reviewed identity
+#      for every executable used to create the release. The policy's
+#      minisign entry is used only for signing; verification never executes
+#      a Minisign binary, so a fake PATH entry cannot influence the result.
 # A REQUIRE_ASYMMETRIC_SIGNATURE=1 release whose signature does not
 # cryptographically verify over the exact checksums.txt bytes, whose
 # checksums no longer describe the shipped artifacts, or whose verifier
 # was substituted now fails closed here.
 TRUSTED_SIGNING_KEYS_FILE="$SOURCE_ROOT/docs/TRUSTED_SIGNING_KEYS.txt"
 TRUSTED_PUBLIC_KEYS_DIR="$SOURCE_ROOT/docs/signing_keys"
-MINISIGN_BIN=$(command -v minisign || true)
-MINISIGN_BIN_HASH=""
-if [ -n "$MINISIGN_BIN" ]; then
-  MINISIGN_BIN_HASH=$(sha256sum "$MINISIGN_BIN" | awk '{print $1}')
-fi
 python3 "$ROOT/scripts/release_policy.py" signature \
   --version "$VERSION" \
   --require "$REQUIRE_ASYMMETRIC_SIGNATURE" \
@@ -1393,9 +1442,15 @@ python3 "$ROOT/scripts/release_policy.py" signature \
   --trusted-fingerprints-file "$TRUSTED_SIGNING_KEYS_FILE" \
   --checksums "$CHECKSUMS" \
   --trusted-public-keys-dir "$TRUSTED_PUBLIC_KEYS_DIR" \
-  --artifacts-dir "$OUT_DIR" \
-  --minisign-bin "$MINISIGN_BIN" \
-  --minisign-bin-hash "$MINISIGN_BIN_HASH"
+  --artifacts-dir "$OUT_DIR"
+
+# S4 closes the same-UID replacement window through the final release gate.
+# The shipped toolset evidence is valid only if the approved objects still
+# match after signing and in-process verification have completed.
+if ! python3 "$ROOT/scripts/release_toolset.py" --policy "$RELEASE_TOOL_POLICY" --verify "$OUT_DIR/toolset.json"; then
+  echo "release: refusing to complete -- a release tool changed after preflight (Sol13 P0-2/P1-4)" >&2
+  exit 1
+fi
 
 echo "release: OK — $OUT_DIR" >&2
 ls -la "$OUT_DIR" >&2

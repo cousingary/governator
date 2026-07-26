@@ -155,14 +155,17 @@ func TestV12Case39ReleaseToolReplacedAfterPreflightFails(t *testing.T) {
 	}
 
 	toolsetJSON := filepath.Join(tmpDir, "toolset.json")
-	cmd := exec.Command("python3", toolsetPy, "--out", toolsetJSON, "--tools", "faketool")
-	cmd.Env = append(os.Environ(), "PATH="+fakeToolDir+":"+os.Getenv("PATH"))
+	policy := filepath.Join(tmpDir, "tool-policy.yaml")
+	policyBody := "tools:\n  faketool:\n    path: " + fakeTool + "\n    sha256: " + fileSHA256Hex(t, fakeTool) + "\n"
+	if err := os.WriteFile(policy, []byte(policyBody), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command("python3", toolsetPy, "--policy", policy, "--out", toolsetJSON, "--tools", "faketool")
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("release_toolset.py --out: %v\n%s", err, out)
 	}
 
-	verifyCmd := exec.Command("python3", toolsetPy, "--verify", toolsetJSON)
-	verifyCmd.Env = append(os.Environ(), "PATH="+fakeToolDir+":"+os.Getenv("PATH"))
+	verifyCmd := exec.Command("python3", toolsetPy, "--policy", policy, "--tools", "faketool", "--verify", toolsetJSON)
 	if out, err := verifyCmd.CombinedOutput(); err != nil {
 		t.Fatalf("verify of unmodified toolset should pass: %v\n%s", err, out)
 	}
@@ -171,8 +174,7 @@ func TestV12Case39ReleaseToolReplacedAfterPreflightFails(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	verifyCmd2 := exec.Command("python3", toolsetPy, "--verify", toolsetJSON)
-	verifyCmd2.Env = append(os.Environ(), "PATH="+fakeToolDir+":"+os.Getenv("PATH"))
+	verifyCmd2 := exec.Command("python3", toolsetPy, "--policy", policy, "--tools", "faketool", "--verify", toolsetJSON)
 	out2, err2 := verifyCmd2.CombinedOutput()
 	if err2 == nil {
 		t.Fatal("release_toolset.py --verify must FAIL when a tool binary is substituted after preflight (Sol12 P1-4)")

@@ -119,12 +119,13 @@ def main(argv: list[str]) -> int:
     p.add_argument("--release-attempt-id", required=True)
     p.add_argument("--go-test-parallelism", required=True)
     p.add_argument("--platforms", required=True)
+    p.add_argument("--go-bin", required=True, help="approved Go executable from release-tool policy")
     args = p.parse_args(argv)
 
     disk, mem = disk_and_mem()
     docker, systemd = docker_systemd_state()
     uname, is_wsl = kernel_wsl()
-    go_version = run_ok(["go", "version"])
+    go_version = run_ok([args.go_bin, "version"])
     python_version = platform.python_version()
 
     data = {

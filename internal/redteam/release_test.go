@@ -113,7 +113,15 @@ func TestAttack26DirtyReleaseBinaryReportsAContradictoryRelease(t *testing.T) {
 func runReleaseVerify(t *testing.T, distDir, repoRoot, platform string) (string, error) {
 	t.Helper()
 	script := releaseVerifyScript(t)
-	cmd := exec.Command(script, "--out-dir", distDir, "--repo", repoRoot, "--platform", platform, "--gov-bin", govBinary(t))
+	pythonBin, err := exec.LookPath("python3")
+	if err != nil {
+		t.Fatal(err)
+	}
+	tarBin, err := exec.LookPath("tar")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command(script, "--out-dir", distDir, "--repo", repoRoot, "--platform", platform, "--python-bin", pythonBin, "--tar-bin", tarBin, "--gov-bin", govBinary(t))
 	out, err := cmd.CombinedOutput()
 	return string(out), err
 }

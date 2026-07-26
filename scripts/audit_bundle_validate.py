@@ -24,7 +24,7 @@ error naming exactly what is missing -- never a silent "OK".
 Usage:
   audit_bundle_validate.py --dist-dir DIR --repo REPO --release-commit SHA
     [--architecture-doc PATH] [--trusted-fingerprints-file FILE]
-    [--trusted-public-keys-dir DIR] [--minisign-bin PATH]
+    [--trusted-public-keys-dir DIR]
 """
 import argparse
 import gzip
@@ -32,7 +32,6 @@ import hashlib
 import json
 import pathlib
 import re
-import shutil
 import subprocess
 import sys
 
@@ -87,7 +86,6 @@ def main(argv: list[str]) -> int:
     p.add_argument("--architecture-doc", default=None)
     p.add_argument("--trusted-fingerprints-file", default=None)
     p.add_argument("--trusted-public-keys-dir", default=None)
-    p.add_argument("--minisign-bin", default=None)
     args = p.parse_args(argv)
 
     dist = pathlib.Path(args.dist_dir)
@@ -213,10 +211,6 @@ def main(argv: list[str]) -> int:
     # Cryptographic signature verification -- reuse Session 1's machinery
     # rather than reinventing it (release_policy.py signature).
     if args.trusted_fingerprints_file and args.trusted_public_keys_dir:
-        minisign_bin = args.minisign_bin or shutil.which("minisign") or ""
-        minisign_hash = ""
-        if minisign_bin and pathlib.Path(minisign_bin).is_file():
-            minisign_hash = hashlib.sha256(pathlib.Path(minisign_bin).read_bytes()).hexdigest()
         version = manifest.get("version", "")
         cmd = [
             sys.executable, str(pathlib.Path(__file__).parent / "release_policy.py"), "signature",
@@ -226,8 +220,6 @@ def main(argv: list[str]) -> int:
             "--checksums", str(dist / "checksums.txt"),
             "--trusted-public-keys-dir", args.trusted_public_keys_dir,
             "--artifacts-dir", str(dist),
-            "--minisign-bin", minisign_bin,
-            "--minisign-bin-hash", minisign_hash,
         ]
         proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
         if proc.returncode != 0:

@@ -1563,6 +1563,41 @@ cases:
     session: rc6-u13-s3
     required: true
     status: implemented
+  - case: 266
+    name: TestV13Case21FakeMinisignReturningSuccessIsRejected
+    session: rc6-u13-s4
+    required: true
+    status: implemented
+  - case: 267
+    name: TestV13Case22FakeMinisignBlessingItsOwnHashIsRejected
+    session: rc6-u13-s4
+    required: true
+    status: implemented
+  - case: 268
+    name: TestV13Case23ForgedSignatureWithTrustedKeyIDIsRejected
+    session: rc6-u13-s4
+    required: true
+    status: implemented
+  - case: 269
+    name: TestV13Case24VerifierHashDifferingFromIndependentPolicyIsRejected
+    session: rc6-u13-s4
+    required: true
+    status: implemented
+  - case: 270
+    name: TestV13Case25ReleaseToolChangedAfterPreflightIsRejected
+    session: rc6-u13-s4
+    required: true
+    status: implemented
+  - case: 271
+    name: TestV13Case26AbsentApprovedToolsetPolicyIsRejected
+    session: rc6-u13-s4
+    required: true
+    status: implemented
+  - case: 272
+    name: TestV13Case27ObservedAndApprovedToolHashesDifferIsRejected
+    session: rc6-u13-s4
+    required: true
+    status: implemented
   - case: 296
     name: TestWaitPIDGoneDoesNotTreatEPERMAsGone
     session: rc6-u13-s3-gap-closure

@@ -13,7 +13,7 @@
 # commit drifts from the manifest) and assert this script refuses both.
 #
 # Usage:
-#   scripts/release_verify.sh --out-dir <dir> --repo <repo-root> --platform <platform_id> [--gov-bin <path>]
+#   scripts/release_verify.sh --out-dir <dir> --repo <repo-root> --platform <platform_id> --python-bin <path> --tar-bin <path> [--gov-bin <path>]
 #
 # --out-dir   the release staging directory (release.sh's $OUT_DIR / "dist"):
 #             must already contain claims.yaml, build-manifest.json, and
@@ -25,6 +25,8 @@
 # --platform  the platform id (e.g. linux_amd64) whose archive to extract
 #             and verify -- normally the host platform, since that is the
 #             only archive release.sh's acceptance smoke test can execute.
+# --python-bin and --tar-bin are the exact approved executables selected by
+#             release_tool_policy.yaml; this verifier never looks them up.
 # --gov-bin   OPTIONAL. Which `gov` binary runs `claims verify`. Defaults to
 #             the just-extracted artifact itself (self-hosting: the shipped
 #             binary proves it can verify its own release, which is the real
@@ -34,7 +36,7 @@
 set -euo pipefail
 
 usage() {
-  echo "usage: $0 --out-dir <dir> --repo <repo-root> --platform <platform_id> [--gov-bin <path>]" >&2
+  echo "usage: $0 --out-dir <dir> --repo <repo-root> --platform <platform_id> --python-bin <path> --tar-bin <path> [--gov-bin <path>]" >&2
   exit 2
 }
 
@@ -42,6 +44,8 @@ OUT_DIR=""
 REPO=""
 PLATFORM=""
 GOV_BIN_OVERRIDE=""
+PYTHON_BIN=""
+TAR_BIN=""
 while [ $# -gt 0 ]; do
   case "$1" in
   --out-dir)
@@ -60,19 +64,27 @@ while [ $# -gt 0 ]; do
     GOV_BIN_OVERRIDE=$2
     shift 2
     ;;
+  --python-bin)
+    PYTHON_BIN=$2
+    shift 2
+    ;;
+  --tar-bin)
+    TAR_BIN=$2
+    shift 2
+    ;;
   *)
     usage
     ;;
   esac
 done
-[ -n "$OUT_DIR" ] && [ -n "$REPO" ] && [ -n "$PLATFORM" ] || usage
+[ -n "$OUT_DIR" ] && [ -n "$REPO" ] && [ -n "$PLATFORM" ] && [ -n "$PYTHON_BIN" ] && [ -n "$TAR_BIN" ] || usage
 
 MANIFEST="$OUT_DIR/build-manifest.json"
 CLAIMS_FILE="$OUT_DIR/claims.yaml"
 [ -f "$MANIFEST" ] || { echo "release_verify: $MANIFEST not found" >&2; exit 1; }
 [ -f "$CLAIMS_FILE" ] || { echo "release_verify: $CLAIMS_FILE not found" >&2; exit 1; }
 
-VERSION=$(python3 -c "import json; print(json.load(open('$MANIFEST'))['version'])")
+VERSION=$("$PYTHON_BIN" -c "import json; print(json.load(open('$MANIFEST'))['version'])")
 ARCHIVE="$OUT_DIR/gov_${VERSION}_${PLATFORM}.tar.gz"
 [ -f "$ARCHIVE" ] || { echo "release_verify: $ARCHIVE not found" >&2; exit 1; }
 
@@ -86,7 +98,7 @@ trap 'rm -rf "$EXTRACT_DIR"' EXIT
 # happens to run this script. -p makes extraction reproduce the archived
 # mode bit-for-bit, so the mode assertion is deterministic regardless of the
 # caller's environment.
-tar -xzf "$ARCHIVE" -C "$EXTRACT_DIR" -p
+"$TAR_BIN" -xzf "$ARCHIVE" -C "$EXTRACT_DIR" -p
 EXTRACTED_BIN="$EXTRACT_DIR/gov"
 [ -f "$EXTRACTED_BIN" ] || { echo "release_verify: archive $ARCHIVE does not contain a 'gov' binary" >&2; exit 1; }
 
