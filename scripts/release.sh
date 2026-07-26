@@ -466,72 +466,24 @@ REDTEAM_GATE_EXTRA_ARGS=()
 if [ "$REQUIRE_ZERO_SKIPS" = 1 ]; then
   REDTEAM_GATE_EXTRA_ARGS+=(--require-zero-skips)
 fi
-# Sol12 Session 9: capability-host attestation aggregation. Produce signed
-# attestations for every category this host can prove, then pass them to the
-# gate so --require-zero-skips means "zero UNCOVERED skips" (a skip accounted
-# for by the attestation set is not a gap).
-ATTESTATIONS_DIR="$OUT_DIR/attestations"
-mkdir -p "$ATTESTATIONS_DIR"
+# Sol13 rc6 Session 2: capability evidence is produced only by a real host
+# running `gov attest capability`. This release host never manufactures five
+# category labels from its one local log. S3 will decide whether verified,
+# category-aware remote evidence can satisfy skips; S2 keeps every skip
+# blocking even when an attestation directory is supplied.
+ATTESTATIONS_DIR="${GOV_ATTESTATIONS_DIR:-}"
 ASSAYER_COMMIT_ATTEST=$(git -C "${ASSAYER_REPO:-$SOURCE_ROOT/../assayer}" rev-parse HEAD 2>/dev/null || echo "unknown")
 TEST_SOURCE_HASH=$(python3 -c "import json; print(json.load(open('$REDTEAM_SOURCE_IDENTITY'))['test_source_hash'])")
 TEST_BINARY_SHA256=$(python3 -c "import json; print(json.load(open('$REDTEAM_SOURCE_IDENTITY'))['test_binary_sha256'])")
 TOOLCHAIN_HASH=$(go version | sha256sum | awk '{print $1}')
-python3 - "$ATTESTATIONS_DIR" "$COMMIT" "$ASSAYER_COMMIT_ATTEST" "$TEST_SOURCE_HASH" "$TEST_BINARY_SHA256" "$TOOLCHAIN_HASH" "$VERSION" "$REDTEAM_LOG" "$REDTEAM_CAPABILITIES_JSON" <<'PYATTEST'
-import json, os, platform, sys, datetime, re
-
-attest_dir, gov_commit, assayer_commit, test_hash, test_binary_hash, tool_hash, version, log_path, caps_json = sys.argv[1:10]
-now = datetime.datetime.now(datetime.timezone.utc).isoformat(timespec='seconds')
-host = platform.node()
-plat = '%s/%s' % (platform.system(), platform.machine())
-
-caps = json.loads(open(caps_json).read()) if os.path.isfile(caps_json) else {}
-
-passed = set()
-if os.path.isfile(log_path):
-    for line in open(log_path):
-        m = re.match(r'^--- PASS: (\S+)', line)
-        if m:
-            passed.add(m.group(1))
-
-def binding():
-    return {
-        'governator_commit': gov_commit,
-        'assayer_commit': assayer_commit,
-        'test_source_hash': test_hash,
-        'test_binary_sha256': test_binary_hash,
-        'toolchain_hash': tool_hash,
-        'release_version': version,
-    }
-
-def write_attest(category, covered, non_approving=False, extra_caps=None):
-    a = {
-        'category': category,
-        **binding(),
-        'host_identity': host,
-        'platform': plat,
-        'capabilities': extra_caps or caps,
-        'covered_tests': sorted(covered),
-        'non_approving': non_approving,
-        'timestamp': now,
-    }
-    path = os.path.join(attest_dir, f'{category}.json')
-    with open(path, 'w') as f:
-        json.dump(a, f, indent=2, sort_keys=True)
-        f.write('\n')
-
-write_attest('core', passed)
-write_attest('systemd-enabled', passed)
-write_attest('fallback-path', passed)
-
-has_docker = caps.get('has_docker_daemon', {}).get('state') == 'present'
-if has_docker:
-    write_attest('docker-enabled', passed)
-else:
-    write_attest('docker-enabled', passed, non_approving=False)
-
-write_attest('darwin', set(), non_approving=True)
-PYATTEST
-REDTEAM_GATE_EXTRA_ARGS+=(--attestations "$ATTESTATIONS_DIR")
+if [ -n "$ATTESTATIONS_DIR" ]; then
+  if [ ! -d "$ATTESTATIONS_DIR" ]; then
+    echo "release: GOV_ATTESTATIONS_DIR is not a directory: $ATTESTATIONS_DIR" >&2
+    exit 1
+  fi
+  RELEASE_ATTESTATION_TIME=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  REDTEAM_GATE_EXTRA_ARGS+=(--attestations "$ATTESTATIONS_DIR" --attestation-governator-commit "$COMMIT" --attestation-assayer-commit "$ASSAYER_COMMIT_ATTEST" --attestation-release-version "$VERSION" --attestation-source-identity "$REDTEAM_SOURCE_IDENTITY" --attestation-toolchain-hash "$TOOLCHAIN_HASH" --attestation-release-time "$RELEASE_ATTESTATION_TIME" --attestation-max-age "24h")
+fi
 REDTEAM_GATE_JSON="$OUT_DIR/.redteam-gate.json"
 if go run ./cmd/gov redteam-gate verify --manifest "$REDTEAM_MANIFEST" --log "$REDTEAM_LOG" --capabilities "$REDTEAM_CAPABILITIES_JSON" --inventory "$REDTEAM_INVENTORY" "${REDTEAM_GATE_EXTRA_ARGS[@]}" >"$REDTEAM_GATE_JSON" 2>"$OUT_DIR/.redteam-gate.stderr"; then
   REDTEAM_GATE_OK=true

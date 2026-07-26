@@ -3,6 +3,8 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/ed25519"
+	"crypto/rand"
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
@@ -11,6 +13,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"runtime/debug"
@@ -76,6 +79,13 @@ func run(args []string) int {
 	// resilient — the launching job already validated config) skip the guard.
 	switch args[0] {
 	case "init", "validate", "version", "--version", "-version", "help", "--help", "-h", "hook", "tools":
+	case "attest":
+		if len(args) > 1 && args[1] == "capability" {
+			break
+		}
+		if code := guardConfig(); code != 0 {
+			return code
+		}
 	default:
 		if code := guardConfig(); code != 0 {
 			return code
@@ -392,6 +402,9 @@ func run(args []string) int {
 	case "containment":
 		return containmentCmd(args[1:])
 	case "attest":
+		if len(args) > 1 && args[1] == "capability" {
+			return capabilityAttestCmd(args[1:])
+		}
 		return attestCmd(args[1:])
 	case "cleanup":
 		return cleanupCmd(args[1:])
@@ -2028,6 +2041,167 @@ func claimsCmd(args []string) int {
 	return exit
 }
 
+type attestationSourceIdentity struct {
+	TestSourceHash   string `json:"test_source_hash"`
+	TestBinarySHA256 string `json:"test_binary_sha256"`
+}
+
+// attestCmd runs a capability host's exact command itself, captures its raw
+// output, and signs the resulting evidence. It never accepts a caller-provided
+// result list, which prevents a host from signing a list detached from its log.
+func capabilityAttestCmd(args []string) int {
+	usage := "usage: gov attest capability --category <category> --out <attestation.json> --private-key-file <path> --capabilities <path> --probe-implementation-version <version> --source-identity <path> --governator-commit <commit> --assayer-commit <commit> --release-version <version> -- [test command ...]"
+	if len(args) < 1 || args[0] != "capability" {
+		return bad(usage)
+	}
+	values := map[string]string{}
+	var command []string
+	for rest := args[1:]; len(rest) > 0; {
+		if rest[0] == "--" {
+			command = rest[1:]
+			break
+		}
+		if len(rest) < 2 || !strings.HasPrefix(rest[0], "--") {
+			return bad(usage)
+		}
+		switch rest[0] {
+		case "--category", "--out", "--private-key-file", "--capabilities", "--probe-implementation-version", "--source-identity", "--governator-commit", "--assayer-commit", "--release-version", "--host-identity", "--kernel":
+			values[rest[0]] = rest[1]
+			rest = rest[2:]
+		default:
+			return bad(usage)
+		}
+	}
+	for _, required := range []string{"--category", "--out", "--private-key-file", "--capabilities", "--probe-implementation-version", "--source-identity", "--governator-commit", "--assayer-commit", "--release-version"} {
+		if values[required] == "" {
+			return bad(usage)
+		}
+	}
+	if len(command) == 0 {
+		return bad(usage)
+	}
+	privateKeyText, err := os.ReadFile(values["--private-key-file"])
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "attest:", err)
+		return 1
+	}
+	privateKey, err := redteamgate.ParseEd25519PrivateKey(string(privateKeyText))
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "attest:", err)
+		return 1
+	}
+	capabilityData, err := os.ReadFile(values["--capabilities"])
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "attest:", err)
+		return 1
+	}
+	capabilities := map[string]redteamgate.CapabilityRecord{}
+	if err := json.Unmarshal(capabilityData, &capabilities); err != nil {
+		fmt.Fprintln(os.Stderr, "attest: capabilities:", err)
+		return 1
+	}
+	identityData, err := os.ReadFile(values["--source-identity"])
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "attest:", err)
+		return 1
+	}
+	var identity attestationSourceIdentity
+	if err := json.Unmarshal(identityData, &identity); err != nil || identity.TestSourceHash == "" || identity.TestBinarySHA256 == "" {
+		fmt.Fprintln(os.Stderr, "attest: source identity must contain test_source_hash and test_binary_sha256")
+		return 1
+	}
+	host, err := os.Hostname()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "attest:", err)
+		return 1
+	}
+	if values["--host-identity"] != "" {
+		host = values["--host-identity"]
+	}
+	kernel := values["--kernel"]
+	if kernel == "" {
+		if output, err := exec.Command("uname", "-r").Output(); err == nil { // govratchet:exec-allow(release_tooling)
+			kernel = strings.TrimSpace(string(output))
+		}
+	}
+	if kernel == "" {
+		kernel = runtime.GOOS
+	}
+	toolchainOutput, err := exec.Command("go", "version").Output() // govratchet:exec-allow(release_tooling)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "attest: could not identify the Go toolchain used by the red-team command:", err)
+		return 1
+	}
+	started := time.Now().UTC()
+	output, commandErr := exec.Command(command[0], command[1:]...).CombinedOutput() // govratchet:exec-allow(release_tooling)
+	completed := time.Now().UTC()
+	passed, skipped, failed := redteamgate.AttestationResultsFromLog(string(output))
+	if len(passed)+len(skipped)+len(failed) == 0 {
+		fmt.Fprintln(os.Stderr, "attest: test command did not emit any Go test results")
+		return 1
+	}
+	logHash := sha256.Sum256(output)
+	identifier := make([]byte, 16)
+	if _, err := rand.Read(identifier); err != nil {
+		fmt.Fprintln(os.Stderr, "attest:", err)
+		return 1
+	}
+	attestation := redteamgate.CapabilityAttestation{
+		AttestationID:              hex.EncodeToString(identifier),
+		Category:                   values["--category"],
+		HostIdentity:               host,
+		Platform:                   runtime.GOOS + "/" + runtime.GOARCH,
+		Kernel:                     kernel,
+		Capabilities:               capabilities,
+		ProbeImplementationVersion: values["--probe-implementation-version"],
+		GovernatorCommit:           values["--governator-commit"],
+		AssayerCommit:              values["--assayer-commit"],
+		ReleaseVersion:             values["--release-version"],
+		TestSourceHash:             identity.TestSourceHash,
+		TestBinarySHA256:           identity.TestBinarySHA256,
+		ToolchainHash:              sha256Hex(toolchainOutput),
+		TestCommand:                command,
+		PassedTests:                passed,
+		SkippedTests:               skipped,
+		FailedTests:                failed,
+		RawLogSHA256:               hex.EncodeToString(logHash[:]),
+		StartedAt:                  started.Format(time.RFC3339),
+		CompletedAt:                completed.Format(time.RFC3339),
+		SigningKeyID:               redteamgate.SigningKeyID(privateKey.Public().(ed25519.PublicKey)),
+	}
+	if err := redteamgate.SignCapabilityAttestation(&attestation, privateKey); err != nil {
+		fmt.Fprintln(os.Stderr, "attest:", err)
+		return 1
+	}
+	serialized, err := json.MarshalIndent(attestation, "", "  ")
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "attest:", err)
+		return 1
+	}
+	if err := os.MkdirAll(filepath.Dir(values["--out"]), 0o755); err != nil {
+		fmt.Fprintln(os.Stderr, "attest:", err)
+		return 1
+	}
+	if err := os.WriteFile(values["--out"]+".log", output, 0o644); err != nil {
+		fmt.Fprintln(os.Stderr, "attest:", err)
+		return 1
+	}
+	if err := os.WriteFile(values["--out"], append(serialized, '\n'), 0o644); err != nil {
+		fmt.Fprintln(os.Stderr, "attest:", err)
+		return 1
+	}
+	if commandErr != nil {
+		fmt.Fprintln(os.Stderr, "attest: test command failed:", commandErr)
+		return 1
+	}
+	return 0
+}
+
+func sha256Hex(data []byte) string {
+	digest := sha256.Sum256(data)
+	return hex.EncodeToString(digest[:])
+}
+
 // redteamGateCmd handles `gov redteam-gate verify`: the Session 7
 // identity-based release gate (report HS4) that replaces
 // scripts/release.sh's old MIN_REDTEAM_TESTS/EXPECTED_REDTEAM_SKIPS
@@ -2042,7 +2216,7 @@ func claimsCmd(args []string) int {
 // inventory release.sh discovers from //go:build redteam-tagged source —
 // every inventory test must be a manifest case or a documented exclusion.
 func redteamGateCmd(args []string) int {
-	usage := "usage: gov redteam-gate verify --manifest <path> --log <path> [--capabilities <json>] [--inventory <path>] [--attestations <dir>] [--require-zero-skips]"
+	usage := "usage: gov redteam-gate verify --manifest <path> --log <path> [--capabilities <json>] [--inventory <path>] [--attestations <dir> --attestation-trust <path> --attestation-governator-commit <commit> --attestation-assayer-commit <commit> --attestation-release-version <version> --attestation-source-identity <path> --attestation-toolchain-hash <sha256> --attestation-release-time <rfc3339> --attestation-max-age <duration>] [--require-zero-skips]"
 	if len(args) < 1 || args[0] != "verify" {
 		return bad(usage)
 	}
@@ -2051,6 +2225,14 @@ func redteamGateCmd(args []string) int {
 	capabilitiesJSON := ""
 	inventoryPath := ""
 	attestationsDir := ""
+	attestationTrustPath := ""
+	attestationGovernatorCommit := ""
+	attestationAssayerCommit := ""
+	attestationReleaseVersion := ""
+	attestationSourceIdentityPath := ""
+	attestationToolchainHash := ""
+	attestationReleaseTime := ""
+	attestationMaxAge := ""
 	requireZeroSkips := false
 	rest := args[1:]
 	for len(rest) > 0 {
@@ -2089,6 +2271,54 @@ func redteamGateCmd(args []string) int {
 				return bad(usage)
 			}
 			attestationsDir = rest[1]
+			rest = rest[2:]
+		case "--attestation-trust":
+			if len(rest) < 2 {
+				return bad(usage)
+			}
+			attestationTrustPath = rest[1]
+			rest = rest[2:]
+		case "--attestation-governator-commit":
+			if len(rest) < 2 {
+				return bad(usage)
+			}
+			attestationGovernatorCommit = rest[1]
+			rest = rest[2:]
+		case "--attestation-assayer-commit":
+			if len(rest) < 2 {
+				return bad(usage)
+			}
+			attestationAssayerCommit = rest[1]
+			rest = rest[2:]
+		case "--attestation-release-version":
+			if len(rest) < 2 {
+				return bad(usage)
+			}
+			attestationReleaseVersion = rest[1]
+			rest = rest[2:]
+		case "--attestation-source-identity":
+			if len(rest) < 2 {
+				return bad(usage)
+			}
+			attestationSourceIdentityPath = rest[1]
+			rest = rest[2:]
+		case "--attestation-toolchain-hash":
+			if len(rest) < 2 {
+				return bad(usage)
+			}
+			attestationToolchainHash = rest[1]
+			rest = rest[2:]
+		case "--attestation-release-time":
+			if len(rest) < 2 {
+				return bad(usage)
+			}
+			attestationReleaseTime = rest[1]
+			rest = rest[2:]
+		case "--attestation-max-age":
+			if len(rest) < 2 {
+				return bad(usage)
+			}
+			attestationMaxAge = rest[1]
 			rest = rest[2:]
 		case "--require-zero-skips":
 			// P1-3 (Sol10 rc4 Session 8): a production release must not
@@ -2132,7 +2362,48 @@ func redteamGateCmd(args []string) int {
 	}
 	var aggResult *redteamgate.AggregationResult
 	if attestationsDir != "" {
-		atts, err := redteamgate.LoadAttestations(attestationsDir)
+		if attestationGovernatorCommit == "" || attestationAssayerCommit == "" || attestationReleaseVersion == "" || attestationSourceIdentityPath == "" || attestationToolchainHash == "" || attestationReleaseTime == "" || attestationMaxAge == "" {
+			fmt.Fprintln(os.Stderr, "redteam-gate: attestations require an independently supplied binding, release time, and freshness window")
+			return 1
+		}
+		identityData, err := os.ReadFile(attestationSourceIdentityPath)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "redteam-gate: --attestation-source-identity:", err)
+			return 1
+		}
+		var identity attestationSourceIdentity
+		if err := json.Unmarshal(identityData, &identity); err != nil || identity.TestSourceHash == "" || identity.TestBinarySHA256 == "" {
+			fmt.Fprintln(os.Stderr, "redteam-gate: --attestation-source-identity must contain test_source_hash and test_binary_sha256")
+			return 1
+		}
+		releaseTime, err := time.Parse(time.RFC3339, attestationReleaseTime)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "redteam-gate: --attestation-release-time:", err)
+			return 1
+		}
+		maxAge, err := time.ParseDuration(attestationMaxAge)
+		if err != nil || maxAge <= 0 {
+			fmt.Fprintln(os.Stderr, "redteam-gate: --attestation-max-age must be a positive duration")
+			return 1
+		}
+		trust, err := redteamgate.LoadTrustedSignerRegistry(attestationTrustPath)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "redteam-gate: --attestation-trust:", err)
+			return 1
+		}
+		atts, err := redteamgate.LoadAttestationsWithOptions(attestationsDir, redteamgate.AttestationVerificationOptions{
+			TrustRegistry: trust,
+			ExpectedBinding: &redteamgate.AttestationBinding{
+				GovernatorCommit: attestationGovernatorCommit,
+				AssayerCommit:    attestationAssayerCommit,
+				ReleaseVersion:   attestationReleaseVersion,
+				TestSourceHash:   identity.TestSourceHash,
+				TestBinarySHA256: identity.TestBinarySHA256,
+				ToolchainHash:    attestationToolchainHash,
+			},
+			ReleaseTime: releaseTime,
+			MaxAge:      maxAge,
+		})
 		if err != nil {
 			fmt.Fprintln(os.Stderr, "redteam-gate: --attestations:", err)
 			return 1

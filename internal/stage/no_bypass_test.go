@@ -43,6 +43,11 @@ func TestNoRawProcessLaunchOutsideStageExecutor(t *testing.T) {
 		// artifact (`gov version --json`) or runs read-only git plumbing to
 		// check claims against history. Not a governed runtime stage.
 		"internal/claims/claims.go": 4,
+		// Capability-host release attestation invokes uname/go identity probes
+		// and the explicit red-team test command that it signs into release
+		// evidence. It has no contract, job, or governed runtime authority;
+		// the command is a release verification input, not a backend launch.
+		"cmd/gov/main.go": 3,
 		// internal/gitplumb/gitplumb.go: fully migrated (rc3 Session 5, Sol9
 		// P0-6) — every git invocation now launches through a held, verified
 		// toolregistry.Handle (gitplumb.Session.gitHandle / openGitHandle),

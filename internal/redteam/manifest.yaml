@@ -1475,6 +1475,46 @@ cases:
     session: rc6-u13-s1
     required: true
     status: implemented
+  - case: 249
+    name: TestV13Case5UnsignedAttestationIsRejected
+    session: rc6-u13-s2
+    required: true
+    status: implemented
+  - case: 250
+    name: TestV13Case6InvalidAttestationSignatureIsRejected
+    session: rc6-u13-s2
+    required: true
+    status: implemented
+  - case: 251
+    name: TestV13Case7UntrustedAttestationSignerIsRejected
+    session: rc6-u13-s2
+    required: true
+    status: implemented
+  - case: 252
+    name: TestV13Case8AttestationForAnotherCommitIsRejected
+    session: rc6-u13-s2
+    required: true
+    status: implemented
+  - case: 253
+    name: TestV13Case9AttestationForAnotherRedteamBinaryIsRejected
+    session: rc6-u13-s2
+    required: true
+    status: implemented
+  - case: 254
+    name: TestV13Case10FakeFiveCategorySameHostAttestationBundleIsRejected
+    session: rc6-u13-s2
+    required: true
+    status: implemented
+  - case: 255
+    name: TestV13Case11ModifiedLogAfterAttestationIsRejected
+    session: rc6-u13-s2
+    required: true
+    status: implemented
+  - case: 256
+    name: TestV13Case12TestListedAsCoveredWithoutAppearingInSignedLogIsRejected
+    session: rc6-u13-s2
+    required: true
+    status: implemented
 
 # Exclusions (Sol12 P0-2): every //go:build redteam-tagged test that is NOT a
 # manifest corpus case must be explicitly classified here with a documented
