@@ -1598,6 +1598,56 @@ cases:
     session: rc6-u13-s4
     required: true
     status: implemented
+  - case: 273
+    name: TestV13Case28AbsoluteSymlinkEscapingClosureIsRejected
+    session: rc6-u13-s5
+    required: true
+    status: implemented
+  - case: 274
+    name: TestV13Case29RelativeSymlinkEscapingClosureIsRejected
+    session: rc6-u13-s5
+    required: true
+    status: implemented
+  - case: 275
+    name: TestV13Case30PnpmStoreSymlinkIsFrozenOrRejected
+    session: rc6-u13-s5
+    required: true
+    status: implemented
+  - case: 276
+    name: TestV13Case31NpmLinkDependencyIsFrozenOrRejected
+    session: rc6-u13-s5
+    required: true
+    status: implemented
+  - case: 277
+    name: TestV13Case32SymlinkCycleIsRejected
+    session: rc6-u13-s5
+    required: true
+    status: implemented
+  - case: 278
+    name: TestV13Case33BrokenSymlinkIsRejected
+    session: rc6-u13-s5
+    required: true
+    status: implemented
+  - case: 279
+    name: TestV13Case34ExternalTargetChangedAfterIdentityCalculationIsDetected
+    session: rc6-u13-s5
+    required: true
+    status: implemented
+  - case: 280
+    name: TestV13Case35ExternalTargetRestoredAfterExecutionIsDetected
+    session: rc6-u13-s5
+    required: true
+    status: implemented
+  - case: 281
+    name: TestV13Case36NativeAddonReachedThroughExternalSymlinkIsRejected
+    session: rc6-u13-s5
+    required: true
+    status: implemented
+  - case: 282
+    name: TestV13Case37UnprovenClosureCannotApprove
+    session: rc6-u13-s5
+    required: true
+    status: implemented
   - case: 296
     name: TestWaitPIDGoneDoesNotTreatEPERMAsGone
     session: rc6-u13-s3-gap-closure
