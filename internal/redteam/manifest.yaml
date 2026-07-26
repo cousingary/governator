@@ -1678,6 +1678,41 @@ cases:
     session: rc6-u13-s7
     required: true
     status: implemented
+  - case: 289
+    name: TestV13Case289InstalledBinaryDifferingFromReleaseBinaryIsRejected
+    session: rc6-u13-s8
+    required: true
+    status: implemented
+  - case: 290
+    name: TestV13Case290InstalledBinaryWithWrongModeIsRejected
+    session: rc6-u13-s8
+    required: true
+    status: implemented
+  - case: 291
+    name: TestV13Case291HookInvokingOlderBinaryIsDetected
+    session: rc6-u13-s8
+    required: true
+    status: implemented
+  - case: 292
+    name: TestV13Case292HookConfigurationChangedAfterInstallationIsDetected
+    session: rc6-u13-s8
+    required: true
+    status: implemented
+  - case: 293
+    name: TestV13Case293MalformedApplyPatchLiveCanaryDenies
+    session: rc6-u13-s8
+    required: true
+    status: implemented
+  - case: 294
+    name: TestV13Case294ArchitectureClaimsLiveRc5WhileInstallEvidenceSaysRc3IsRejected
+    session: rc6-u13-s8
+    required: true
+    status: implemented
+  - case: 295
+    name: TestV13Case295LiveInstallClaimWithoutInstallationEvidenceIsRejected
+    session: rc6-u13-s8
+    required: true
+    status: implemented
   - case: 296
     name: TestWaitPIDGoneDoesNotTreatEPERMAsGone
     session: rc6-u13-s3-gap-closure

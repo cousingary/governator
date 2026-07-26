@@ -86,6 +86,8 @@ def main(argv: list[str]) -> int:
     p.add_argument("--architecture-doc", default=None)
     p.add_argument("--trusted-fingerprints-file", default=None)
     p.add_argument("--trusted-public-keys-dir", default=None)
+    p.add_argument("--install-evidence", default=None,
+                   help="signed install-evidence.json; required when the architecture doc claims a live deployment")
     args = p.parse_args(argv)
 
     dist = pathlib.Path(args.dist_dir)
@@ -224,6 +226,37 @@ def main(argv: list[str]) -> int:
         proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
         if proc.returncode != 0:
             return fail([f"cryptographic signature verification failed: {proc.stdout.strip()}"])
+
+    # Sol13 P1-3: a live-install claim in the architecture doc must be backed
+    # by a signed install-evidence record. The architecture doc check
+    # (check_architecture_doc.py) already enforces this when --install-evidence
+    # is passed; here we enforce it at the bundle-validation tier too, so a
+    # release-mode bundle cannot ship an unevidenced live-install claim even
+    # if the caller forgot to wire the flag through check_architecture_doc.py.
+    if args.architecture_doc:
+        arch_text = pathlib.Path(args.architecture_doc).read_text(encoding="utf-8")
+        live_claim_patterns = [
+            re.compile(r"live gate installed", re.IGNORECASE),
+            re.compile(r"deployed to production", re.IGNORECASE),
+            re.compile(r"installed at ~?/?\.local/bin/gov", re.IGNORECASE),
+            re.compile(r"live[- ]deployed", re.IGNORECASE),
+            re.compile(r"running in production", re.IGNORECASE),
+        ]
+        has_live_claim = any(pat.search(arch_text) for pat in live_claim_patterns)
+        if has_live_claim:
+            if not args.install_evidence:
+                missing.append(
+                    "LIVE_INSTALL_CLAIM_WITHOUT_EVIDENCE: architecture doc claims a live deployment/installation "
+                    "but no --install-evidence file was supplied to this validator"
+                )
+            elif not pathlib.Path(args.install_evidence).is_file():
+                missing.append(
+                    f"LIVE_INSTALL_CLAIM_WITHOUT_EVIDENCE: architecture doc claims a live deployment/installation "
+                    f"but the install-evidence file {args.install_evidence!r} does not exist"
+                )
+
+    if missing:
+        return fail(missing)
 
     print(f"audit_bundle_validate: OK -- {dist} is a complete, verified release ({len(archives)} platform archive(s), commit {args.release_commit})", file=sys.stderr)
     return 0

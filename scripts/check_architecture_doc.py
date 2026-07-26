@@ -221,6 +221,48 @@ def check_front_matter(fm: dict, repo: str | None, dist_dir: str | None) -> list
     return failures
 
 
+def check_front_matter_prose_contradiction(fm: dict, body: str) -> list[str]:
+    """Sol13 P1-3: front matter and status prose must not disagree about
+    tag/release/live-gate state. The architecture doc is the unreliable
+    narrator -- hand-editing prose is not a durable fix; this check makes
+    the contradiction a hard failure so it cannot ship."""
+    failures: list[str] = []
+
+    gov_tag = fm.get("governator_tag")
+    if gov_tag:
+        no_tag_patterns = [
+            re.compile(r"[Nn]o\s+`?" + re.escape(gov_tag) + r"`?\s+git tag currently exists"),
+            re.compile(r"front matter\s+`governator_tag:\s*null`"),
+            re.compile(r"governator_tag:\s*null"),
+        ]
+        for pat in no_tag_patterns:
+            if pat.search(body):
+                failures.append(
+                    f"FRONT_MATTER_PROSE_CONTRADICTION: front matter declares governator_tag: {gov_tag!r} "
+                    f"but the document body claims no such tag exists (matched: {pat.pattern!r}). "
+                    "The front matter is authoritative; the prose is stale and must be corrected."
+                )
+                break
+
+    release_state = fm.get("release_state")
+    if release_state == "complete":
+        incomplete_patterns = [
+            re.compile(r"[Nn]o\s+v?\d+\.\d+\.\d+(?:-rc\d+)?\s+(?:git\s+)?tag currently exists"),
+            re.compile(r"release[_ ]state[:\s]+pending", re.IGNORECASE),
+            re.compile(r"the tag is cut.*as the final step", re.IGNORECASE),
+        ]
+        for pat in incomplete_patterns:
+            if pat.search(body):
+                failures.append(
+                    f"FRONT_MATTER_PROSE_CONTRADICTION: front matter declares release_state: complete "
+                    f"but the document body describes the release as still pending (matched: {pat.pattern!r}). "
+                    "The front matter is authoritative; the prose is stale and must be corrected."
+                )
+                break
+
+    return failures
+
+
 def check_live_deployment_claims(text: str, install_evidence: str | None) -> list[str]:
     hits = [pat.pattern for pat in LIVE_DEPLOYMENT_PATTERNS if pat.search(text)]
     if not hits:
@@ -250,6 +292,7 @@ def main(argv: list[str]) -> int:
         failures.extend(check_front_matter(fm, args.repo, args.dist_dir))
         failures.extend(check_live_deployment_claims(text, args.install_evidence))
         failures.extend(check_conflicting_current_commits(fm, text))
+        failures.extend(check_front_matter_prose_contradiction(fm, text))
 
     prose_ok, prose_msg = check_prose_staleness(text)
     if not prose_ok:

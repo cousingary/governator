@@ -148,6 +148,10 @@ if [ "$AUDIT_BUNDLE_MODE" = release ]; then
   if [ -f "$ROOT/docs/TRUSTED_SIGNING_KEYS.txt" ] && [ -d "$ROOT/docs/signing_keys" ]; then
     VALIDATE_ARGS+=(--trusted-fingerprints-file "$ROOT/docs/TRUSTED_SIGNING_KEYS.txt" --trusted-public-keys-dir "$ROOT/docs/signing_keys")
   fi
+  INSTALL_EVIDENCE_FILE="${INSTALL_EVIDENCE:-$OUT_DIR/dist/install-evidence.json}"
+  if [ -f "$INSTALL_EVIDENCE_FILE" ]; then
+    VALIDATE_ARGS+=(--install-evidence "$INSTALL_EVIDENCE_FILE")
+  fi
   if ! python3 "$ROOT/scripts/audit_bundle_validate.py" "${VALIDATE_ARGS[@]}"; then
     echo "audit_bundle: refusing to ship a release-mode bundle over incomplete/unverified release evidence -- set AUDIT_BUNDLE_MODE=source-only for an explicit, clearly-labeled source-only bundle instead" >&2
     exit 1
@@ -156,7 +160,8 @@ fi
 
 # --- evidence/: release/test/acceptance evidence for this ref -------------
 for f in test-summary.json acceptance-summary.json claims-verify-report.txt \
-  build-manifest.json checksums.txt checksums.txt.minisig checksums.txt.hmac; do
+  build-manifest.json checksums.txt checksums.txt.minisig checksums.txt.hmac \
+  install-evidence.json; do
   if [ -f "$OUT_DIR/dist/$f" ]; then
     cp "$OUT_DIR/dist/$f" "$OUT_DIR/evidence/$f"
   fi

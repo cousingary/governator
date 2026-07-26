@@ -1,0 +1,346 @@
+#!/usr/bin/env python3
+"""scripts/install_evidence.py — Sol13 P1-3 / P2: signed installation-evidence
+record with a real four-check hook canary.
+
+Before this script existed, the live gate reported a version string but nothing
+bound the installed binary to the release binary, nothing recorded the hook
+configuration, and the architecture document could contradict itself about
+what was actually installed. This script produces a cryptographically signed,
+machine-verifiable installation record that closes that gap.
+
+The evidence record carries (Sol13 report's exact shape):
+  installed_path, installed_sha256, installed_mode, version, source_commit,
+  dirty, hook_configuration_path, hook_command, hook_configuration_sha256,
+  installed_at, installer_identity, release_manifest_sha256, signature
+
+Signing uses the same Ed25519 scheme as the S2 capability attestations:
+the signature covers the canonical sorted-key JSON of every field except
+`signature` itself. The signing key ID is `ed25519:<hex(sha256(pubkey))>`.
+
+The four-check hook canary runs at generate time and its results are embedded
+in the record. Installation fails (exit 1) if any check fails:
+  (a) benign action allows
+  (b) protected-path action denies
+  (c) malformed apply_patch denies
+  (d) installed binary hash equals release binary hash
+
+Usage:
+  install_evidence.py generate \
+    --installed-path PATH --release-manifest PATH \
+    --hook-config PATH --signing-key HEXKEY \
+    [--installer-identity ID] [--out PATH]
+
+  install_evidence.py verify \
+    --evidence PATH --release-manifest PATH \
+    --trusted-public-key HEXKEY
+
+Exit 0 on success. Exit 1 with a diagnostic on any failure.
+"""
+import argparse
+import base64
+import hashlib
+import json
+import os
+import pathlib
+import stat
+import subprocess
+import sys
+import tempfile
+from datetime import datetime, timezone
+
+CANARY_FIELDS = (
+    "canary_benign_allows",
+    "canary_protected_denies",
+    "canary_malformed_patch_denies",
+    "canary_binary_hash_matches",
+)
+
+
+def sha256_file(path: str) -> str:
+    return hashlib.sha256(pathlib.Path(path).read_bytes()).hexdigest()
+
+
+def canonical_payload(record: dict) -> bytes:
+    payload = {k: v for k, v in record.items() if k != "signature"}
+    return json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+
+
+def signing_key_id(public_key_bytes: bytes) -> str:
+    return "ed25519:" + hashlib.sha256(public_key_bytes).hexdigest()
+
+
+def sign_record(record: dict, private_key_hex: str) -> str:
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
+    key_bytes = bytes.fromhex(private_key_hex.strip())
+    if len(key_bytes) == 64:
+        key_bytes = key_bytes[:32]
+    if len(key_bytes) != 32:
+        raise ValueError(f"expected a 32-byte (or 64-byte Go-format) hex Ed25519 private key, got {len(key_bytes)} bytes")
+    private_key = Ed25519PrivateKey.from_private_bytes(key_bytes)
+    message = canonical_payload(record)
+    signature = private_key.sign(message)
+    return base64.b64encode(signature).decode()
+
+
+def verify_record(record: dict, public_key_hex: str) -> tuple[bool, str]:
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+    from cryptography.exceptions import InvalidSignature
+
+    key_bytes = bytes.fromhex(public_key_hex.strip())
+    if len(key_bytes) != 32:
+        return False, f"expected a 32-byte hex Ed25519 public key, got {len(key_bytes)} bytes"
+    public_key = Ed25519PublicKey.from_public_bytes(key_bytes)
+    signature_b64 = record.get("signature", "")
+    if not signature_b64:
+        return False, "INSTALL_EVIDENCE_UNSIGNED: evidence record carries no signature"
+    try:
+        signature = base64.b64decode(signature_b64, validate=True)
+    except Exception as exc:
+        return False, f"INSTALL_EVIDENCE_BAD_SIGNATURE_ENCODING: {exc}"
+    message = canonical_payload(record)
+    try:
+        public_key.verify(signature, message)
+    except InvalidSignature:
+        return False, "INSTALL_EVIDENCE_INVALID_SIGNATURE: signature does not verify against the trusted public key"
+    expected_kid = signing_key_id(key_bytes)
+    if record.get("signing_key_id") != expected_kid:
+        return False, (
+            f"INSTALL_EVIDENCE_SIGNER_MISMATCH: evidence signing_key_id is {record.get('signing_key_id')!r} "
+            f"but the trusted key's identity is {expected_kid!r}"
+        )
+    return True, ""
+
+
+def run_hook_canary(gov_bin: str, hook_config: str) -> dict:
+    results = {}
+    env = dict(os.environ)
+    env["GOV_HOOK_CONFIG"] = hook_config
+
+    benign_input = json.dumps({
+        "tool_name": "Read",
+        "tool_input": {"file_path": "/tmp/benign-read-target.txt"},
+    })
+    proc = subprocess.run(
+        [gov_bin, "hook", "pre-tool-use"],
+        input=benign_input, capture_output=True, text=True, env=env, timeout=30,
+    )
+    results["canary_benign_allows"] = proc.returncode == 0
+
+    protected_input = json.dumps({
+        "tool_name": "Write",
+        "tool_input": {"file_path": "/etc/passwd", "content": "pwned"},
+    })
+    proc = subprocess.run(
+        [gov_bin, "hook", "pre-tool-use"],
+        input=protected_input, capture_output=True, text=True, env=env, timeout=30,
+    )
+    results["canary_protected_denies"] = proc.returncode != 0
+
+    malformed_input = json.dumps({
+        "tool_name": "apply_patch",
+        "tool_input": {"patch": "not a valid patch\x00\x01\x02"},
+    })
+    proc = subprocess.run(
+        [gov_bin, "hook", "pre-tool-use"],
+        input=malformed_input, capture_output=True, text=True, env=env, timeout=30,
+    )
+    results["canary_malformed_patch_denies"] = proc.returncode != 0
+
+    return results
+
+
+def cmd_generate(args: argparse.Namespace) -> int:
+    installed_path = pathlib.Path(args.installed_path)
+    if not installed_path.is_file():
+        print(f"install_evidence: installed binary not found at {installed_path}", file=sys.stderr)
+        return 1
+
+    installed_sha256 = sha256_file(str(installed_path))
+    installed_mode = oct(stat.S_IMODE(installed_path.stat().st_mode))
+
+    release_manifest = pathlib.Path(args.release_manifest)
+    if not release_manifest.is_file():
+        print(f"install_evidence: release manifest not found at {release_manifest}", file=sys.stderr)
+        return 1
+    release_manifest_sha256 = sha256_file(str(release_manifest))
+
+    try:
+        manifest = json.loads(release_manifest.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError) as exc:
+        print(f"install_evidence: cannot parse release manifest: {exc}", file=sys.stderr)
+        return 1
+
+    version = manifest.get("version", "")
+    source_commit = manifest.get("source_commit", "")
+    dirty = manifest.get("dirty", False)
+
+    release_binary_sha256 = None
+    for artifact in manifest.get("artifacts", []):
+        if artifact.get("name", "").endswith("/gov") or artifact.get("name") == "gov":
+            release_binary_sha256 = artifact.get("sha256")
+            break
+    if release_binary_sha256 is None:
+        checksums_path = release_manifest.parent / "checksums.txt"
+        if checksums_path.is_file():
+            for line in checksums_path.read_text().splitlines():
+                parts = line.split()
+                if len(parts) == 2 and parts[1].rstrip("*").endswith("/gov"):
+                    release_binary_sha256 = parts[0]
+                    break
+
+    hook_config_path = pathlib.Path(args.hook_config)
+    if not hook_config_path.is_file():
+        print(f"install_evidence: hook configuration not found at {hook_config_path}", file=sys.stderr)
+        return 1
+    hook_config_sha256 = sha256_file(str(hook_config_path))
+    hook_command = "gov hook pre-tool-use"
+
+    if installed_mode != "0o755":
+        print(
+            f"install_evidence: WRONG_BINARY_MODE: installed binary mode is {installed_mode}, "
+            "expected 0o755 (release tarballs preserve 0755; the outer source ZIP flattens it -- "
+            "install from the tarball, not the ZIP)",
+            file=sys.stderr,
+        )
+        return 1
+
+    canary = run_hook_canary(str(installed_path), str(hook_config_path))
+
+    if release_binary_sha256 is not None:
+        canary["canary_binary_hash_matches"] = installed_sha256 == release_binary_sha256
+    else:
+        canary["canary_binary_hash_matches"] = False
+
+    failures = [k for k in CANARY_FIELDS if not canary.get(k)]
+    if failures:
+        print(f"install_evidence: hook canary FAILED: {failures}", file=sys.stderr)
+        return 1
+
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
+    key_bytes = bytes.fromhex(args.signing_key.strip())
+    if len(key_bytes) == 64:
+        key_bytes = key_bytes[:32]
+    private_key = Ed25519PrivateKey.from_private_bytes(key_bytes)
+    public_key = private_key.public_key()
+    from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
+    pub_bytes = public_key.public_bytes(Encoding.Raw, PublicFormat.Raw)
+    kid = signing_key_id(pub_bytes)
+
+    record = {
+        "installed_path": str(installed_path),
+        "installed_sha256": installed_sha256,
+        "installed_mode": installed_mode,
+        "version": version,
+        "source_commit": source_commit,
+        "dirty": dirty,
+        "hook_configuration_path": str(hook_config_path),
+        "hook_command": hook_command,
+        "hook_configuration_sha256": hook_config_sha256,
+        "installed_at": datetime.now(timezone.utc).isoformat(),
+        "installer_identity": args.installer_identity or os.environ.get("USER", "unknown"),
+        "release_manifest_sha256": release_manifest_sha256,
+        "signing_key_id": kid,
+    }
+    record.update(canary)
+    record["signature"] = sign_record(record, args.signing_key)
+
+    out_path = args.out or str(installed_path.parent / "install-evidence.json")
+    pathlib.Path(out_path).write_text(json.dumps(record, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    print(f"install_evidence: OK -- signed evidence written to {out_path}", file=sys.stderr)
+    return 0
+
+
+def cmd_verify(args: argparse.Namespace) -> int:
+    evidence_path = pathlib.Path(args.evidence)
+    if not evidence_path.is_file():
+        print(f"install_evidence: LIVE_INSTALL_CLAIM_WITHOUT_EVIDENCE: {evidence_path} does not exist", file=sys.stderr)
+        return 1
+
+    try:
+        record = json.loads(evidence_path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError) as exc:
+        print(f"install_evidence: cannot parse evidence: {exc}", file=sys.stderr)
+        return 1
+
+    ok, msg = verify_record(record, args.trusted_public_key)
+    if not ok:
+        print(f"install_evidence: {msg}", file=sys.stderr)
+        return 1
+
+    release_manifest = pathlib.Path(args.release_manifest)
+    if release_manifest.is_file():
+        actual_manifest_sha = sha256_file(str(release_manifest))
+        if record.get("release_manifest_sha256") != actual_manifest_sha:
+            print(
+                f"install_evidence: RELEASE_MANIFEST_MISMATCH: evidence records release_manifest_sha256="
+                f"{record.get('release_manifest_sha256')!r} but the supplied manifest hashes to {actual_manifest_sha}",
+                file=sys.stderr,
+            )
+            return 1
+
+    installed_path = record.get("installed_path", "")
+    if installed_path and pathlib.Path(installed_path).is_file():
+        actual_sha = sha256_file(installed_path)
+        if record.get("installed_sha256") != actual_sha:
+            print(
+                f"install_evidence: INSTALLED_BINARY_CHANGED: evidence records installed_sha256="
+                f"{record.get('installed_sha256')!r} but the binary at {installed_path} now hashes to {actual_sha}",
+                file=sys.stderr,
+            )
+            return 1
+        actual_mode = oct(stat.S_IMODE(pathlib.Path(installed_path).stat().st_mode))
+        if record.get("installed_mode") != actual_mode:
+            print(
+                f"install_evidence: INSTALLED_BINARY_MODE_CHANGED: evidence records mode "
+                f"{record.get('installed_mode')!r} but the binary now has mode {actual_mode}",
+                file=sys.stderr,
+            )
+            return 1
+
+    hook_config_path = record.get("hook_configuration_path", "")
+    if hook_config_path and pathlib.Path(hook_config_path).is_file():
+        actual_hook_sha = sha256_file(hook_config_path)
+        if record.get("hook_configuration_sha256") != actual_hook_sha:
+            print(
+                f"install_evidence: HOOK_CONFIGURATION_CHANGED: evidence records hook_configuration_sha256="
+                f"{record.get('hook_configuration_sha256')!r} but {hook_config_path} now hashes to {actual_hook_sha}",
+                file=sys.stderr,
+            )
+            return 1
+
+    for field in CANARY_FIELDS:
+        if not record.get(field):
+            print(f"install_evidence: CANARY_CHECK_FAILED: {field} is not true in the evidence record", file=sys.stderr)
+            return 1
+
+    print(f"install_evidence: OK -- {evidence_path} verifies (version={record.get('version')}, commit={record.get('source_commit')})", file=sys.stderr)
+    return 0
+
+
+def main(argv: list[str]) -> int:
+    p = argparse.ArgumentParser(description="Signed installation-evidence record (Sol13 P1-3)")
+    sub = p.add_subparsers(dest="command", required=True)
+
+    gen = sub.add_parser("generate", help="generate signed installation evidence")
+    gen.add_argument("--installed-path", required=True, help="path to the installed gov binary")
+    gen.add_argument("--release-manifest", required=True, help="path to build-manifest.json from the release")
+    gen.add_argument("--hook-config", required=True, help="path to the hook configuration file")
+    gen.add_argument("--signing-key", required=True, help="64-byte hex Ed25519 private key")
+    gen.add_argument("--installer-identity", default=None, help="identity of the installer (defaults to $USER)")
+    gen.add_argument("--out", default=None, help="output path (defaults to <installed-dir>/install-evidence.json)")
+
+    ver = sub.add_parser("verify", help="verify signed installation evidence")
+    ver.add_argument("--evidence", required=True, help="path to install-evidence.json")
+    ver.add_argument("--release-manifest", required=True, help="path to build-manifest.json to cross-check")
+    ver.add_argument("--trusted-public-key", required=True, help="32-byte hex Ed25519 public key")
+
+    args = p.parse_args(argv)
+    if args.command == "generate":
+        return cmd_generate(args)
+    return cmd_verify(args)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))
