@@ -188,7 +188,7 @@ func baseContract(root string) contracts.Contract {
 		Forbidden:   contracts.Forbidden{Paths: []string{".git/**"}, Commands: []string{"rm -rf"}, Behaviors: []string{"network"}},
 		Budget:      contracts.Budget{MaxMinutes: 1, MaxCommands: 5, MaxFilesChanged: 5, MaxLinesChanged: 20, MaxNewFiles: 5, MaxDeleted: 0},
 		Preflight:   contracts.Preflight{IntendedWrites: []string{"output/**"}},
-		Success:     contracts.Success{RequiredFiles: []string{"output/result.txt"}, Validators: []string{"test -f output/result.txt"}},
+		Success:     contracts.Success{RequiredFiles: []string{"output/result.txt"}, Validators: []string{"test -f output/result.txt"}, ValidatorSpecs: []contracts.ValidatorSpec{{Command: "test -f output/result.txt", Tools: []string{"test"}}}},
 		OnViolation: "quarantine",
 		Local:       &contracts.LocalRunnerConfig{ReadRoots: shellReadRootsForFixtures()},
 	}
@@ -234,6 +234,7 @@ func enrollRealControllerTools(t *testing.T) {
 		{"bash", "/usr/bin/bash"},
 		{"unshare", "/usr/bin/unshare"},
 		{"systemd-run", "/usr/bin/systemd-run"},
+		{"test", "/usr/bin/test"},
 	} {
 		path := tool.abs
 		if _, err := os.Stat(path); err != nil {

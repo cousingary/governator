@@ -108,7 +108,9 @@ preflight:
   intended_writes: ["output/**"]
 success:
   required_files: ["output/result.txt"]
-  validators: ["test -f output/result.txt"]
+  validators:
+    - command: test -f output/result.txt
+      tools: [test]
 on_violation: quarantine
 %s`, jobID, root, readRootsYAML())
 	path := filepath.Join(jobsDir, jobID+".yaml")
@@ -134,6 +136,35 @@ printf '{"type":"result","total_cost_usd":0.25}\n'
 		t.Fatal(err)
 	}
 	return bin
+}
+
+func enrollValidatorTools(t *testing.T, names ...string) {
+	t.Helper()
+	t.Setenv("GOV_TOOLREGISTRY_FILE", filepath.Join(t.TempDir(), "tools.yaml"))
+	base := []string{"git", "bash", "unshare", "test", "true", "printf", "rm", "sleep"}
+	seen := map[string]bool{}
+	for _, name := range append(base, names...) {
+		if seen[name] {
+			continue
+		}
+		seen[name] = true
+		bin, err := lookPathPreferCanonical(name)
+		if err != nil {
+			t.Fatalf("resolve validator tool %s: %v", name, err)
+		}
+		if _, err := toolregistry.Enroll(name, bin); err != nil {
+			t.Fatalf("enroll validator tool %s: %v", name, err)
+		}
+	}
+}
+
+func lookPathPreferCanonical(name string) (string, error) {
+	if name == "git" {
+		if _, err := os.Stat("/usr/bin/git"); err == nil {
+			return "/usr/bin/git", nil
+		}
+	}
+	return exec.LookPath(name)
 }
 
 func captureHook(t *testing.T, script string) string {
@@ -284,6 +315,7 @@ func TestBatchRunResolvesDirectoryAndPrintsSummary(t *testing.T) {
 	t.Setenv("GOV_HOME", home)
 	t.Setenv("GOV_CONFIG", filepath.Join(t.TempDir(), "missing-config.yaml"))
 	t.Setenv("GOV_CLAUDE_BIN", batchFakeBin(t))
+	enrollValidatorTools(t, "test")
 
 	jobsDir := t.TempDir()
 	batchJobFixture(t, jobsDir, "dir-job-a")

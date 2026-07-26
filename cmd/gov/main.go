@@ -1364,8 +1364,9 @@ func planCreate(args []string) int {
 		},
 		Preflight: contracts.Preflight{IntendedWrites: []string{planRel}},
 		Success: contracts.Success{
-			RequiredFiles: []string{planRel},
-			Validators:    []string{"test -f " + planShQuote(planRel)},
+			RequiredFiles:  []string{planRel},
+			Validators:     []string{"test -f " + planShQuote(planRel)},
+			ValidatorSpecs: []contracts.ValidatorSpec{{Command: "test -f " + planShQuote(planRel), Tools: []string{"test"}}},
 		},
 		OnViolation: "quarantine",
 	}

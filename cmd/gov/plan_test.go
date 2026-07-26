@@ -87,7 +87,7 @@ func planJobYAML(jobID, root string, dependsOn []string) string {
     forbidden: {paths: [".git/**"], commands: ["rm -rf"], behaviors: [network]}
     budget: {max_minutes: 10, max_commands: 10, max_files_changed: 3, max_lines_changed: 100, max_new_files: 1, max_deleted: 0, max_tokens: 10000}
     preflight: {intended_writes: ["internal/**"]}
-    success: {required_files: ["internal/x.go"], validators: ["true"]}
+    success: {required_files: ["internal/x.go"], validators: [{command: "true", tools: [true]}]}
     on_violation: quarantine
     risk_class: low
     depends_on: %s
@@ -99,6 +99,7 @@ func TestPlanCommandEndToEndWritesValidatedJobFilesAndShow(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("GOV_HOME", home)
 	t.Setenv("GOV_CONFIG", filepath.Join(t.TempDir(), "missing-config.yaml"))
+	enrollValidatorTools(t, "true")
 
 	root := planProjectRoot(t)
 	t.Chdir(root)
@@ -262,6 +263,7 @@ func TestPlanCommandQuarantinesOnCyclicPlanAndWritesNoJobFiles(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("GOV_HOME", home)
 	t.Setenv("GOV_CONFIG", filepath.Join(t.TempDir(), "missing-config.yaml"))
+	enrollValidatorTools(t, "true")
 
 	root := planProjectRoot(t)
 	t.Chdir(root)
@@ -339,7 +341,9 @@ preflight:
   intended_writes: ["output/**"]
 success:
   required_files: ["output/result.txt"]
-  validators: ["test -f output/result.txt"]
+  validators:
+    - command: test -f output/result.txt
+      tools: [test]
 on_violation: quarantine
 risk_class: low
 depends_on: %s
@@ -356,6 +360,7 @@ func TestBatchRunOrderedCLIRunsDependentJobAfterDependency(t *testing.T) {
 	t.Setenv("GOV_HOME", home)
 	t.Setenv("GOV_CONFIG", filepath.Join(t.TempDir(), "missing-config.yaml"))
 	t.Setenv("GOV_CLAUDE_BIN", batchFakeBin(t))
+	enrollValidatorTools(t, "test")
 
 	jobsDir := t.TempDir()
 	orderedBatchJobFixture(t, jobsDir, "ordered-cli-a", nil)
