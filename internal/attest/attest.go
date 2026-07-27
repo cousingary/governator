@@ -610,8 +610,12 @@ func Current(db *sql.DB, cfg config.Config, agent agents.Agent, resolution agent
 	if err := ensureSchema(db); err != nil {
 		return Attestation{}, false, err
 	}
+	// ORDER BY rowid, not created_at -- created_at is TEXT in time.RFC3339Nano
+	// (attest.go:275), whose trimmed trailing zeros make SQLite's lexicographic
+	// order disagree with chronological order (see internal/runtime/artifacts.go).
+	// Selecting the wrong row here honors a stale capability attestation.
 	row := db.QueryRow(`SELECT id,backend,adapter_id,adapter_version,requested_executable,resolved_executable,executable_path,executable_file_identity,executable_sha256,version_output,model_id,account_id,config_hash,backend_config_hash,probe_suite_version,supported_flags,sandbox_probe,read_only_probe,network_probe,transcript_probe,approval_probe,probe_notes,probe_timings_json,probe_suite_total_ms,created_at,expires_at
-FROM capability_attestations WHERE backend=? AND executable_path=? AND executable_sha256=? AND executable_file_identity=? AND config_hash=? AND backend_config_hash=? AND model_id=? AND probe_suite_version=? ORDER BY created_at DESC LIMIT 1`, agent.Name(), resolution.CanonicalPath, resolution.SHA256, resolution.FileIdentity, cfg.Hash(), EffectiveBackendConfigHash(cfg, agent.Name()), agent.Name(), ProbeSuiteVersion)
+FROM capability_attestations WHERE backend=? AND executable_path=? AND executable_sha256=? AND executable_file_identity=? AND config_hash=? AND backend_config_hash=? AND model_id=? AND probe_suite_version=? ORDER BY rowid DESC LIMIT 1`, agent.Name(), resolution.CanonicalPath, resolution.SHA256, resolution.FileIdentity, cfg.Hash(), EffectiveBackendConfigHash(cfg, agent.Name()), agent.Name(), ProbeSuiteVersion)
 	var a Attestation
 	var supported, sandbox, readOnly, network, transcript, approval int
 	if err := row.Scan(&a.ID, &a.Backend, &a.AdapterID, &a.AdapterVersion, &a.RequestedExecutable, &a.ResolvedExecutable, &a.ExecutablePath, &a.ExecutableFileIdentity, &a.ExecutableSHA256, &a.VersionOutput, &a.ModelID, &a.AccountID, &a.ConfigHash, &a.BackendConfigHash, &a.ProbeSuiteVersion, &supported, &sandbox, &readOnly, &network, &transcript, &approval, &a.ProbeNotes, &a.ProbeTimingsJSON, &a.ProbeSuiteTotalMS, &a.CreatedAt, &a.ExpiresAt); err != nil {

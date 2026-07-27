@@ -53,7 +53,20 @@ func consumedArtifactIdentities(db *sql.DB, home string, c contracts.Contract) (
 		}
 		var src, sha string
 		var size int64
-		err := db.QueryRow(`SELECT a.path,a.sha256,a.bytes FROM artifacts a JOIN runs r ON r.id=a.run_id WHERE a.name=? AND r.job_id=? AND r.status='APPROVED' ORDER BY r.created DESC LIMIT 1`, name, producer).Scan(&src, &sha, &size)
+		// Order by r.rowid, NOT r.created. runs.created is TEXT in
+		// time.RFC3339Nano, which trims trailing zeros from the fractional
+		// second, so SQLite's lexicographic ordering inverts chronological
+		// ordering whenever the earlier timestamp's fraction is a prefix of
+		// the later one's ("...00Z" > "...00.5Z" because 'Z' > '.'). That
+		// returned the OLDER approved run and served a stale consumed
+		// artifact -- the exact failure TestV6Case22 asserts against, which
+		// was previously misdiagnosed as host contention. rowid is the
+		// insertion order of the run row, which has the same semantics as
+		// created (both recorded at run start) but is monotonic and immune
+		// to the format. rowid must be the PRIMARY sort key: appending it as
+		// a tiebreak after created would never fire, since the bug is a
+		// mis-compare rather than a tie.
+		err := db.QueryRow(`SELECT a.path,a.sha256,a.bytes FROM artifacts a JOIN runs r ON r.id=a.run_id WHERE a.name=? AND r.job_id=? AND r.status='APPROVED' ORDER BY r.rowid DESC LIMIT 1`, name, producer).Scan(&src, &sha, &size)
 		if err != nil {
 			if err == sql.ErrNoRows {
 				return nil, fmt.Errorf("consumed artifact %q from job %q is not available in the ledger", name, producer)

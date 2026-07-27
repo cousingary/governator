@@ -1723,6 +1723,11 @@ cases:
     session: rc6-u13-s9
     required: true
     status: implemented
+  - case: 298
+    name: TestV13Case298ConsumedArtifactSelectionIsNotLexicographicOnRFC3339Nano
+    session: rc6-u13-s9
+    required: true
+    status: implemented
 
 # Case 296 is not one of Sol13's original 51 findings (which occupy 245-295).
 # It closes a gap the rc6-upg13 S3 exclusion audit found: TestV6Case29's own
@@ -1741,6 +1746,26 @@ cases:
 # platform ClassifyPlatform declares non-approving is a DROPPED claim recorded
 # as such, not a coverage gap) together with its three negative bounds, so the
 # correction can never widen into a general skip waiver.
+
+# Case 298 is likewise outside Sol13's 245-295 finding range. Session 9 found
+# that TestV6Case22's intermittent full-tier failure was a REAL defect, not the
+# host contention that the prior handoff, docs/security.md, and the S3 row had
+# classified it as. runs.created and capability_attestations.created_at are TEXT
+# columns written with time.RFC3339Nano, whose trailing zeros are trimmed; SQLite
+# compares TEXT lexicographically, so `ORDER BY created DESC LIMIT 1` returns the
+# OLDER row whenever the earlier timestamp's fraction is a prefix of the later
+# one's ("...00Z" > "...00.5Z" because 'Z' > '.'). That served a stale consumed
+# artifact, replayed a stale approval, and honored a stale capability
+# attestation. Fixed by ordering on rowid (insertion order -- same semantics,
+# monotonic, format-immune) at internal/runtime/artifacts.go,
+# internal/runtime/identity.go, and internal/attest/attest.go.
+#
+# Case 22 could only catch this probabilistically, because the trap needs a
+# coarsened clock to trim trailing zeros -- which is why it was green 5/5 in
+# isolation and why "re-run until green" would have shipped the bug. Case 298
+# arms the trap by construction with two fixed timestamp literals and asserts
+# both premises (chronological order, and that the lexicographic trap is
+# actually armed), so it fails 100% of the time against the pre-fix query.
 
 # Exclusions (Sol12 P0-2): every //go:build redteam-tagged test that is NOT a
 # manifest corpus case must be explicitly classified here with a documented

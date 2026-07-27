@@ -286,7 +286,11 @@ func replayMatch(db *sql.DB, identityHash string) (string, error) {
 		return "", nil
 	}
 	var prior string
-	err := db.QueryRow(`SELECT id FROM runs WHERE identity_hash=? AND status='APPROVED' ORDER BY created DESC LIMIT 1`, identityHash).Scan(&prior)
+	// ORDER BY rowid, not created -- runs.created is TEXT in time.RFC3339Nano,
+	// whose trimmed trailing zeros make SQLite's lexicographic order disagree
+	// with chronological order (see internal/runtime/artifacts.go). Selecting
+	// the wrong prior run here replays a stale approval.
+	err := db.QueryRow(`SELECT id FROM runs WHERE identity_hash=? AND status='APPROVED' ORDER BY rowid DESC LIMIT 1`, identityHash).Scan(&prior)
 	if err == sql.ErrNoRows {
 		return "", nil
 	}
