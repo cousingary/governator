@@ -1397,12 +1397,21 @@ CHECKSUMS="$OUT_DIR/checksums.txt"
 # any shipped file is missing from checksums.txt, so omitting a directory that
 # does not exist cannot weaken coverage, while omitting one that DOES exist
 # would still be caught there.
+#
+# redteam-source-identity.json (Sol13 rc6 Session 1 P0-4) is shipped evidence:
+# unlike its siblings .redteam-inventory.txt / .redteam-gate.json, it is not
+# dot-prefixed and is not removed above. It was added to $OUT_DIR without being
+# added here, so the first rc6 release built every artifact, signed checksums.txt,
+# and only then failed the coverage check in release_policy.py -- rc5 never hit
+# it because the file did not exist. It is written unconditionally before the
+# tier pipeline's checkpoints can affect anything, so listing it cannot recreate
+# the attestations-style "listed but absent" sha256sum failure described above.
 (
   cd "$OUT_DIR"
   checksum_inputs=(
     *.tar.gz build-manifest.json architecture-build-metadata.json sbom.json
     claims.yaml test-summary.json acceptance-summary.json claims-verify-report.txt
-    preflight.json toolset.json gov *.log.gz
+    preflight.json toolset.json gov *.log.gz redteam-source-identity.json
   )
   for attestation_file in attestations/*.json; do
     [ -e "$attestation_file" ] || break
