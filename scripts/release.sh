@@ -1386,7 +1386,30 @@ rm -f "$MAIN_TIER_JSONL" "$OUT_DIR/.checkpoint-aggregate.json"
 rm -f "$OUT_DIR/.redteam-gate.json" "$OUT_DIR/.redteam-gate.stderr" "$OUT_DIR/.redteam-inventory.txt"
 
 CHECKSUMS="$OUT_DIR/checksums.txt"
-(cd "$OUT_DIR" && sha256sum -- *.tar.gz build-manifest.json architecture-build-metadata.json sbom.json claims.yaml test-summary.json acceptance-summary.json claims-verify-report.txt preflight.json toolset.json gov *.log.gz attestations/*.json >"$(basename "$CHECKSUMS")")
+# Sol13 rc6 Session 9: attestations/ exists only when the operator supplied
+# GOV_ATTESTATIONS_DIR (release.sh treats it as optional -- `${GOV_ATTESTATIONS_DIR:-}`).
+# Listing `attestations/*.json` unconditionally made sha256sum fail outright on
+# every release that does not carry capability attestations, after all six tiers,
+# the fuzz targets, and all four platform artifacts had already been built. Like
+# the approved-tool policy parser, this path had never executed end to end.
+# Enumerate the directory instead, so present attestations are still covered --
+# release_policy.py's checksum-coverage check independently fails the release if
+# any shipped file is missing from checksums.txt, so omitting a directory that
+# does not exist cannot weaken coverage, while omitting one that DOES exist
+# would still be caught there.
+(
+  cd "$OUT_DIR"
+  checksum_inputs=(
+    *.tar.gz build-manifest.json architecture-build-metadata.json sbom.json
+    claims.yaml test-summary.json acceptance-summary.json claims-verify-report.txt
+    preflight.json toolset.json gov *.log.gz
+  )
+  for attestation_file in attestations/*.json; do
+    [ -e "$attestation_file" ] || break
+    checksum_inputs+=("$attestation_file")
+  done
+  sha256sum -- "${checksum_inputs[@]}" >"$(basename "$CHECKSUMS")"
+)
 
 # ---------------------------------------------------------------------------
 # checksums.txt.hmac — HMAC-SHA256 over checksums.txt, keyed by an
