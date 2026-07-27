@@ -75,6 +75,26 @@ func s3RunAuditValidate(t *testing.T, distDir, repo, releaseCommit string) (stri
 
 // s3WriteGzippedLog gzip-compresses content to path and returns the sha256
 // of the DECOMPRESSED content.
+// s3IdentityGate is the `gov redteam-gate verify` verdict a real release ships
+// at test-summary.json suites.redteam.identity_gate. audit_bundle_validate
+// validates production red-team skips through it BY IDENTITY -- gate ok,
+// strict zero-skip mode, no failures, and no unauthorized skips -- rather than
+// by a raw tests_skipped count, which could never reach 0 on any single host
+// and could not tell a dropped claim from a coverage gap (rc6 Session 9).
+// Every fixture claiming to be a complete dist must supply it.
+func s3IdentityGate() map[string]any {
+	return map[string]any{
+		"ok":                 true,
+		"require_zero_skips": true,
+		"discovered":         58,
+		"run":                58,
+		"skipped":            0,
+		"failed":             0,
+		"inventory_supplied": true,
+		"unexpected_skips":   []string{},
+	}
+}
+
 func s3WriteGzippedLog(t *testing.T, path, content string) string {
 	t.Helper()
 	f, err := os.Create(path)
@@ -153,6 +173,13 @@ func s3BuildCompleteDist(t *testing.T, commit string) string {
 			"log_path":      logName,
 			"log_sha256":    sha,
 			"tests_skipped": 0,
+		}
+		if tier == "redteam" {
+			// A real release always carries the gate's structured verdict here,
+			// and audit_bundle_validate validates production skips by identity
+			// through it rather than by raw count (rc6 Session 9). A fixture
+			// without it is not a complete dist.
+			suites[tier].(map[string]any)["identity_gate"] = s3IdentityGate()
 		}
 	}
 	writeJSON(t, filepath.Join(dist, "test-summary.json"), map[string]any{

@@ -208,7 +208,7 @@ func s8WriteCompleteDist(t *testing.T, dir, commit string) {
 	testSummary := map[string]any{
 		"overall_result": "PASS",
 		"suites": map[string]any{
-			"redteam": map[string]any{"tests_skipped": 0},
+			"redteam": map[string]any{"tests_skipped": 0, "identity_gate": s3IdentityGate()},
 		},
 	}
 	tsdata, _ := json.Marshal(testSummary)

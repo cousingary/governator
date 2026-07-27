@@ -196,7 +196,11 @@ func minimalPassingRedteamSuite(commit, logSHA, logPath string) map[string]any {
 		"tests_run":        58,
 		"tests_skipped":    0,
 		"tests_failed":     0,
-		"identity_gate":    map[string]any{"ok": true, "discovered": 58, "run": 58, "skipped": 0, "failed": 0},
+		// Was a hand-rolled subset lacking require_zero_skips/unexpected_skips.
+		// audit_bundle_validate now reads those to validate production skips by
+		// identity (rc6 Session 9), so the fixture must carry the same shape a
+		// real release ships.
+		"identity_gate": s3IdentityGate(),
 	}
 	if logSHA != "" {
 		suite["log_sha256"] = logSHA
