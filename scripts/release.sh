@@ -32,9 +32,21 @@ release_tool_value() {
       active=1
       continue
     fi
-    if [ "$active" = 1 ] && [ "$line" = "    ${wanted_field}: "* ]; then
-      printf '%s\n' "${line#"    ${wanted_field}: "}"
-      return 0
+    # Sol13 rc6 Session 9: `[ "$x" = "prefix"* ]` is a LITERAL comparison --
+    # `[` does no pattern matching, and the unquoted `*` is only subject to
+    # (here always failing) pathname expansion, so this test could never be
+    # true and release_tool_value always returned 1. Every approved tool
+    # therefore read as "absent from the policy" and release.sh aborted
+    # before its first step. It went unnoticed because S4 introduced this
+    # loop and Session 9 is the first end-to-end release.sh run. `case` is
+    # POSIX and actually globs.
+    if [ "$active" = 1 ]; then
+      case "$line" in
+      "    ${wanted_field}: "*)
+        printf '%s\n' "${line#"    ${wanted_field}: "}"
+        return 0
+        ;;
+      esac
     fi
     if [ "$active" = 1 ] && [ "${line#  }" != "$line" ] && [ "${line#    }" = "$line" ]; then
       return 1
