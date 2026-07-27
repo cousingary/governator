@@ -32,6 +32,7 @@ import (
 	"github.com/cousingary/governator/internal/containment"
 	"github.com/cousingary/governator/internal/contracts"
 	"github.com/cousingary/governator/internal/enforce"
+	govruntime "github.com/cousingary/governator/internal/runtime"
 	"github.com/cousingary/governator/internal/toolregistry"
 )
 
@@ -101,75 +102,125 @@ func TestV7Case8CleanupValidatorDetachedDescendantExtinctionFailureBlocksApprova
 		}
 	}
 
-	mntParent := t.TempDir()
-	mnt := filepath.Join(mntParent, "case8-hang")
-	if err := os.Mkdir(mnt, 0755); err != nil {
-		t.Fatalf("mkdir mountpoint: %v", err)
-	}
+	// Sol13 rc6 Session 9: the mount is staged INSIDE the governed worktree,
+	// at the workspace-relative path below, via the WorkspaceReadyForTesting
+	// seam. Before this it lived in the test's own TempDir, which Landlock
+	// denies a governed descendant outright -- so the descendant's open()
+	// failed before it could ever block, the readiness gate reported "did not
+	// reach a confirmed blocking-read state", and case 8 skipped on every
+	// host with real containment. That is the exact opposite of where this
+	// case needs to run, and no capability host could have fixed it: the
+	// stronger the containment, the more certainly it skipped.
+	//
+	// .codegraph is the deliberate choice of prefix: it is the one workspace
+	// path fingerprint, validateFinalWorktreeShape, the change-set
+	// computation and the merge-tree verification all exclude by name, so the
+	// scaffolding cannot perturb what the run measures -- and, critically, no
+	// measurement walk can ever open the file that never answers a read.
+	const hangDirRel = ".codegraph/case8-hang"
+	var (
+		daemon     *hangfuseDaemon
+		stopDaemon func()
+		mountErr   error
+	)
 	// The daemon is owned by the test process, never by the governed run --
 	// it must outlive the run's own containment teardown for the reader to
 	// stay genuinely stuck. Stopped only after the assertion below.
-	daemon, stopDaemon, err := mountHangfuse(mnt)
-	if err != nil {
-		t.Fatalf("mount hangfuse: %v", err)
+	govruntime.WorkspaceReadyForTesting = func(work string) error {
+		mnt := filepath.Join(work, filepath.FromSlash(hangDirRel))
+		if err := os.MkdirAll(mnt, 0755); err != nil {
+			mountErr = fmt.Errorf("mkdir in-workspace mountpoint: %w", err)
+			return nil
+		}
+		d, stop, err := mountHangfuse(mnt)
+		if err != nil {
+			mountErr = fmt.Errorf("mount hangfuse in workspace: %w", err)
+			return nil
+		}
+		daemon, stopDaemon = d, stop
+		return nil
 	}
-	defer stopDaemon()
+	defer func() {
+		govruntime.WorkspaceReadyForTesting = nil
+		if stopDaemon != nil {
+			stopDaemon()
+		}
+	}()
 
 	// Sol12 rc5 Session 2 (P0-1): EXPLICIT SYNCHRONIZATION replaces the old
 	// timing assumption. The previous form ran the whole governed run (whose
 	// containment teardown fires Extinguish at an unspecified moment) and only
 	// AFTERWARDS checked whether the detached descendant had happened to reach
 	// its blocking read in time -- a race that flaked into a conditional skip
-	// whenever the setsid->sh->dd chain lost to the extinction deadline. The
+	// whenever the descendant lost to the extinction deadline. The
 	// containment.ExtinguishGateForTesting seam blocks Extinguish at its
 	// kill-boundary until this closure confirms the daemon has actually
 	// observed a FUSE_READ from the descendant, so extinction can NEVER fire
-	// before the blocking-read state is reached. The decision is sticky: the
-	// per-stage cleanup scope and the run-level scope each call Extinguish,
-	// so once the read is confirmed (or definitively absent) later calls
-	// return the same verdict without re-waiting.
+	// before the blocking-read state is reached.
+	//
+	// Sol13 rc6 Session 9: SUCCESS is sticky, FAILURE is not. Extinguish is
+	// called at more than one boundary and the FIRST of them is the backend
+	// stage's scope -- which tears down before the cleanup validator has run,
+	// so no descendant exists yet and no read can possibly have been seen.
+	// The original form latched that first non-observation as a permanent
+	// gateErr and returned it from every later call, which aborted the run at
+	// "pre-extinction readiness gate failed" before the cleanup validator's
+	// own extinction boundary was ever reached. Measured directly: the same
+	// fixture with a non-latching gate reaches the blocking read and
+	// quarantines the run. So each boundary re-waits, and only a confirmed
+	// read is remembered; the synchronization guarantee S2 wanted (extinction
+	// never fires ahead of the blocking-read state) is unchanged, while an
+	// early boundary can no longer poison a later one.
+	//
+	// The gate never returns an error now. A window that elapses without a
+	// read is not a refusal to extinguish -- it just means this boundary had
+	// nothing to wait for. Whether the descendant EVER reached the read is
+	// decided once, after the run, from readConfirmed.
 	var (
-		gateErr       error
 		gateCalled    bool
 		readConfirmed bool
 	)
 	containment.ExtinguishGateForTesting = func() error {
 		gateCalled = true
-		if readConfirmed {
+		if readConfirmed || daemon == nil {
 			return nil
 		}
-		if gateErr != nil {
-			return gateErr
+		if daemon.waitForRead(6 * time.Second) {
+			readConfirmed = true
 		}
-		if !daemon.waitForRead(6 * time.Second) {
-			gateErr = fmt.Errorf("descendant did not reach the blocking FUSE read within 6s")
-			return gateErr
-		}
-		readConfirmed = true
 		return nil
 	}
 	defer func() { containment.ExtinguishGateForTesting = nil }()
 
 	root := fixtureRepo(t)
 	c := baseContract(root)
-	// The hangfuse mount is deliberately NOT declared in the cleanup
-	// validator's read_roots: contracts require validator read_roots to be
-	// relative to workspace.root (an absolute host path is rejected), and the
-	// FUSE mount cannot live inside the committed-only git worktree the run
-	// executes in. Under Landlock the descendant therefore cannot open this
-	// external mount on an enforcing host; the readiness gate above turns
-	// that into an honest, structural conditional skip rather than the old
-	// timing flake. On a host where the read IS reachable (a dedicated
-	// capability host, or once Session 5's in-workspace immutable artifact
-	// source lands), the gate confirms the blocking read and the
-	// extinction-failure assertion below runs for real.
-	cleanupCommand := "exec > /dev/null 2>&1; setsid sh -c 'dd if=" + mnt + "/hang of=/dev/null bs=1 count=1' < /dev/null & sleep 1"
+	// Now that the mount is inside the workspace, the hang file is reachable
+	// through an ORDINARY workspace-relative validator read_root -- the same
+	// declaration any real contract would make, no widening of the sandbox
+	// and no absolute host path (validatePathPatterns rejects those outright).
+	// The descendant runs under exactly production's Landlock policy and is
+	// granted exactly one extra readable directory, which is the mechanism
+	// under test, never the invariant under test.
+	// setsid'd, backgrounded, and pointed at declared workspace paths on both
+	// ends. Two incidental details of the old command are gone because both
+	// aborted the validator before it could spawn anything, and neither was
+	// ever part of what case 8 asserts: the /dev/null redirects (Landlock
+	// grants no access to /dev, which forbiddenBroadReadRoots refuses to
+	// declare as a read root at all) and the nested `sh -c` wrapper around dd
+	// (measured: `setsid sh -c 'dd ...' &` never reaches the read, while
+	// `setsid dd ... &` does). The shape that matters is unchanged and is the
+	// whole point of the case -- the validator's own visible process exits 0
+	// immediately, leaving a detached descendant in a session of its own,
+	// stuck in an unkillable FUSE read.
+	cleanupCommand := "setsid dd if=" + hangDirRel + "/hang of=output/case8-sink bs=1 count=1 & sleep 1"
 	c.Cleanup = &contracts.Cleanup{
 		Required:   false,
 		Validators: []string{cleanupCommand},
 		ValidatorSpecs: []contracts.ValidatorSpec{{
-			Command: cleanupCommand,
-			Tools:   []string{"dd", "setsid", "sleep", "sh"},
+			Command:    cleanupCommand,
+			Tools:      []string{"dd", "setsid", "sleep", "sh"},
+			ReadRoots:  []string{hangDirRel},
+			WriteRoots: []string{"output"},
 		}},
 	}
 	bin := fakeBackend(t, standardBackendBody(""))
@@ -178,14 +229,14 @@ func TestV7Case8CleanupValidatorDetachedDescendantExtinctionFailureBlocksApprova
 	// The gate is the P0-1 synchronization primitive. If the run never
 	// reached any extinction boundary (gateCalled=false -- contract rejected
 	// or the chain aborted early) OR the descendant never reached a confirmed
-	// blocking read (gateErr set -- e.g. Landlock denied the external mount),
-	// this host cannot drive the full deterministic chain case 8 asserts.
-	// Skip honestly: a structural host-capability limit, not the timing race
-	// the old form hid behind. The manifest authorizes this skip via the
+	// blocking read at ANY boundary, this host cannot drive the full
+	// deterministic chain case 8 asserts. Skip honestly: a structural
+	// host-capability limit, not the timing race the old form hid behind. The
+	// manifest authorizes this skip via the
 	// case8_hangfuse_extinction_fixture predicate (Session 2 makes that skip
 	// reflect capability, not timing).
-	if !gateCalled || gateErr != nil {
-		t.Skipf("conditional: case8 hangfuse extinction fixture: the cleanup-validator descendant did not reach a confirmed blocking-read state before extinction on this host (gateCalled=%v, gateErr=%v, runErr=%v)", gateCalled, gateErr, runErr)
+	if !gateCalled || !readConfirmed {
+		t.Skipf("conditional: case8 hangfuse extinction fixture: the cleanup-validator descendant did not reach a confirmed blocking-read state before extinction on this host (gateCalled=%v, readConfirmed=%v, mountErr=%v, runErr=%v)", gateCalled, readConfirmed, mountErr, runErr)
 	}
 	// The gate fired AND confirmed the blocking read: the descendant is
 	// genuinely stuck in an unkillable FUSE read, so Extinguish must have
@@ -194,10 +245,22 @@ func TestV7Case8CleanupValidatorDetachedDescendantExtinctionFailureBlocksApprova
 	if rec.Status == "APPROVED" {
 		t.Fatalf("cleanup validator's detached descendant survived SIGKILL past the extinction deadline (genuine kernel-level uninterruptible sleep via an unanswered FUSE read), yet the run was still APPROVED -- extinction failure must block approval regardless of Cleanup.Required=false")
 	}
-	if runErr == nil {
-		t.Fatalf("descendant confirmed blocked on the unkillable FUSE read (gate released) yet the run reported no extinction failure (status=%q) -- extinction failure must block approval regardless of Cleanup.Required=false", rec.Status)
+	// ...and it must be blocked for THIS reason. Sol13 rc6 Session 9: the
+	// reason now surfaces where a blocked run's reason belongs -- the
+	// quarantine record -- rather than as a returned error. Before this
+	// session the fixture never reached a real extinction boundary, so the
+	// only non-nil runErr it ever saw was the readiness gate refusing to
+	// extinguish at all; with the gate no longer latching, the run proceeds,
+	// extinction genuinely fails, and the runtime quarantines and records it.
+	// Quarantine IS the block this case asserts, so accept the reason from
+	// either channel and refuse a pass that names neither -- otherwise an
+	// unrelated violation (a stage timeout, a contract rejection) could
+	// masquerade as the extinction failure.
+	reason := rec.Message + "\n" + rec.Notes
+	if runErr != nil {
+		reason += "\n" + runErr.Error()
 	}
-	if !strings.Contains(runErr.Error(), "extinction") && !strings.Contains(runErr.Error(), "descendant containment") {
-		t.Fatalf("run failed for the wrong reason after the confirmed blocking read -- expected descendant-containment/extinction failure, got: %v", runErr)
+	if !strings.Contains(reason, "extinction") && !strings.Contains(reason, "descendant containment") {
+		t.Fatalf("run was blocked (status=%q) after the confirmed blocking read, but for the wrong reason -- expected a descendant-containment/extinction failure, got runErr=%v message=%q notes=%q", rec.Status, runErr, rec.Message, rec.Notes)
 	}
 }

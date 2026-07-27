@@ -43,7 +43,9 @@ func TestLoadManifestRejectsBlankName(t *testing.T) {
 // 283-285, plus case 296 (a
 // rc6-upg13 S3 exclusion-audit gap closure enrolling a pre-existing
 // internal/containment test that was never in the manifest -- deliberately
-// numbered outside 265-295, which stays reserved for Sol13 Sessions 4-8),
+// numbered outside 265-295, which stays reserved for Sol13 Sessions 4-8) and
+// case 297 (Sol13 Session 9's release-scope correction, numbered outside the
+// same reserved range for the same reason),
 // plus the documented non-production exclusions that let the authoritative
 // inventory account for every //go:build redteam-tagged security test (P0-2).
 func TestLoadManifestAcceptsRealManifest(t *testing.T) {
@@ -52,8 +54,8 @@ func TestLoadManifestAcceptsRealManifest(t *testing.T) {
 	if err != nil {
 		t.Fatalf("LoadManifest(%s): %v", path, err)
 	}
-	if len(m.Cases) != 295 {
-		t.Fatalf("expected 295 cases in the mandatory final attack corpus, got %d", len(m.Cases))
+	if len(m.Cases) != 296 {
+		t.Fatalf("expected 296 cases in the mandatory final attack corpus, got %d", len(m.Cases))
 	}
 	seen := make(map[int]bool)
 	for _, c := range m.Cases {

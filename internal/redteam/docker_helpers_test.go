@@ -103,10 +103,16 @@ func dockerContract(root, image string) contracts.Contract {
 	// confinement boundary), so clear it rather than leaving a
 	// local-runner-only field on a docker contract.
 	c.Local = nil
-	c.Success = contracts.Success{
-		RequiredFiles: []string{"output/result.txt"},
-		Validators:    []string{":"},
-	}
+	// Sol13 rc6 Session 9: this used to override Success with a bare legacy
+	// string validator (`Validators: []string{":"}`, no ValidatorSpecs),
+	// which S6 made permanently non-approving --
+	// LEGACY_VALIDATOR_NON_APPROVING quarantines the run before the attack
+	// under test ever gets a chance to happen. It is the same regression
+	// class S6 left behind in 43 other fixtures; these two survived only
+	// because they are Docker-gated and every prior tier ran with the daemon
+	// stopped, so they never executed to fail. baseContract already carries
+	// the correctly structured equivalent of this validator, so the override
+	// is simply dropped rather than re-derived.
 	c.Runner = "docker"
 	c.Docker = &contracts.DockerRunnerConfig{
 		Image:   image,

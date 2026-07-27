@@ -314,15 +314,21 @@ func ParseVerboseLog(log string) map[string]Outcome {
 
 // Result is the identity-based gate's verdict over one redteam run.
 type Result struct {
-	OK                     bool     `json:"ok"`
-	Discovered             int      `json:"discovered"`
-	Run                    int      `json:"run"`
-	Skipped                int      `json:"skipped"`
-	Failed                 int      `json:"failed"`
-	MissingTests           []string `json:"missing_tests,omitempty"`
-	UnexpectedTests        []string `json:"unexpected_tests,omitempty"`
-	FailedTests            []string `json:"failed_tests,omitempty"`
-	UnexpectedSkips        []string `json:"unexpected_skips,omitempty"`
+	OK              bool     `json:"ok"`
+	Discovered      int      `json:"discovered"`
+	Run             int      `json:"run"`
+	Skipped         int      `json:"skipped"`
+	Failed          int      `json:"failed"`
+	MissingTests    []string `json:"missing_tests,omitempty"`
+	UnexpectedTests []string `json:"unexpected_tests,omitempty"`
+	FailedTests     []string `json:"failed_tests,omitempty"`
+	UnexpectedSkips []string `json:"unexpected_skips,omitempty"`
+	// OutOfScopeSkips lists production-mode skips excused because the case
+	// is bound to a platform this release declares non-approving (see
+	// SkipOutOfReleaseScope). They are dropped claims, not covered ones:
+	// recorded here so an auditor reading the evidence bundle sees exactly
+	// which properties the release stopped asserting.
+	OutOfScopeSkips        []string `json:"out_of_scope_skips,omitempty"`
 	IncompleteCapabilities []string `json:"incomplete_capabilities,omitempty"`
 	RequireZeroSkips       bool     `json:"require_zero_skips"`
 	InventorySupplied      bool     `json:"inventory_supplied"`
@@ -453,10 +459,19 @@ func EvaluateWithOptions(manifest Manifest, log string, capabilities map[string]
 		}
 		if o.Result == "SKIP" {
 			if opts.RequireZeroSkips {
-				if opts.Attestations != nil && SkipCoveredByAttestations(name, *opts.Attestations, c) {
+				switch {
+				case SkipOutOfReleaseScope(c):
+					// Sol13 rc6 Session 9: the case is bound to a platform
+					// ClassifyPlatform declares non-approving, so this
+					// release asserts nothing about it and its skip is not a
+					// coverage gap. Recorded explicitly so the evidence
+					// bundle shows WHICH claims were dropped rather than
+					// silently counting the run as fully covered.
+					res.OutOfScopeSkips = append(res.OutOfScopeSkips, name)
+				case opts.Attestations != nil && SkipCoveredByAttestations(name, *opts.Attestations, c):
 					// Session 9: skip is accounted for by the aggregated
 					// attestation set — not a gap.
-				} else {
+				default:
 					res.UnexpectedSkips = append(res.UnexpectedSkips, name)
 				}
 			} else if !skipAllowed(c, o.Reason, capabilities) {
@@ -503,6 +518,7 @@ func EvaluateWithOptions(manifest Manifest, log string, capabilities map[string]
 	sort.Strings(res.UnexpectedTests)
 	sort.Strings(res.FailedTests)
 	sort.Strings(res.UnexpectedSkips)
+	sort.Strings(res.OutOfScopeSkips)
 	sort.Strings(res.MissingTests)
 	sort.Strings(res.IncompleteCapabilities)
 

@@ -1718,6 +1718,11 @@ cases:
     session: rc6-u13-s3-gap-closure
     required: true
     status: implemented
+  - case: 297
+    name: TestV13Case297NonApprovingPlatformSkipIsOutOfReleaseScopeNotAGap
+    session: rc6-u13-s9
+    required: true
+    status: implemented
 
 # Case 296 is not one of Sol13's original 51 findings (which occupy 245-295).
 # It closes a gap the rc6-upg13 S3 exclusion audit found: TestV6Case29's own
@@ -1727,6 +1732,15 @@ cases:
 # but was never enrolled, so V6Case29 could not cite it as a replacement.
 # Numbered 296 (not 265-295) specifically so it never collides with a future
 # S4-S8 case number from Sol13's reserved range.
+
+# Case 297 is likewise outside Sol13's 245-295 finding range. Session 9 found
+# the rc6 cut unsatisfiable by construction: darwin capability attestations
+# are REQUIRED to be non-approving, and non-approving categories were rejected
+# as coverage, so cases 34/35 could not be cleared by any host on earth -- a
+# real Mac included. Case 297 pins the corrected rule (a skip bound to a
+# platform ClassifyPlatform declares non-approving is a DROPPED claim recorded
+# as such, not a coverage gap) together with its three negative bounds, so the
+# correction can never widen into a general skip waiver.
 
 # Exclusions (Sol12 P0-2): every //go:build redteam-tagged test that is NOT a
 # manifest corpus case must be explicitly classified here with a documented

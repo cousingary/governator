@@ -316,13 +316,25 @@ func TestV7Case21RTKMinimalismAnnotationChangeInvalidatesReplay(t *testing.T) {
 // the exact same reason never even reach a Hash() comparison, closing RB5's
 // "an unknown sentinel can let two unknown environments compare equal" gap
 // at the lookup layer rather than relying on the hash of the word "unknown"
-// happening to differ. Uses baseContract's legacy string Validators (not
-// strictReplayContract's ValidatorSpecs) as the lever: runtime.go's runOnce
-// explicitly marks validator_tools/validator_scripts Known:false whenever a
-// contract has legacy Validators with no ValidatorSpecs (line ~2859), which
-// is exactly a "required identity stays unknown" condition -- deliberately
-// paired with strictReplayConfig's declared backend identity, so backend
-// unknown-ness cannot be what's disabling replay here.
+// happening to differ.
+//
+// The lever is baseContract's legacy string Validators with the structured
+// ValidatorSpecs removed: runtime.go's runOnce explicitly marks
+// validator_tools/validator_scripts Known:false whenever a contract has
+// legacy Validators with no ValidatorSpecs (line ~3219), which is exactly a
+// "required identity stays unknown" condition -- deliberately paired with
+// strictReplayConfig's declared backend identity, so backend unknown-ness
+// cannot be what's disabling replay here.
+//
+// Sol13 S9: Sol13 S6 made legacy string validators non-approving
+// (legacyValidatorApprovalViolations quarantines outright), so this run no
+// longer reaches APPROVED. The unknown-identity -> strict-replay-disabled
+// property this case asserts is unchanged and is now read directly off the
+// RunRecord.StrictReplayEligible field; the quarantine is S6's strictly
+// stronger consequence of the very same legacy-validator condition. An
+// approving-but-unknown integration shape no longer exists (the only
+// participants that can be Known:false are git/shell, which the run cannot
+// execute without), so the property is asserted on the quarantined run.
 func TestV7Case30UnknownRequiredIdentityDisablesStrictReplay(t *testing.T) {
 	strictReplayConfig(t)
 	root := fixtureRepo(t)
@@ -333,11 +345,18 @@ func TestV7Case30UnknownRequiredIdentityDisablesStrictReplay(t *testing.T) {
 	strictReplayEnrollControllerTools(t)
 
 	c := baseContract(root)
+	c.Success.ValidatorSpecs = nil
 	bin := fakeBackend(t, standardBackendBody(""))
 
 	r1 := runGoverned(t, home, bin, c)
-	if r1.Status != "APPROVED" {
-		t.Fatalf("run 1 expected APPROVED, got status=%s message=%s", r1.Status, r1.Message)
+	if r1.Status != "QUARANTINED" {
+		t.Fatalf("run 1 expected QUARANTINED (legacy string validators are non-approving since Sol13 S6), got status=%s message=%s", r1.Status, r1.Message)
+	}
+	if !strings.Contains(r1.Message, "LEGACY_VALIDATOR_NON_APPROVING") {
+		t.Fatalf("run 1 quarantine reason = %q, want it to contain LEGACY_VALIDATOR_NON_APPROVING", r1.Message)
+	}
+	if r1.StrictReplayEligible {
+		t.Fatal("run 1 reported StrictReplayEligible=true even though its legacy string validators leave validator_tools/validator_scripts identity permanently unknown -- an unknown required identity must disable strict replay")
 	}
 	if r1.Replayed {
 		t.Fatal("run 1 (first ever run) reported Replayed=true")
@@ -345,10 +364,10 @@ func TestV7Case30UnknownRequiredIdentityDisablesStrictReplay(t *testing.T) {
 
 	r2 := runGoverned(t, home, bin, c)
 	if r2.Replayed {
-		t.Fatal("run 2, byte-for-byte identical to run 1, reported Replayed=true even though the contract's legacy string validators leave validator_tools/validator_scripts identity permanently unknown -- an unknown required identity must disable strict replay, never compare equal to another unknown run")
+		t.Fatal("run 2, byte-for-byte identical to run 1, reported Replayed=true even though the legacy string validators leave a required execution identity permanently unknown -- an unknown required identity must disable strict replay, never compare equal to another unknown run")
 	}
-	if r2.Status != "APPROVED" {
-		t.Fatalf("run 2 expected a fresh APPROVED (non-replayed) outcome, got status=%s message=%s", r2.Status, r2.Message)
+	if r2.StrictReplayEligible {
+		t.Fatal("run 2 reported StrictReplayEligible=true despite the same unknown validator identity")
 	}
 }
 
@@ -522,7 +541,7 @@ func TestV7Case23ConsumedArtifactChangeBetweenHashAndStagingInvalidatesReplay(t 
 		Forbidden:   contracts.Forbidden{Paths: []string{".git/**"}, Commands: []string{"rm -rf"}, Behaviors: []string{"network"}},
 		Budget:      contracts.Budget{MaxMinutes: 1, MaxCommands: 5, MaxFilesChanged: 5, MaxLinesChanged: 20, MaxNewFiles: 5, MaxDeleted: 0},
 		Preflight:   contracts.Preflight{IntendedWrites: []string{"output/**", ".governator/artifacts/**"}},
-		Success:     contracts.Success{RequiredFiles: []string{"output/result.txt"}, Validators: []string{"test -f output/result.txt"}},
+		Success:     contracts.Success{RequiredFiles: []string{"output/result.txt"}, Validators: []string{"test -f output/result.txt"}, ValidatorSpecs: []contracts.ValidatorSpec{{Command: "test -f output/result.txt", Tools: []string{"test"}}}},
 		Produces:    []contracts.ArtifactSpec{{Name: "art", Path: ".governator/artifacts/art.txt", MaxBytes: 1024}},
 		OnViolation: "quarantine",
 		Local:       &contracts.LocalRunnerConfig{ReadRoots: shellReadRootsForFixtures()},
@@ -563,7 +582,7 @@ printf '{"type":"result","total_cost_usd":0.25}\n'
 		Forbidden:       contracts.Forbidden{Paths: []string{".git/**"}, Commands: []string{"rm -rf"}, Behaviors: []string{"network"}},
 		Budget:          contracts.Budget{MaxMinutes: 1, MaxCommands: 5, MaxFilesChanged: 5, MaxLinesChanged: 20, MaxNewFiles: 5, MaxDeleted: 0},
 		Preflight:       contracts.Preflight{IntendedWrites: []string{"output/**"}},
-		Success:         contracts.Success{RequiredFiles: []string{"output/result.txt"}, Validators: []string{"test -f output/result.txt"}},
+		Success:         contracts.Success{RequiredFiles: []string{"output/result.txt"}, Validators: []string{"test -f output/result.txt"}, ValidatorSpecs: []contracts.ValidatorSpec{{Command: "test -f output/result.txt", Tools: []string{"test"}}}},
 		Consumes:        []string{"art"},
 		ArtifactSources: map[string]string{"art": "v7-case23-producer"},
 		OnViolation:     "quarantine",

@@ -145,12 +145,24 @@ func TestV13Case18SameEvidenceRelabeledUnderMultipleCategoriesIsRejected(t *test
 	}
 }
 
+// Sol13 rc6 Session 9: this case originally used the darwin category as its
+// vehicle, which conflated two independent rules -- "a NonApproving category
+// never covers a skip" (this case) and "a case bound to a platform the
+// release declares non-approving is out of release scope entirely" (case
+// 297). Conflated, they deadlocked: darwin attestations MUST be NonApproving
+// (verifyCategoryCapabilityProof) yet NonApproving never covered, so no host
+// could ever clear cases 34/35 and no rc6 could ever be cut. The invariant
+// this case exists for is unchanged and asserted here on a category that is
+// NOT platform-bound, so it stays orthogonal to release scope.
 func TestV13Case19NonApprovingCategoryCannotCoverProductionTest(t *testing.T) {
-	manifest := redteamgate.Manifest{Cases: []redteamgate.CaseEntry{{Case: 1, Name: "TestDarwinOnly", Required: true, AttestationCategory: redteamgate.AttestationCategoryDarwin}}}
-	log := "=== RUN   TestDarwinOnly\n--- SKIP: TestDarwinOnly (0.00s)\n"
-	result := redteamgate.EvaluateWithOptions(manifest, log, nil, redteamgate.Options{RequireZeroSkips: true, Attestations: &redteamgate.AggregationResult{CoverageByCategory: map[string]map[string]bool{redteamgate.AttestationCategoryDarwin: {"TestDarwinOnly": true}}, NonApprovingCategories: map[string]bool{redteamgate.AttestationCategoryDarwin: true}}})
+	manifest := redteamgate.Manifest{Cases: []redteamgate.CaseEntry{{Case: 1, Name: "TestDockerOnly", Required: true, AttestationCategory: redteamgate.AttestationCategoryDockerEnabled}}}
+	log := "=== RUN   TestDockerOnly\n--- SKIP: TestDockerOnly (0.00s)\n"
+	result := redteamgate.EvaluateWithOptions(manifest, log, nil, redteamgate.Options{RequireZeroSkips: true, Attestations: &redteamgate.AggregationResult{CoverageByCategory: map[string]map[string]bool{redteamgate.AttestationCategoryDockerEnabled: {"TestDockerOnly": true}}, NonApprovingCategories: map[string]bool{redteamgate.AttestationCategoryDockerEnabled: true}}})
 	if result.OK || len(result.UnexpectedSkips) != 1 {
 		t.Fatalf("non-approving category covered a production skip: %+v", result)
+	}
+	if len(result.OutOfScopeSkips) != 0 {
+		t.Fatalf("a non-platform-bound category must never be excused as out of release scope: %+v", result)
 	}
 }
 

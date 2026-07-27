@@ -82,6 +82,7 @@ func TestV10Case15OptionalCleanupCorruptionWithNonzeroExitDoesNotMerge(t *testin
 	// bytes and the run would quarantine -- APPROVED here is only possible
 	// because the failed cleanup's corruption never reached it.
 	c.Success.Validators = append(c.Success.Validators, `[ "$(cat output/result.txt)" = "ok" ]`)
+	c.Success.ValidatorSpecs = append(c.Success.ValidatorSpecs, contracts.ValidatorSpec{Command: `[ "$(cat output/result.txt)" = "ok" ]`, Tools: []string{"cat"}})
 	corrupt := `printf 'CORRUPTED-BY-CLEANUP' > output/result.txt; exit 1`
 	c.Cleanup = &contracts.Cleanup{
 		Required:       false,
@@ -104,6 +105,7 @@ func TestV10Case16SuccessfulCleanupInvalidatingPassingValidatorBlocksApproval(t 
 	root := fixtureRepo(t)
 	c := baseContract(root)
 	c.Success.Validators = append(c.Success.Validators, `[ "$(cat output/result.txt)" = "ok" ]`)
+	c.Success.ValidatorSpecs = append(c.Success.ValidatorSpecs, contracts.ValidatorSpec{Command: `[ "$(cat output/result.txt)" = "ok" ]`, Tools: []string{"cat"}})
 	spoil := `printf 'SPOILED-BY-SUCCESSFUL-CLEANUP' > output/result.txt`
 	c.Cleanup = &contracts.Cleanup{
 		Required:       false,
@@ -147,6 +149,7 @@ func TestV10Case17CleanupPartialWriteBeforeTimeoutRestoresPreCleanupState(t *tes
 	c := baseContract(root)
 	c.Budget.MaxMinutes = 1
 	c.Success.Validators = append(c.Success.Validators, `[ "$(cat output/result.txt)" = "ok" ]`)
+	c.Success.ValidatorSpecs = append(c.Success.ValidatorSpecs, contracts.ValidatorSpec{Command: `[ "$(cat output/result.txt)" = "ok" ]`, Tools: []string{"cat"}})
 	hang := `printf 'PARTIAL-BEFORE-TIMEOUT' > output/result.txt; sleep 90`
 	c.Cleanup = &contracts.Cleanup{
 		Required:       false,
@@ -231,6 +234,7 @@ func TestV10Case20SuccessValidatorsExecuteAfterLastCleanupMutation(t *testing.T)
 	// the backend's original "ok\n" -- a failure here would mean success
 	// validators still ran before cleanup.
 	c.Success.Validators = append(c.Success.Validators, `[ "$(cat output/result.txt)" = "MUTATED-BY-CLEANUP" ]`)
+	c.Success.ValidatorSpecs = append(c.Success.ValidatorSpecs, contracts.ValidatorSpec{Command: `[ "$(cat output/result.txt)" = "MUTATED-BY-CLEANUP" ]`, Tools: []string{"cat"}})
 	bin := fakeBackend(t, standardBackendBody(""))
 	rec := runGoverned(t, t.TempDir(), bin, c)
 	if rec.Status != "APPROVED" {

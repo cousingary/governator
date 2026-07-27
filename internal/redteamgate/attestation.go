@@ -266,11 +266,56 @@ func AggregateAndVerify(atts []CapabilityAttestation, requiredCategories []strin
 	return res
 }
 
+// CategoryPlatform reports the GOOS a capability-attestation category is
+// bound to, or "" when the category is not platform-bound (core,
+// docker-enabled, systemd-enabled and fallback-path all describe capability
+// shapes of an approving Linux host, not a distinct release platform).
+func CategoryPlatform(category string) string {
+	if category == AttestationCategoryDarwin {
+		return "darwin"
+	}
+	return ""
+}
+
+// SkipOutOfReleaseScope reports whether a case's skip falls outside anything
+// this release claims: the case is bound to a platform ClassifyPlatform
+// declares non-approving, so the release ships no approving artifact for it
+// and asserts no production property about it.
+//
+// This is the rule the rc6 plan states for Session 9.2 -- "if a category has
+// no available host, the release must either drop the claim for that platform
+// (non-approving, as rc5 correctly did for Darwin) or block" -- and without it
+// the gate demanded the impossible. Darwin was deadlocked by construction:
+// verifyCategoryCapabilityProof REQUIRES every darwin attestation to be
+// NonApproving, and SkipCoveredByAttestations then rejected every
+// NonApproving category outright, so a genuine, signed, passing run on a real
+// Mac could not clear the darwin cases either. No host on earth satisfied it;
+// the release could never be cut, which is a gate defect, not evidence of a
+// missing machine.
+//
+// The exemption is self-tightening: it is derived from ClassifyPlatform, so
+// the day darwin moves into approvingPlatforms the exemption disappears on its
+// own and real darwin coverage becomes mandatory again.
+func SkipOutOfReleaseScope(caseEntry CaseEntry) bool {
+	platform := CategoryPlatform(caseEntry.AttestationCategory)
+	if platform == "" {
+		return false
+	}
+	return ClassifyPlatform(platform) == PlatformNonApproving
+}
+
 // SkipCoveredByAttestations accepts a production skip only when the manifest
 // names a category and that exact category's signed, capability-proven host
 // recorded a pass for the exact test. Local absence evidence never replaces a
 // host execution in a zero-skip production release.
+//
+// The single exception is a case the release makes no claim about at all --
+// see SkipOutOfReleaseScope. Everything the release DOES claim still requires
+// an exact category-matched signed host pass.
 func SkipCoveredByAttestations(test string, aggregation AggregationResult, caseEntry CaseEntry) bool {
+	if SkipOutOfReleaseScope(caseEntry) {
+		return true
+	}
 	if caseEntry.AttestationCategory == "" || aggregation.NonApprovingCategories[caseEntry.AttestationCategory] {
 		return false
 	}

@@ -51,35 +51,57 @@ import (
 
 var RuntimeGOOS = goruntime.GOOS
 
+// WorkspaceReadyForTesting is a TEST-ONLY staging seam (Sol13 rc6 Session 9).
+// When non-nil it is invoked with the prepared worktree path immediately after
+// the WORKSPACE_READY lifecycle event -- after the baseline fingerprint, before
+// the agent launches -- so a red-team fixture can place host-level scaffolding
+// inside the governed workspace that a committed-only tree cannot carry. It
+// exists for corpus case 8, whose unkillable-descendant mechanism (a hangfuse
+// mount) must be reachable from INSIDE the run's Landlock read set to prove
+// anything: staged in the test's own TempDir it was denied on every enforcing
+// host, so the case skipped precisely where containment was real.
+//
+// Fixtures must stage under .codegraph/, the one workspace prefix every
+// measurement path (fingerprint, validateFinalWorktreeShape, the change-set
+// and merge-tree computations) already excludes by name -- scaffolding must
+// never be able to alter what the run measures, and a FUSE file that never
+// answers a read would otherwise hang the fingerprint walk forever.
+//
+// Production code MUST NEVER set this; only _test.go / redteam-corpus code
+// assigns it and defers restoring nil, exactly like
+// containment.ExtinguishGateForTesting and enforce.SelfExeOverride.
+var WorkspaceReadyForTesting func(work string) error
+
 type RunRecord struct {
-	ID              string                    `json:"id"`
-	JobID           string                    `json:"job_id"`
-	JobType         string                    `json:"job_type,omitempty"`
-	Agent           string                    `json:"agent,omitempty"`
-	Mode            string                    `json:"mode,omitempty"`
-	Status          string                    `json:"status"`
-	Root            string                    `json:"root"`
-	Worktree        string                    `json:"worktree,omitempty"`
-	Branch          string                    `json:"branch,omitempty"`
-	Diff            string                    `json:"diff,omitempty"`
-	Transcript      string                    `json:"transcript,omitempty"`
-	Message         string                    `json:"message"`
-	Commit          string                    `json:"commit,omitempty"`
-	Created         string                    `json:"created"`
-	Replayed        bool                      `json:"replayed"`
-	IdentityHash    string                    `json:"identity_hash,omitempty"`
-	CostUSD         float64                   `json:"cost_usd"`
-	Usage           observability.TokenUsage  `json:"usage"`
-	ToolCalls       int                       `json:"tool_calls"`
-	TranscriptBytes int64                     `json:"transcript_bytes"`
-	Graph           contextgraph.Snapshot     `json:"graph"`
-	ValidOutput     bool                      `json:"valid_output"`
-	FailureTaxonomy string                    `json:"failure_taxonomy,omitempty"`
-	SelfReview      *contracts.ResultDocument `json:"self_review,omitempty"`
-	PromptVersion   string                    `json:"prompt_version,omitempty"`
-	Envelope        string                    `json:"envelope,omitempty"`
-	Notes           string                    `json:"notes,omitempty"`
-	RepairOf        string                    `json:"repair_of,omitempty"`
+	ID                   string                    `json:"id"`
+	JobID                string                    `json:"job_id"`
+	JobType              string                    `json:"job_type,omitempty"`
+	Agent                string                    `json:"agent,omitempty"`
+	Mode                 string                    `json:"mode,omitempty"`
+	Status               string                    `json:"status"`
+	Root                 string                    `json:"root"`
+	Worktree             string                    `json:"worktree,omitempty"`
+	Branch               string                    `json:"branch,omitempty"`
+	Diff                 string                    `json:"diff,omitempty"`
+	Transcript           string                    `json:"transcript,omitempty"`
+	Message              string                    `json:"message"`
+	Commit               string                    `json:"commit,omitempty"`
+	Created              string                    `json:"created"`
+	Replayed             bool                      `json:"replayed"`
+	IdentityHash         string                    `json:"identity_hash,omitempty"`
+	StrictReplayEligible bool                      `json:"strict_replay_eligible"`
+	CostUSD              float64                   `json:"cost_usd"`
+	Usage                observability.TokenUsage  `json:"usage"`
+	ToolCalls            int                       `json:"tool_calls"`
+	TranscriptBytes      int64                     `json:"transcript_bytes"`
+	Graph                contextgraph.Snapshot     `json:"graph"`
+	ValidOutput          bool                      `json:"valid_output"`
+	FailureTaxonomy      string                    `json:"failure_taxonomy,omitempty"`
+	SelfReview           *contracts.ResultDocument `json:"self_review,omitempty"`
+	PromptVersion        string                    `json:"prompt_version,omitempty"`
+	Envelope             string                    `json:"envelope,omitempty"`
+	Notes                string                    `json:"notes,omitempty"`
+	RepairOf             string                    `json:"repair_of,omitempty"`
 }
 
 func envelopeJSON(spec agents.BackendSpec, capability agents.Capability) string {
@@ -3263,7 +3285,7 @@ func (r *Runner) runOnce(ctx context.Context, c contracts.Contract) (RunRecord, 
 	work, branch := ws.Path, ws.Branch
 	transcript := filepath.Join(r.Home, "transcripts", id+".jsonl")
 	spec := agents.SpecFromContract(c, work)
-	rec := RunRecord{ID: id, JobID: c.JobID, JobType: c.JobType, Agent: resolved.Agent, Mode: string(c.Mode), Status: "RUNNING", Root: root, Worktree: work, Branch: branch, Transcript: transcript, Created: time.Now().UTC().Format(time.RFC3339Nano), PromptVersion: promptVersion.ID, Envelope: envelopeJSON(spec, agent.Capabilities()), RepairOf: c.RepairLineage, IdentityHash: identity.Hash()}
+	rec := RunRecord{ID: id, JobID: c.JobID, JobType: c.JobType, Agent: resolved.Agent, Mode: string(c.Mode), Status: "RUNNING", Root: root, Worktree: work, Branch: branch, Transcript: transcript, Created: time.Now().UTC().Format(time.RFC3339Nano), PromptVersion: promptVersion.ID, Envelope: envelopeJSON(spec, agent.Capabilities()), RepairOf: c.RepairLineage, IdentityHash: identity.Hash(), StrictReplayEligible: identity.StrictReplayEligible}
 	if err = insertRun(db, rec, hash, head); err != nil {
 		return rec, err
 	}
@@ -3285,6 +3307,22 @@ func (r *Runner) runOnce(ctx context.Context, c contracts.Contract) (RunRecord, 
 	}
 	if err := lifecycle.Record(db, id, lifecycle.WorkspaceReady, string(wsDescriptorJSON), lifecycle.Now()); err != nil {
 		return rec, err
+	}
+	// Sol13 rc6 Session 9 (P0, case 8): test-only seam, exact sibling of
+	// containment.ExtinguishGateForTesting. Fires once the worktree exists
+	// and its baseline fingerprint has already been taken, so a fixture can
+	// stage host-level scaffolding INSIDE the governed workspace that could
+	// not exist in a committed-only tree. Case 8 needs precisely this: its
+	// hangfuse mount used to live in the test's own TempDir, which Landlock
+	// denies the governed descendant, so the one corpus case proving
+	// "extinction failure blocks approval" skipped on every host where
+	// containment was real -- the only hosts where it means anything. Nil in
+	// production; the release gate's inventory + manifest make an unreferenced
+	// seam visible rather than silent.
+	if WorkspaceReadyForTesting != nil {
+		if err := WorkspaceReadyForTesting(work); err != nil {
+			return rec, err
+		}
 	}
 	// Consume the exact frozen graph snapshot represented by replay identity.
 	graphSnapshot := preReplayGraph
@@ -4407,6 +4445,7 @@ func (r *Runner) runOnce(ctx context.Context, c contracts.Contract) (RunRecord, 
 	// on, not the commit the run started from.
 	identity.ApprovedHead = approved
 	rec.IdentityHash = identity.Hash()
+	rec.StrictReplayEligible = identity.StrictReplayEligible
 	if err := updateRun(db, rec, approved); err != nil {
 		if rootCommitted {
 			payload, _ := json.Marshal(runUpdatePayload{Record: rec, Approved: approved})

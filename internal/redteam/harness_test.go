@@ -19,6 +19,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"sync"
 	"testing"
 
@@ -234,7 +235,6 @@ func enrollRealControllerTools(t *testing.T) {
 		{"bash", "/usr/bin/bash"},
 		{"unshare", "/usr/bin/unshare"},
 		{"systemd-run", "/usr/bin/systemd-run"},
-		{"test", "/usr/bin/test"},
 	} {
 		path := tool.abs
 		if _, err := os.Stat(path); err != nil {
@@ -243,6 +243,38 @@ func enrollRealControllerTools(t *testing.T) {
 				if tool.name == "unshare" || tool.name == "systemd-run" {
 					continue
 				}
+				t.Fatal(lookErr)
+			}
+			path = looked
+		}
+		if canonical, err := filepath.EvalSymlinks(path); err == nil {
+			path = canonical
+		}
+		if _, err := toolregistry.Enroll(tool.name, path); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Tools baseContract's structured validators declare. Enrolled only when
+	// absent so a test that deliberately re-enrolls one at a manipulated inode
+	// (e.g. TestV7Case17 re-enrolls "test" at a fresh copy to invalidate
+	// replay) is not clobbered back to the canonical path on every runGoverned.
+	for _, tool := range []struct{ name, abs string }{
+		{"test", "/usr/bin/test"},
+		{"cat", "/usr/bin/cat"},
+		{"setsid", "/usr/bin/setsid"},
+		{"sh", "/usr/bin/sh"},
+		{"sleep", "/usr/bin/sleep"},
+		{"printf", "/usr/bin/printf"},
+	} {
+		if r, err := toolregistry.Load(); err == nil {
+			if e, ok := r.Entry(tool.name); ok && strings.TrimSpace(e.Path) != "" {
+				continue
+			}
+		}
+		path := tool.abs
+		if _, err := os.Stat(path); err != nil {
+			looked, lookErr := exec.LookPath(tool.name)
+			if lookErr != nil {
 				t.Fatal(lookErr)
 			}
 			path = looked

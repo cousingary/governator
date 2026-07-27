@@ -126,6 +126,10 @@ func TestV6Case3ValidatorSetsidDelayedWriterCannotWriteAfterApproval(t *testing.
 		"test -f output/result.txt",
 		"setsid sh -c 'sleep 2; printf validator-escaped > " + escapeTarget + "' < /dev/null > /dev/null 2>&1 &",
 	}
+	c.Success.ValidatorSpecs = []contracts.ValidatorSpec{
+		{Command: "test -f output/result.txt", Tools: []string{"test"}},
+		{Command: "setsid sh -c 'sleep 2; printf validator-escaped > " + escapeTarget + "' < /dev/null > /dev/null 2>&1 &", Tools: []string{"setsid", "sh", "sleep", "printf"}},
+	}
 	bin := fakeBackend(t, standardBackendBody(""))
 
 	rec := runGoverned(t, t.TempDir(), bin, c)
@@ -158,6 +162,9 @@ func TestV6Case4CleanupValidatorDetachedChildCannotWriteAfterApproval(t *testing
 		Required: false,
 		Validators: []string{
 			"setsid sh -c 'sleep 2; printf cleanup-escaped > " + escapeTarget + "' < /dev/null > /dev/null 2>&1 &",
+		},
+		ValidatorSpecs: []contracts.ValidatorSpec{
+			{Command: "setsid sh -c 'sleep 2; printf cleanup-escaped > " + escapeTarget + "' < /dev/null > /dev/null 2>&1 &", Tools: []string{"setsid", "sh", "sleep", "printf"}},
 		},
 	}
 	bin := fakeBackend(t, standardBackendBody(""))

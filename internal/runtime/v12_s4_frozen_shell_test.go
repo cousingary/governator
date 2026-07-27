@@ -1,3 +1,5 @@
+//go:build redteam
+
 package runtime
 
 // v12_s4_frozen_shell_test.go holds the Sol v12 rc5 Session 4 corpus for

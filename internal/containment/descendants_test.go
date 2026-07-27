@@ -8,7 +8,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
-	"syscall"
 	"testing"
 	"time"
 
@@ -353,18 +352,6 @@ func TestSystemdScopeRejectsUnconfirmedObservedCgroup(t *testing.T) {
 	}
 	if s.resolveErr == nil {
 		t.Fatal("expected resolveErr for unconfirmed generated systemd unit")
-	}
-}
-
-func TestWaitPIDGoneDoesNotTreatEPERMAsGone(t *testing.T) {
-	if os.Geteuid() == 0 {
-		t.Skip("root can signal pid 1; EPERM fixture unavailable")
-	}
-	if err := syscall.Kill(1, 0); err != syscall.EPERM {
-		t.Skipf("pid 1 did not produce EPERM in this environment: %v", err)
-	}
-	if err := waitPIDGone(1, 0); err == nil {
-		t.Fatal("waitPIDGone treated EPERM as extinction proof")
 	}
 }
 

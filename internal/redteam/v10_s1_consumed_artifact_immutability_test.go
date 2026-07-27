@@ -98,7 +98,7 @@ func v10ProducerConsumer(t *testing.T) (root, home, producerJobID string) {
 		Forbidden:   contracts.Forbidden{Paths: []string{".git/**"}, Commands: []string{"rm -rf"}, Behaviors: []string{"network"}},
 		Budget:      contracts.Budget{MaxMinutes: 1, MaxCommands: 5, MaxFilesChanged: 5, MaxLinesChanged: 20, MaxNewFiles: 5, MaxDeleted: 0},
 		Preflight:   contracts.Preflight{IntendedWrites: []string{"output/**", ".governator/artifacts/**"}},
-		Success:     contracts.Success{RequiredFiles: []string{"output/result.txt"}, Validators: []string{"test -f output/result.txt"}},
+		Success:     contracts.Success{RequiredFiles: []string{"output/result.txt"}, Validators: []string{"test -f output/result.txt"}, ValidatorSpecs: []contracts.ValidatorSpec{{Command: "test -f output/result.txt", Tools: []string{"test"}}}},
 		Produces:    []contracts.ArtifactSpec{{Name: "art", Path: ".governator/artifacts/art.txt", MaxBytes: 1024}},
 		OnViolation: "quarantine",
 		Local:       &contracts.LocalRunnerConfig{ReadRoots: shellReadRootsForFixtures()},
@@ -142,7 +142,7 @@ func v10ConsumerContract(root, producerJobID string, extraReadRoots ...string) c
 		Forbidden:       contracts.Forbidden{Paths: []string{".git/**"}, Commands: []string{"rm -rf"}, Behaviors: []string{"network"}},
 		Budget:          contracts.Budget{MaxMinutes: 1, MaxCommands: 5, MaxFilesChanged: 5, MaxLinesChanged: 20, MaxNewFiles: 5, MaxDeleted: 0},
 		Preflight:       contracts.Preflight{IntendedWrites: []string{"output/**"}},
-		Success:         contracts.Success{RequiredFiles: []string{"output/result.txt"}, Validators: []string{"test -f output/result.txt"}},
+		Success:         contracts.Success{RequiredFiles: []string{"output/result.txt"}, Validators: []string{"test -f output/result.txt"}, ValidatorSpecs: []contracts.ValidatorSpec{{Command: "test -f output/result.txt", Tools: []string{"test"}}}},
 		Consumes:        []string{"art"},
 		ArtifactSources: map[string]string{"art": producerJobID},
 		OnViolation:     "quarantine",
@@ -208,6 +208,10 @@ func TestV10Case5ValidatorObservesExactOriginalBytesDespiteMutationAttempt(t *te
 	consumer.Success.Validators = append(consumer.Success.Validators,
 		`(printf 'MUTATED-BY-VALIDATOR' > .governator/consumed/art) 2>/dev/null || true`,
 		`[ "$(cat .governator/consumed/art)" = "`+v10OriginalContent+`" ]`,
+	)
+	consumer.Success.ValidatorSpecs = append(consumer.Success.ValidatorSpecs,
+		contracts.ValidatorSpec{Command: `(printf 'MUTATED-BY-VALIDATOR' > .governator/consumed/art) 2>/dev/null || true`, Tools: []string{"printf"}},
+		contracts.ValidatorSpec{Command: `[ "$(cat .governator/consumed/art)" = "` + v10OriginalContent + `" ]`, Tools: []string{"cat"}},
 	)
 	body := `mkdir -p output
 cat .governator/consumed/art > output/result.txt
