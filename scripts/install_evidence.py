@@ -20,9 +20,18 @@ the signature covers the canonical sorted-key JSON of every field except
 The four-check hook canary runs at generate time and its results are embedded
 in the record. Installation fails (exit 1) if any check fails:
   (a) benign action allows
-  (b) protected-path action denies
+  (b) protected-path action denies (against a manifest the canary seeds itself
+      via GOV_PROTECTED_PATHS, plus a negative bound proving it is not denying
+      everything -- the operator's own protected-path list is legitimately
+      empty on a host that has not needed one, and testing it would test
+      configuration rather than the gate)
   (c) malformed apply_patch denies
-  (d) installed binary hash equals release binary hash
+  (d) installed binary hash equals the release binary hash for THIS platform
+
+Allow/deny is read from the hook's stdout JSON
+(`hookSpecificOutput.permissionDecision`), never from its exit code: a
+well-formed PreToolUse hook exits 0 whatever it decides, and an allow emits no
+payload at all.
 
 Usage:
   install_evidence.py generate \
@@ -42,6 +51,7 @@ import hashlib
 import json
 import os
 import pathlib
+import platform
 import stat
 import subprocess
 import sys
@@ -54,6 +64,17 @@ CANARY_FIELDS = (
     "canary_malformed_patch_denies",
     "canary_binary_hash_matches",
 )
+
+
+def current_platform_id() -> str:
+    """Host platform in the release's `<goos>_<goarch>` form (e.g. linux_amd64)."""
+    goos = {"linux": "linux", "darwin": "darwin"}.get(platform.system().lower(), platform.system().lower())
+    machine = platform.machine().lower()
+    goarch = {
+        "x86_64": "amd64", "amd64": "amd64",
+        "aarch64": "arm64", "arm64": "arm64",
+    }.get(machine, machine)
+    return f"{goos}_{goarch}"
 
 
 def sha256_file(path: str) -> str:
@@ -112,40 +133,75 @@ def verify_record(record: dict, public_key_hex: str) -> tuple[bool, str]:
     return True, ""
 
 
+def hook_decision(gov_bin: str, env: dict, payload: dict) -> str:
+    """Run one PreToolUse hook invocation and return its permission decision.
+
+    The decision is carried in the hook's stdout JSON, NEVER in its exit code:
+    internal/runtime/gate.go's EmitHookJSON unconditionally `return 0`, because
+    the PreToolUse protocol expects a well-formed hook to exit 0 and express
+    allow/deny in `hookSpecificOutput.permissionDecision`. An allow emits no
+    payload at all. Earlier revisions of this canary asserted `returncode != 0`
+    for the two deny checks, which could therefore never pass on any host
+    regardless of gate behavior -- this script had never been run end to end
+    against a real release until rc6 Session 9.
+    """
+    proc = subprocess.run(
+        [gov_bin, "hook", "pre-tool-use"],
+        input=json.dumps(payload), capture_output=True, text=True, env=env, timeout=30,
+    )
+    if proc.returncode != 0:
+        return "error"
+    out = proc.stdout.strip()
+    if not out:
+        return "allow"
+    try:
+        decision = json.loads(out)
+    except json.JSONDecodeError:
+        return "error"
+    return decision.get("hookSpecificOutput", {}).get("permissionDecision", "allow")
+
+
 def run_hook_canary(gov_bin: str, hook_config: str) -> dict:
     results = {}
     env = dict(os.environ)
     env["GOV_HOOK_CONFIG"] = hook_config
 
-    benign_input = json.dumps({
+    results["canary_benign_allows"] = hook_decision(gov_bin, env, {
         "tool_name": "Read",
         "tool_input": {"file_path": "/tmp/benign-read-target.txt"},
-    })
-    proc = subprocess.run(
-        [gov_bin, "hook", "pre-tool-use"],
-        input=benign_input, capture_output=True, text=True, env=env, timeout=30,
-    )
-    results["canary_benign_allows"] = proc.returncode == 0
+    }) == "allow"
 
-    protected_input = json.dumps({
-        "tool_name": "Write",
-        "tool_input": {"file_path": "/etc/passwd", "content": "pwned"},
-    })
-    proc = subprocess.run(
-        [gov_bin, "hook", "pre-tool-use"],
-        input=protected_input, capture_output=True, text=True, env=env, timeout=30,
-    )
-    results["canary_protected_denies"] = proc.returncode != 0
+    # The protected-path canary seeds its OWN manifest via GOV_PROTECTED_PATHS
+    # rather than assuming the operator's list contains any particular entry.
+    # Protected paths are operator configuration and are legitimately empty on
+    # a host that has not needed one yet; asserting that e.g. /etc/passwd is
+    # protected tested the operator's config, not the gate. Seeding a pattern
+    # proves the enforcement mechanism itself on every host, and the negative
+    # bound below proves the canary is not simply denying everything.
+    with tempfile.TemporaryDirectory(prefix="gov-install-canary-") as tmp:
+        tmp_path = pathlib.Path(tmp)
+        guarded = tmp_path / "guarded"
+        guarded.mkdir()
+        manifest = tmp_path / "protected_paths.txt"
+        manifest.write_text(f"{guarded}/**\n")
+        canary_env = dict(env)
+        canary_env["GOV_PROTECTED_PATHS"] = str(manifest)
+        canary_env.pop("HARNESS_UNLOCK", None)  # an unlock would void the check
 
-    malformed_input = json.dumps({
+        denied = hook_decision(gov_bin, canary_env, {
+            "tool_name": "Write",
+            "tool_input": {"file_path": str(guarded / "secret.txt"), "content": "pwned"},
+        })
+        allowed = hook_decision(gov_bin, canary_env, {
+            "tool_name": "Write",
+            "tool_input": {"file_path": str(tmp_path / "unguarded.txt"), "content": "ok"},
+        })
+        results["canary_protected_denies"] = denied == "deny" and allowed == "allow"
+
+    results["canary_malformed_patch_denies"] = hook_decision(gov_bin, env, {
         "tool_name": "apply_patch",
         "tool_input": {"patch": "not a valid patch\x00\x01\x02"},
-    })
-    proc = subprocess.run(
-        [gov_bin, "hook", "pre-tool-use"],
-        input=malformed_input, capture_output=True, text=True, env=env, timeout=30,
-    )
-    results["canary_malformed_patch_denies"] = proc.returncode != 0
+    }) == "deny"
 
     return results
 
@@ -175,19 +231,38 @@ def cmd_generate(args: argparse.Namespace) -> int:
     source_commit = manifest.get("source_commit", "")
     dirty = manifest.get("dirty", False)
 
+    # Resolve the release binary hash for THIS host's platform. build-manifest
+    # artifact entries are keyed by `platform` and carry `binary_sha256` /
+    # `extracted_binary_sha256`; they have no `name` field. The previous lookup
+    # matched on artifact["name"] and fell back to a checksums.txt line ending
+    # in "/gov" -- the entry is the bare name "gov", so neither ever matched and
+    # release_binary_sha256 was always None, hard-failing canary_binary_hash_matches
+    # even when every hash agreed. Never executed until rc6 Session 9.
     release_binary_sha256 = None
+    host_platform = current_platform_id()
     for artifact in manifest.get("artifacts", []):
-        if artifact.get("name", "").endswith("/gov") or artifact.get("name") == "gov":
-            release_binary_sha256 = artifact.get("sha256")
+        if artifact.get("platform") == host_platform:
+            release_binary_sha256 = (
+                artifact.get("binary_sha256")
+                or artifact.get("extracted_binary_sha256")
+                or artifact.get("sha256")
+            )
             break
     if release_binary_sha256 is None:
         checksums_path = release_manifest.parent / "checksums.txt"
         if checksums_path.is_file():
             for line in checksums_path.read_text().splitlines():
                 parts = line.split()
-                if len(parts) == 2 and parts[1].rstrip("*").endswith("/gov"):
+                if len(parts) == 2 and parts[1].rstrip("*").rsplit("/", 1)[-1] == "gov":
                     release_binary_sha256 = parts[0]
                     break
+    if release_binary_sha256 is None:
+        print(
+            f"install_evidence: RELEASE_BINARY_HASH_UNRESOLVED: no artifact for platform "
+            f"{host_platform!r} in {release_manifest} and no bare 'gov' entry in checksums.txt",
+            file=sys.stderr,
+        )
+        return 1
 
     hook_config_path = pathlib.Path(args.hook_config)
     if not hook_config_path.is_file():

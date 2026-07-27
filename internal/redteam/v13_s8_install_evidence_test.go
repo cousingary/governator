@@ -50,8 +50,20 @@ func s8WriteManifest(t *testing.T, dir, version, commit, govBinPath string) stri
 		"version":       version,
 		"source_commit": commit,
 		"dirty":         false,
+		// Must mirror the REAL build-manifest schema that scripts/release.sh
+		// emits: entries are keyed by `platform` and carry `binary_sha256` /
+		// `extracted_binary_sha256`. There is no `name` field. The original
+		// fixture used {"name": "gov", "sha256": ...}, a shape no release ever
+		// produces, which is exactly why install_evidence.py's binary-hash
+		// lookup could be broken against every real manifest while these cases
+		// stayed green (rc6 Session 9).
 		"artifacts": []map[string]any{
-			{"name": "gov", "sha256": binSHA},
+			{
+				"platform":                s8HostPlatform(),
+				"binary_sha256":           binSHA,
+				"extracted_binary_sha256": binSHA,
+				"approving":               true,
+			},
 		},
 	}
 	path := filepath.Join(dir, "build-manifest.json")
@@ -65,25 +77,61 @@ func s8WriteManifest(t *testing.T, dir, version, commit, govBinPath string) stri
 	return path
 }
 
+// s8HostPlatform mirrors install_evidence.py's current_platform_id() so the
+// fixture manifest carries an artifact entry for the host actually running the
+// test, the same way a real release does.
+func s8HostPlatform() string {
+	goarch := runtime.GOARCH
+	return runtime.GOOS + "_" + goarch
+}
+
 func s8WriteFakeGov(t *testing.T, dir, version string) string {
 	t.Helper()
 	path := filepath.Join(dir, "gov")
-	script := "#!/bin/sh\n" +
-		"case \"$1\" in\n" +
-		"  hook)\n" +
-		"    input=$(cat)\n" +
-		"    tool=$(printf '%s' \"$input\" | python3 -c 'import sys,json; print(json.load(sys.stdin).get(\"tool_name\",\"\"))' 2>/dev/null)\n" +
-		"    case \"$tool\" in\n" +
-		"      Read) exit 0 ;;\n" +
-		"      Write)\n" +
-		"        fp=$(printf '%s' \"$input\" | python3 -c 'import sys,json; print(json.load(sys.stdin).get(\"tool_input\",{}).get(\"file_path\",\"\"))' 2>/dev/null)\n" +
-		"        case \"$fp\" in /etc/*) exit 1 ;; *) exit 0 ;; esac ;;\n" +
-		"      apply_patch) exit 1 ;;\n" +
-		"      *) exit 0 ;;\n" +
-		"    esac ;;\n" +
-		"  version) echo 'gov " + version + "' ;;\n" +
-		"  *) exit 0 ;;\n" +
-		"esac\n"
+	// This stub must mirror the REAL hook protocol, not a convenient shorthand:
+	// internal/runtime/gate.go's EmitHookJSON always exits 0 and expresses the
+	// verdict in stdout JSON (an allow emits nothing at all), and protected
+	// paths come from the GOV_PROTECTED_PATHS manifest rather than a hardcoded
+	// /etc prefix. The previous stub denied by `exit 1` against a baked-in
+	// /etc/* rule, which let install_evidence.py assert the wrong signal
+	// against a gate that never uses it -- the canary was unpassable on every
+	// real host while these cases stayed green (rc6 Session 9).
+	script := `#!/usr/bin/env python3
+import json, os, sys
+
+def emit_deny(reason):
+    json.dump({"hookSpecificOutput": {
+        "hookEventName": "PreToolUse",
+        "permissionDecision": "deny",
+        "permissionDecisionReason": "GOVERNATOR GATE - " + reason,
+    }}, sys.stdout)
+    sys.exit(0)
+
+argv = sys.argv[1:]
+if argv[:1] == ["hook"]:
+    payload = json.load(sys.stdin)
+    tool = payload.get("tool_name", "")
+    tool_input = payload.get("tool_input", {}) or {}
+    if tool == "apply_patch":
+        emit_deny("missing apply_patch command")
+    if tool in ("Write", "Edit", "MultiEdit", "NotebookEdit"):
+        target = tool_input.get("file_path") or tool_input.get("notebook_path") or ""
+        manifest = os.environ.get("GOV_PROTECTED_PATHS", "")
+        patterns = []
+        if manifest and os.path.isfile(manifest):
+            for line in open(manifest):
+                line = line.split("#", 1)[0].strip()
+                if line:
+                    patterns.append(line)
+        for pattern in patterns:
+            prefix = pattern[:-3] if pattern.endswith("/**") else pattern
+            if target == prefix or target.startswith(prefix.rstrip("/") + "/"):
+                emit_deny(target + " is a PROTECTED path (matched '" + pattern + "')")
+    sys.exit(0)          # allow: exit 0, no payload
+if argv[:1] in (["version"], ["--version"]):
+    print("gov ` + version + `")
+sys.exit(0)
+`
 	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}
