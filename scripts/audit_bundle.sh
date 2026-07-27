@@ -83,8 +83,18 @@ mkdir -p "$OUT_DIR/source" "$OUT_DIR/dist" "$OUT_DIR/architecture" "$OUT_DIR/evi
 git archive --format=tar "$REF" | tar -x -C "$OUT_DIR/source"
 
 # --- dist/: whatever scripts/release.sh already produced, verbatim --------
+# Exception: dist/assayer-venvs/ is BUILD SCAFFOLDING, not release evidence.
+# release.sh materializes one virtualenv per Python in the Assayer support
+# matrix (3.10-3.13) to run that tier; the venvs carry pip-installed
+# site-packages full of __pycache__, .venv and *.egg-info -- the exact
+# categories the contamination scan below refuses by name. They are not
+# checksummed, not signed, and not referenced by any manifest: the tier's
+# evidence is assayer-python*.log.gz, which IS copied. Copying them in made a
+# release-mode bundle impossible (rc6 Session 9 -- first cycle to ever get a
+# release-mode bundle this far).
 if [ -d "$DIST_DIR" ] && [ -n "$(ls -A "$DIST_DIR" 2>/dev/null)" ]; then
   cp -a "$DIST_DIR"/. "$OUT_DIR/dist/"
+  rm -rf "$OUT_DIR/dist/assayer-venvs"
 else
   echo "audit_bundle: WARNING: $DIST_DIR is empty or absent -- run scripts/release.sh first for a populated dist/ tier" >&2
 fi
