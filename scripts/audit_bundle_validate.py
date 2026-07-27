@@ -124,12 +124,47 @@ def main(argv: list[str]) -> int:
         missing.append(f"acceptance-summary.json overall_result is {acceptance_summary.get('overall_result')!r}, not PASS")
 
     # zero production red-team skips
+    # Production red-team skips are validated by IDENTITY, not by count.
+    #
+    # This check previously required a literal `tests_skipped == 0`, which no
+    # host could ever satisfy: corpus cases 34/35 are Darwin-native and never
+    # run on Linux, and on a real Mac their capability attestation is forced
+    # non-approving. A release-mode bundle was therefore unobtainable --
+    # reproducing at this second enforcement point exactly the deadlock corpus
+    # case 297 removed from the gate itself. A raw count also cannot tell a
+    # DROPPED CLAIM (a skip bound to a platform ClassifyPlatform declares
+    # non-approving, asserting no production property) or a pre-declared
+    # capability-conditioned skip from an unaccounted coverage gap.
+    #
+    # `gov redteam-gate verify` already answers this by name, and release.sh
+    # ships its full structured verdict as suites.redteam.identity_gate. Defer
+    # to it -- the same "identity-based, not count-based" doctrine (Sol v7 S7
+    # HS4) that release.sh's own gate invocation follows. `ok` under
+    # `require_zero_skips` means every skip was individually authorized by name;
+    # `unexpected_skips` is the gate's list of those that were NOT.
     redteam_suite = test_summary.get("suites", {}).get("redteam", {})
-    skipped = redteam_suite.get("tests_skipped")
-    if skipped is None:
-        missing.append("test-summary.json suites.redteam.tests_skipped is absent -- cannot confirm zero production skips")
-    elif skipped != 0:
-        missing.append(f"test-summary.json suites.redteam.tests_skipped is {skipped}, not 0 -- a production release must carry zero red-team skips")
+    gate = redteam_suite.get("identity_gate")
+    if not isinstance(gate, dict):
+        missing.append(
+            "test-summary.json suites.redteam.identity_gate is absent -- cannot confirm "
+            "every production red-team skip was individually authorized"
+        )
+    else:
+        if gate.get("ok") is not True:
+            missing.append(f"suites.redteam.identity_gate.ok is {gate.get('ok')!r}, not true -- the red-team gate refused this run")
+        if gate.get("require_zero_skips") is not True:
+            missing.append(
+                f"suites.redteam.identity_gate.require_zero_skips is {gate.get('require_zero_skips')!r}, "
+                "not true -- a production release must be gated in strict zero-skip mode"
+            )
+        if gate.get("failed") not in (0, None) or gate.get("failed") is None:
+            missing.append(f"suites.redteam.identity_gate.failed is {gate.get('failed')!r}, not 0")
+        unexpected = gate.get("unexpected_skips") or []
+        if unexpected:
+            missing.append(
+                f"suites.redteam.identity_gate.unexpected_skips is non-empty ({', '.join(unexpected)}) "
+                "-- a production release must carry zero unauthorized red-team skips"
+            )
 
     # exact tag-and-commit match: release commit == manifest source_commit ==
     # (when declared) architecture doc's declared commit.
