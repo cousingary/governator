@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/cousingary/governator/internal/dbtime"
 	_ "modernc.org/sqlite"
 )
 
@@ -316,6 +317,10 @@ CREATE TABLE IF NOT EXISTS policy_overrides(id INTEGER PRIMARY KEY AUTOINCREMENT
 			return nil, alterErr
 		}
 	}
+	if err := migratePolicyOverrideTimes(db); err != nil {
+		db.Close()
+		return nil, err
+	}
 	// lease_owner/lease_until (Sol P1.5, finding #12) turn maintenance_outbox
 	// into a real leased queue: PendingOutbox used to hand every "pending" row
 	// to whichever `gov reconcile` process asked, so two processes running
@@ -373,6 +378,105 @@ CREATE INDEX IF NOT EXISTS maintenance_outbox_lease ON maintenance_outbox(status
 		return nil, err
 	}
 	return db, nil
+}
+
+// ensureLedgerColumn is the observability-ledger sibling of
+// internal/attest.ensureColumn. Ledger migrations are additive: existing
+// tables are never rewritten, and a repeated Open is idempotent.
+func ensureLedgerColumn(db *sql.DB, table, name, decl string) error {
+	rows, err := db.Query("PRAGMA table_info(" + table + ")")
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var cid int
+		var column, typ string
+		var notnull int
+		var defaultValue any
+		var primaryKey int
+		if err := rows.Scan(&cid, &column, &typ, &notnull, &defaultValue, &primaryKey); err != nil {
+			return err
+		}
+		if column == name {
+			return rows.Err()
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	_, err = db.Exec(fmt.Sprintf("ALTER TABLE %s ADD COLUMN %s %s", table, name, decl))
+	return err
+}
+
+// migratePolicyOverrideTimes adds and backfills the numeric authority columns
+// introduced in rc7. The backfill is performed in Go so the exact same parser
+// governs migration and future dual-writes. Any unreadable authoritative
+// timestamp aborts Open; silently assigning time zero could reactivate an
+// expired policy override.
+func migratePolicyOverrideTimes(db *sql.DB) error {
+	decl := fmt.Sprintf("INTEGER NOT NULL DEFAULT %d", dbtime.UnsetUnixNano)
+	for _, column := range []string{"created_unix_nano", "expires_unix_nano", "reserved_unix_nano"} {
+		if err := ensureLedgerColumn(db, "policy_overrides", column, decl); err != nil {
+			return fmt.Errorf("add policy_overrides.%s: %w", column, err)
+		}
+	}
+
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	rows, err := tx.Query(`SELECT id,created_at,expires_at,reserved_at FROM policy_overrides`)
+	if err != nil {
+		return err
+	}
+	type migratedRow struct {
+		id                         int64
+		created, expires, reserved int64
+	}
+	var migrated []migratedRow
+	for rows.Next() {
+		var id int64
+		var createdText, expiresText, reservedText string
+		if err := rows.Scan(&id, &createdText, &expiresText, &reservedText); err != nil {
+			rows.Close()
+			return err
+		}
+		if createdText == "" {
+			rows.Close()
+			return fmt.Errorf("backfill policy_overrides row %d: created_at is empty", id)
+		}
+		created, err := dbtime.LegacyToUnixNano(createdText)
+		if err != nil {
+			rows.Close()
+			return fmt.Errorf("backfill policy_overrides row %d created_at: %w", id, err)
+		}
+		expires, err := dbtime.LegacyToUnixNano(expiresText)
+		if err != nil {
+			rows.Close()
+			return fmt.Errorf("backfill policy_overrides row %d expires_at: %w", id, err)
+		}
+		reserved, err := dbtime.LegacyToUnixNano(reservedText)
+		if err != nil {
+			rows.Close()
+			return fmt.Errorf("backfill policy_overrides row %d reserved_at: %w", id, err)
+		}
+		migrated = append(migrated, migratedRow{id: id, created: created, expires: expires, reserved: reserved})
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return err
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	for _, row := range migrated {
+		if _, err := tx.Exec(`UPDATE policy_overrides SET created_unix_nano=?,expires_unix_nano=?,reserved_unix_nano=? WHERE id=?`, row.created, row.expires, row.reserved, row.id); err != nil {
+			return fmt.Errorf("backfill policy_overrides row %d: %w", row.id, err)
+		}
+	}
+	return tx.Commit()
 }
 
 // Batch summarizes one gov batch run for the ledger's batches table.
@@ -802,6 +906,7 @@ func Failures(home string, limit int) ([]Failure, error) {
 		return nil, err
 	}
 	defer db.Close()
+	// govratchet:sql-time-allow(s4_semantics_review)
 	rows, err := db.Query(`SELECT id,job_id,COALESCE(agent,''),COALESCE(job_type,''),failure_taxonomy,message,created,COALESCE(repair_of,'') FROM runs WHERE failure_taxonomy<>'' ORDER BY created DESC LIMIT ?`, limit)
 	if err != nil {
 		return nil, err

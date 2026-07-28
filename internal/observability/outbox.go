@@ -92,6 +92,7 @@ func ClaimOutbox(db *sql.DB, owner string, limit int, now, leaseUntil string) ([
 	if limit <= 0 {
 		return nil, nil
 	}
+	// govratchet:sql-time-allow(s3_numeric_migration)
 	rows, err := db.Query(`UPDATE maintenance_outbox
 SET status='processing', lease_owner=?, lease_until=?, updated_at=?
 WHERE id IN (
@@ -112,6 +113,7 @@ RETURNING `+outboxColumns, owner, leaseUntil, now, now, limit)
 // depth without taking a lease. `gov reconcile` itself claims via
 // ClaimOutbox, never this.
 func PendingOutbox(db *sql.DB) ([]OutboxItem, error) {
+	// govratchet:sql-time-allow(s3_numeric_migration)
 	rows, err := db.Query(`SELECT ` + outboxColumns + ` FROM maintenance_outbox WHERE status='pending' ORDER BY created_at ASC, id ASC`)
 	if err != nil {
 		return nil, err
@@ -124,6 +126,7 @@ func PendingOutbox(db *sql.DB) ([]OutboxItem, error) {
 // currently leased ("processing") is never stale by this definition even if
 // its attempts count is high — it is actively being retried, not stuck.
 func StaleOutbox(db *sql.DB, maxAttempts int) ([]OutboxItem, error) {
+	// govratchet:sql-time-allow(s3_numeric_migration)
 	rows, err := db.Query(`SELECT `+outboxColumns+` FROM maintenance_outbox WHERE status='pending' AND attempts>=? ORDER BY created_at ASC, id ASC`, maxAttempts)
 	if err != nil {
 		return nil, err

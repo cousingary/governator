@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/cousingary/governator/internal/dbtime"
 	"github.com/cousingary/governator/internal/observability"
 )
 
@@ -88,7 +89,7 @@ func AskResolve(id int64, res AskResolution) (observability.PolicyCheckpoint, er
 	if err != nil {
 		return observability.PolicyCheckpoint{}, err
 	}
-	now := time.Now().UTC().Format(time.RFC3339Nano)
+	now := dbtime.FormatLegacy(time.Now())
 	status := "denied"
 	if res.Verdict == "ALLOW" {
 		status = "approved"
@@ -107,14 +108,13 @@ func AskResolve(id int64, res AskResolution) (observability.PolicyCheckpoint, er
 
 	expiresAt := ""
 	if res.CreateRule && res.TTL > 0 {
-		expiresAt = time.Now().UTC().Add(res.TTL).Format(time.RFC3339Nano)
+		expiresAt = dbtime.FormatLegacy(time.Now().Add(res.TTL))
 	}
-	oneShot := 0
-	if !res.CreateRule {
-		oneShot = 1
-	}
-	if _, err := tx.Exec(`INSERT INTO policy_overrides(scope_key,target,verdict,reason,created_by,created_at,expires_at,one_shot) VALUES(?,?,?,?,?,?,?,?)`,
-		scopeKey, overrideTarget, res.Verdict, res.Note, res.ResolvedBy, now, expiresAt, oneShot); err != nil {
+	if err := observability.RecordPolicyOverrideTx(tx, observability.PolicyOverride{
+		ScopeKey: scopeKey, Target: overrideTarget, Verdict: res.Verdict,
+		Reason: res.Note, CreatedBy: res.ResolvedBy, CreatedAt: now,
+		ExpiresAt: expiresAt, OneShot: !res.CreateRule,
+	}); err != nil {
 		return observability.PolicyCheckpoint{}, err
 	}
 	if err := tx.Commit(); err != nil {

@@ -830,6 +830,7 @@ func rateQuery(db *sql.DB, query, agent, jobType string, isHit func(string) bool
 // composes directly into assayQualityComponent alongside the other rates
 // (higher = better, like every other component here).
 func panelAgreementRateFor(db *sql.DB, agent, jobType string) float64 {
+	// govratchet:sql-time-allow(s4_semantics_review)
 	rows, err := db.Query(`
 SELECT pm.panel_id, pm.job_id, r.status
 FROM panel_members pm

@@ -378,6 +378,7 @@ func PanelDisagreementRate(home string) (PanelDisagreement, error) {
 		return PanelDisagreement{}, err
 	}
 	defer db.Close()
+	// govratchet:sql-time-allow(s4_semantics_review)
 	rows, err := db.Query(`
 SELECT pm.panel_id, pm.job_id, r.status
 FROM panel_members pm

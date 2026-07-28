@@ -183,6 +183,7 @@ func ReleaseForRun(ledger *sql.DB, runID string, now time.Time) error {
 // quota.ExpireStale does — a single conditional UPDATE, so it can never
 // race a concurrent Settle/Release into a double-decrement.
 func expireStaleReservations(ledger *sql.DB, now time.Time) error {
+	// govratchet:sql-time-allow(s2_numeric_migration)
 	_, err := ledger.Exec(`UPDATE spend_reservations SET status='expired', settled_at=? WHERE status='pending' AND expires_at<>'' AND expires_at<?`,
 		formatSpendTime(now), formatSpendTime(now))
 	return err

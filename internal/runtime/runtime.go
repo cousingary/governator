@@ -231,6 +231,7 @@ func Last(id string) (RunRecord, error) {
 	q := `SELECT id,job_id,COALESCE(job_type,''),COALESCE(agent,''),COALESCE(mode,''),status,root,worktree,branch,diff,transcript,message,COALESCE(commit_hash,''),created,cost_usd,valid_output,failure_taxonomy,result_json,COALESCE(prompt_version,''),COALESCE(envelope_json,''),COALESCE(notes,''),input_tokens,output_tokens,cached_input_tokens,cache_creation_tokens,reasoning_tokens,total_tokens,usage_available,tool_calls,transcript_bytes,COALESCE(graph_provider,''),COALESCE(graph_version,''),COALESCE(graph_fingerprint,''),graph_files,graph_nodes,graph_edges,graph_db_bytes,COALESCE(repair_of,'') FROM runs`
 	var row *sql.Row
 	if id == "" || id == "last" {
+		// govratchet:sql-time-allow(s4_semantics_review)
 		row = db.QueryRow(q + ` ORDER BY created DESC LIMIT 1`)
 	} else {
 		row = db.QueryRow(q+` WHERE id=?`, id)
@@ -245,6 +246,7 @@ func Quarantines() ([]RunRecord, error) {
 		return nil, err
 	}
 	defer db.Close()
+	// govratchet:sql-time-allow(s4_semantics_review)
 	rows, err := db.Query(`SELECT id,job_id,COALESCE(job_type,''),COALESCE(agent,''),COALESCE(mode,''),status,root,worktree,branch,diff,transcript,message,COALESCE(commit_hash,''),created,cost_usd,valid_output,failure_taxonomy,result_json,COALESCE(prompt_version,''),COALESCE(envelope_json,''),COALESCE(notes,''),input_tokens,output_tokens,cached_input_tokens,cache_creation_tokens,reasoning_tokens,total_tokens,usage_available,tool_calls,transcript_bytes,COALESCE(graph_provider,''),COALESCE(graph_version,''),COALESCE(graph_fingerprint,''),graph_files,graph_nodes,graph_edges,graph_db_bytes,COALESCE(repair_of,'') FROM runs WHERE status='QUARANTINED' ORDER BY created DESC`)
 	if err != nil {
 		return nil, err

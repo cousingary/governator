@@ -66,6 +66,7 @@ func ParitySummary(home string) (ParityReport, error) {
 			report.CoverageDays = b.Sub(a).Hours() / 24
 		}
 	}
+	// govratchet:sql-time-allow(s4_semantics_review)
 	rows, err := db.Query(`SELECT payload_hash,payload,go_decision,py_decision,matched,py_unavailable,shadow_script_path,shadow_script_sha256,created FROM parity_events WHERE matched=0 OR py_unavailable=1 ORDER BY created DESC`)
 	if err != nil {
 		return report, err

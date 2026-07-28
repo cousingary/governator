@@ -4,6 +4,8 @@ import (
 	"database/sql"
 	"fmt"
 	"time"
+
+	"github.com/cousingary/governator/internal/dbtime"
 )
 
 // PolicyCheckpoint is one Session 5 (Sol Phase 4) checkpointed ASK: a run
@@ -64,6 +66,7 @@ const policyCheckpointColumns = `id,run_id,job_id,target,reason,sources,policy_h
 // PendingPolicyCheckpoints returns every "pending" row, oldest first, for
 // `gov ask list` / `gov ask show`.
 func PendingPolicyCheckpoints(db *sql.DB) ([]PolicyCheckpoint, error) {
+	// govratchet:sql-time-allow(s4_semantics_review)
 	rows, err := db.Query(`SELECT ` + policyCheckpointColumns + ` FROM policy_checkpoints WHERE status='pending' ORDER BY created_at ASC, id ASC`)
 	if err != nil {
 		return nil, err
@@ -170,23 +173,55 @@ const oneShotReservationTTL = 30 * time.Minute
 // transaction so the reclaim and the subsequent claim/select see a
 // consistent view.
 func reclaimStaleOneShotReservations(tx *sql.Tx, now string) error {
-	nowT, err := time.Parse(time.RFC3339Nano, now)
+	nowT, err := dbtime.ParseLegacy(now)
 	if err != nil {
 		return err
 	}
-	cutoff := nowT.Add(-oneShotReservationTTL).Format(time.RFC3339Nano)
-	_, err = tx.Exec(`UPDATE policy_overrides SET expired_at=? WHERE one_shot=1 AND consumed_at='' AND expired_at='' AND reserved_at<>'' AND reserved_at<?`, now, cutoff)
+	if nowT.IsZero() {
+		return fmt.Errorf("reclaim stale one-shot reservations: now is empty")
+	}
+	cutoffNanos, err := dbtime.ToUnixNano(nowT.Add(-oneShotReservationTTL))
+	if err != nil {
+		return err
+	}
+	_, err = tx.Exec(`UPDATE policy_overrides SET expired_at=? WHERE one_shot=1 AND consumed_at='' AND expired_at='' AND reserved_at<>'' AND reserved_unix_nano<>? AND reserved_unix_nano<?`, now, dbtime.UnsetUnixNano, cutoffNanos)
 	return err
 }
 
 // RecordPolicyOverride persists one temporary override rule.
 func RecordPolicyOverride(db *sql.DB, o PolicyOverride) error {
+	return recordPolicyOverride(db, o)
+}
+
+// RecordPolicyOverrideTx persists one temporary override inside the caller's
+// existing transaction. It exists for AskResolve, whose checkpoint resolution
+// and override creation must commit atomically.
+func RecordPolicyOverrideTx(tx *sql.Tx, o PolicyOverride) error {
+	return recordPolicyOverride(tx, o)
+}
+
+type policyOverrideExecer interface {
+	Exec(query string, args ...any) (sql.Result, error)
+}
+
+func recordPolicyOverride(exec policyOverrideExecer, o PolicyOverride) error {
+	if o.CreatedAt == "" {
+		return fmt.Errorf("record policy override: created_at is empty")
+	}
+	createdNanos, err := dbtime.LegacyToUnixNano(o.CreatedAt)
+	if err != nil {
+		return fmt.Errorf("record policy override created_at: %w", err)
+	}
+	expiresNanos, err := dbtime.LegacyToUnixNano(o.ExpiresAt)
+	if err != nil {
+		return fmt.Errorf("record policy override expires_at: %w", err)
+	}
 	oneShot := 0
 	if o.OneShot {
 		oneShot = 1
 	}
-	_, err := db.Exec(`INSERT INTO policy_overrides(scope_key,target,verdict,reason,created_by,created_at,expires_at,one_shot) VALUES(?,?,?,?,?,?,?,?)`,
-		o.ScopeKey, o.Target, o.Verdict, o.Reason, o.CreatedBy, o.CreatedAt, o.ExpiresAt, oneShot)
+	_, err = exec.Exec(`INSERT INTO policy_overrides(scope_key,target,verdict,reason,created_by,created_at,expires_at,one_shot,created_unix_nano,expires_unix_nano,reserved_unix_nano) VALUES(?,?,?,?,?,?,?,?,?,?,?)`,
+		o.ScopeKey, o.Target, o.Verdict, o.Reason, o.CreatedBy, o.CreatedAt, o.ExpiresAt, oneShot, createdNanos, expiresNanos, dbtime.UnsetUnixNano)
 	return err
 }
 
@@ -217,7 +252,17 @@ func scanActivePolicyOverrideRows(rows *sql.Rows) ([]PolicyOverride, error) {
 // a caller folding multiple matching overrides into one LayerResult
 // naturally prefers the most recent operator decision.
 func ActivePolicyOverrides(db *sql.DB, scopeKey, now string) ([]PolicyOverride, error) {
-	rows, err := db.Query(`SELECT `+activePolicyOverrideColumns+` FROM policy_overrides WHERE scope_key=? AND (expires_at='' OR expires_at>?) AND consumed_at='' AND expired_at='' AND reserved_at='' ORDER BY created_at DESC, id DESC`, scopeKey, now)
+	nowNanos, err := dbtime.LegacyToUnixNano(now)
+	if err != nil {
+		return nil, fmt.Errorf("active policy overrides now: %w", err)
+	}
+	if nowNanos == dbtime.UnsetUnixNano {
+		return nil, fmt.Errorf("active policy overrides: now is empty")
+	}
+	// ORDER BY id, not created_at: operator precedence is insertion order,
+	// and RFC3339Nano text is not chronologically sortable across fractional
+	// boundaries. id must be the primary key, not a text-time tiebreaker.
+	rows, err := db.Query(`SELECT `+activePolicyOverrideColumns+` FROM policy_overrides WHERE scope_key=? AND (expires_unix_nano=? OR expires_unix_nano>?) AND consumed_at='' AND expired_at='' AND reserved_at='' ORDER BY id DESC`, scopeKey, dbtime.UnsetUnixNano, nowNanos)
 	if err != nil {
 		return nil, err
 	}
@@ -237,6 +282,13 @@ func ActivePolicyOverrides(db *sql.DB, scopeKey, now string) ([]PolicyOverride, 
 // remains available for a future evaluation — never leave a claimed
 // reservation unresolved.
 func ClaimActivePolicyOverrides(db *sql.DB, scopeKey, now string) ([]PolicyOverride, error) {
+	nowNanos, err := dbtime.LegacyToUnixNano(now)
+	if err != nil {
+		return nil, fmt.Errorf("claim active policy overrides now: %w", err)
+	}
+	if nowNanos == dbtime.UnsetUnixNano {
+		return nil, fmt.Errorf("claim active policy overrides: now is empty")
+	}
 	tx, err := db.Begin()
 	if err != nil {
 		return nil, err
@@ -245,7 +297,9 @@ func ClaimActivePolicyOverrides(db *sql.DB, scopeKey, now string) ([]PolicyOverr
 	if err := reclaimStaleOneShotReservations(tx, now); err != nil {
 		return nil, err
 	}
-	rows, err := tx.Query(`SELECT `+activePolicyOverrideColumns+` FROM policy_overrides WHERE scope_key=? AND (expires_at='' OR expires_at>?) AND consumed_at='' AND expired_at='' AND reserved_at='' ORDER BY created_at DESC, id DESC`, scopeKey, now)
+	// ORDER BY id, not created_at: this is operator insertion precedence, not
+	// wall-clock chronology, and text timestamps can invert at fractions.
+	rows, err := tx.Query(`SELECT `+activePolicyOverrideColumns+` FROM policy_overrides WHERE scope_key=? AND (expires_unix_nano=? OR expires_unix_nano>?) AND consumed_at='' AND expired_at='' AND reserved_at='' ORDER BY id DESC`, scopeKey, dbtime.UnsetUnixNano, nowNanos)
 	if err != nil {
 		return nil, err
 	}
@@ -260,7 +314,7 @@ func ClaimActivePolicyOverrides(db *sql.DB, scopeKey, now string) ([]PolicyOverr
 			claimed = append(claimed, o)
 			continue
 		}
-		res, err := tx.Exec(`UPDATE policy_overrides SET reserved_at=? WHERE id=? AND one_shot=1 AND consumed_at='' AND expired_at='' AND reserved_at=''`, now, o.ID)
+		res, err := tx.Exec(`UPDATE policy_overrides SET reserved_at=?,reserved_unix_nano=? WHERE id=? AND one_shot=1 AND consumed_at='' AND expired_at='' AND reserved_at=''`, now, nowNanos, o.ID)
 		if err != nil {
 			return nil, err
 		}
@@ -340,6 +394,6 @@ func ConsumePolicyOverrideReservations(db *sql.DB, ids []int64, now string) erro
 // through. The WHERE clause only matches a still-reserved row, so a release
 // racing a consume or an expiry reclaim is a safe no-op.
 func ReleasePolicyOverrideReservation(db *sql.DB, id int64, now string) error {
-	_, err := db.Exec(`UPDATE policy_overrides SET reserved_at='' WHERE id=? AND one_shot=1 AND reserved_at<>'' AND consumed_at='' AND expired_at=''`, id)
+	_, err := db.Exec(`UPDATE policy_overrides SET reserved_at='',reserved_unix_nano=? WHERE id=? AND one_shot=1 AND reserved_at<>'' AND consumed_at='' AND expired_at=''`, dbtime.UnsetUnixNano, id)
 	return err
 }

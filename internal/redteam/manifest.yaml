@@ -1728,6 +1728,40 @@ cases:
     session: rc6-u13-s9
     required: true
     status: implemented
+  # Sol14 numbers its six S1 test names 298-303 because this manifest held
+  # 297 entries at cycle start. The pre-existing out-of-band Sol13 correction
+  # above already owns numeric case id 298, so these entries use the next six
+  # unique manifest ids while preserving the plan's exact required test names.
+  - case: 299
+    name: TestV14Case298OlderWholeSecondAllowDoesNotOverrideNewerFractionalDeny
+    session: rc7-u14-s1
+    required: true
+    status: implemented
+  - case: 300
+    name: TestV14Case299ExpiredWholeSecondAllowIsInactiveAtLaterFractionalTime
+    session: rc7-u14-s1
+    required: true
+    status: implemented
+  - case: 301
+    name: TestV14Case300StaleWholeSecondOneShotReservationIsReclaimedAtFractionalCutoff
+    session: rc7-u14-s1
+    required: true
+    status: implemented
+  - case: 302
+    name: TestV14Case301MultipleOverridesInSameSecondResolveByInsertionOrder
+    session: rc7-u14-s1
+    required: true
+    status: implemented
+  - case: 303
+    name: TestV14Case302PolicyOverrideMigrationFromRc6LedgerPreservesAuthorityOrder
+    session: rc7-u14-s1
+    required: true
+    status: implemented
+  - case: 304
+    name: TestV14Case303UnparseableAuthoritativeTimestampFailsBackfillClosed
+    session: rc7-u14-s1
+    required: true
+    status: implemented
 
 # Case 296 is not one of Sol13's original 51 findings (which occupy 245-295).
 # It closes a gap the rc6-upg13 S3 exclusion audit found: TestV6Case29's own

@@ -50,7 +50,9 @@ func TestLoadManifestRejectsBlankName(t *testing.T) {
 // column selected the OLDER row, serving stale consumed artifacts, replayed
 // approvals, and capability attestations -- numbered outside the same reserved
 // range for the same reason),
-// plus the documented non-production exclusions that let the authoritative
+// plus six Sol14 S1 cases (whose TestV14Case298-303 names are cycle-ordinal;
+// their manifest ids are 299-304 because the prior Sol13 correction already
+// owns id 298), plus the documented non-production exclusions that let the authoritative
 // inventory account for every //go:build redteam-tagged security test (P0-2).
 func TestLoadManifestAcceptsRealManifest(t *testing.T) {
 	path := filepath.Join("..", "redteam", "manifest.yaml")
@@ -58,8 +60,8 @@ func TestLoadManifestAcceptsRealManifest(t *testing.T) {
 	if err != nil {
 		t.Fatalf("LoadManifest(%s): %v", path, err)
 	}
-	if len(m.Cases) != 297 {
-		t.Fatalf("expected 297 cases in the mandatory final attack corpus, got %d", len(m.Cases))
+	if len(m.Cases) != 303 {
+		t.Fatalf("expected 303 cases in the mandatory final attack corpus, got %d", len(m.Cases))
 	}
 	seen := make(map[int]bool)
 	for _, c := range m.Cases {

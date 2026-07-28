@@ -286,6 +286,7 @@ func ExpireStale(db *sql.DB, now time.Time) error {
 	if db == nil {
 		return nil
 	}
+	// govratchet:sql-time-allow(s2_numeric_migration)
 	rows, err := db.Query(`SELECT id FROM quota_reservations WHERE settled_at='' AND expires_at<>'' AND expires_at<?`, formatTime(now))
 	if err != nil {
 		return err
@@ -396,6 +397,7 @@ func NextReset(db *sql.DB, backend string, now time.Time) time.Time {
 		return time.Time{}
 	}
 	var raw string
+	// govratchet:sql-time-allow(s2_numeric_migration)
 	err := db.QueryRow(`SELECT reset_at FROM quota_windows WHERE backend=? AND reset_at>? ORDER BY reset_at ASC LIMIT 1`, normalize(backend), formatTime(now)).Scan(&raw)
 	if err != nil {
 		return time.Time{}
@@ -436,6 +438,7 @@ func scanWindow(s scanner) (Window, error) {
 }
 
 func rolloverExpired(db *sql.DB, now time.Time) error {
+	// govratchet:sql-time-allow(s2_numeric_migration)
 	rows, err := db.Query(`SELECT backend,account,window_type FROM quota_windows WHERE reset_at<>'' AND reset_at<=?`, formatTime(now))
 	if err != nil {
 		return err
