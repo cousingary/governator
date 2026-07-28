@@ -84,17 +84,17 @@ func TestMarkOutboxDoneRemovesFromPending(t *testing.T) {
 	if err := EnqueueOutbox(db, "run-2", "quota_reset_hint", `{}`, "2026-07-12T00:00:00Z"); err != nil {
 		t.Fatal(err)
 	}
-	pending, err := PendingOutbox(db)
+	items, err := ClaimOutbox(db, "test-owner", 10, "2026-07-12T00:00:01Z", "2026-07-12T00:05:01Z")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(pending) != 1 {
-		t.Fatalf("expected 1 pending row, got %d", len(pending))
+	if len(items) != 1 {
+		t.Fatalf("expected 1 claimed row, got %d", len(items))
 	}
-	if err := MarkOutboxDone(db, pending[0].ID, "2026-07-12T00:00:01Z"); err != nil {
+	if err := MarkOutboxDone(db, items[0].ID, "test-owner", "2026-07-12T00:00:02Z"); err != nil {
 		t.Fatal(err)
 	}
-	pending, err = PendingOutbox(db)
+	pending, err := PendingOutbox(db)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -358,6 +358,10 @@ CREATE TABLE IF NOT EXISTS maintenance_outbox_applied(outbox_id INTEGER PRIMARY 
 		db.Close()
 		return nil, err
 	}
+	if err := migrateOutboxTimes(db); err != nil {
+		db.Close()
+		return nil, err
+	}
 	if _, err = db.Exec(`CREATE INDEX IF NOT EXISTS runs_key ON runs(contract_hash, approved_head, status);
 CREATE INDEX IF NOT EXISTS runs_identity ON runs(identity_hash, status);
 CREATE INDEX IF NOT EXISTS runs_failure ON runs(failure_taxonomy, created);
@@ -678,6 +682,75 @@ func backfillQuotaWindows(db *sql.DB) error {
 	for _, row := range migrated {
 		if _, err := tx.Exec(`UPDATE quota_windows SET reset_unix_nano=?,window_started_unix_nano=?,updated_unix_nano=? WHERE backend=? AND account=? AND window_type=?`, row.reset, row.started, row.updated, row.backend, row.account, row.windowType); err != nil {
 			return fmt.Errorf("backfill quota_windows %s/%s/%s: %w", row.backend, row.account, row.windowType, err)
+		}
+	}
+	return tx.Commit()
+}
+
+// migrateOutboxTimes adds and backfills the numeric authority columns for
+// maintenance_outbox (rc7 Session 3). Same fail-closed rule as
+// migratePolicyOverrideTimes: an unparseable authoritative timestamp aborts
+// Open rather than silently becoming time-zero.
+func migrateOutboxTimes(db *sql.DB) error {
+	decl := fmt.Sprintf("INTEGER NOT NULL DEFAULT %d", dbtime.UnsetUnixNano)
+	for _, column := range []string{"lease_until_unix_nano", "created_unix_nano", "updated_unix_nano"} {
+		if err := ensureLedgerColumn(db, "maintenance_outbox", column, decl); err != nil {
+			return fmt.Errorf("add maintenance_outbox.%s: %w", column, err)
+		}
+	}
+
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	rows, err := tx.Query(`SELECT id,created_at,updated_at,lease_until FROM maintenance_outbox WHERE created_unix_nano=?`, dbtime.UnsetUnixNano)
+	if err != nil {
+		return err
+	}
+	type migratedRow struct {
+		id                           int64
+		created, updated, leaseUntil int64
+	}
+	var migrated []migratedRow
+	for rows.Next() {
+		var id int64
+		var createdText, updatedText, leaseUntilText string
+		if err := rows.Scan(&id, &createdText, &updatedText, &leaseUntilText); err != nil {
+			rows.Close()
+			return err
+		}
+		if createdText == "" {
+			rows.Close()
+			return fmt.Errorf("backfill maintenance_outbox row %d: created_at is empty", id)
+		}
+		created, err := dbtime.LegacyToUnixNano(createdText)
+		if err != nil {
+			rows.Close()
+			return fmt.Errorf("backfill maintenance_outbox row %d created_at: %w", id, err)
+		}
+		updated, err := dbtime.LegacyToUnixNano(updatedText)
+		if err != nil {
+			rows.Close()
+			return fmt.Errorf("backfill maintenance_outbox row %d updated_at: %w", id, err)
+		}
+		leaseUntil, err := dbtime.LegacyToUnixNano(leaseUntilText)
+		if err != nil {
+			rows.Close()
+			return fmt.Errorf("backfill maintenance_outbox row %d lease_until: %w", id, err)
+		}
+		migrated = append(migrated, migratedRow{id: id, created: created, updated: updated, leaseUntil: leaseUntil})
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return err
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	for _, row := range migrated {
+		if _, err := tx.Exec(`UPDATE maintenance_outbox SET created_unix_nano=?,updated_unix_nano=?,lease_until_unix_nano=? WHERE id=?`, row.created, row.updated, row.leaseUntil, row.id); err != nil {
+			return fmt.Errorf("backfill maintenance_outbox row %d: %w", row.id, err)
 		}
 	}
 	return tx.Commit()

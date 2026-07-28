@@ -208,13 +208,13 @@ func reconcileOwnerID() string {
 // (Sol P1.5, finding #12 — two `gov reconcile` processes running
 // concurrently can never claim the same row, closing the double-dispatch
 // this session's regression corpus reproduces) then retried against the same
-// operation the original best-effort call attempted. A row already recorded
-// in maintenance_outbox_applied (its operation ran to completion on a prior
-// lease that expired before MarkOutboxDone landed) is finalized without
-// re-running the operation. A row that succeeds is marked done and applied;
-// a row that fails again is released back to pending with its attempts
-// counter incremented, ready for the next reconcile pass (or for `gov
-// cleanup --stale` to give up on, once attempts crosses the caller's
+// operation the original best-effort call attempted. A row whose operation
+// was already executed (ClaimOutboxExecution returns false because the
+// applied-marker PRIMARY KEY already exists) is finalized without re-running
+// the operation. A row that succeeds is marked done; a row that fails again
+// has its applied-marker released and is returned to pending with its
+// attempts counter incremented, ready for the next reconcile pass (or for
+// `gov cleanup --stale` to give up on, once attempts crosses the caller's
 // threshold).
 func Reconcile(ctx context.Context) (ReconcileReport, error) {
 	db, err := dbOpen(Home())
@@ -237,12 +237,12 @@ func Reconcile(ctx context.Context) (ReconcileReport, error) {
 	for _, item := range items {
 		report.Processed++
 		nowStr := time.Now().UTC().Format(time.RFC3339Nano)
-		applied, err := observability.OutboxAlreadyApplied(db, item.ID)
+		claimed, err := observability.ClaimOutboxExecution(db, item.ID, nowStr)
 		if err != nil {
 			return report, err
 		}
-		if applied {
-			if err := observability.MarkOutboxDone(db, item.ID, nowStr); err != nil {
+		if !claimed {
+			if err := observability.MarkOutboxDone(db, item.ID, owner, nowStr); err != nil {
 				return report, err
 			}
 			report.Done++
@@ -250,6 +250,9 @@ func Reconcile(ctx context.Context) (ReconcileReport, error) {
 			continue
 		}
 		if opErr := dispatchReconcile(ctx, db, cfg, item); opErr != nil {
+			if err := observability.ReleaseOutboxExecution(db, item.ID); err != nil {
+				return report, err
+			}
 			if err := observability.MarkOutboxRetry(db, item.ID, opErr.Error(), nowStr); err != nil {
 				return report, err
 			}
@@ -257,10 +260,7 @@ func Reconcile(ctx context.Context) (ReconcileReport, error) {
 			report.Outcomes = append(report.Outcomes, ReconcileOutcome{ID: item.ID, RunID: item.RunID, OpKind: item.OpKind, Status: "retry", Error: opErr.Error()})
 			continue
 		}
-		if err := observability.MarkOutboxApplied(db, item.ID, nowStr); err != nil {
-			return report, err
-		}
-		if err := observability.MarkOutboxDone(db, item.ID, nowStr); err != nil {
+		if err := observability.MarkOutboxDone(db, item.ID, owner, nowStr); err != nil {
 			return report, err
 		}
 		report.Done++
