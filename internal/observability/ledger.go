@@ -1183,8 +1183,8 @@ func Failures(home string, limit int) ([]Failure, error) {
 		return nil, err
 	}
 	defer db.Close()
-	// govratchet:sql-time-allow(s4_semantics_review)
-	rows, err := db.Query(`SELECT id,job_id,COALESCE(agent,''),COALESCE(job_type,''),failure_taxonomy,message,created,COALESCE(repair_of,'') FROM runs WHERE failure_taxonomy<>'' ORDER BY created DESC LIMIT ?`, limit)
+	// ORDER BY rowid, not created -- insertion order; created is TEXT RFC3339Nano (Sol14 P1-3).
+	rows, err := db.Query(`SELECT id,job_id,COALESCE(agent,''),COALESCE(job_type,''),failure_taxonomy,message,created,COALESCE(repair_of,'') FROM runs WHERE failure_taxonomy<>'' ORDER BY rowid DESC LIMIT ?`, limit)
 	if err != nil {
 		return nil, err
 	}

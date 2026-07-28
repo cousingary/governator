@@ -66,8 +66,8 @@ const policyCheckpointColumns = `id,run_id,job_id,target,reason,sources,policy_h
 // PendingPolicyCheckpoints returns every "pending" row, oldest first, for
 // `gov ask list` / `gov ask show`.
 func PendingPolicyCheckpoints(db *sql.DB) ([]PolicyCheckpoint, error) {
-	// govratchet:sql-time-allow(s4_semantics_review)
-	rows, err := db.Query(`SELECT ` + policyCheckpointColumns + ` FROM policy_checkpoints WHERE status='pending' ORDER BY created_at ASC, id ASC`)
+	// ORDER BY id, not created_at -- insertion order; id is INTEGER PRIMARY KEY (Sol14 P1-3).
+	rows, err := db.Query(`SELECT ` + policyCheckpointColumns + ` FROM policy_checkpoints WHERE status='pending' ORDER BY id ASC`)
 	if err != nil {
 		return nil, err
 	}

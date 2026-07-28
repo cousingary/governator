@@ -15,14 +15,13 @@ import (
 	"testing"
 )
 
-// allowedSQLTimeClasses are the only temporary or non-authoritative reasons a
-// SQL text-time comparison/order site may remain. S2-S4 delete the migration
-// classes as each table family moves to numeric authority; this map must never
-// gain another migration class.
+// allowedSQLTimeClasses are the only non-authoritative reasons a SQL text-time
+// comparison/order site may remain. Only display and export exemptions exist;
+// every authoritative site was migrated to numeric or rowid ordering in rc7
+// Sessions 1-4. This map must never gain another class.
 var allowedSQLTimeClasses = map[string]string{
-	"s4_semantics_review": "remaining insertion-order versus chronological-order sites scheduled for rc7 Session 4",
-	"display_only":        "read-only presentation ordering with no authority or routing effect",
-	"export_only":         "offline export ordering with no authority or routing effect",
+	"display_only": "read-only presentation ordering with no authority or routing effect",
+	"export_only":  "offline export ordering with no authority or routing effect",
 }
 
 var sqlTimeColumnPattern = regexp.MustCompile(`(?i)\b(created|created_at|updated_at|expires_at|reserved_at|lease_until|reset_at|settled_at)\b`)
@@ -153,7 +152,7 @@ func TestSQLTimestampRatchetDetectsComparisonOrderingAndInvalidMarkers(t *testin
 		{"ordering", "package fixture\nvar q = `SELECT * FROM x ORDER BY created_at DESC`\n", 1},
 		{"not-equal sentinel is not chronological", "package fixture\nvar q = `SELECT * FROM x WHERE expires_at<>''`\n", 0},
 		{"numeric replacement", "package fixture\nvar q = `SELECT * FROM x WHERE expires_unix_nano>? ORDER BY created_unix_nano`\n", 0},
-		{"valid marker", "package fixture\n// govratchet:sql-time-allow(s4_semantics_review)\nvar q = `SELECT * FROM x WHERE expires_at>?`\n", 0},
+		{"valid marker", "package fixture\n// govratchet:sql-time-allow(display_only)\nvar q = `SELECT * FROM x WHERE expires_at>?`\n", 0},
 		{"invalid marker", "package fixture\n// govratchet:sql-time-allow(made_up)\nvar q = `SELECT * FROM x ORDER BY created_at`\n", 1},
 	}
 	for _, test := range tests {

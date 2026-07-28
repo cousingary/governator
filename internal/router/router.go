@@ -830,13 +830,14 @@ func rateQuery(db *sql.DB, query, agent, jobType string, isHit func(string) bool
 // composes directly into assayQualityComponent alongside the other rates
 // (higher = better, like every other component here).
 func panelAgreementRateFor(db *sql.DB, agent, jobType string) float64 {
-	// govratchet:sql-time-allow(s4_semantics_review)
+	// ORDER BY r.rowid, not r.created -- newest run per job is insertion order;
+	// created is TEXT RFC3339Nano and not lexicographically sortable (Sol14 P1-3).
 	rows, err := db.Query(`
 SELECT pm.panel_id, pm.job_id, r.status
 FROM panel_members pm
 JOIN runs r ON r.job_id = pm.job_id
 WHERE pm.agent = ? AND r.job_type = ?
-ORDER BY pm.panel_id ASC, pm.job_id ASC, r.created DESC`, agent, jobType)
+ORDER BY pm.panel_id ASC, pm.job_id ASC, r.rowid DESC`, agent, jobType)
 	if err != nil {
 		return 0.5
 	}

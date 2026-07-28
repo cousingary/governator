@@ -119,8 +119,8 @@ func RecoverStaleRuns(ctx context.Context) ([]RecoveryVerdict, error) {
 		return nil, err
 	}
 	defer db.Close()
-	// govratchet:sql-time-allow(s4_semantics_review)
-	rows, err := db.Query(`SELECT id FROM runs WHERE status='RUNNING' ORDER BY created ASC`)
+	// ORDER BY rowid, not created -- insertion order; created is TEXT RFC3339Nano (Sol14 P1-3).
+	rows, err := db.Query(`SELECT id FROM runs WHERE status='RUNNING' ORDER BY rowid ASC`)
 	if err != nil {
 		return nil, err
 	}

@@ -1827,6 +1827,16 @@ cases:
     session: rc7-u14-s3
     required: true
     status: implemented
+  - case: 318
+    name: TestV14Case317StaleCreatedTimeRoutingRowDoesNotFeedQualityScoring
+    session: rc7-u14-s4
+    required: true
+    status: implemented
+  - case: 319
+    name: TestV14Case318GovDiffLastSelectsTheActualLatestRun
+    session: rc7-u14-s4
+    required: true
+    status: implemented
 
 # Case 296 is not one of Sol13's original 51 findings (which occupy 245-295).
 # It closes a gap the rc6-upg13 S3 exclusion audit found: TestV6Case29's own

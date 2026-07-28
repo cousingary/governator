@@ -378,12 +378,13 @@ func PanelDisagreementRate(home string) (PanelDisagreement, error) {
 		return PanelDisagreement{}, err
 	}
 	defer db.Close()
-	// govratchet:sql-time-allow(s4_semantics_review)
+	// ORDER BY r.rowid, not r.created -- newest run per job is insertion order;
+	// created is TEXT RFC3339Nano and not lexicographically sortable (Sol14 P1-3).
 	rows, err := db.Query(`
 SELECT pm.panel_id, pm.job_id, r.status
 FROM panel_members pm
 JOIN runs r ON r.job_id = pm.job_id
-ORDER BY pm.panel_id ASC, pm.job_id ASC, r.created DESC`)
+ORDER BY pm.panel_id ASC, pm.job_id ASC, r.rowid DESC`)
 	if err != nil {
 		return PanelDisagreement{}, err
 	}
