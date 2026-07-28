@@ -91,8 +91,8 @@ func TestQuotaUtilizationsHonestZeroWithoutLimit(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, err := db.Exec(`INSERT INTO quota_windows(backend,account,window_type,estimated_limit,measured_usage,confidence,updated_at) VALUES
-('claude','default','daily',100,40,0.8,'t0'),
-('codex','default','daily',0,15,0,'t1')`); err != nil {
+('claude','default','daily',100,40,0.8,'2026-07-10T10:00:00Z'),
+('codex','default','daily',0,15,0,'2026-07-10T10:00:01Z')`); err != nil {
 		t.Fatal(err)
 	}
 	db.Close()

@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/cousingary/governator/internal/config"
+	"github.com/cousingary/governator/internal/dbtime"
 	"github.com/cousingary/governator/internal/spend"
 )
 
@@ -93,10 +94,10 @@ func SeedFromConfig(db *sql.DB, cfg config.Config, now time.Time) error {
 		if confidence > 1 {
 			confidence = 1
 		}
-		if _, err := db.Exec(`INSERT INTO quota_windows(backend,account,window_type,window_started_at,reset_at,estimated_limit,measured_usage,reserved_usage,confidence,source,updated_at)
-VALUES(?,?,?,?,?,?,0,0,?,'config',?)
-ON CONFLICT(backend,account,window_type) DO UPDATE SET estimated_limit=excluded.estimated_limit, reset_at=excluded.reset_at, confidence=excluded.confidence, source='config', updated_at=excluded.updated_at`,
-			backend, account, windowType, formatTime(started), formatTime(reset), q.EstimatedLimit, confidence, formatTime(now)); err != nil {
+		if _, err := db.Exec(`INSERT INTO quota_windows(backend,account,window_type,window_started_at,reset_at,estimated_limit,measured_usage,reserved_usage,confidence,source,updated_at,window_started_unix_nano,reset_unix_nano,updated_unix_nano)
+VALUES(?,?,?,?,?,?,0,0,?,'config',?,?,?,?)
+ON CONFLICT(backend,account,window_type) DO UPDATE SET estimated_limit=excluded.estimated_limit, reset_at=excluded.reset_at, confidence=excluded.confidence, source='config', updated_at=excluded.updated_at, reset_unix_nano=excluded.reset_unix_nano, updated_unix_nano=excluded.updated_unix_nano`,
+			backend, account, windowType, formatTime(started), formatTime(reset), q.EstimatedLimit, confidence, formatTime(now), mustNanos(started), mustNanos(reset), mustNanos(now)); err != nil {
 			return err
 		}
 	}
@@ -139,10 +140,10 @@ func Reserve(db *sql.DB, backend, account, runID string, usage float64, ttl time
 	}
 	defer tx.Rollback()
 	for _, w := range windows {
-		res, err := tx.Exec(`UPDATE quota_windows SET reserved_usage=reserved_usage+?, updated_at=?
+		res, err := tx.Exec(`UPDATE quota_windows SET reserved_usage=reserved_usage+?, updated_at=?, updated_unix_nano=?
 WHERE backend=? AND account=? AND window_type=?
   AND (estimated_limit<=0 OR measured_usage+reserved_usage+?<=estimated_limit)`,
-			usage, formatTime(now), backend, account, w.WindowType, usage)
+			usage, formatTime(now), mustNanos(now), backend, account, w.WindowType, usage)
 		if err != nil {
 			return Reservation{}, err
 		}
@@ -155,7 +156,7 @@ WHERE backend=? AND account=? AND window_type=?
 		}
 	}
 	expires := now.Add(ttl)
-	res, err := tx.Exec(`INSERT INTO quota_reservations(run_id,backend,account,usage,expires_at,created_at,settled_at) VALUES(?,?,?,?,?,?,'')`, runID, backend, account, usage, formatTime(expires), formatTime(now))
+	res, err := tx.Exec(`INSERT INTO quota_reservations(run_id,backend,account,usage,expires_at,created_at,settled_at,expires_unix_nano,created_unix_nano,settled_unix_nano) VALUES(?,?,?,?,?,?,'',?,?,?)`, runID, backend, account, usage, formatTime(expires), formatTime(now), mustNanos(expires), mustNanos(now), dbtime.UnsetUnixNano)
 	if err != nil {
 		return Reservation{}, err
 	}
@@ -216,10 +217,14 @@ func claimReservation(tx *sql.Tx, reservationID int64, now time.Time, expired bo
 	if expired {
 		expiredFlag = 1
 	}
-	err = tx.QueryRow(`UPDATE quota_reservations SET settled_at=?, expired=?
+	nowNanos, err := dbtime.ToUnixNano(now)
+	if err != nil {
+		return "", "", 0, false, err
+	}
+	err = tx.QueryRow(`UPDATE quota_reservations SET settled_at=?, settled_unix_nano=?, expired=?
 WHERE id=? AND settled_at=''
 RETURNING backend, account, usage`,
-		formatTime(now), expiredFlag, reservationID).Scan(&backend, &account, &reserved)
+		formatTime(now), nowNanos, expiredFlag, reservationID).Scan(&backend, &account, &reserved)
 	if err == sql.ErrNoRows {
 		return "", "", 0, false, nil
 	}
@@ -245,7 +250,7 @@ func Release(db *sql.DB, reservationID int64, now time.Time) error {
 	if !ok {
 		return nil
 	}
-	if _, err := tx.Exec(`UPDATE quota_windows SET reserved_usage=MAX(reserved_usage-?,0), updated_at=? WHERE backend=? AND account=?`, reserved, formatTime(now), backend, account); err != nil {
+	if _, err := tx.Exec(`UPDATE quota_windows SET reserved_usage=MAX(reserved_usage-?,0), updated_at=?, updated_unix_nano=? WHERE backend=? AND account=?`, reserved, formatTime(now), mustNanos(now), backend, account); err != nil {
 		return err
 	}
 	return tx.Commit()
@@ -276,7 +281,7 @@ func Settle(db *sql.DB, reservationID int64, measuredUsage float64, now time.Tim
 	if _, err := tx.Exec(`UPDATE quota_reservations SET measured_usage=? WHERE id=?`, measuredUsage, reservationID); err != nil {
 		return err
 	}
-	if _, err := tx.Exec(`UPDATE quota_windows SET reserved_usage=MAX(reserved_usage-?,0), measured_usage=measured_usage+?, updated_at=? WHERE backend=? AND account=?`, reserved, measuredUsage, formatTime(now), backend, account); err != nil {
+	if _, err := tx.Exec(`UPDATE quota_windows SET reserved_usage=MAX(reserved_usage-?,0), measured_usage=measured_usage+?, updated_at=?, updated_unix_nano=? WHERE backend=? AND account=?`, reserved, measuredUsage, formatTime(now), mustNanos(now), backend, account); err != nil {
 		return err
 	}
 	return tx.Commit()
@@ -286,8 +291,11 @@ func ExpireStale(db *sql.DB, now time.Time) error {
 	if db == nil {
 		return nil
 	}
-	// govratchet:sql-time-allow(s2_numeric_migration)
-	rows, err := db.Query(`SELECT id FROM quota_reservations WHERE settled_at='' AND expires_at<>'' AND expires_at<?`, formatTime(now))
+	nowNanos, err := dbtime.ToUnixNano(now)
+	if err != nil {
+		return err
+	}
+	rows, err := db.Query(`SELECT id FROM quota_reservations WHERE settled_at='' AND expires_unix_nano<>? AND expires_unix_nano<?`, dbtime.UnsetUnixNano, nowNanos)
 	if err != nil {
 		return err
 	}
@@ -325,7 +333,7 @@ func expireOne(db *sql.DB, reservationID int64, now time.Time) error {
 	if !ok {
 		return nil
 	}
-	if _, err := tx.Exec(`UPDATE quota_windows SET reserved_usage=MAX(reserved_usage-?,0), updated_at=? WHERE backend=? AND account=?`, reserved, formatTime(now), backend, account); err != nil {
+	if _, err := tx.Exec(`UPDATE quota_windows SET reserved_usage=MAX(reserved_usage-?,0), updated_at=?, updated_unix_nano=? WHERE backend=? AND account=?`, reserved, formatTime(now), mustNanos(now), backend, account); err != nil {
 		return err
 	}
 	return tx.Commit()
@@ -385,10 +393,10 @@ func ApplyResetHint(db *sql.DB, backend, account string, resetAt time.Time, now 
 		return nil
 	}
 	windowType := inferWindowType(now, resetAt)
-	_, err := db.Exec(`INSERT INTO quota_windows(backend,account,window_type,window_started_at,reset_at,estimated_limit,measured_usage,reserved_usage,confidence,source,updated_at)
-VALUES(?,?,?,?,?,0,0,0,0.9,'error_hint',?)
-ON CONFLICT(backend,account,window_type) DO UPDATE SET reset_at=excluded.reset_at, confidence=MAX(confidence,0.9), source='error_hint', updated_at=excluded.updated_at`,
-		backend, account, windowType, formatTime(now), formatTime(resetAt), formatTime(now))
+	_, err := db.Exec(`INSERT INTO quota_windows(backend,account,window_type,window_started_at,reset_at,estimated_limit,measured_usage,reserved_usage,confidence,source,updated_at,window_started_unix_nano,reset_unix_nano,updated_unix_nano)
+VALUES(?,?,?,?,?,0,0,0,0.9,'error_hint',?,?,?,?)
+ON CONFLICT(backend,account,window_type) DO UPDATE SET reset_at=excluded.reset_at, confidence=MAX(confidence,0.9), source='error_hint', updated_at=excluded.updated_at, reset_unix_nano=excluded.reset_unix_nano, updated_unix_nano=excluded.updated_unix_nano`,
+		backend, account, windowType, formatTime(now), formatTime(resetAt), formatTime(now), mustNanos(now), mustNanos(resetAt), mustNanos(now))
 	return err
 }
 
@@ -396,9 +404,12 @@ func NextReset(db *sql.DB, backend string, now time.Time) time.Time {
 	if db == nil {
 		return time.Time{}
 	}
+	nowNanos, err := dbtime.ToUnixNano(now)
+	if err != nil {
+		return time.Time{}
+	}
 	var raw string
-	// govratchet:sql-time-allow(s2_numeric_migration)
-	err := db.QueryRow(`SELECT reset_at FROM quota_windows WHERE backend=? AND reset_at>? ORDER BY reset_at ASC LIMIT 1`, normalize(backend), formatTime(now)).Scan(&raw)
+	err = db.QueryRow(`SELECT reset_at FROM quota_windows WHERE backend=? AND reset_unix_nano>? ORDER BY reset_unix_nano ASC LIMIT 1`, normalize(backend), nowNanos).Scan(&raw)
 	if err != nil {
 		return time.Time{}
 	}
@@ -438,8 +449,11 @@ func scanWindow(s scanner) (Window, error) {
 }
 
 func rolloverExpired(db *sql.DB, now time.Time) error {
-	// govratchet:sql-time-allow(s2_numeric_migration)
-	rows, err := db.Query(`SELECT backend,account,window_type FROM quota_windows WHERE reset_at<>'' AND reset_at<=?`, formatTime(now))
+	nowNanos, err := dbtime.ToUnixNano(now)
+	if err != nil {
+		return err
+	}
+	rows, err := db.Query(`SELECT backend,account,window_type FROM quota_windows WHERE reset_unix_nano<>? AND reset_unix_nano<=?`, dbtime.UnsetUnixNano, nowNanos)
 	if err != nil {
 		return err
 	}
@@ -457,7 +471,17 @@ func rolloverExpired(db *sql.DB, now time.Time) error {
 		return err
 	}
 	for _, k := range keys {
-		if _, err := db.Exec(`UPDATE quota_windows SET window_started_at=?, reset_at=?, measured_usage=0, reserved_usage=0, updated_at=? WHERE backend=? AND account=? AND window_type=?`, formatTime(windowStart(k.windowType, now)), formatTime(nextReset(k.windowType, now)), formatTime(now), k.backend, k.account, k.windowType); err != nil {
+		newStart := windowStart(k.windowType, now)
+		newReset := nextReset(k.windowType, now)
+		newStartNanos, err := dbtime.ToUnixNano(newStart)
+		if err != nil {
+			return err
+		}
+		newResetNanos, err := dbtime.ToUnixNano(newReset)
+		if err != nil {
+			return err
+		}
+		if _, err := db.Exec(`UPDATE quota_windows SET window_started_at=?, reset_at=?, measured_usage=0, reserved_usage=0, updated_at=?, window_started_unix_nano=?, reset_unix_nano=?, updated_unix_nano=? WHERE backend=? AND account=? AND window_type=?`, formatTime(newStart), formatTime(newReset), formatTime(now), newStartNanos, newResetNanos, nowNanos, k.backend, k.account, k.windowType); err != nil {
 			return err
 		}
 	}
@@ -493,10 +517,15 @@ func clamp(v float64) float64 {
 }
 
 func formatTime(t time.Time) string {
-	if t.IsZero() {
-		return ""
+	return dbtime.FormatLegacy(t)
+}
+
+func mustNanos(t time.Time) int64 {
+	n, err := dbtime.ToUnixNano(t)
+	if err != nil {
+		panic(err)
 	}
-	return t.UTC().Format(time.RFC3339Nano)
+	return n
 }
 
 func parseTimeOrZero(s string) time.Time {

@@ -33,6 +33,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/cousingary/governator/internal/dbtime"
 	"github.com/cousingary/governator/internal/observability"
 	"github.com/cousingary/governator/internal/quota"
 )
@@ -113,17 +114,11 @@ func isValidBackend(name string) bool {
 
 // timestamp helpers: the ledger stores RFC3339Nano strings; empty == zero.
 func formatTime(t time.Time) string {
-	if t.IsZero() {
-		return ""
-	}
-	return t.UTC().Format(time.RFC3339Nano)
+	return dbtime.FormatLegacy(t)
 }
 
 func parseTime(s string) time.Time {
-	if strings.TrimSpace(s) == "" {
-		return timeZero
-	}
-	t, err := time.Parse(time.RFC3339Nano, s)
+	t, err := dbtime.ParseLegacy(strings.TrimSpace(s))
 	if err != nil {
 		return timeZero
 	}

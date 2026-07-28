@@ -321,6 +321,10 @@ CREATE TABLE IF NOT EXISTS policy_overrides(id INTEGER PRIMARY KEY AUTOINCREMENT
 		db.Close()
 		return nil, err
 	}
+	if err := migrateSpendQuotaTimes(db); err != nil {
+		db.Close()
+		return nil, err
+	}
 	// lease_owner/lease_until (Sol P1.5, finding #12) turn maintenance_outbox
 	// into a real leased queue: PendingOutbox used to hand every "pending" row
 	// to whichever `gov reconcile` process asked, so two processes running
@@ -474,6 +478,206 @@ func migratePolicyOverrideTimes(db *sql.DB) error {
 	for _, row := range migrated {
 		if _, err := tx.Exec(`UPDATE policy_overrides SET created_unix_nano=?,expires_unix_nano=?,reserved_unix_nano=? WHERE id=?`, row.created, row.expires, row.reserved, row.id); err != nil {
 			return fmt.Errorf("backfill policy_overrides row %d: %w", row.id, err)
+		}
+	}
+	return tx.Commit()
+}
+
+// migrateSpendQuotaTimes adds and backfills the numeric authority columns for
+// spend_reservations, quota_reservations, and quota_windows (rc7 Session 2).
+// Same fail-closed rule as migratePolicyOverrideTimes: an unparseable
+// authoritative timestamp aborts Open rather than silently becoming time-zero.
+func migrateSpendQuotaTimes(db *sql.DB) error {
+	decl := fmt.Sprintf("INTEGER NOT NULL DEFAULT %d", dbtime.UnsetUnixNano)
+	for _, column := range []string{"expires_unix_nano", "created_unix_nano", "settled_unix_nano"} {
+		if err := ensureLedgerColumn(db, "spend_reservations", column, decl); err != nil {
+			return fmt.Errorf("add spend_reservations.%s: %w", column, err)
+		}
+	}
+	for _, column := range []string{"expires_unix_nano", "created_unix_nano", "settled_unix_nano"} {
+		if err := ensureLedgerColumn(db, "quota_reservations", column, decl); err != nil {
+			return fmt.Errorf("add quota_reservations.%s: %w", column, err)
+		}
+	}
+	for _, column := range []string{"reset_unix_nano", "window_started_unix_nano", "updated_unix_nano"} {
+		if err := ensureLedgerColumn(db, "quota_windows", column, decl); err != nil {
+			return fmt.Errorf("add quota_windows.%s: %w", column, err)
+		}
+	}
+
+	if err := backfillSpendReservations(db); err != nil {
+		return err
+	}
+	if err := backfillQuotaReservations(db); err != nil {
+		return err
+	}
+	return backfillQuotaWindows(db)
+}
+
+func backfillSpendReservations(db *sql.DB) error {
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	rows, err := tx.Query(`SELECT id,expires_at,created_at,settled_at FROM spend_reservations`)
+	if err != nil {
+		return err
+	}
+	type migratedRow struct {
+		id                        int64
+		expires, created, settled int64
+	}
+	var migrated []migratedRow
+	for rows.Next() {
+		var id int64
+		var expiresText, createdText, settledText string
+		if err := rows.Scan(&id, &expiresText, &createdText, &settledText); err != nil {
+			rows.Close()
+			return err
+		}
+		if createdText == "" {
+			rows.Close()
+			return fmt.Errorf("backfill spend_reservations row %d: created_at is empty", id)
+		}
+		expires, err := dbtime.LegacyToUnixNano(expiresText)
+		if err != nil {
+			rows.Close()
+			return fmt.Errorf("backfill spend_reservations row %d expires_at: %w", id, err)
+		}
+		created, err := dbtime.LegacyToUnixNano(createdText)
+		if err != nil {
+			rows.Close()
+			return fmt.Errorf("backfill spend_reservations row %d created_at: %w", id, err)
+		}
+		settled, err := dbtime.LegacyToUnixNano(settledText)
+		if err != nil {
+			rows.Close()
+			return fmt.Errorf("backfill spend_reservations row %d settled_at: %w", id, err)
+		}
+		migrated = append(migrated, migratedRow{id: id, expires: expires, created: created, settled: settled})
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return err
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	for _, row := range migrated {
+		if _, err := tx.Exec(`UPDATE spend_reservations SET expires_unix_nano=?,created_unix_nano=?,settled_unix_nano=? WHERE id=?`, row.expires, row.created, row.settled, row.id); err != nil {
+			return fmt.Errorf("backfill spend_reservations row %d: %w", row.id, err)
+		}
+	}
+	return tx.Commit()
+}
+
+func backfillQuotaReservations(db *sql.DB) error {
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	rows, err := tx.Query(`SELECT id,expires_at,created_at,settled_at FROM quota_reservations`)
+	if err != nil {
+		return err
+	}
+	type migratedRow struct {
+		id                        int64
+		expires, created, settled int64
+	}
+	var migrated []migratedRow
+	for rows.Next() {
+		var id int64
+		var expiresText, createdText, settledText string
+		if err := rows.Scan(&id, &expiresText, &createdText, &settledText); err != nil {
+			rows.Close()
+			return err
+		}
+		if createdText == "" {
+			rows.Close()
+			return fmt.Errorf("backfill quota_reservations row %d: created_at is empty", id)
+		}
+		expires, err := dbtime.LegacyToUnixNano(expiresText)
+		if err != nil {
+			rows.Close()
+			return fmt.Errorf("backfill quota_reservations row %d expires_at: %w", id, err)
+		}
+		created, err := dbtime.LegacyToUnixNano(createdText)
+		if err != nil {
+			rows.Close()
+			return fmt.Errorf("backfill quota_reservations row %d created_at: %w", id, err)
+		}
+		settled, err := dbtime.LegacyToUnixNano(settledText)
+		if err != nil {
+			rows.Close()
+			return fmt.Errorf("backfill quota_reservations row %d settled_at: %w", id, err)
+		}
+		migrated = append(migrated, migratedRow{id: id, expires: expires, created: created, settled: settled})
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return err
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	for _, row := range migrated {
+		if _, err := tx.Exec(`UPDATE quota_reservations SET expires_unix_nano=?,created_unix_nano=?,settled_unix_nano=? WHERE id=?`, row.expires, row.created, row.settled, row.id); err != nil {
+			return fmt.Errorf("backfill quota_reservations row %d: %w", row.id, err)
+		}
+	}
+	return tx.Commit()
+}
+
+func backfillQuotaWindows(db *sql.DB) error {
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	rows, err := tx.Query(`SELECT backend,account,window_type,reset_at,window_started_at,updated_at FROM quota_windows`)
+	if err != nil {
+		return err
+	}
+	type migratedRow struct {
+		backend, account, windowType string
+		reset, started, updated      int64
+	}
+	var migrated []migratedRow
+	for rows.Next() {
+		var backend, account, windowType, resetText, startedText, updatedText string
+		if err := rows.Scan(&backend, &account, &windowType, &resetText, &startedText, &updatedText); err != nil {
+			rows.Close()
+			return err
+		}
+		reset, err := dbtime.LegacyToUnixNano(resetText)
+		if err != nil {
+			rows.Close()
+			return fmt.Errorf("backfill quota_windows %s/%s/%s reset_at: %w", backend, account, windowType, err)
+		}
+		started, err := dbtime.LegacyToUnixNano(startedText)
+		if err != nil {
+			rows.Close()
+			return fmt.Errorf("backfill quota_windows %s/%s/%s window_started_at: %w", backend, account, windowType, err)
+		}
+		updated, err := dbtime.LegacyToUnixNano(updatedText)
+		if err != nil {
+			rows.Close()
+			return fmt.Errorf("backfill quota_windows %s/%s/%s updated_at: %w", backend, account, windowType, err)
+		}
+		migrated = append(migrated, migratedRow{backend: backend, account: account, windowType: windowType, reset: reset, started: started, updated: updated})
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return err
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	for _, row := range migrated {
+		if _, err := tx.Exec(`UPDATE quota_windows SET reset_unix_nano=?,window_started_unix_nano=?,updated_unix_nano=? WHERE backend=? AND account=? AND window_type=?`, row.reset, row.started, row.updated, row.backend, row.account, row.windowType); err != nil {
+			return fmt.Errorf("backfill quota_windows %s/%s/%s: %w", row.backend, row.account, row.windowType, err)
 		}
 	}
 	return tx.Commit()

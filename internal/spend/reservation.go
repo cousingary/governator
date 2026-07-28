@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/cousingary/governator/internal/config"
+	"github.com/cousingary/governator/internal/dbtime"
 )
 
 // GlobalReservation is one row reserved against the daily spend cap, shared
@@ -55,9 +56,17 @@ func ReserveGlobal(ledger *sql.DB, cfg config.Config, runID string, estimate flo
 	day := now.UTC().Format("2006-01-02")
 	expires := formatSpendTime(now.Add(ttl))
 	created := formatSpendTime(now)
+	expiresNanos, err := dbtime.ToUnixNano(now.Add(ttl))
+	if err != nil {
+		return GlobalReservation{}, false, "", err
+	}
+	createdNanos, err := dbtime.ToUnixNano(now)
+	if err != nil {
+		return GlobalReservation{}, false, "", err
+	}
 	if cfg.Spend.DailyCapUSD <= 0 {
-		res, err := ledger.Exec(`INSERT INTO spend_reservations(run_id,day,estimated_usd,status,expires_at,created_at) VALUES(?,?,?,'pending',?,?)`,
-			runID, day, estimate, expires, created)
+		res, err := ledger.Exec(`INSERT INTO spend_reservations(run_id,day,estimated_usd,status,expires_at,created_at,expires_unix_nano,created_unix_nano) VALUES(?,?,?,'pending',?,?,?,?)`,
+			runID, day, estimate, expires, created, expiresNanos, createdNanos)
 		if err != nil {
 			return GlobalReservation{}, false, "", err
 		}
@@ -67,8 +76,8 @@ func ReserveGlobal(ledger *sql.DB, cfg config.Config, runID string, estimate flo
 		}
 		return GlobalReservation{ID: id, RunID: runID, Day: day, EstimatedUSD: estimate}, true, "", nil
 	}
-	res, err := ledger.Exec(`INSERT INTO spend_reservations(run_id,day,estimated_usd,status,expires_at,created_at)
-SELECT ?,?,?,'pending',?,?
+	res, err := ledger.Exec(`INSERT INTO spend_reservations(run_id,day,estimated_usd,status,expires_at,created_at,expires_unix_nano,created_unix_nano)
+SELECT ?,?,?,'pending',?,?,?,?
 WHERE (
   COALESCE((SELECT SUM(cost_usd) FROM runs WHERE substr(created,1,10)=? AND status<>'RUNNING'
              AND id NOT IN (SELECT run_id FROM spend_reservations WHERE run_id<>'' AND day=?)),0)
@@ -76,7 +85,7 @@ WHERE (
   + COALESCE((SELECT SUM(actual_usd) FROM spend_reservations WHERE day=? AND status='settled'),0)
   + ?
 ) <= ?`,
-		runID, day, estimate, expires, created,
+		runID, day, estimate, expires, created, expiresNanos, createdNanos,
 		day, day, day, day, estimate, cfg.Spend.DailyCapUSD)
 	if err != nil {
 		return GlobalReservation{}, false, "", err
@@ -130,14 +139,18 @@ func SettleGlobal(ledger *sql.DB, reservationID int64, actualUSD float64, costAv
 	if actualUSD < 0 {
 		actualUSD = 0
 	}
+	nowNanos, err := dbtime.ToUnixNano(now)
+	if err != nil {
+		return err
+	}
 	tx, err := ledger.Begin()
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
 	var estimated float64
-	err = tx.QueryRow(`UPDATE spend_reservations SET status='settled', settled_at=? WHERE id=? AND status='pending' RETURNING estimated_usd`,
-		formatSpendTime(now), reservationID).Scan(&estimated)
+	err = tx.QueryRow(`UPDATE spend_reservations SET status='settled', settled_at=?, settled_unix_nano=? WHERE id=? AND status='pending' RETURNING estimated_usd`,
+		formatSpendTime(now), nowNanos, reservationID).Scan(&estimated)
 	if err == sql.ErrNoRows {
 		return nil
 	}
@@ -161,8 +174,12 @@ func ReleaseGlobal(ledger *sql.DB, reservationID int64, now time.Time) error {
 	if ledger == nil || reservationID == 0 {
 		return nil
 	}
-	_, err := ledger.Exec(`UPDATE spend_reservations SET status='released', settled_at=? WHERE id=? AND status='pending'`,
-		formatSpendTime(now), reservationID)
+	nowNanos, err := dbtime.ToUnixNano(now)
+	if err != nil {
+		return err
+	}
+	_, err = ledger.Exec(`UPDATE spend_reservations SET status='released', settled_at=?, settled_unix_nano=? WHERE id=? AND status='pending'`,
+		formatSpendTime(now), nowNanos, reservationID)
 	return err
 }
 
@@ -173,8 +190,12 @@ func ReleaseForRun(ledger *sql.DB, runID string, now time.Time) error {
 	if ledger == nil || runID == "" {
 		return nil
 	}
-	_, err := ledger.Exec(`UPDATE spend_reservations SET status='released', settled_at=? WHERE run_id=? AND status='pending'`,
-		formatSpendTime(now), runID)
+	nowNanos, err := dbtime.ToUnixNano(now)
+	if err != nil {
+		return err
+	}
+	_, err = ledger.Exec(`UPDATE spend_reservations SET status='released', settled_at=?, settled_unix_nano=? WHERE run_id=? AND status='pending'`,
+		formatSpendTime(now), nowNanos, runID)
 	return err
 }
 
@@ -183,15 +204,15 @@ func ReleaseForRun(ledger *sql.DB, runID string, now time.Time) error {
 // quota.ExpireStale does — a single conditional UPDATE, so it can never
 // race a concurrent Settle/Release into a double-decrement.
 func expireStaleReservations(ledger *sql.DB, now time.Time) error {
-	// govratchet:sql-time-allow(s2_numeric_migration)
-	_, err := ledger.Exec(`UPDATE spend_reservations SET status='expired', settled_at=? WHERE status='pending' AND expires_at<>'' AND expires_at<?`,
-		formatSpendTime(now), formatSpendTime(now))
+	nowNanos, err := dbtime.ToUnixNano(now)
+	if err != nil {
+		return err
+	}
+	_, err = ledger.Exec(`UPDATE spend_reservations SET status='expired', settled_at=?, settled_unix_nano=? WHERE status='pending' AND expires_unix_nano<>? AND expires_unix_nano<?`,
+		formatSpendTime(now), nowNanos, dbtime.UnsetUnixNano, nowNanos)
 	return err
 }
 
 func formatSpendTime(t time.Time) string {
-	if t.IsZero() {
-		return ""
-	}
-	return t.UTC().Format(time.RFC3339Nano)
+	return dbtime.FormatLegacy(t)
 }

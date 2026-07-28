@@ -20,7 +20,6 @@ import (
 // classes as each table family moves to numeric authority; this map must never
 // gain another migration class.
 var allowedSQLTimeClasses = map[string]string{
-	"s2_numeric_migration": "spend/quota reservation and window predicates scheduled for rc7 Session 2",
 	"s3_numeric_migration": "outbox lease and queue ordering predicates scheduled for rc7 Session 3",
 	"s4_semantics_review":  "remaining insertion-order versus chronological-order sites scheduled for rc7 Session 4",
 	"display_only":         "read-only presentation ordering with no authority or routing effect",
@@ -155,7 +154,7 @@ func TestSQLTimestampRatchetDetectsComparisonOrderingAndInvalidMarkers(t *testin
 		{"ordering", "package fixture\nvar q = `SELECT * FROM x ORDER BY created_at DESC`\n", 1},
 		{"not-equal sentinel is not chronological", "package fixture\nvar q = `SELECT * FROM x WHERE expires_at<>''`\n", 0},
 		{"numeric replacement", "package fixture\nvar q = `SELECT * FROM x WHERE expires_unix_nano>? ORDER BY created_unix_nano`\n", 0},
-		{"valid marker", "package fixture\n// govratchet:sql-time-allow(s2_numeric_migration)\nvar q = `SELECT * FROM x WHERE expires_at>?`\n", 0},
+		{"valid marker", "package fixture\n// govratchet:sql-time-allow(s3_numeric_migration)\nvar q = `SELECT * FROM x WHERE expires_at>?`\n", 0},
 		{"invalid marker", "package fixture\n// govratchet:sql-time-allow(made_up)\nvar q = `SELECT * FROM x ORDER BY created_at`\n", 1},
 	}
 	for _, test := range tests {

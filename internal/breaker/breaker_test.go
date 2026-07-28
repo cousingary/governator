@@ -441,7 +441,7 @@ func TestQuotaExhaustedUsesQuotaResetAt(t *testing.T) {
 	db := newDB(t)
 	now := time.Date(2026, 7, 10, 10, 0, 0, 0, time.UTC)
 	reset := now.Add(17 * time.Minute)
-	if _, err := db.Exec(`INSERT INTO quota_windows(backend,account,window_type,window_started_at,reset_at,estimated_limit,measured_usage,reserved_usage,confidence,source,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)`, "codex", "default", "daily", now.Format(time.RFC3339Nano), reset.Format(time.RFC3339Nano), 1000.0, 1000.0, 0.0, 0.9, "error_hint", now.Format(time.RFC3339Nano)); err != nil {
+	if _, err := db.Exec(`INSERT INTO quota_windows(backend,account,window_type,window_started_at,reset_at,estimated_limit,measured_usage,reserved_usage,confidence,source,updated_at,window_started_unix_nano,reset_unix_nano,updated_unix_nano) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, "codex", "default", "daily", now.Format(time.RFC3339Nano), reset.Format(time.RFC3339Nano), 1000.0, 1000.0, 0.0, 0.9, "error_hint", now.Format(time.RFC3339Nano), now.UnixNano(), reset.UnixNano(), now.UnixNano()); err != nil {
 		t.Fatal(err)
 	}
 	mustRecordFailure(t, db, "codex", observability.InfraQuotaExhausted, now)
@@ -454,7 +454,7 @@ func TestQuotaExhaustedUsesQuotaResetAt(t *testing.T) {
 func TestStoreQuotaReadsHeadroom(t *testing.T) {
 	db := newDB(t)
 	base := time.Date(2026, 7, 10, 10, 0, 0, 0, time.UTC)
-	if _, err := db.Exec(`INSERT INTO quota_windows(backend,account,window_type,window_started_at,reset_at,estimated_limit,measured_usage,reserved_usage,confidence,source,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)`, "codex", "default", "daily", base.Format(time.RFC3339Nano), base.Add(24*time.Hour).Format(time.RFC3339Nano), 1000.0, 250.0, 250.0, 0.8, "config", base.Format(time.RFC3339Nano)); err != nil {
+	if _, err := db.Exec(`INSERT INTO quota_windows(backend,account,window_type,window_started_at,reset_at,estimated_limit,measured_usage,reserved_usage,confidence,source,updated_at,window_started_unix_nano,reset_unix_nano,updated_unix_nano) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, "codex", "default", "daily", base.Format(time.RFC3339Nano), base.Add(24*time.Hour).Format(time.RFC3339Nano), 1000.0, 250.0, 250.0, 0.8, "config", base.Format(time.RFC3339Nano), base.UnixNano(), base.Add(24*time.Hour).UnixNano(), base.UnixNano()); err != nil {
 		t.Fatal(err)
 	}
 	store := Store{DB: db, Now: func() time.Time { return base }}
