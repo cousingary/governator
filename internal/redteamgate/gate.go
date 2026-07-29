@@ -374,6 +374,19 @@ type Options struct {
 	// (Session 9). When non-empty and RequireZeroSkips is set, a skip is
 	// covered (not a gap) if SkipCoveredByAttestations reports true.
 	Attestations *AggregationResult
+
+	// ExactManifests is the set of name-inventoried, no-case-number security
+	// manifests (Sol14 rc7 Session 9b) that Session 9d enforces "zero
+	// unaccounted skips" across, alongside the numbered corpus. S9b ships the
+	// ExactManifest/ManifestSet schema and loader (internal/redteamgate/
+	// exact_manifest.go) wired to ZERO manifests: this field is populated only
+	// when a caller passes one or more --exact-manifest paths, and S9b's
+	// EvaluateWithOptions does NOT consume it, so a current-corpus release run
+	// (no exact manifests) is byte-for-byte identical to the pre-S9b gate.
+	// S9d is the session that reads this field and folds exact-manifest
+	// accounting into OK. Leaving it read-but-unused here is the deliberate
+	// infrastructure-only boundary of S9b.
+	ExactManifests []ExactManifest
 }
 
 // EvaluateWithOptions is the identity-based gate. Over one parsed redteam

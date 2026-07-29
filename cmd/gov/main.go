@@ -2219,7 +2219,7 @@ func sha256Hex(data []byte) string {
 // inventory release.sh discovers from //go:build redteam-tagged source —
 // every inventory test must be a manifest case or a documented exclusion.
 func redteamGateCmd(args []string) int {
-	usage := "usage: gov redteam-gate verify --manifest <path> --log <path> [--capabilities <json>] [--inventory <path>] [--attestations <dir> --attestation-trust <path> --attestation-governator-commit <commit> --attestation-assayer-commit <commit> --attestation-release-version <version> --attestation-source-identity <path> --attestation-toolchain-hash <sha256> --attestation-release-time <rfc3339> --attestation-max-age <duration>] [--require-zero-skips]"
+	usage := "usage: gov redteam-gate verify --manifest <path> --log <path> [--capabilities <json>] [--inventory <path>] [--exact-manifest <path>...] [--attestations <dir> --attestation-trust <path> --attestation-governator-commit <commit> --attestation-assayer-commit <commit> --attestation-release-version <version> --attestation-source-identity <path> --attestation-toolchain-hash <sha256> --attestation-release-time <rfc3339> --attestation-max-age <duration>] [--require-zero-skips]"
 	if len(args) < 1 || args[0] != "verify" {
 		return bad(usage)
 	}
@@ -2227,6 +2227,14 @@ func redteamGateCmd(args []string) int {
 	logPath := ""
 	capabilitiesJSON := ""
 	inventoryPath := ""
+	// exactManifestPaths is the repeatable --exact-manifest option (Sol14 rc7
+	// Session 9b). Each path is one name-inventoried, no-case-number exact
+	// manifest (internal/redteamgate/exact_manifest.go) loaded alongside the
+	// numbered corpus via LoadManifestSet. S9b wires the loader and validates
+	// the combined set; S9d is the session that enforces zero unaccounted
+	// skips across them. Empty (the current corpus) is byte-identical to the
+	// pre-S9b gate.
+	exactManifestPaths := []string{}
 	attestationsDir := ""
 	attestationTrustPath := ""
 	attestationGovernatorCommit := ""
@@ -2268,6 +2276,18 @@ func redteamGateCmd(args []string) int {
 				return bad(usage)
 			}
 			inventoryPath = rest[1]
+			rest = rest[2:]
+		case "--exact-manifest":
+			// Sol14 rc7 S9b: one name-inventoried exact manifest path,
+			// repeatable. Loaded with the numbered corpus via
+			// LoadManifestSet, which validates the combined set (unique
+			// manifest names, no test in two manifests, no test that is
+			// also a numbered corpus case). S9b loads and validates only;
+			// S9d enforces zero unaccounted skips across the set.
+			if len(rest) < 2 {
+				return bad(usage)
+			}
+			exactManifestPaths = append(exactManifestPaths, rest[1])
 			rest = rest[2:]
 		case "--attestations":
 			if len(rest) < 2 {
@@ -2338,11 +2358,12 @@ func redteamGateCmd(args []string) int {
 		fmt.Fprintln(os.Stderr, "redteam-gate: --manifest and --log are both required")
 		return bad(usage)
 	}
-	manifest, err := redteamgate.LoadManifest(manifestPath)
+	manifestSet, err := redteamgate.LoadManifestSet(manifestPath, exactManifestPaths)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "redteam-gate:", err)
 		return 1
 	}
+	manifest := manifestSet.Corpus
 	logData, err := os.ReadFile(logPath)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "redteam-gate:", err)
@@ -2424,6 +2445,9 @@ func redteamGateCmd(args []string) int {
 		RequireZeroSkips: requireZeroSkips,
 		DiscoveredTests:  discovered,
 		Attestations:     aggResult,
+		// S9b: populated and validated, but EvaluateWithContext does not yet
+		// enforce across them. S9d folds exact-manifest accounting into OK.
+		ExactManifests: manifestSet.ExactManifests,
 	})
 	if err := json.NewEncoder(os.Stdout).Encode(result); err != nil {
 		fmt.Fprintln(os.Stderr, "redteam-gate:", err)
@@ -3322,6 +3346,6 @@ Usage:
   gov doctor
   gov health [reset <backend>]
   gov claims verify [--file <path>] [--repo <path>] [--artifact <path>] [--manifest <path>] [--release] [--portable-release]
-  gov redteam-gate verify --manifest <path> --log <path> [--capabilities <json>] [--inventory <path>] [--require-zero-skips]
+  gov redteam-gate verify --manifest <path> --log <path> [--capabilities <json>] [--inventory <path>] [--exact-manifest <path>...] [--require-zero-skips]
   gov version`)
 }
