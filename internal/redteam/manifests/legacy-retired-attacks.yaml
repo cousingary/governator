@@ -1,4 +1,14 @@
 # Sol14 rc7 Session 9c exact manifest (Sol14 P1-2).
+#
+# PERMANENT BY OPERATOR DECISION (Jeremy, 2026-07-29). The rc7 plan's S9c body
+# said to DELETE these 23 superseded exclusions. That instruction is void: keep
+# the tests. Superseded attacks are the regression record that the invariants
+# their successors now cover were ever actually broken, so 23 named, runnable,
+# passing legacy attacks are worth more than a deletion commit. This manifest is
+# not a staging area and not cleanup debt. Do not delete these tests, retire this
+# file, or re-propose deletion in a later session -- only Jeremy, saying so again
+# explicitly, can reverse this.
+#
 # legacy attacks superseded by stronger enrolled corpus cases (kept runnable for regression; accounted, not excluded). Name-inventoried only -- no case numbers (see
 # internal/redteamgate/exact_manifest.go). S9d enforces zero
 # unaccounted skips across the manifest set; S9c populates it and
