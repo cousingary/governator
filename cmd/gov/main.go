@@ -2467,7 +2467,7 @@ func integrationGateCmd(args []string) int {
 	// compiler-determined expected test names. A package-level zero exit is
 	// no longer sufficient evidence: the prior tier's sole test always
 	// skipped behind `ok ... 0.026s`. See internal/redteamgate.
-	usage := "usage: gov integration-gate verify --log <path> --expected-names <path> [--harness-evidence <dir> --governator-binary <path> --expected-packages <path>]"
+	usage := "usage: gov integration-gate verify --log <path> --expected-names <path> [--harness-evidence <dir> --governator-binary <path> --expected-packages <path> --assayer-commit <commit>]"
 	if len(args) < 1 || args[0] != "verify" {
 		return bad(usage)
 	}
@@ -2476,6 +2476,7 @@ func integrationGateCmd(args []string) int {
 	harnessEvidencePath := ""
 	governorBinaryPath := ""
 	expectedPackagesPath := ""
+	expectedAssayerCommit := ""
 	rest := args[1:]
 	for len(rest) > 0 {
 		switch rest[0] {
@@ -2508,6 +2509,12 @@ func integrationGateCmd(args []string) int {
 				return bad(usage)
 			}
 			expectedPackagesPath = rest[1]
+			rest = rest[2:]
+		case "--assayer-commit":
+			if len(rest) < 2 {
+				return bad(usage)
+			}
+			expectedAssayerCommit = rest[1]
 			rest = rest[2:]
 		default:
 			return bad(usage)
@@ -2549,6 +2556,7 @@ func integrationGateCmd(args []string) int {
 		HarnessEvidencePath:          harnessEvidencePath,
 		ExpectedGovernorBinarySHA256: governorBinarySHA,
 		ExpectedEvidencePackages:     expectedPackages,
+		ExpectedAssayerCommit:        expectedAssayerCommit,
 	})
 	if err := json.NewEncoder(os.Stdout).Encode(result); err != nil {
 		fmt.Fprintln(os.Stderr, "integration-gate:", err)

@@ -277,6 +277,10 @@ for line in open(sys.argv[1]):
         print(line[4:]); break
 " "$ASSAYER_LOCK_FILE" 2>/dev/null || true)
 fi
+if ! printf '%s' "$ASSAYER_LOCKED_REF" | grep -qE '^[0-9a-f]{40}$'; then
+  echo "release: assayer.lock must pin an immutable 40-character commit, not a tag or branch" >&2
+  exit 1
+fi
 # P1-5: Assayer's commit is part of release IDENTITY (a checkpoint from a
 # release attempt built against a different Assayer checkout must never be
 # reused) -- computed here, before any test tier runs, rather than only
@@ -285,6 +289,10 @@ if [ -d "$ASSAYER_REPO" ]; then
   ASSAYER_COMMIT=$(git -C "$ASSAYER_REPO" rev-parse HEAD 2>/dev/null || echo "unknown")
 else
   ASSAYER_COMMIT="absent"
+fi
+if [ "$ASSAYER_COMMIT" != "$ASSAYER_LOCKED_REF" ]; then
+  echo "release: ASSAYER_REPO commit $ASSAYER_COMMIT does not equal assayer.lock $ASSAYER_LOCKED_REF" >&2
+  exit 1
 fi
 
 GO_SUM_HASH=$(sha256sum go.sum | awk '{print $1}')
@@ -420,6 +428,11 @@ fi
 mkdir -p "$INTEGRATION_EVIDENCE_DIR"
 cat >"$INTEGRATION_EXPECTED_NAMES" <<'EOF_INTEGRATION_NAMES'
 TestEvaluateAgainstRealCLIPassAndFail
+TestEvaluateShaMismatchAfterEvaluationIsError
+TestEvaluateNonzeroExitIsError
+TestEvaluateTimeout
+TestEvaluateUnparseableStdoutIsError
+TestSol3ArtifactDeclaredPathReachesRealAssayerFilePathCheck
 TestInspectCodeGraphStatus
 TestPrepareBuildsFingerprintAndQueries
 TestPrepareAutoDegradesOnProviderFailure
@@ -431,7 +444,7 @@ EOF_INTEGRATION_PACKAGES
 {
   printf 'unit\t%s\tgo test -p %s -parallel %s -count=1 ./...\n' "$UNIT_LOG" "$GO_TEST_PARALLELISM" "$GO_TEST_PARALLELISM"
   printf 'race\t%s\tgo test -race -timeout=30m -p %s -parallel %s -count=1 ./...\n' "$RACE_LOG" "$GO_TEST_PARALLELISM" "$GO_TEST_PARALLELISM"
-  printf 'integration\t%s\tGOV_INTEGRATION_GOV_BIN=%q GOV_INTEGRATION_EVIDENCE_OUT=%q go test -json -tags integration -p %s -parallel %s -count=1 ./internal/assay/... ./internal/contextgraph/... > %q && %q integration-gate verify --log %q --expected-names %q --harness-evidence %q --governator-binary %q --expected-packages %q > %q && cat %q\n' "$INTEGRATION_LOG" "$INTEGRATION_GOV_BIN" "$INTEGRATION_EVIDENCE_DIR" "$GO_TEST_PARALLELISM" "$GO_TEST_PARALLELISM" "$INTEGRATION_JSON_LOG" "$INTEGRATION_GOV_BIN" "$INTEGRATION_JSON_LOG" "$INTEGRATION_EXPECTED_NAMES" "$INTEGRATION_EVIDENCE_DIR" "$INTEGRATION_GOV_BIN" "$INTEGRATION_EXPECTED_PACKAGES" "$INTEGRATION_GATE_JSON" "$INTEGRATION_JSON_LOG"
+  printf 'integration\t%s\tASSAYER_REPO=%q GOV_INTEGRATION_ASSAYER_COMMIT=%q GOV_INTEGRATION_GOV_BIN=%q GOV_INTEGRATION_EVIDENCE_OUT=%q go test -json -tags integration -p %s -parallel %s -count=1 ./internal/assay/... ./internal/contextgraph/... > %q && %q integration-gate verify --log %q --expected-names %q --harness-evidence %q --governator-binary %q --expected-packages %q --assayer-commit %q > %q && cat %q\n' "$INTEGRATION_LOG" "$ASSAYER_REPO" "$ASSAYER_COMMIT" "$INTEGRATION_GOV_BIN" "$INTEGRATION_EVIDENCE_DIR" "$GO_TEST_PARALLELISM" "$GO_TEST_PARALLELISM" "$INTEGRATION_JSON_LOG" "$INTEGRATION_GOV_BIN" "$INTEGRATION_JSON_LOG" "$INTEGRATION_EXPECTED_NAMES" "$INTEGRATION_EVIDENCE_DIR" "$INTEGRATION_GOV_BIN" "$INTEGRATION_EXPECTED_PACKAGES" "$ASSAYER_COMMIT" "$INTEGRATION_GATE_JSON" "$INTEGRATION_JSON_LOG"
   # Sol redteam v6 S0 (P0-18, partial): the build-tagged internal/redteam/
   # corpus was never actually compiled by any release or CI command --
   # "black_box_corpus" here only runs Sol3-prefixed tests, which never
@@ -1088,7 +1101,7 @@ data = {
         # compares, never trusts the summary's word alone.
         "unit": {"command": f"go test {par} -count=1 ./...", "result": unit_result, "duration_seconds": int(unit_seconds), "started_at": unit_started, "ended_at": unit_ended, "log_sha256": unit_log_sha, "log_path": "unit.log.gz"},
         "race": {"command": f"go test -race {par} -count=1 ./...", "result": race_result, "duration_seconds": int(race_seconds), "started_at": race_started, "ended_at": race_ended, "log_sha256": race_log_sha, "log_path": "race.log.gz"},
-        "integration": {"command": f"go test -json -tags integration {par} -count=1 ./internal/assay/... ./internal/contextgraph/...", "result": integration_result, "duration_seconds": int(integration_seconds), "started_at": integration_started, "ended_at": integration_ended, "log_sha256": integration_log_sha, "log_path": "integration.log.gz", "expected_tests": ["TestEvaluateAgainstRealCLIPassAndFail", "TestInspectCodeGraphStatus", "TestPrepareBuildsFingerprintAndQueries", "TestPrepareAutoDegradesOnProviderFailure"], "identity_gate": {**integration_gate, "ok": integration_gate_ok == "true"}, "harness_evidence": integration_evidence},
+        "integration": {"command": f"go test -json -tags integration {par} -count=1 ./internal/assay/... ./internal/contextgraph/...", "result": integration_result, "duration_seconds": int(integration_seconds), "started_at": integration_started, "ended_at": integration_ended, "log_sha256": integration_log_sha, "log_path": "integration.log.gz", "expected_tests": ["TestEvaluateAgainstRealCLIPassAndFail", "TestEvaluateShaMismatchAfterEvaluationIsError", "TestEvaluateNonzeroExitIsError", "TestEvaluateTimeout", "TestEvaluateUnparseableStdoutIsError", "TestSol3ArtifactDeclaredPathReachesRealAssayerFilePathCheck", "TestInspectCodeGraphStatus", "TestPrepareBuildsFingerprintAndQueries", "TestPrepareAutoDegradesOnProviderFailure"], "identity_gate": {**integration_gate, "ok": integration_gate_ok == "true"}, "harness_evidence": integration_evidence},
         "black_box_corpus": {
             "command": f"go test -run Sol3 -v {par} -count=1 ./...",
             "result": corpus_result,

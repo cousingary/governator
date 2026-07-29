@@ -13,4 +13,4 @@
 # runner, so the documented tag-push workflow could not reproduce the local
 # release pipeline (Sol11 P1-4). Update this ref as part of the same
 # change that bumps the Assayer pin -- never point it at a moving branch.
-ref=v1.1.6
+ref=c509318637bbcc02c7802b7489f9c65bf8621e5d

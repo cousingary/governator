@@ -10,47 +10,26 @@ package assay
 // "Keep the existing fast stub-subprocess unit tests as a separate, still-
 // always-run tier").
 //
-// The fixture it runs against — testdata/assayer_fixture/ — is a pinned,
-// checked-in copy of the real Assayer repo's cli.py + assayer/ package
-// (source commit recorded in testdata/assayer_fixture/PINNED_COMMIT). It
-// replaces the old behavior of copying from a live sibling checkout at
-// /mnt/e/downloads/assayer and skipping the test outright if that path
-// didn't exist on the machine (t.Skipf) — the exact silent-skip behavior the
-// plan requires to stop being acceptable in CI. There is nothing left to
-// skip: the fixture ships in this repo, so a missing/broken fixture or a
-// missing python3 interpreter is a hard test failure (t.Fatal), never t.Skip.
-//
-// Rationale for a checked-in fixture over a submodule/CI checkout: the real
-// Assayer repo (/mnt/e/downloads/assayer) has no git remote today (confirmed
-// via `git remote -v`), so a submodule or `git clone` checkout step in CI is
-// not viable. The evaluate path is also fully offline/stdlib-only (see
-// internal/assay/assay.go's package doc and cli.py's own docstring: it never
-// imports `supabase` — that import is lazy, inside Store.client — and never
-// touches the network), so a small pinned fixture is sufficient to exercise
-// the real CLI contract without vendoring the whole app (schema.sql,
-// tests/, the Supabase-backed quarantine/store commands are all out of scope
-// for what Evaluate() calls).
+// It runs only against ASSAYER_REPO, whose clean, tagged identity and package
+// tree hash are verified by the package TestMain before any test can run.
 import (
 	"context"
 	"encoding/json"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"testing"
 
 	"github.com/cousingary/governator/internal/enforce"
+	"github.com/cousingary/governator/internal/integrationharness"
 )
 
-func fixtureAssayerRepo(t *testing.T) string {
+func releasedAssayerRepo(t *testing.T) string {
 	t.Helper()
-	dir, err := filepath.Abs(filepath.Join("testdata", "assayer_fixture"))
-	if err != nil {
-		t.Fatalf("resolve fixture path: %v", err)
+	repo := os.Getenv("ASSAYER_REPO")
+	if repo == "" {
+		t.Fatal("ASSAYER_REPO is required: the integration tier must never fall back to a checked-in fixture")
 	}
-	if _, err := os.Stat(filepath.Join(dir, "cli.py")); err != nil {
-		t.Fatalf("pinned assayer fixture missing or broken at %s: %v (this is a mandatory CI failure, not a skip)", dir, err)
-	}
-	return dir
+	return repo
 }
 
 func TestEvaluateAgainstRealCLIPassAndFail(t *testing.T) {
@@ -65,15 +44,24 @@ func TestEvaluateAgainstRealCLIPassAndFail(t *testing.T) {
 	if !enforce.Supported() {
 		t.Fatalf("integration tier reached a test with external enforcement unavailable -- the TestMain should have fail-closed the package first (Sol14 P0-2)")
 	}
-	repo := fixtureAssayerRepo(t)
+	repo := releasedAssayerRepo(t)
 
 	dir := t.TempDir()
-	content := `{"content":"This is a real, sufficiently long piece of generated content."}`
+	content := `{"content":"def add(a, b):\n    return a + b\n","language":"python"}`
 	path, sha := writeArtifact(t, dir, content)
 	req := baseRequest(sha)
-	req.Payload = json.RawMessage(`{"content":"This is a real, sufficiently long piece of generated content."}`)
+	req.CheckProfile = "coding-output-v2"
+	req.ArtifactDeclaredPath = "result.py"
+	req.Payload = json.RawMessage(content)
 
 	snap := buildTestSnapshot(t, repo)
+	identity, err := integrationharness.ResolveAssayerIdentity(repo, os.Getenv("GOV_INTEGRATION_ASSAYER_COMMIT"))
+	if err != nil {
+		t.Fatalf("resolve real Assayer identity: %v", err)
+	}
+	if snap.Identity.PackageTreeHash != identity.PackageTreeHash {
+		t.Fatalf("Assayer identity package tree %s does not match sealed Snapshot tree %s", identity.PackageTreeHash, snap.Identity.PackageTreeHash)
+	}
 	v := Evaluate(context.Background(), Config{Repo: repo, Python: "python3"}, req, path, snap)
 	if v.Verdict != VerdictPass {
 		t.Fatalf("expected pass verdict against real assayer CLI, got %+v", v)
@@ -95,6 +83,7 @@ func TestEvaluateAgainstRealCLIPassAndFail(t *testing.T) {
 	badContent := `{}`
 	badPath, badSHA := writeArtifact(t, dir, badContent)
 	badReq := baseRequest(badSHA)
+	badReq.CheckProfile = "coding-output-v2"
 	badReq.Payload = json.RawMessage(`{}`)
 
 	badV := Evaluate(context.Background(), Config{Repo: repo, Python: "python3"}, badReq, badPath, snap)

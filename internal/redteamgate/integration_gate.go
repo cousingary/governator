@@ -84,13 +84,19 @@ type IntegrationResult struct {
 // so the release gate binds the tier to the exact components it claims to
 // have exercised rather than to a self-asserted "ok".
 type HarnessEvidence struct {
-	GovernorBinarySHA256 string `json:"governor_binary_sha256"`
-	GovernorBinarySource string `json:"governor_binary_source"`
-	EnforceSupported     bool   `json:"enforce_supported"`
-	SandboxMechanism     string `json:"sandbox_mechanism"`
-	AssayerSource        string `json:"assayer_source"`
-	AssayerCommit        string `json:"assayer_commit"`
-	FailClosedReason     string `json:"fail_closed_reason,omitempty"`
+	GovernorBinarySHA256   string `json:"governor_binary_sha256"`
+	GovernorBinarySource   string `json:"governor_binary_source"`
+	EnforceSupported       bool   `json:"enforce_supported"`
+	SandboxMechanism       string `json:"sandbox_mechanism"`
+	AssayerSource          string `json:"assayer_source"`
+	AssayerCommit          string `json:"assayer_commit"`
+	AssayerVersion         string `json:"assayer_version,omitempty"`
+	AssayerTag             string `json:"assayer_tag,omitempty"`
+	AssayerPackageTreeHash string `json:"assayer_package_tree_hash,omitempty"`
+	AssayerSchemaVersion   string `json:"assayer_schema_version,omitempty"`
+	AssayerPythonRuntime   string `json:"assayer_python_runtime,omitempty"`
+	AssayerClean           bool   `json:"assayer_clean"`
+	FailClosedReason       string `json:"fail_closed_reason,omitempty"`
 }
 
 // IntegrationOptions supplies the release-bound facts that cannot be learned
@@ -101,6 +107,7 @@ type IntegrationOptions struct {
 	HarnessEvidencePath          string
 	ExpectedGovernorBinarySHA256 string
 	ExpectedEvidencePackages     []string
+	ExpectedAssayerCommit        string
 }
 
 // EvaluateIntegration checks a parsed `go test -json` integration-tier log
@@ -198,6 +205,16 @@ func EvaluateIntegrationWithOptions(log string, expected []string, opts Integrat
 				check(strings.TrimSpace(hev.AssayerSource) != "", "evidence records no assayer_source (Assayer identity not recorded)")
 				if pkg == "assay" {
 					check(strings.TrimSpace(hev.AssayerCommit) != "", "evidence records no assayer_commit for the real Assayer bridge")
+					if opts.ExpectedAssayerCommit != "" {
+						check(hev.AssayerSource == "ASSAYER_REPO", fmt.Sprintf("evidence assayer_source %q is not the required ASSAYER_REPO checkout", hev.AssayerSource))
+						check(hev.AssayerCommit == opts.ExpectedAssayerCommit, "evidence assayer_commit does not match the immutable release Assayer commit")
+						check(strings.TrimSpace(hev.AssayerVersion) != "", "evidence records no Assayer version")
+						check(strings.TrimSpace(hev.AssayerTag) != "", "evidence records no Assayer tag")
+						check(strings.TrimSpace(hev.AssayerPackageTreeHash) != "", "evidence records no Assayer package-tree hash")
+						check(strings.TrimSpace(hev.AssayerSchemaVersion) != "", "evidence records no Assayer schema version")
+						check(strings.TrimSpace(hev.AssayerPythonRuntime) != "", "evidence records no Assayer Python runtime")
+						check(hev.AssayerClean, "evidence reports a dirty Assayer checkout")
+					}
 				}
 			}
 			for pkg := range expectedPackages {

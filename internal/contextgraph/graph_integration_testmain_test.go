@@ -26,5 +26,5 @@ import (
 // the field ambiguous. S9 moves these three tests into their own exact-name
 // integration manifest alongside the Assayer one.
 func TestMain(m *testing.M) {
-	os.Exit(integrationharness.Setup(m.Run, "contextgraph", "n/a (contextgraph)", ""))
+	os.Exit(integrationharness.Setup(m.Run, "contextgraph", integrationharness.AssayerIdentity{Source: "n/a (contextgraph)"}, nil))
 }

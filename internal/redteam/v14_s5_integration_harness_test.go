@@ -41,7 +41,8 @@ func v14S5CandidateAndTier(t *testing.T, pattern string, packages ...string) (st
 	args = append(args, packages...)
 	tier := exec.Command("go", args...)
 	tier.Dir = root
-	tier.Env = append(os.Environ(), "GOV_INTEGRATION_GOV_BIN="+candidate, "GOV_INTEGRATION_EVIDENCE_OUT="+evidenceDir)
+	assayerRepo := filepath.Join(filepath.Dir(root), "assayer")
+	tier.Env = append(os.Environ(), "ASSAYER_REPO="+assayerRepo, "GOV_INTEGRATION_GOV_BIN="+candidate, "GOV_INTEGRATION_EVIDENCE_OUT="+evidenceDir)
 	output, err := tier.CombinedOutput()
 	if err != nil {
 		t.Fatalf("mandatory integration tier: %v: %s", err, output)

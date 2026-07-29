@@ -53,6 +53,11 @@ type SnapshotIdentity struct {
 	// PackageHash is TreeHash: a sha256 over exactly the file set copied
 	// into Dir (path+content), sorted by path.
 	PackageHash string
+	// PackageTreeHash is the canonical hash of the executable source-tree
+	// members that were packed into Package. Assayer's `identity` command
+	// emits this same value, allowing the release integration gate to bind the
+	// tool-reported checkout to the exact source tree Snapshot sealed.
+	PackageTreeHash string
 	// PythonIdentity is the verified python3 handle's registry identity,
 	// captured once at resolve time -- never re-resolved.
 	PythonIdentity toolregistry.Identity
@@ -98,6 +103,25 @@ type SnapshotIdentity struct {
 	// Cleanliness mirrors Snapshot.Cleanliness -- see that field's doc
 	// comment and the Cleanliness type doc comment (Sol11 P1-2).
 	Cleanliness Cleanliness
+}
+
+type packagedFile struct{ rel, sha string }
+
+// packageTreeHash is deliberately independent of zip metadata. Both this Go
+// package and Assayer's `cli.py identity` hash sorted
+// path/NUL/content-sha256/newline records, where cli.py's archive name is
+// __main__.py. Keep the encoding byte-for-byte in sync with Assayer.
+func packageTreeHash(files []packagedFile) string {
+	files = append([]packagedFile(nil), files...)
+	sort.Slice(files, func(i, j int) bool { return files[i].rel < files[j].rel })
+	h := sha256.New()
+	for _, file := range files {
+		_, _ = h.Write([]byte(file.rel))
+		_, _ = h.Write([]byte{0})
+		_, _ = h.Write([]byte(file.sha))
+		_, _ = h.Write([]byte{'\n'})
+	}
+	return hex.EncodeToString(h.Sum(nil))
 }
 
 // Snapshot is the executable Assayer distribution -- cli.py plus the
@@ -294,7 +318,6 @@ func BuildSnapshot(registry *toolregistry.Registry, cfg Config) (*Snapshot, erro
 		return nil, fmt.Errorf("assay: sealed-memfd package execution is unsupported on %s", runtime.GOOS)
 	}
 
-	type packagedFile struct{ rel, sha string }
 	var packaged []packagedFile
 
 	buf := &bytes.Buffer{}
@@ -362,6 +385,7 @@ func BuildSnapshot(registry *toolregistry.Registry, cfg Config) (*Snapshot, erro
 	zipBytes := buf.Bytes()
 	packageSum := sha256.Sum256(zipBytes)
 	packageHash := hex.EncodeToString(packageSum[:])
+	treeHash := packageTreeHash(packaged)
 
 	pkg, merr := sealPackageMemfd(zipBytes)
 	if merr != nil {
@@ -399,6 +423,7 @@ func BuildSnapshot(registry *toolregistry.Registry, cfg Config) (*Snapshot, erro
 	}
 	identity := SnapshotIdentity{
 		PackageHash:                 packageHash,
+		PackageTreeHash:             treeHash,
 		PythonIdentity:              pythonHandle.Identity,
 		RuntimeHash:                 runtimeManifest.RuntimeHash,
 		DependencyHash:              runtimeManifest.DependencyHash,

@@ -33,7 +33,7 @@ func TestLoadManifestRejectsBlankName(t *testing.T) {
 
 // TestLoadManifestAcceptsRealManifest is a regression check that
 // internal/redteam/manifest.yaml (the actual release-gating manifest, not a
-// fixture) parses cleanly under the Sol12 strict decoder: 285
+// fixture) parses cleanly under the Sol12 strict decoder: 330
 // uniquely-numbered, uniquely-named required cases (the rc5 upgrade-12
 // Session 1 corpus, cases 196-205, Session 2's cases 206-208, Session 3's
 // cases 209-214, Session 4's cases 215-221, Session 5's cases 222-226, and
@@ -56,15 +56,16 @@ func TestLoadManifestRejectsBlankName(t *testing.T) {
 // 305-310), plus seven Sol14 S3 cases (TestV14Case310-316, manifest ids
 // 311-317), plus two Sol14 S4 cases (TestV14Case317-318, manifest ids
 // 318-319), plus the documented non-production exclusions that let the authoritative
-// inventory account for every //go:build redteam-tagged security test (P0-2).
+// inventory account for every //go:build redteam-tagged security test (P0-2),
+// plus Sol14 S5's five cases and S6's seven release-bound Assayer cases.
 func TestLoadManifestAcceptsRealManifest(t *testing.T) {
 	path := filepath.Join("..", "redteam", "manifest.yaml")
 	m, err := LoadManifest(path)
 	if err != nil {
 		t.Fatalf("LoadManifest(%s): %v", path, err)
 	}
-	if len(m.Cases) != 323 {
-		t.Fatalf("expected 323 cases in the mandatory final attack corpus, got %d", len(m.Cases))
+	if len(m.Cases) != 330 {
+		t.Fatalf("expected 330 cases in the mandatory final attack corpus, got %d", len(m.Cases))
 	}
 	seen := make(map[int]bool)
 	for _, c := range m.Cases {

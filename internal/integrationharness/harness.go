@@ -32,6 +32,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"sync"
 	"time"
 
@@ -69,14 +70,66 @@ var (
 // checkout; S5 records whatever the tier actually used -- honestly, never
 // over-claimed.
 type Evidence struct {
-	GovernorBinarySHA256 string `json:"governor_binary_sha256"`
-	GovernorBinarySource string `json:"governor_binary_source"`
-	EnforceSupported     bool   `json:"enforce_supported"`
-	SandboxMechanism     string `json:"sandbox_mechanism"`
-	AssayerSource        string `json:"assayer_source"`
-	AssayerCommit        string `json:"assayer_commit"`
-	RecordedAt           string `json:"recorded_at"`
-	FailClosedReason     string `json:"fail_closed_reason,omitempty"`
+	GovernorBinarySHA256   string `json:"governor_binary_sha256"`
+	GovernorBinarySource   string `json:"governor_binary_source"`
+	EnforceSupported       bool   `json:"enforce_supported"`
+	SandboxMechanism       string `json:"sandbox_mechanism"`
+	AssayerSource          string `json:"assayer_source"`
+	AssayerCommit          string `json:"assayer_commit"`
+	AssayerVersion         string `json:"assayer_version,omitempty"`
+	AssayerTag             string `json:"assayer_tag,omitempty"`
+	AssayerPackageTreeHash string `json:"assayer_package_tree_hash,omitempty"`
+	AssayerSchemaVersion   string `json:"assayer_schema_version,omitempty"`
+	AssayerPythonRuntime   string `json:"assayer_python_runtime,omitempty"`
+	AssayerClean           bool   `json:"assayer_clean"`
+	RecordedAt             string `json:"recorded_at"`
+	FailClosedReason       string `json:"fail_closed_reason,omitempty"`
+}
+
+// AssayerIdentity is emitted by the Assayer checkout itself (`cli.py
+// identity`). It is intentionally not reconstructed from filesystem probes
+// in Governator: the integration evidence must bind the tool that actually
+// evaluated artifacts, not a second observer's claim about that checkout.
+type AssayerIdentity struct {
+	Source          string `json:"-"`
+	Version         string `json:"version"`
+	Tag             string `json:"tag"`
+	Commit          string `json:"commit"`
+	PackageTreeHash string `json:"package_tree_hash"`
+	SchemaVersion   string `json:"schema_version"`
+	PythonRuntime   string `json:"python_runtime"`
+	Clean           bool   `json:"clean"`
+}
+
+// ResolveAssayerIdentity runs the requested Assayer checkout's own identity
+// command and fail-closes on any incomplete, dirty, or wrong-commit answer.
+// expectedCommit is the immutable release-manifest pin; empty is allowed for
+// a standalone developer integration run, but never for release.sh.
+func ResolveAssayerIdentity(repo, expectedCommit string) (AssayerIdentity, error) {
+	if strings.TrimSpace(repo) == "" {
+		return AssayerIdentity{}, errors.New("ASSAYER_REPO is required for the mandatory real Assayer integration tier")
+	}
+	cmd := exec.Command("python3", filepath.Join(repo, "cli.py"), "identity")
+	cmd.Dir = repo
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return AssayerIdentity{}, fmt.Errorf("Assayer identity command failed: %w: %s", err, strings.TrimSpace(string(out)))
+	}
+	var identity AssayerIdentity
+	if err := json.Unmarshal(out, &identity); err != nil {
+		return AssayerIdentity{}, fmt.Errorf("parse Assayer identity JSON: %w", err)
+	}
+	identity.Source = "ASSAYER_REPO"
+	if identity.Version == "" || identity.Tag == "" || identity.Commit == "" || identity.PackageTreeHash == "" || identity.SchemaVersion == "" || identity.PythonRuntime == "" {
+		return AssayerIdentity{}, fmt.Errorf("Assayer identity is incomplete: %+v", identity)
+	}
+	if !identity.Clean {
+		return AssayerIdentity{}, errors.New("Assayer identity reports a dirty checkout")
+	}
+	if expectedCommit != "" && identity.Commit != expectedCommit {
+		return AssayerIdentity{}, fmt.Errorf("Assayer identity commit %s does not equal release commit %s", identity.Commit, expectedCommit)
+	}
+	return identity, nil
 }
 
 // ResolveGovBinary returns the rc-candidate `gov` binary path the
@@ -192,16 +245,37 @@ func writeEvidence(pkgName string, ev Evidence) {
 // so its evidence record is filed distinctly (see EvidenceOutEnv).
 // assayerSource/assayerCommit let the caller record honestly which Assayer
 // the tier ran against.
-func Setup(run func() int, pkgName, assayerSource, assayerCommit string) int {
+func Setup(run func() int, pkgName string, assayer AssayerIdentity, assayerErr error) int {
+	evidence := Evidence{
+		AssayerSource:          assayer.Source,
+		AssayerCommit:          assayer.Commit,
+		AssayerVersion:         assayer.Version,
+		AssayerTag:             assayer.Tag,
+		AssayerPackageTreeHash: assayer.PackageTreeHash,
+		AssayerSchemaVersion:   assayer.SchemaVersion,
+		AssayerPythonRuntime:   assayer.PythonRuntime,
+		AssayerClean:           assayer.Clean,
+	}
+	if assayerErr != nil {
+		reason := fmt.Sprintf("resolve exact Assayer identity: %v", assayerErr)
+		fmt.Fprintf(os.Stderr, "integration: FAIL-CLOSED: %s\n", reason)
+		evidence.FailClosedReason = reason
+		writeEvidence(pkgName, evidence)
+		return 1
+	}
 	govPath, govSource, err := ResolveGovBinary()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "integration: resolve gov binary: %v\n", err)
-		writeEvidence(pkgName, Evidence{GovernorBinarySource: govSource, AssayerSource: assayerSource, AssayerCommit: assayerCommit, FailClosedReason: fmt.Sprintf("resolve gov binary: %v", err)})
+		evidence.GovernorBinarySource = govSource
+		evidence.FailClosedReason = fmt.Sprintf("resolve gov binary: %v", err)
+		writeEvidence(pkgName, evidence)
 		return 1
 	}
 	if err := VerifyELF(govPath); err != nil {
 		fmt.Fprintf(os.Stderr, "integration: gov binary verification: %v\n", err)
-		writeEvidence(pkgName, Evidence{GovernorBinarySource: govSource, AssayerSource: assayerSource, AssayerCommit: assayerCommit, FailClosedReason: fmt.Sprintf("gov binary verification: %v", err)})
+		evidence.GovernorBinarySource = govSource
+		evidence.FailClosedReason = fmt.Sprintf("gov binary verification: %v", err)
+		writeEvidence(pkgName, evidence)
 		return 1
 	}
 	govSHA, _ := SHA256File(govPath)
@@ -213,25 +287,19 @@ func Setup(run func() int, pkgName, assayerSource, assayerCommit string) int {
 	if !enforce.Supported() {
 		reason := errors.New("external enforcement unavailable on this host (Landlock LSM ABI>=3 + trusted unshare required)")
 		fmt.Fprintf(os.Stderr, "integration: FAIL-CLOSED: %v\n", reason)
-		writeEvidence(pkgName, Evidence{
-			GovernorBinarySHA256: govSHA,
-			GovernorBinarySource: govSource,
-			EnforceSupported:     false,
-			SandboxMechanism:     "unavailable",
-			AssayerSource:        assayerSource,
-			AssayerCommit:        assayerCommit,
-			FailClosedReason:     reason.Error(),
-		})
+		evidence.GovernorBinarySHA256 = govSHA
+		evidence.GovernorBinarySource = govSource
+		evidence.EnforceSupported = false
+		evidence.SandboxMechanism = "unavailable"
+		evidence.FailClosedReason = reason.Error()
+		writeEvidence(pkgName, evidence)
 		return 1
 	}
 
-	writeEvidence(pkgName, Evidence{
-		GovernorBinarySHA256: govSHA,
-		GovernorBinarySource: govSource,
-		EnforceSupported:     true,
-		SandboxMechanism:     "landlock+unshare (enforce.Supported)",
-		AssayerSource:        assayerSource,
-		AssayerCommit:        assayerCommit,
-	})
+	evidence.GovernorBinarySHA256 = govSHA
+	evidence.GovernorBinarySource = govSource
+	evidence.EnforceSupported = true
+	evidence.SandboxMechanism = "landlock+unshare (enforce.Supported)"
+	writeEvidence(pkgName, evidence)
 	return run()
 }

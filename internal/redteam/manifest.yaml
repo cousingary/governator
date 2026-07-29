@@ -1862,6 +1862,41 @@ cases:
     session: rc7-u14-s5
     required: true
     status: implemented
+  - case: 325
+    name: TestV14Case324RealAssayerPassVerdictIsHonored
+    session: rc7-u14-s6
+    required: true
+    status: implemented
+  - case: 326
+    name: TestV14Case325RealAssayerFailVerdictIsHonored
+    session: rc7-u14-s6
+    required: true
+    status: implemented
+  - case: 327
+    name: TestV14Case326AssayerNonzeroExitIsError
+    session: rc7-u14-s6
+    required: true
+    status: implemented
+  - case: 328
+    name: TestV14Case327AssayerTimeoutIsError
+    session: rc7-u14-s6
+    required: true
+    status: implemented
+  - case: 329
+    name: TestV14Case328MalformedAssayerOutputIsError
+    session: rc7-u14-s6
+    required: true
+    status: implemented
+  - case: 330
+    name: TestV14Case329PostEvaluationArtifactMutationIsDetected
+    session: rc7-u14-s6
+    required: true
+    status: implemented
+  - case: 331
+    name: TestV14Case330AssayerCheckoutCommitMustEqualReleaseCommit
+    session: rc7-u14-s6
+    required: true
+    status: implemented
 
 # Case 296 is not one of Sol13's original 51 findings (which occupy 245-295).
 # It closes a gap the rc6-upg13 S3 exclusion audit found: TestV6Case29's own

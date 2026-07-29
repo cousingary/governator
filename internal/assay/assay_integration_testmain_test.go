@@ -4,7 +4,6 @@ package assay
 
 import (
 	"os"
-	"path/filepath"
 	"testing"
 
 	"github.com/cousingary/governator/internal/integrationharness"
@@ -31,14 +30,8 @@ import (
 // gate (scripts/release.sh -> `gov integration-gate verify`) parses the
 // -json stream to require every expected test ran with zero skips.
 func TestMain(m *testing.M) {
-	// Record the Assayer identity this tier runs against (today the checked-in
-	// fixture; S6 binds this to the exact released Assayer checkout and makes
-	// the gate require the match). Best-effort: an empty commit is recorded
-	// honestly, never fabricated.
-	assayerCommit := ""
-	if repo, absErr := filepath.Abs(filepath.Join("testdata", "assayer_fixture")); absErr == nil {
-		env := DescribeEnvironment(Config{Repo: repo, Python: "python3"})
-		assayerCommit = env.AssayerCommit
-	}
-	os.Exit(integrationharness.Setup(m.Run, "assay", "fixture", assayerCommit))
+	identity, err := integrationharness.ResolveAssayerIdentity(
+		os.Getenv("ASSAYER_REPO"), os.Getenv("GOV_INTEGRATION_ASSAYER_COMMIT"),
+	)
+	os.Exit(integrationharness.Setup(m.Run, "assay", identity, err))
 }
