@@ -109,7 +109,7 @@ func ResolveAssayerIdentity(repo, expectedCommit string) (AssayerIdentity, error
 	if strings.TrimSpace(repo) == "" {
 		return AssayerIdentity{}, errors.New("ASSAYER_REPO is required for the mandatory real Assayer integration tier")
 	}
-	cmd := exec.Command("python3", filepath.Join(repo, "cli.py"), "identity")
+	cmd := exec.Command("python3", filepath.Join(repo, "cli.py"), "identity") // govratchet:exec-allow(release_tooling) -- release-bound Assayer identity evidence probe, never a governed run
 	cmd.Dir = repo
 	out, err := cmd.CombinedOutput()
 	if err != nil {
@@ -149,7 +149,7 @@ func ResolveGovBinary() (path, source string, err error) {
 			return
 		}
 		out := filepath.Join(dir, "gov")
-		cmd := exec.Command("go", "build", "-buildvcs=false", "-o", out, "./cmd/gov")
+		cmd := exec.Command("go", "build", "-buildvcs=false", "-o", out, "./cmd/gov") // govratchet:exec-allow(release_tooling) -- integration-tier candidate build, never a governed run
 		cmd.Dir = repoRoot
 		if combined, runErr := cmd.CombinedOutput(); runErr != nil {
 			govBinErr = fmt.Errorf("%w: %s", runErr, combined)

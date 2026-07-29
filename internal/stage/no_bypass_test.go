@@ -48,6 +48,12 @@ func TestNoRawProcessLaunchOutsideStageExecutor(t *testing.T) {
 		// evidence. It has no contract, job, or governed runtime authority;
 		// the command is a release verification input, not a backend launch.
 		"cmd/gov/main.go": 3,
+		// The S6 integration harness runs only the released Assayer checkout's
+		// self-identity probe and, for standalone integration tests, builds the
+		// disposable candidate binary. Both are release-bound verification
+		// tooling, not governed stages or backend launches; keeping their exact
+		// count here makes any future raw launch addition fail closed.
+		"internal/integrationharness/harness.go": 2,
 		// internal/gitplumb/gitplumb.go: fully migrated (rc3 Session 5, Sol9
 		// P0-6) — every git invocation now launches through a held, verified
 		// toolregistry.Handle (gitplumb.Session.gitHandle / openGitHandle),
