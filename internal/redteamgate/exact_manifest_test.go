@@ -190,11 +190,11 @@ func TestLoadManifestSetAcceptsValidCombination(t *testing.T) {
 // unchanged for a passing test, while a test that is NEITHER a corpus case,
 // NOR excluded, NOR in an exact manifest is still flagged UnexpectedTests.
 //
-// (S9b shipped the field read-but-unused; S9c begins reading it. Skip-evidence
-// enforcement across the set remains S9d's work: a SKIP in an exact-manifest
-// test is still tolerated here, not yet required to prove capability evidence.
-// A FAIL, however, still blocks the release -- the fold accounts for the name
-// only, it never waives a failure.)
+// S9d enforces skip-evidence across the set: a SKIP in an exact-manifest test
+// under RequireZeroSkips must have the manifest's required_capabilities proven
+// ABSENT. A FAIL still blocks the release regardless. The capability record
+// supplied here proves "linux" present so the P0-3 incomplete-capabilities
+// check passes.
 func TestEvaluateWithOptionsAccountsForExactManifestTests(t *testing.T) {
 	manifest := Manifest{Cases: []CaseEntry{{Case: 1, Name: "TestCorpusOne", Required: true}}}
 	// TestExactExtra is in the inventory but is neither a corpus case nor an
@@ -202,7 +202,9 @@ func TestEvaluateWithOptionsAccountsForExactManifestTests(t *testing.T) {
 	// it is accounted.
 	passLog := "=== RUN   TestCorpusOne\n--- PASS: TestCorpusOne (0.00s)\n" +
 		"=== RUN   TestExactExtra\n--- PASS: TestExactExtra (0.00s)\n"
-	caps := map[string]CapabilityRecord{}
+	caps := map[string]CapabilityRecord{
+		"linux": {State: CapabilityPresent, Probe: "runtime.GOOS", Result: "linux"},
+	}
 	inventory := []string{"TestCorpusOne", "TestExactExtra"}
 
 	without := EvaluateWithOptions(manifest, passLog, caps, Options{DiscoveredTests: inventory})

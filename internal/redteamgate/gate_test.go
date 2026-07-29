@@ -191,3 +191,77 @@ func TestEvaluateIgnoresLegacyV6CaseNamesOutsideManifest(t *testing.T) {
 		t.Fatalf("unexpected tests = %+v, want none", res.UnexpectedTests)
 	}
 }
+
+func TestEvaluateExactManifestSkipBlockedWhenCapabilityPresent(t *testing.T) {
+	manifest := Manifest{Cases: []CaseEntry{{Case: 1, Name: "TestCorpusOne", Required: true}}}
+	exact := []ExactManifest{{
+		Name:                 "attacks",
+		RequiredCapabilities: []string{"linux"},
+		Tests:                []string{"TestExactAttack"},
+	}}
+	log := "" +
+		"=== RUN   TestCorpusOne\n--- PASS: TestCorpusOne (0.00s)\n" +
+		"=== RUN   TestExactAttack\n--- SKIP: TestExactAttack (0.00s)\n"
+	caps := map[string]CapabilityRecord{
+		"linux": {State: CapabilityPresent, Probe: "runtime.GOOS", Result: "linux"},
+	}
+	res := EvaluateWithOptions(manifest, log, caps, Options{
+		RequireZeroSkips: true,
+		DiscoveredTests:  []string{"TestCorpusOne", "TestExactAttack"},
+		ExactManifests:   exact,
+	})
+	if res.OK {
+		t.Fatalf("exact-manifest skip with capability present must block: %+v", res)
+	}
+	if len(res.UnexpectedSkips) != 1 || res.UnexpectedSkips[0] != "TestExactAttack" {
+		t.Fatalf("expected TestExactAttack in UnexpectedSkips, got %+v", res)
+	}
+}
+
+func TestEvaluateExactManifestSkipAuthorizedWhenCapabilityAbsent(t *testing.T) {
+	manifest := Manifest{Cases: []CaseEntry{{Case: 1, Name: "TestCorpusOne", Required: true}}}
+	exact := []ExactManifest{{
+		Name:                 "docker-tests",
+		RequiredCapabilities: []string{"has_docker_daemon"},
+		Tests:                []string{"TestDockerAttack"},
+	}}
+	log := "" +
+		"=== RUN   TestCorpusOne\n--- PASS: TestCorpusOne (0.00s)\n" +
+		"=== RUN   TestDockerAttack\n--- SKIP: TestDockerAttack (0.00s)\n"
+	caps := map[string]CapabilityRecord{
+		"has_docker_daemon": {State: CapabilityAbsent, Probe: "docker info", Result: "cannot connect"},
+	}
+	res := EvaluateWithOptions(manifest, log, caps, Options{
+		RequireZeroSkips: true,
+		DiscoveredTests:  []string{"TestCorpusOne", "TestDockerAttack"},
+		ExactManifests:   exact,
+	})
+	if !res.OK {
+		t.Fatalf("exact-manifest skip with capability proven absent must be authorized: %+v", res)
+	}
+	if len(res.OutOfScopeSkips) != 1 || res.OutOfScopeSkips[0] != "TestDockerAttack" {
+		t.Fatalf("expected TestDockerAttack in OutOfScopeSkips, got %+v", res)
+	}
+}
+
+func TestEvaluateExactManifestIncompleteCapabilityBlocks(t *testing.T) {
+	manifest := Manifest{Cases: []CaseEntry{{Case: 1, Name: "TestCorpusOne", Required: true}}}
+	exact := []ExactManifest{{
+		Name:                 "attacks",
+		RequiredCapabilities: []string{"linux"},
+		Tests:                []string{"TestExactAttack"},
+	}}
+	log := "" +
+		"=== RUN   TestCorpusOne\n--- PASS: TestCorpusOne (0.00s)\n" +
+		"=== RUN   TestExactAttack\n--- PASS: TestExactAttack (0.00s)\n"
+	res := EvaluateWithOptions(manifest, log, nil, Options{
+		DiscoveredTests: []string{"TestCorpusOne", "TestExactAttack"},
+		ExactManifests:  exact,
+	})
+	if res.OK {
+		t.Fatalf("incomplete capability evidence must block: %+v", res)
+	}
+	if len(res.IncompleteCapabilities) != 1 {
+		t.Fatalf("expected one incomplete capability, got %+v", res.IncompleteCapabilities)
+	}
+}

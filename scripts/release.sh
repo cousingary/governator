@@ -562,9 +562,11 @@ REDTEAM_MANIFEST="internal/redteam/manifest.yaml"
 # Sol14 rc7 Session 9c (P1-2): the name-inventoried exact manifests that drain
 # the former exclusion list. Every *.yaml under internal/redteam/manifests/ is
 # passed to the gate as --exact-manifest; the gate accounts for each listed test
-# by name (not unmanifested drift) and S9d will enforce zero unaccounted skips
-# across the set. An empty directory leaves the array empty and aborts the
-# release below, so a release cannot accidentally run with a missing manifest
+# by name (not unmanifested drift) and S9d enforces zero unaccounted skips
+# across the set: under --require-zero-skips, a skip by an exact-manifest test
+# is authorized only when the manifest's required_capabilities are proven ABSENT
+# in the capability record. An empty directory leaves the array empty and aborts
+# the release below, so a release cannot accidentally run with a missing manifest
 # set. NUL-delimited collection (mapfile -d '') is required: a plain `mapfile -t`
 # over NUL-separated input silently collapses the whole list to one entry, which
 # would pass only the first manifest and make the other five look like drift.

@@ -379,14 +379,14 @@ type Options struct {
 	// manifests (Sol14 rc7 Session 9b) that the gate accounts for alongside the
 	// numbered corpus. S9b shipped the ExactManifest/ManifestSet schema and
 	// loader (internal/redteamgate/exact_manifest.go) wired to ZERO manifests.
-	// S9c populates the manifests and consumes this field at the NAME level
-	// only: a test listed by any exact manifest is "accounted for by name" and
-	// is therefore not unmanifested drift (P0-2), so an exclusion drained into
-	// an exact manifest cannot widen the gate. S9c does NOT yet enforce skips
-	// across the set -- that "zero unaccounted skips" enforcement (capability
-	// evidence per skip, RequireZeroSkips across every manifest) is S9d's work.
-	// A zero-manifest caller (no exact manifests supplied) is byte-for-byte
-	// identical to the pre-S9b gate; the field is read but never widens OK.
+	// S9c populates the manifests and consumes this field at the NAME level:
+	// a test listed by any exact manifest is "accounted for by name" and is
+	// therefore not unmanifested drift (P0-2). S9d enforces zero unaccounted
+	// skips across the set: under RequireZeroSkips, a test listed by an exact
+	// manifest that SKIPs is authorized only when the manifest's
+	// required_capabilities are proven ABSENT in the capability record
+	// (exactManifestSkipAuthorized). A skip with all capabilities proven
+	// present, or with incomplete evidence, blocks the release.
 	ExactManifests []ExactManifest
 }
 
@@ -423,13 +423,11 @@ func EvaluateWithOptions(manifest Manifest, log string, capabilities map[string]
 	// name" (Sol14 P1-2). At the name level this is the same accounting role a
 	// documented exclusion played -- a test in this set that appears in the log
 	// is not unmanifested drift (P0-2) -- so draining an exclusion into an exact
-	// manifest cannot widen what the gate waves through. The DIFFERENCE from an
-	// exclusion (and from a corpus case) is enforced in S9d, not here: S9c only
-	// stops these names being flagged UnexpectedTests; it does not yet require
-	// capability-evidence-backed skip accounting across the set (that is the
-	// "zero unaccounted skips" enforcement S9d owns). A test that FAILS is still
-	// added to FailedTests above this branch, so an exact-manifest test that
-	// fails still blocks the release; only its SKIP is tolerated pending S9d.
+	// manifest cannot widen what the gate waves through. S9d enforces the
+	// DIFFERENCE from an exclusion (and from a corpus case): a test that FAILS
+	// is still added to FailedTests, and a test that SKIPs under
+	// RequireZeroSkips must have its manifest's required_capabilities proven
+	// ABSENT (exactManifestSkipAuthorized) or it blocks the release.
 	exactAccounted := make(map[string]bool)
 	for _, em := range opts.ExactManifests {
 		for _, name := range em.Tests {
@@ -444,10 +442,17 @@ func EvaluateWithOptions(manifest Manifest, log string, capabilities map[string]
 	// P0-3: every predicate the manifest references must be proven in the
 	// supplied capability record. Collect them first so an incomplete record
 	// blocks regardless of whether the corresponding case actually skipped.
+	// S9d extends this to exact-manifest required_capabilities: a manifest
+	// whose predicate is not proven present/absent cannot authorize a skip.
 	manifestPredicates := make(map[string]bool)
 	for _, c := range manifest.Cases {
 		if c.Conditional && c.AllowedSkip != nil && c.AllowedSkip.Predicate != "" {
 			manifestPredicates[c.AllowedSkip.Predicate] = true
+		}
+	}
+	for _, em := range opts.ExactManifests {
+		for _, pred := range em.RequiredCapabilities {
+			manifestPredicates[pred] = true
 		}
 	}
 	for pred := range manifestPredicates {
@@ -490,6 +495,22 @@ func EvaluateWithOptions(manifest Manifest, log string, capabilities map[string]
 			if _, isExcluded := excluded[name]; !isExcluded {
 				if _, isExact := exactAccounted[name]; !isExact {
 					res.UnexpectedTests = append(res.UnexpectedTests, name)
+				}
+			}
+			// S9d: zero-unaccounted-skips enforcement across the exact
+			// manifest set. A test listed by an exact manifest that SKIPs
+			// is authorized only when the manifest's required_capabilities
+			// are proven ABSENT (the host genuinely lacks the capability
+			// the manifest declares). Proven present means the test should
+			// have run; unknown/missing is CAPABILITY_EVIDENCE_INCOMPLETE
+			// (already flagged above). Under RequireZeroSkips an
+			// unauthorized skip blocks the release exactly as a corpus
+			// case skip does.
+			if o.Result == "SKIP" && exactAccounted[name] && opts.RequireZeroSkips {
+				if exactManifestSkipAuthorized(name, opts.ExactManifests, capabilities) {
+					res.OutOfScopeSkips = append(res.OutOfScopeSkips, name)
+				} else {
+					res.UnexpectedSkips = append(res.UnexpectedSkips, name)
 				}
 			}
 			continue
@@ -617,4 +638,40 @@ func skipAllowed(c CaseEntry, reason string, capabilities map[string]CapabilityR
 		return true
 	}
 	return strings.Contains(reason, c.AllowedSkip.Reason)
+}
+
+// exactManifestSkipAuthorized reports whether a SKIP for a test listed in an
+// exact manifest is authorized by capability evidence (Sol14 rc7 S9d). A skip
+// is authorized only when the manifest that lists the test declares at least
+// one required_capability that is explicitly proven ABSENT in the supplied
+// capability record — meaning the host genuinely lacks the capability the
+// manifest needs, so the test is legitimately outside the claimed production
+// platform. If every required capability is proven present the test should
+// have run and the skip is a gap. If a predicate is missing from the record
+// entirely it is CAPABILITY_EVIDENCE_INCOMPLETE (flagged separately above)
+// and never authorizes a skip.
+func exactManifestSkipAuthorized(name string, manifests []ExactManifest, capabilities map[string]CapabilityRecord) bool {
+	for _, em := range manifests {
+		found := false
+		for _, testName := range em.Tests {
+			if testName == name {
+				found = true
+				break
+			}
+		}
+		if !found {
+			continue
+		}
+		for _, pred := range em.RequiredCapabilities {
+			rec, ok := capabilities[pred]
+			if !ok {
+				return false
+			}
+			if rec.State == CapabilityAbsent {
+				return true
+			}
+		}
+		return false
+	}
+	return false
 }

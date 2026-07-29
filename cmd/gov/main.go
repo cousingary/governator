@@ -2230,10 +2230,10 @@ func redteamGateCmd(args []string) int {
 	// exactManifestPaths is the repeatable --exact-manifest option (Sol14 rc7
 	// Session 9b). Each path is one name-inventoried, no-case-number exact
 	// manifest (internal/redteamgate/exact_manifest.go) loaded alongside the
-	// numbered corpus via LoadManifestSet. S9b wires the loader and validates
-	// the combined set; S9d is the session that enforces zero unaccounted
-	// skips across them. Empty (the current corpus) is byte-identical to the
-	// pre-S9b gate.
+	// numbered corpus via LoadManifestSet. S9d enforces zero unaccounted
+	// skips across them: under --require-zero-skips, a skip by an
+	// exact-manifest test is authorized only when the manifest's
+	// required_capabilities are proven ABSENT in the capability record.
 	exactManifestPaths := []string{}
 	attestationsDir := ""
 	attestationTrustPath := ""
@@ -2282,8 +2282,10 @@ func redteamGateCmd(args []string) int {
 			// repeatable. Loaded with the numbered corpus via
 			// LoadManifestSet, which validates the combined set (unique
 			// manifest names, no test in two manifests, no test that is
-			// also a numbered corpus case). S9b loads and validates only;
-			// S9d enforces zero unaccounted skips across the set.
+			// also a numbered corpus case). S9d enforces zero unaccounted
+			// skips across the set: under --require-zero-skips, a skip by
+			// an exact-manifest test is authorized only when the manifest's
+			// required_capabilities are proven ABSENT.
 			if len(rest) < 2 {
 				return bad(usage)
 			}
@@ -2445,11 +2447,11 @@ func redteamGateCmd(args []string) int {
 		RequireZeroSkips: requireZeroSkips,
 		DiscoveredTests:  discovered,
 		Attestations:     aggResult,
-		// S9c: exact manifests are now consumed at the name level -- a test
+		// S9c: exact manifests are consumed at the name level -- a test
 		// listed by any exact manifest is "accounted for" and is not flagged
-		// unmanifested drift, so draining an exclusion into an exact manifest
-		// cannot widen the gate. Skip-evidence enforcement across the set
-		// (RequireZeroSkips with capability evidence) remains S9d's work.
+		// unmanifested drift. S9d: under RequireZeroSkips, a skip by an
+		// exact-manifest test is authorized only when the manifest's
+		// required_capabilities are proven ABSENT in the capability record.
 		ExactManifests: manifestSet.ExactManifests,
 	})
 	if err := json.NewEncoder(os.Stdout).Encode(result); err != nil {
