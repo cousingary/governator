@@ -41,7 +41,7 @@ func s7WriteIdentity(t *testing.T, path string, fields map[string]string) {
 	args := []string{s7CheckpointScript(t), "identity"}
 	for _, k := range []string{
 		"governator_commit", "governator_tag", "assayer_commit",
-		"go_sum_hash", "toolchain_hash", "environment_hash",
+		"go_sum_hash", "toolchain_hash", "environment_hash", "capabilities_hash",
 		"go_test_parallelism", "requested_version", "expected_exact_tag",
 		"release_mode", "distribution_allowed",
 	} {
@@ -65,6 +65,7 @@ func s7DefaultFields() map[string]string {
 		"go_sum_hash":          "gosum-hash-1",
 		"toolchain_hash":       "toolchain-hash-1",
 		"environment_hash":     "environment-hash-1",
+		"capabilities_hash":    "capabilities-hash-1",
 		"go_test_parallelism":  "2",
 		"requested_version":    "1.0.2-rc5",
 		"expected_exact_tag":   "v1.0.2-rc5",

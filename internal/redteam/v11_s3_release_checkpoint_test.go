@@ -53,6 +53,7 @@ type s3Identity struct {
 	GoSumHash           string
 	ToolchainHash       string
 	EnvironmentHash     string
+	CapabilitiesHash    string
 	GoTestParallelism   string
 	RequestedVersion    string
 	ExpectedExactTag    string
@@ -68,6 +69,7 @@ func s3DefaultIdentity() s3Identity {
 		GoSumHash:           "gosum-hash-1",
 		ToolchainHash:       "toolchain-hash-1",
 		EnvironmentHash:     "environment-hash-1",
+		CapabilitiesHash:    "capabilities-hash-1",
 		GoTestParallelism:   "2",
 		RequestedVersion:    "1.0.2-rc5-test",
 		ExpectedExactTag:    "v1.0.2-rc5-test",
@@ -87,6 +89,7 @@ func s3WriteIdentityFile(t *testing.T, path string, id s3Identity) {
 		"--go-sum-hash", id.GoSumHash,
 		"--toolchain-hash", id.ToolchainHash,
 		"--environment-hash", id.EnvironmentHash,
+		"--capabilities-hash", id.CapabilitiesHash,
 		"--go-test-parallelism", id.GoTestParallelism,
 		"--requested-version", id.RequestedVersion,
 		"--expected-exact-tag", id.ExpectedExactTag,

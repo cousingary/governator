@@ -325,6 +325,29 @@ TOOLSET_HASH=$(python3 "$ROOT/scripts/release_toolset.py" --policy "$RELEASE_TOO
 # is correctly invalidated.
 TOOLCHAIN_HASH=$(printf '%s|%s|%s\n' "$(go version)" "$(python3 --version 2>&1)" "$TOOLSET_HASH" | sha256sum | awk '{print $1}')
 ENVIRONMENT_HASH=$(printf '%s|GOMAXPROCS=%s|parallelism=%s|platforms=%s\n' "$(uname -a)" "${GOMAXPROCS:-}" "$GO_TEST_PARALLELISM" "$PLATFORMS" | sha256sum | awk '{print $1}')
+# Sol14 rc7 Session 10: host CAPABILITY STATE is part of release identity.
+# A red-team tier's result is a function of which capabilities the host
+# actually had -- a Docker-absent run legitimately SKIPs the real-daemon
+# cases, a Docker-present run must RUN them. ENVIRONMENT_HASH above covers
+# uname/GOMAXPROCS/parallelism/platforms and does NOT capture that, so a
+# checkpoint from a Docker-absent attempt was reusable by a Docker-present
+# one: the gate then scored a FRESH capability probe against a STALE tier
+# log and could authorize or reject skips under capabilities that were not
+# in effect when the log was produced. Found end to end on the rc7 cut,
+# where TestV12Case31 was reported as an unauthorized skip.
+#
+# Only the capability STATES are hashed, deliberately: each record also
+# carries a probe timestamp and host identity, and folding those in would
+# change the hash on every invocation and make every checkpoint permanently
+# unreusable -- defeating the resumable-checkpoint design (P1-5).
+RELEASE_CAPABILITIES_JSON=$(python3 "$ROOT/scripts/redteam_capabilities.py")
+CAPABILITIES_HASH=$(printf '%s' "$RELEASE_CAPABILITIES_JSON" | python3 -c "
+import hashlib, json, sys
+records = json.load(sys.stdin)
+states = {name: record.get('state', 'unknown') for name, record in records.items()}
+canonical = json.dumps(states, sort_keys=True, separators=(',', ':'))
+print(hashlib.sha256(canonical.encode()).hexdigest())
+")
 # Sol12 P1-5 (rc5 Session 7): use the expected v${VERSION} tag directly
 # rather than the first sorted tag at HEAD -- multiple tags on one commit
 # must bind to the exact expected tag, not an arbitrary one.
@@ -338,6 +361,7 @@ python3 "$ROOT/scripts/release_checkpoint.py" identity \
   --governator-commit "$COMMIT" --governator-tag "$RELEASE_TAG_FOR_IDENTITY" \
   --assayer-commit "$ASSAYER_COMMIT" --go-sum-hash "$GO_SUM_HASH" \
   --toolchain-hash "$TOOLCHAIN_HASH" --environment-hash "$ENVIRONMENT_HASH" \
+  --capabilities-hash "$CAPABILITIES_HASH" \
   --go-test-parallelism "$GO_TEST_PARALLELISM" \
   --requested-version "$VERSION" --expected-exact-tag "v${VERSION}" \
   --release-mode "$RELEASE_MODE" --distribution-allowed "$DISTRIBUTION_ALLOWED" >"$CANDIDATE_IDENTITY"
@@ -603,7 +627,13 @@ done
 # host, platform, and timestamp so the evidence is self-describing; the
 # signed per-host capability attestations aggregated at release (Sessions
 # 5/6/9) carry the full evidence_hash/signature on top of this same schema.
-REDTEAM_CAPABILITIES_JSON=$(python3 scripts/redteam_capabilities.py)
+#
+# Sol14 rc7 Session 10: the probe itself now runs ONCE, before the checkpoint
+# identity is computed (see CAPABILITIES_HASH above), and this gate consumes
+# that exact evidence. Re-probing here would score a fresh capability record
+# against a tier log that may have been produced under different host
+# capabilities -- the same stale-evidence class this cycle keeps closing.
+REDTEAM_CAPABILITIES_JSON=$RELEASE_CAPABILITIES_JSON
 # Sol13 rc6 Session 1 (P0-4): this one shared computation supplies the
 # tagged source inventory, source identity, and aggregate compiled-test-binary
 # identity. Directory names are never used to decide which attack source is

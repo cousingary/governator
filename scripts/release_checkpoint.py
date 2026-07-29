@@ -62,6 +62,7 @@ IDENTITY_FIELDS = (
     "go_sum_hash",
     "toolchain_hash",
     "environment_hash",
+    "capabilities_hash",
     "go_test_parallelism",
     "requested_version",
     "expected_exact_tag",
