@@ -110,12 +110,26 @@ rm -rf "$OUT_DIR/dist/.checkpoints"
 # S8: a machine-readable live-install claim must carry its signed record in
 # the bundle itself. An operator may supply the live record outside dist/;
 # copy it into the packaged evidence location before release-mode validation.
+#
+# Sol14 rc7 Session 10: that location is evidence/, NEVER dist/. Installation
+# evidence describes installing the finished release, so it necessarily comes
+# into existence AFTER checksums.txt was generated and signed -- it can never
+# be one of the files checksums.txt covers. Copying it into dist/ (as S8 did)
+# therefore put a permanently-uncoverable file inside the very directory
+# release_policy.py sweeps for "every shipped file is checksummed", and
+# release-mode validation failed closed on `missing: install-evidence.json`
+# for every live-install claim -- unsatisfiable by construction. Another path
+# that had never run end to end: S8 built and tested the evidence tooling, but
+# no release had yet reached a release-mode bundle carrying a real record.
+# evidence/ is where the bundle already keeps release/test/acceptance evidence,
+# it is outside the coverage sweep, and audit_bundle_validate.py takes the
+# record's path explicitly, so nothing is weakened by moving it there.
 if [ -n "${INSTALL_EVIDENCE:-}" ]; then
   if [ ! -f "$INSTALL_EVIDENCE" ]; then
     echo "audit_bundle: INSTALL_EVIDENCE does not name a file: $INSTALL_EVIDENCE" >&2
     exit 1
   fi
-  cp "$INSTALL_EVIDENCE" "$OUT_DIR/dist/install-evidence.json"
+  cp "$INSTALL_EVIDENCE" "$OUT_DIR/evidence/install-evidence.json"
 fi
 
 if [ "$AUDIT_BUNDLE_MODE" = source-only ]; then
@@ -169,7 +183,7 @@ if [ "$AUDIT_BUNDLE_MODE" = release ]; then
   if [ -f "$ROOT/docs/TRUSTED_SIGNING_KEYS.txt" ] && [ -d "$ROOT/docs/signing_keys" ]; then
     VALIDATE_ARGS+=(--trusted-fingerprints-file "$ROOT/docs/TRUSTED_SIGNING_KEYS.txt" --trusted-public-keys-dir "$ROOT/docs/signing_keys")
   fi
-  INSTALL_EVIDENCE_FILE="$OUT_DIR/dist/install-evidence.json"
+  INSTALL_EVIDENCE_FILE="$OUT_DIR/evidence/install-evidence.json"
   if [ -f "$INSTALL_EVIDENCE_FILE" ]; then
     VALIDATE_ARGS+=(--install-evidence "$INSTALL_EVIDENCE_FILE")
   fi
@@ -180,9 +194,11 @@ if [ "$AUDIT_BUNDLE_MODE" = release ]; then
 fi
 
 # --- evidence/: release/test/acceptance evidence for this ref -------------
+# install-evidence.json is deliberately absent from this list: it is copied
+# straight into evidence/ above (Sol14 rc7 Session 10) and never lands in
+# dist/, because it cannot be covered by the release's own checksums.txt.
 for f in test-summary.json acceptance-summary.json claims-verify-report.txt \
-  build-manifest.json checksums.txt checksums.txt.minisig checksums.txt.hmac \
-  install-evidence.json; do
+  build-manifest.json checksums.txt checksums.txt.minisig checksums.txt.hmac; do
   if [ -f "$OUT_DIR/dist/$f" ]; then
     cp "$OUT_DIR/dist/$f" "$OUT_DIR/evidence/$f"
   fi
