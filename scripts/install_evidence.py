@@ -344,6 +344,12 @@ def cmd_verify(args: argparse.Namespace) -> int:
         print(f"install_evidence: {msg}", file=sys.stderr)
         return 1
 
+    required = ("installed_path", "installed_sha256", "installed_mode", "hook_configuration_path", "hook_configuration_sha256", "release_manifest_sha256", "signing_key_id", *CANARY_FIELDS)
+    absent = [field for field in required if record.get(field) in (None, "")]
+    if absent:
+        print(f"install_evidence: INSTALL_EVIDENCE_MISSING_FIELDS: {', '.join(absent)}", file=sys.stderr)
+        return 1
+
     release_manifest = pathlib.Path(args.release_manifest)
     if release_manifest.is_file():
         actual_manifest_sha = sha256_file(str(release_manifest))
@@ -355,8 +361,11 @@ def cmd_verify(args: argparse.Namespace) -> int:
             )
             return 1
 
-    installed_path = record.get("installed_path", "")
-    if installed_path and pathlib.Path(installed_path).is_file():
+    installed_path = record["installed_path"]
+    if not pathlib.Path(installed_path).is_file():
+        print(f"install_evidence: INSTALLED_BINARY_UNAVAILABLE: {installed_path}", file=sys.stderr)
+        return 1
+    else:
         actual_sha = sha256_file(installed_path)
         if record.get("installed_sha256") != actual_sha:
             print(
@@ -374,8 +383,11 @@ def cmd_verify(args: argparse.Namespace) -> int:
             )
             return 1
 
-    hook_config_path = record.get("hook_configuration_path", "")
-    if hook_config_path and pathlib.Path(hook_config_path).is_file():
+    hook_config_path = record["hook_configuration_path"]
+    if not pathlib.Path(hook_config_path).is_file():
+        print(f"install_evidence: HOOK_CONFIGURATION_UNAVAILABLE: {hook_config_path}", file=sys.stderr)
+        return 1
+    else:
         actual_hook_sha = sha256_file(hook_config_path)
         if record.get("hook_configuration_sha256") != actual_hook_sha:
             print(
@@ -388,6 +400,14 @@ def cmd_verify(args: argparse.Namespace) -> int:
     for field in CANARY_FIELDS:
         if not record.get(field):
             print(f"install_evidence: CANARY_CHECK_FAILED: {field} is not true in the evidence record", file=sys.stderr)
+            return 1
+
+    if args.rerun_canaries:
+        actual = run_hook_canary(installed_path, hook_config_path)
+        actual["canary_binary_hash_matches"] = record["installed_sha256"] == sha256_file(installed_path)
+        failed = [field for field in CANARY_FIELDS if actual.get(field) is not True]
+        if failed:
+            print(f"install_evidence: REPRODUCED_CANARY_FAILED: {', '.join(failed)}", file=sys.stderr)
             return 1
 
     print(f"install_evidence: OK -- {evidence_path} verifies (version={record.get('version')}, commit={record.get('source_commit')})", file=sys.stderr)
@@ -410,6 +430,7 @@ def main(argv: list[str]) -> int:
     ver.add_argument("--evidence", required=True, help="path to install-evidence.json")
     ver.add_argument("--release-manifest", required=True, help="path to build-manifest.json to cross-check")
     ver.add_argument("--trusted-public-key", required=True, help="32-byte hex Ed25519 public key")
+    ver.add_argument("--rerun-canaries", action="store_true", help="re-run hook canaries against the recorded installation")
 
     args = p.parse_args(argv)
     if args.command == "generate":

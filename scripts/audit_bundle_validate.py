@@ -35,6 +35,8 @@ import re
 import subprocess
 import sys
 
+from install_evidence import CANARY_FIELDS, sha256_file, verify_record
+
 REQUIRED_TOP_LEVEL_FILES = (
     "checksums.txt",
     "checksums.txt.minisig",
@@ -76,6 +78,61 @@ def extract_doc_commit(text: str) -> str | None:
     if m:
         return m.group(1)
     return None
+
+
+def validate_live_install(fm: dict, evidence_path: pathlib.Path | None, manifest_path: pathlib.Path) -> list[str]:
+    """Validate the S8 front-matter claim without inspecting prose."""
+    if fm.get("live_install_claim") is not True:
+        return []
+    failures: list[str] = []
+    required_fm = ("installed_binary_sha256", "hook_configuration_sha256", "install_evidence_sha256", "install_evidence_signer")
+    absent = [field for field in required_fm if not isinstance(fm.get(field), str) or not fm[field]]
+    if absent:
+        failures.append("LIVE_INSTALL_METADATA_INCOMPLETE: " + ", ".join(absent))
+    if evidence_path is None:
+        return failures + ["LIVE_INSTALL_CLAIM_WITHOUT_EVIDENCE: live_install_claim is true but no --install-evidence file was supplied"]
+    if not evidence_path.is_file():
+        return failures + [f"LIVE_INSTALL_CLAIM_WITHOUT_EVIDENCE: {evidence_path} does not exist"]
+    try:
+        evidence = load_json(evidence_path)
+    except (OSError, json.JSONDecodeError) as exc:
+        return failures + [f"INSTALL_EVIDENCE_UNREADABLE: {exc}"]
+    if sha256_file(str(evidence_path)) != fm.get("install_evidence_sha256"):
+        failures.append("INSTALL_EVIDENCE_HASH_MISMATCH: install evidence does not match architecture metadata")
+    if evidence.get("installed_sha256") != fm.get("installed_binary_sha256"):
+        failures.append("INSTALLED_BINARY_HASH_MISMATCH: evidence does not match architecture metadata")
+    if evidence.get("hook_configuration_sha256") != fm.get("hook_configuration_sha256"):
+        failures.append("HOOK_CONFIGURATION_HASH_MISMATCH: evidence does not match architecture metadata")
+    signer = fm.get("install_evidence_signer", "")
+    prefix = "ed25519-public-key:"
+    if not isinstance(signer, str) or not signer.startswith(prefix):
+        failures.append("INSTALL_EVIDENCE_SIGNER_UNUSABLE: install_evidence_signer must be ed25519-public-key:<hex>")
+        public_key = None
+    else:
+        public_key = signer[len(prefix):]
+        try:
+            ok, message = verify_record(evidence, public_key)
+        except ValueError as exc:
+            ok, message = False, str(exc)
+        if not ok:
+            failures.append(message)
+    required_record = ("installed_path", "installed_sha256", "installed_mode", "hook_configuration_path", "hook_configuration_sha256", "release_manifest_sha256", *CANARY_FIELDS)
+    absent_record = [field for field in required_record if evidence.get(field) in (None, "")]
+    if absent_record:
+        failures.append("INSTALL_EVIDENCE_MISSING_FIELDS: " + ", ".join(absent_record))
+    if evidence.get("installed_mode") != "0o755":
+        failures.append("INSTALLED_BINARY_MODE_MISMATCH: installed mode must be 0o755")
+    if evidence.get("release_manifest_sha256") != sha256_file(str(manifest_path)):
+        failures.append("RELEASE_MANIFEST_MISMATCH: install evidence is not bound to this build manifest")
+    if not failures and public_key is not None:
+        proc = subprocess.run([
+            sys.executable, str(pathlib.Path(__file__).parent / "install_evidence.py"), "verify",
+            "--evidence", str(evidence_path), "--release-manifest", str(manifest_path),
+            "--trusted-public-key", public_key, "--rerun-canaries",
+        ], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        if proc.returncode != 0:
+            failures.append(f"INSTALL_EVIDENCE_VERIFICATION_FAILED: {proc.stdout.strip()}")
+    return failures
 
 
 def main(argv: list[str]) -> int:
@@ -262,33 +319,17 @@ def main(argv: list[str]) -> int:
         if proc.returncode != 0:
             return fail([f"cryptographic signature verification failed: {proc.stdout.strip()}"])
 
-    # Sol13 P1-3: a live-install claim in the architecture doc must be backed
-    # by a signed install-evidence record. The architecture doc check
-    # (check_architecture_doc.py) already enforces this when --install-evidence
-    # is passed; here we enforce it at the bundle-validation tier too, so a
-    # release-mode bundle cannot ship an unevidenced live-install claim even
-    # if the caller forgot to wire the flag through check_architecture_doc.py.
+    # S8 intentionally ignores live-install prose. Only machine-readable
+    # front matter can assert the claim.
     if args.architecture_doc:
         arch_text = pathlib.Path(args.architecture_doc).read_text(encoding="utf-8")
-        live_claim_patterns = [
-            re.compile(r"live gate installed", re.IGNORECASE),
-            re.compile(r"deployed to production", re.IGNORECASE),
-            re.compile(r"installed at ~?/?\.local/bin/gov", re.IGNORECASE),
-            re.compile(r"live[- ]deployed", re.IGNORECASE),
-            re.compile(r"running in production", re.IGNORECASE),
-        ]
-        has_live_claim = any(pat.search(arch_text) for pat in live_claim_patterns)
-        if has_live_claim:
-            if not args.install_evidence:
-                missing.append(
-                    "LIVE_INSTALL_CLAIM_WITHOUT_EVIDENCE: architecture doc claims a live deployment/installation "
-                    "but no --install-evidence file was supplied to this validator"
-                )
-            elif not pathlib.Path(args.install_evidence).is_file():
-                missing.append(
-                    f"LIVE_INSTALL_CLAIM_WITHOUT_EVIDENCE: architecture doc claims a live deployment/installation "
-                    f"but the install-evidence file {args.install_evidence!r} does not exist"
-                )
+        from check_architecture_doc import parse_front_matter
+        fm = parse_front_matter(arch_text) or {}
+        missing.extend(validate_live_install(
+            fm,
+            pathlib.Path(args.install_evidence) if args.install_evidence else None,
+            dist / "build-manifest.json",
+        ))
 
     if missing:
         return fail(missing)

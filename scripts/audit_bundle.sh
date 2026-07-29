@@ -107,6 +107,17 @@ rm -rf "$OUT_DIR/dist/$(basename "$OUT_DIR")"
 # release evidence -- never part of an audit bundle.
 rm -rf "$OUT_DIR/dist/.checkpoints"
 
+# S8: a machine-readable live-install claim must carry its signed record in
+# the bundle itself. An operator may supply the live record outside dist/;
+# copy it into the packaged evidence location before release-mode validation.
+if [ -n "${INSTALL_EVIDENCE:-}" ]; then
+  if [ ! -f "$INSTALL_EVIDENCE" ]; then
+    echo "audit_bundle: INSTALL_EVIDENCE does not name a file: $INSTALL_EVIDENCE" >&2
+    exit 1
+  fi
+  cp "$INSTALL_EVIDENCE" "$OUT_DIR/dist/install-evidence.json"
+fi
+
 if [ "$AUDIT_BUNDLE_MODE" = source-only ]; then
   NOTICE="$OUT_DIR/NOT_A_RELEASE.txt"
   {
@@ -158,7 +169,7 @@ if [ "$AUDIT_BUNDLE_MODE" = release ]; then
   if [ -f "$ROOT/docs/TRUSTED_SIGNING_KEYS.txt" ] && [ -d "$ROOT/docs/signing_keys" ]; then
     VALIDATE_ARGS+=(--trusted-fingerprints-file "$ROOT/docs/TRUSTED_SIGNING_KEYS.txt" --trusted-public-keys-dir "$ROOT/docs/signing_keys")
   fi
-  INSTALL_EVIDENCE_FILE="${INSTALL_EVIDENCE:-$OUT_DIR/dist/install-evidence.json}"
+  INSTALL_EVIDENCE_FILE="$OUT_DIR/dist/install-evidence.json"
   if [ -f "$INSTALL_EVIDENCE_FILE" ]; then
     VALIDATE_ARGS+=(--install-evidence "$INSTALL_EVIDENCE_FILE")
   fi

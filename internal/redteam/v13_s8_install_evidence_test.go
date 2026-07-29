@@ -400,7 +400,7 @@ func TestV13Case295LiveInstallClaimWithoutInstallationEvidenceIsRejected(t *test
 	s8WriteCompleteDist(t, distDir, commit)
 
 	archDoc := filepath.Join(dir, "arch.md")
-	if err := os.WriteFile(archDoc, []byte("# Arch\n\nThe live gate installed at ~/.local/bin/gov is running.\n"), 0o644); err != nil {
+	if err := os.WriteFile(archDoc, []byte("---\nlive_install_claim: true\ninstalled_binary_sha256: null\nhook_configuration_sha256: null\ninstall_evidence_sha256: null\ninstall_evidence_signer: null\n---\n# Arch\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 

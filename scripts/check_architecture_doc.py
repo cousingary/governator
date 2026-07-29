@@ -34,15 +34,16 @@ five contradiction categories are caught:
        (d) STALE_RELEASE_CLAIM     -- the same prose staleness check as (1),
            run against the front-matter doc's body too (a doc can carry
            BOTH front matter and a Remediation-history section).
-       (e) UNSUPPORTED_LIVE_DEPLOYMENT_CLAIM -- prose claims a live
-           gate/deployment ("live gate installed", "deployed to
-           production", ...) with no corresponding --install-evidence file.
+       (e) Live-install evidence is deliberately enforced only by
+           audit_bundle_validate.py from the machine-readable
+           ``live_install_claim`` front-matter field. Prose has no effect on
+           enforcement, so this document checker does not inspect it.
 
 Front matter absent -> only category (1)/(d)'s prose check runs (today's
-exact behavior, byte-for-byte). Front matter present -> categories (a)-(e)
+exact behavior, byte-for-byte). Front matter present -> categories (a)-(d)
 all run, IN ADDITION to the prose check.
 
-Usage: check_architecture_doc.py <path> [--repo DIR] [--dist-dir DIR] [--install-evidence FILE]
+Usage: check_architecture_doc.py <path> [--repo DIR] [--dist-dir DIR]
 Exit 0 if consistent. Exit 1 with a diagnostic (prefixed by the category
 tag above) on the first contradiction found.
 """
@@ -57,17 +58,6 @@ import sys
 VERSION_RE = re.compile(r"v\d+\.\d+\.\d+(?:-rc\d+)?")
 CURRENT_STATE_SECTION_HEADING = "remediation history"
 FRONT_MATTER_RE = re.compile(r"\A---\n(.*?)\n---\n", re.DOTALL)
-
-LIVE_DEPLOYMENT_PATTERNS = [
-    re.compile(p, re.IGNORECASE)
-    for p in (
-        r"live gate installed",
-        r"deployed to production",
-        r"installed at ~?/?\.local/bin/gov",
-        r"live[- ]deployed",
-        r"running in production",
-    )
-]
 
 
 def parse_front_matter(text: str) -> dict | None:
@@ -263,24 +253,11 @@ def check_front_matter_prose_contradiction(fm: dict, body: str) -> list[str]:
     return failures
 
 
-def check_live_deployment_claims(text: str, install_evidence: str | None) -> list[str]:
-    hits = [pat.pattern for pat in LIVE_DEPLOYMENT_PATTERNS if pat.search(text)]
-    if not hits:
-        return []
-    if install_evidence and pathlib.Path(install_evidence).is_file():
-        return []
-    return [
-        "UNSUPPORTED_LIVE_DEPLOYMENT_CLAIM: architecture doc claims a live deployment/installation "
-        f"(matched: {hits}) with no --install-evidence file recording actual installation evidence"
-    ]
-
-
 def main(argv: list[str]) -> int:
     p = argparse.ArgumentParser()
     p.add_argument("path")
     p.add_argument("--repo", default=None, help="repo root for tag/commit resolution (front-matter docs)")
     p.add_argument("--dist-dir", default=None, help="release dist/ dir for artifact-existence + manifest-hash checks (front-matter docs)")
-    p.add_argument("--install-evidence", default=None, help="file recording installation evidence for live-deployment claims")
     args = p.parse_args(argv)
 
     text = pathlib.Path(args.path).read_text(encoding="utf-8")
@@ -290,7 +267,6 @@ def main(argv: list[str]) -> int:
     fm = parse_front_matter(text)
     if fm is not None:
         failures.extend(check_front_matter(fm, args.repo, args.dist_dir))
-        failures.extend(check_live_deployment_claims(text, args.install_evidence))
         failures.extend(check_conflicting_current_commits(fm, text))
         failures.extend(check_front_matter_prose_contradiction(fm, text))
 
