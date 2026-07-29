@@ -1892,9 +1892,39 @@ cases:
     session: rc7-u14-s6
     required: true
     status: implemented
-  - case: 331
+  - case: 330
     name: TestV14Case330AssayerCheckoutCommitMustEqualReleaseCommit
     session: rc7-u14-s6
+    required: true
+    status: implemented
+  - case: 331
+    name: TestV14Case331MutatedFrozenDependencyAfterFinalVerificationIsDetected
+    session: rc7-u14-s7
+    required: true
+    status: implemented
+  - case: 332
+    name: TestV14Case332DependencyRestoredBeforeBackendCompletionIsStillDetected
+    session: rc7-u14-s7
+    required: true
+    status: implemented
+  - case: 333
+    name: TestV14Case333NativeAddonTransientSwapIsDetected
+    session: rc7-u14-s7
+    required: true
+    status: implemented
+  - case: 334
+    name: TestV14Case334EntryUnchangedWhileDependencyChangesIsDetected
+    session: rc7-u14-s7
+    required: true
+    status: implemented
+  - case: 335
+    name: TestV14Case335LocalNodeBackendCannotObtainProductionApproval
+    session: rc7-u14-s7
+    required: true
+    status: implemented
+  - case: 336
+    name: TestV14Case336DigestPinnedContainerizedNodeBackendCanApprove
+    session: rc7-u14-s7
     required: true
     status: implemented
 

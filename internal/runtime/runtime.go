@@ -3240,6 +3240,10 @@ func (r *Runner) runOnce(ctx context.Context, c contracts.Contract) (RunRecord, 
 		identity.StrictReplayEligible = false
 		identity.StrictReplayDisabledReason = "backend dependency closure could not be proven (frozen+hashed); strict replay disabled"
 	}
+	if reason := nodeBackendApprovalViolation(handle.DependencyClosureHash, c); reason != "" {
+		identity.StrictReplayEligible = false
+		identity.StrictReplayDisabledReason = reason
+	}
 	if legacy := legacyValidatorApprovalViolations(c); len(legacy) > 0 {
 		identity.StrictReplayEligible = false
 		identity.StrictReplayDisabledReason = "legacy string validators are migration-only; strict replay disabled"
@@ -3580,6 +3584,14 @@ func (r *Runner) runOnce(ctx context.Context, c contracts.Contract) (RunRecord, 
 			ResolvedBin: handle.CanonicalPath,
 		}})
 	}
+	// S7: re-verify the entire Node closure after backend execution. Restoring
+	// bytes can hide a transient attack from this observation, which is why a
+	// local Node backend remains non-approving below; persistent mutation is
+	// nevertheless a concrete recorded failure.
+	var postRunClosureErr error
+	if handle.DependencyClosureHash != "" && c.EffectiveRunner() == "local" {
+		postRunClosureErr = handle.VerifyUnchanged()
+	}
 	// Session 3a: surface runner observations — limits/provenance as notes,
 	// and output truncation as a loud OUTPUT_TRUNCATED ledger event. A run
 	// requiring a complete transcript (docker.require_complete_transcript)
@@ -3771,6 +3783,12 @@ func (r *Runner) runOnce(ctx context.Context, c contracts.Contract) (RunRecord, 
 	// approval failure, not merely a replay downgrade.
 	if !handle.PathResolution.DependencyClosureProven {
 		violations = append(violations, "NODE_DEPENDENCY_CLOSURE_UNPROVEN: backend dependency closure could not be frozen and hashed; production approval blocked")
+	}
+	if reason := nodeBackendApprovalViolation(handle.DependencyClosureHash, c); reason != "" {
+		violations = append(violations, "LOCAL_NODE_BACKEND_NON_APPROVING: "+reason)
+	}
+	if postRunClosureErr != nil {
+		violations = append(violations, "NODE_DEPENDENCY_CLOSURE_POSTRUN_CHANGED: "+postRunClosureErr.Error())
 	}
 	if assaySnapshot != nil && assaySnapshot.Identity.DependencyUnavailableReason != "" &&
 		!strings.HasPrefix(assaySnapshot.Identity.DependencyUnavailableReason, "no site-packages directory resolved") {
@@ -4604,6 +4622,28 @@ func (r *Runner) runOnce(ctx context.Context, c contracts.Contract) (RunRecord, 
 	destroyWorkspaceWithOutbox(db, rec.ID, rn, ws, runApproved)
 	cleanupPending = false
 	return rec, nil
+}
+
+// nodeBackendApprovalViolation is the S7 policy boundary for a Node backend.
+// A frozen same-UID temporary directory is useful for launch isolation and
+// persistent-tamper detection, but it is not structurally immutable: another
+// process with the same UID can mutate and restore it while Node is running.
+// Local execution may therefore proceed for development, but it can never
+// produce a production approval. A digest-pinned Docker runner supplies the
+// separately immutable execution boundary used for approving Node work.
+var nodeDockerDigestRE = regexp.MustCompile(`@sha256:[0-9a-fA-F]{64}$`)
+
+func nodeBackendApprovalViolation(closureHash string, c contracts.Contract) string {
+	if closureHash == "" {
+		return ""
+	}
+	if c.EffectiveRunner() == "local" {
+		return "local Node dependency closures are same-UID mutable; use a digest-pinned Docker runner for production approval"
+	}
+	if c.EffectiveRunner() != "docker" || c.Docker == nil || !nodeDockerDigestRE.MatchString(c.Docker.Image) {
+		return "Node backend production approval requires a digest-pinned Docker runner"
+	}
+	return ""
 }
 
 func captureRecall(home, id, root string, paths []string) error {

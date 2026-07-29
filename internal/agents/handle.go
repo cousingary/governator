@@ -399,8 +399,73 @@ func buildFrozenNodeClosure(canonicalEntry string, entryFile *os.File) (root, ha
 	// chmod mirrors the pre-P0-5 sealed-launch dir's hygiene without being
 	// the security boundary itself.
 	lockdownFrozenTree(dir)
+	// S7: the copy-time digest above cannot be re-evaluated after launch.
+	// Bind identity to a deterministic fingerprint of the frozen tree itself
+	// so VerifyUnchanged can inspect every executable dependency both before
+	// and after the backend runs.
+	hash, err = hashFrozenNodeClosure(dir)
+	if err != nil {
+		return "", "", fmt.Errorf("hash frozen closure: %w", err)
+	}
 	cleanup = false
-	return dir, hex.EncodeToString(hasher.Sum(nil)), nil
+	return dir, hash, nil
+}
+
+// hashFrozenNodeClosure fingerprints every object the Node launcher can
+// resolve from root. Its exact representation is deliberately independent of
+// source paths, modes, and the copy operation, so it can be recomputed after
+// execution to detect mutation of a JS dependency, lockfile, symlink, or
+// native addon.
+func hashFrozenNodeClosure(root string) (string, error) {
+	sum := sha256.New()
+	err := filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		rel, err := filepath.Rel(root, path)
+		if err != nil {
+			return err
+		}
+		if rel == "." {
+			return nil
+		}
+		switch {
+		case info.IsDir():
+			_, _ = fmt.Fprintf(sum, "%s::DIR\n", rel)
+		case info.Mode()&os.ModeSymlink != 0:
+			link, err := os.Readlink(path)
+			if err != nil {
+				return err
+			}
+			resolved, err := filepath.EvalSymlinks(path)
+			if err != nil {
+				return err
+			}
+			inside, err := filepath.Rel(root, resolved)
+			if err != nil || inside == ".." || strings.HasPrefix(inside, ".."+string(filepath.Separator)) || filepath.IsAbs(inside) {
+				return fmt.Errorf("symlink %s escapes frozen dependency closure to %s", rel, resolved)
+			}
+			objectHash, err := hashFrozenNodeObject(resolved, map[string]bool{})
+			if err != nil {
+				return err
+			}
+			_, _ = fmt.Fprintf(sum, "%s::SYMLINK::%s::TARGET::%s\n", rel, link, objectHash)
+		case info.Mode().IsRegular():
+			data, err := os.ReadFile(path)
+			if err != nil {
+				return err
+			}
+			fileHash := sha256.Sum256(data)
+			_, _ = fmt.Fprintf(sum, "%s::FILE::%x\n", rel, fileHash)
+		default:
+			return fmt.Errorf("unsupported frozen dependency object %s (mode %s)", rel, info.Mode())
+		}
+		return nil
+	})
+	if err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(sum.Sum(nil)), nil
 }
 
 // lockdownFrozenTree chmods every file beneath root to 0400 and every
@@ -696,6 +761,15 @@ func composeBackendLaunch(ctx context.Context, scope *containment.Scope, plan en
 // must still match h.SHA256. The dev/inode identity check applies only to the
 // original canonical path (the frozen entry has a fresh inode).
 func (h *BackendExecutionHandle) VerifyUnchanged() error {
+	if h.closureRoot != "" {
+		got, err := hashFrozenNodeClosure(h.closureRoot)
+		if err != nil {
+			return fmt.Errorf("backend dependency closure re-verification: %w", err)
+		}
+		if got != h.DependencyClosureHash {
+			return fmt.Errorf("backend dependency closure re-verification: frozen closure content changed between resolution and verification")
+		}
+	}
 	target := h.CanonicalPath
 	wantSHA := h.SHA256
 	if h.launchPath != "" {

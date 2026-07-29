@@ -359,6 +359,30 @@ func TestNodeBackendClosureFrozenAndHashed(t *testing.T) {
 	if err := h.VerifyUnchanged(); err != nil {
 		t.Fatalf("VerifyUnchanged on untouched frozen entry: %v", err)
 	}
+	// S7: verification must cover the whole closure, not only launchPath.
+	frozenDep := filepath.Join(h.closureRoot, "node_modules", "dep", "index.js")
+	originalFrozenDep, err := os.ReadFile(frozenDep)
+	if err != nil {
+		t.Fatalf("read frozen dependency: %v", err)
+	}
+	if err := os.Chmod(frozenDep, 0600); err != nil {
+		t.Fatalf("make frozen dependency writable as same UID: %v", err)
+	}
+	if err := os.WriteFile(frozenDep, []byte("module.exports = 'hostile';\n"), 0600); err != nil {
+		t.Fatalf("mutate frozen dependency: %v", err)
+	}
+	if err := h.VerifyUnchanged(); err == nil {
+		t.Fatal("VerifyUnchanged must reject a mutated frozen dependency")
+	}
+	if err := os.WriteFile(frozenDep, originalFrozenDep, 0600); err != nil {
+		t.Fatalf("restore frozen dependency: %v", err)
+	}
+	if err := os.Chmod(frozenDep, 0400); err != nil {
+		t.Fatalf("restore frozen dependency mode: %v", err)
+	}
+	if err := h.VerifyUnchanged(); err != nil {
+		t.Fatalf("VerifyUnchanged after restoring the complete closure: %v", err)
+	}
 	// Swapping a dependency in the ORIGINAL tree must NOT change the closure
 	// hash already bound at resolution, and must NOT mutate the frozen copy
 	// the launch reads (the frozen copy is isolated from the live tree).
@@ -366,7 +390,6 @@ func TestNodeBackendClosureFrozenAndHashed(t *testing.T) {
 	if err := os.WriteFile(liveDep, []byte("module.exports = 'hostile';\n"), 0644); err != nil {
 		t.Fatal(err)
 	}
-	frozenDep := filepath.Join(h.closureRoot, "node_modules", "dep", "index.js")
 	frozenDepBytes, err := os.ReadFile(frozenDep)
 	if err != nil {
 		t.Fatalf("read frozen dep: %v", err)

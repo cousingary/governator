@@ -1,10 +1,9 @@
 //go:build sol14repro
 
-// This build-tagged fixture reproduces Sol14 P0-4 with a second same-UID
-// process. It is deliberately NOT part of any release tier: it asserts that
-// the defect is still present, so it must not run in `go test ./...`. S7 adds
-// the enrolled fail-closed regression cases (manifest 331-336) once the
-// production repair exists, at which point this fixture is retired.
+// This build-tagged fixture exercises Sol14 P0-4 with a second same-UID
+// process. It remains outside the ordinary release tier because it directly
+// coordinates a hostile mutator process, but after S7 it proves the complete
+// closure verifier detects that process's dependency swap.
 //
 // Run explicitly:
 //
@@ -76,10 +75,10 @@ func TestSol14P04HelperMutateDependency(t *testing.T) {
 
 // TestSol14P04NodeClosureSameUIDMutation freezes a real Node dependency
 // closure through the production path, then proves that a second same-UID
-// process can swap a dependency's bytes mid-run while VerifyUnchanged() keeps
-// returning nil and the recorded closure hash never moves.
-//
-// A PASS here means the defect reproduces — that is S0's exit criterion.
+// process cannot swap a dependency's bytes without VerifyUnchanged detecting
+// it. Restoring the bytes afterwards is intentionally observable as a clean
+// final tree; local Node execution is separately non-approving because a
+// transient same-UID swap cannot be proven away by an after-the-fact hash.
 func TestSol14P04NodeClosureSameUIDMutation(t *testing.T) {
 	if os.Getenv(depEnvVar) != "" {
 		t.Skip("child mutator process")
@@ -175,11 +174,11 @@ func TestSol14P04NodeClosureSameUIDMutation(t *testing.T) {
 	}
 
 	wantHash := handle.DependencyClosureHash
-	if err := handle.VerifyUnchanged(); err != nil {
-		t.Fatalf("VerifyUnchanged detected the dependency mutation; the P0-4 defect did NOT reproduce: %v", err)
+	if err := handle.VerifyUnchanged(); err == nil {
+		t.Fatal("VerifyUnchanged did not detect the frozen dependency mutation")
 	}
 	if handle.DependencyClosureHash != wantHash {
-		t.Fatalf("recorded closure hash changed during mutation")
+		t.Fatalf("recorded closure identity changed during mutation")
 	}
 
 	if _, err := stdin.Write([]byte("restore\n")); err != nil {
@@ -206,8 +205,8 @@ func TestSol14P04NodeClosureSameUIDMutation(t *testing.T) {
 
 	proof, err := json.Marshal(map[string]any{
 		"dependency_mutated_by_second_same_uid_process": true,
-		"verify_unchanged_returned_nil_during_mutation": true,
-		"closure_hash_unchanged":                        true,
+		"whole_closure_verification_detected_mutation":  true,
+		"closure_identity_remained_bound_to_original":   true,
 		"original_bytes_and_modes_restored":             true,
 	})
 	if err != nil {
