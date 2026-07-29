@@ -397,15 +397,41 @@ echo "release: version=${VERSION} commit=${COMMIT} go=${GO_VERSION} release_atte
 UNIT_LOG="$OUT_DIR/test-unit.log"
 RACE_LOG="$OUT_DIR/test-race.log"
 INTEGRATION_LOG="$OUT_DIR/test-integration.log"
+INTEGRATION_JSON_LOG="$OUT_DIR/.integration.jsonl"
+INTEGRATION_GOV_BIN="$OUT_DIR/integration-gov"
+INTEGRATION_EVIDENCE_DIR="$OUT_DIR/integration-evidence"
+INTEGRATION_EXPECTED_NAMES="$OUT_DIR/integration-expected-names.txt"
+INTEGRATION_EXPECTED_PACKAGES="$OUT_DIR/integration-expected-packages.txt"
+INTEGRATION_GATE_JSON="$OUT_DIR/.integration-gate.json"
 CORPUS_LOG="$OUT_DIR/test-corpus.log"
 REDTEAM_LOG="$OUT_DIR/test-redteam.log"
 REDTEAM_RACE_LOG="$OUT_DIR/test-redteam-race.log"
 
 MAIN_TIER_SPEC=$(mktemp)
+# Sol14 P0-2 (rc7 Session 5): build ONE exact candidate binary before the
+# integration tier. Each integration TestMain receives this path through
+# GOV_INTEGRATION_GOV_BIN, re-execs it as `gov __sandbox_exec`, and records
+# its SHA-256. `gov integration-gate verify` below compares the recorded
+# identities to this object, so a package-level green line cannot stand in
+# for a real governed execution.
+if [ ! -f "$INTEGRATION_GOV_BIN" ]; then
+  go build -trimpath -ldflags "$LDFLAGS" -o "$INTEGRATION_GOV_BIN" ./cmd/gov
+fi
+mkdir -p "$INTEGRATION_EVIDENCE_DIR"
+cat >"$INTEGRATION_EXPECTED_NAMES" <<'EOF_INTEGRATION_NAMES'
+TestEvaluateAgainstRealCLIPassAndFail
+TestInspectCodeGraphStatus
+TestPrepareBuildsFingerprintAndQueries
+TestPrepareAutoDegradesOnProviderFailure
+EOF_INTEGRATION_NAMES
+cat >"$INTEGRATION_EXPECTED_PACKAGES" <<'EOF_INTEGRATION_PACKAGES'
+assay
+contextgraph
+EOF_INTEGRATION_PACKAGES
 {
   printf 'unit\t%s\tgo test -p %s -parallel %s -count=1 ./...\n' "$UNIT_LOG" "$GO_TEST_PARALLELISM" "$GO_TEST_PARALLELISM"
   printf 'race\t%s\tgo test -race -timeout=30m -p %s -parallel %s -count=1 ./...\n' "$RACE_LOG" "$GO_TEST_PARALLELISM" "$GO_TEST_PARALLELISM"
-  printf 'integration\t%s\tgo test -tags integration -p %s -parallel %s -count=1 ./internal/assay/...\n' "$INTEGRATION_LOG" "$GO_TEST_PARALLELISM" "$GO_TEST_PARALLELISM"
+  printf 'integration\t%s\tGOV_INTEGRATION_GOV_BIN=%q GOV_INTEGRATION_EVIDENCE_OUT=%q go test -json -tags integration -p %s -parallel %s -count=1 ./internal/assay/... ./internal/contextgraph/... > %q && %q integration-gate verify --log %q --expected-names %q --harness-evidence %q --governator-binary %q --expected-packages %q > %q && cat %q\n' "$INTEGRATION_LOG" "$INTEGRATION_GOV_BIN" "$INTEGRATION_EVIDENCE_DIR" "$GO_TEST_PARALLELISM" "$GO_TEST_PARALLELISM" "$INTEGRATION_JSON_LOG" "$INTEGRATION_GOV_BIN" "$INTEGRATION_JSON_LOG" "$INTEGRATION_EXPECTED_NAMES" "$INTEGRATION_EVIDENCE_DIR" "$INTEGRATION_GOV_BIN" "$INTEGRATION_EXPECTED_PACKAGES" "$INTEGRATION_GATE_JSON" "$INTEGRATION_JSON_LOG"
   # Sol redteam v6 S0 (P0-18, partial): the build-tagged internal/redteam/
   # corpus was never actually compiled by any release or CI command --
   # "black_box_corpus" here only runs Sol3-prefixed tests, which never
@@ -469,6 +495,13 @@ INTEGRATION_SECONDS=$(tier_field integration duration_seconds); INTEGRATION_SECO
 INTEGRATION_STARTED=$(tier_field integration started)
 INTEGRATION_ENDED=$(tier_field integration completed)
 INTEGRATION_LOG_SHA=$(tier_field integration log_sha256)
+if [ -f "$INTEGRATION_GATE_JSON" ] && [ "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("ok", False))' "$INTEGRATION_GATE_JSON")" = True ]; then
+  INTEGRATION_GATE_OK=true
+else
+  INTEGRATION_GATE_OK=false
+  echo "release: integration-gate verify FAILED — verdict:" >&2
+  if [ -f "$INTEGRATION_GATE_JSON" ]; then cat "$INTEGRATION_GATE_JSON" >&2; fi
+fi
 
 CORPUS_RESULT=$(tier_field corpus result); CORPUS_RESULT=${CORPUS_RESULT:-FAIL}
 CORPUS_SECONDS=$(tier_field corpus duration_seconds); CORPUS_SECONDS=${CORPUS_SECONDS:-0}
@@ -496,6 +529,10 @@ REDTEAM_RACE_LOG_SHA=$(tier_field redteam_race log_sha256)
 
 if [ "$MAIN_TIER_PIPELINE_OK" != true ]; then
   echo "release: refusing to package -- a required test tier failed; scripts/release_tier_pipeline.sh halted the remaining tiers (fail-fast, P1-5). See ${MAIN_TIER_JSONL} for exactly which tier failed and which were never run." >&2
+  exit 1
+fi
+if [ "$INTEGRATION_GATE_OK" != true ]; then
+  echo "release: refusing to package — integration-gate verify rejected the mandatory integration tier (missing/failed/skipped test, wrong candidate binary, or incomplete sandbox evidence); see ${INTEGRATION_GATE_JSON}" >&2
   exit 1
 fi
 
@@ -998,7 +1035,7 @@ TEST_SUMMARY="$OUT_DIR/test-summary.json"
 python3 - "$TEST_SUMMARY" "$COMMIT" "$GO_VERSION" "$BUILD_TS" "$GO_SUM_HASH" \
   "$UNIT_RESULT" "$UNIT_SECONDS" "$UNIT_STARTED" "$UNIT_ENDED" "$UNIT_LOG_SHA" \
   "$RACE_RESULT" "$RACE_SECONDS" "$RACE_STARTED" "$RACE_ENDED" "$RACE_LOG_SHA" \
-  "$INTEGRATION_RESULT" "$INTEGRATION_SECONDS" "$INTEGRATION_STARTED" "$INTEGRATION_ENDED" "$INTEGRATION_LOG_SHA" \
+  "$INTEGRATION_RESULT" "$INTEGRATION_SECONDS" "$INTEGRATION_STARTED" "$INTEGRATION_ENDED" "$INTEGRATION_LOG_SHA" "$INTEGRATION_GATE_OK" "$INTEGRATION_GATE_JSON" "$INTEGRATION_EVIDENCE_DIR" \
   "$CORPUS_RESULT" "$CORPUS_SECONDS" "$CORPUS_STARTED" "$CORPUS_ENDED" "$CORPUS_LOG_SHA" "$CORPUS_TESTS_RUN" "$CORPUS_TESTS_FAILED" \
   "$REDTEAM_RESULT" "$REDTEAM_SECONDS" "$REDTEAM_STARTED" "$REDTEAM_ENDED" "$REDTEAM_LOG_SHA" \
   "$REDTEAM_TESTS_DISCOVERED" "$REDTEAM_TESTS_RUN" "$REDTEAM_TESTS_SKIPPED" "$REDTEAM_TESTS_FAILED" "$REDTEAM_GATE_OK" "$REDTEAM_GATE_JSON" "$REDTEAM_MANIFEST" "$REDTEAM_SOURCE_IDENTITY" \
@@ -1009,7 +1046,7 @@ import json, pathlib, sys
 (summary_path, commit, go_version, build_ts, go_sum_sha256,
  unit_result, unit_seconds, unit_started, unit_ended, unit_log_sha,
  race_result, race_seconds, race_started, race_ended, race_log_sha,
- integration_result, integration_seconds, integration_started, integration_ended, integration_log_sha,
+ integration_result, integration_seconds, integration_started, integration_ended, integration_log_sha, integration_gate_ok, integration_gate_json_path, integration_evidence_dir,
  corpus_result, corpus_seconds, corpus_started, corpus_ended, corpus_log_sha, corpus_tests_run, corpus_tests_failed,
  redteam_result, redteam_seconds, redteam_started, redteam_ended, redteam_log_sha,
  redteam_tests_discovered, redteam_tests_run, redteam_tests_skipped, redteam_tests_failed, redteam_gate_ok, redteam_gate_json_path, redteam_manifest_path, redteam_source_identity_path,
@@ -1021,6 +1058,10 @@ par = f"-p {go_test_parallelism} -parallel {go_test_parallelism}"
 
 redteam_gate = json.loads(pathlib.Path(redteam_gate_json_path).read_text())
 redteam_source_identity = json.loads(pathlib.Path(redteam_source_identity_path).read_text())
+integration_gate = json.loads(pathlib.Path(integration_gate_json_path).read_text())
+integration_evidence = {}
+for evidence_path in sorted(pathlib.Path(integration_evidence_dir).glob("*.json")):
+    integration_evidence[evidence_path.stem] = json.loads(evidence_path.read_text())
 
 fuzz = []
 for line in pathlib.Path(fuzz_results_path).read_text().splitlines():
@@ -1047,7 +1088,7 @@ data = {
         # compares, never trusts the summary's word alone.
         "unit": {"command": f"go test {par} -count=1 ./...", "result": unit_result, "duration_seconds": int(unit_seconds), "started_at": unit_started, "ended_at": unit_ended, "log_sha256": unit_log_sha, "log_path": "unit.log.gz"},
         "race": {"command": f"go test -race {par} -count=1 ./...", "result": race_result, "duration_seconds": int(race_seconds), "started_at": race_started, "ended_at": race_ended, "log_sha256": race_log_sha, "log_path": "race.log.gz"},
-        "integration": {"command": f"go test -tags integration {par} -count=1 ./internal/assay/...", "result": integration_result, "duration_seconds": int(integration_seconds), "started_at": integration_started, "ended_at": integration_ended, "log_sha256": integration_log_sha, "log_path": "integration.log.gz"},
+        "integration": {"command": f"go test -json -tags integration {par} -count=1 ./internal/assay/... ./internal/contextgraph/...", "result": integration_result, "duration_seconds": int(integration_seconds), "started_at": integration_started, "ended_at": integration_ended, "log_sha256": integration_log_sha, "log_path": "integration.log.gz", "expected_tests": ["TestEvaluateAgainstRealCLIPassAndFail", "TestInspectCodeGraphStatus", "TestPrepareBuildsFingerprintAndQueries", "TestPrepareAutoDegradesOnProviderFailure"], "identity_gate": {**integration_gate, "ok": integration_gate_ok == "true"}, "harness_evidence": integration_evidence},
         "black_box_corpus": {
             "command": f"go test -run Sol3 -v {par} -count=1 ./...",
             "result": corpus_result,
@@ -1108,6 +1149,8 @@ for suite in ("unit", "race", "integration", "black_box_corpus", "redteam", "red
         overall = "FAIL"
 if not data["suites"]["redteam"]["identity_gate"]["ok"]:
     overall = "FAIL"
+if not data["suites"]["integration"]["identity_gate"]["ok"]:
+    overall = "FAIL"
 for f in fuzz:
     if f["result"] != "PASS":
         overall = "FAIL"
@@ -1128,7 +1171,7 @@ for _entry in "$UNIT_LOG:unit.log.gz" "$RACE_LOG:race.log.gz" "$INTEGRATION_LOG:
   _dest=${_entry##*:}
   gzip -c "$_raw" >"$OUT_DIR/$_dest"
 done
-rm -f "$FUZZ_RESULTS_JSON" "$UNIT_LOG" "$RACE_LOG" "$INTEGRATION_LOG" "$CORPUS_LOG" "$REDTEAM_LOG" "$REDTEAM_RACE_LOG" "$ASSAYER_LOG" "$ASSAYER_VERSION_TAG_LOG" "$ASSAYER_MATRIX_JSON" "$OUT_DIR"/test-assayer-py*.log "$OUT_DIR"/test-fuzz-*.log
+rm -f "$FUZZ_RESULTS_JSON" "$UNIT_LOG" "$RACE_LOG" "$INTEGRATION_LOG" "$INTEGRATION_JSON_LOG" "$CORPUS_LOG" "$REDTEAM_LOG" "$REDTEAM_RACE_LOG" "$ASSAYER_LOG" "$ASSAYER_VERSION_TAG_LOG" "$ASSAYER_MATRIX_JSON" "$OUT_DIR"/test-assayer-py*.log "$OUT_DIR"/test-fuzz-*.log
 
 # ---------------------------------------------------------------------------
 # Acceptance smoke test: extract the exact distributable archive for THIS
@@ -1416,6 +1459,15 @@ CHECKSUMS="$OUT_DIR/checksums.txt"
   for attestation_file in attestations/*.json; do
     [ -e "$attestation_file" ] || break
     checksum_inputs+=("$attestation_file")
+  done
+  # Sol14 P0-2 (rc7 Session 5): the per-package integration TestMain records
+  # the candidate-binary identity, Assayer identity, and real sandbox
+  # mechanism here. They are release evidence, not disposable scratch, so
+  # bind every record into the signed checksum manifest just like a remote
+  # capability attestation.
+  for integration_evidence in integration-evidence/*.json; do
+    [ -e "$integration_evidence" ] || break
+    checksum_inputs+=("$integration_evidence")
   done
   sha256sum -- "${checksum_inputs[@]}" >"$(basename "$CHECKSUMS")"
 )

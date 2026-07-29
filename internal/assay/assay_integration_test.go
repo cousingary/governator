@@ -55,8 +55,15 @@ func fixtureAssayerRepo(t *testing.T) string {
 
 func TestEvaluateAgainstRealCLIPassAndFail(t *testing.T) {
 	requirePython3Mandatory(t)
+	// Sol14 P0-2 (rc7 Session 5): the integration-tier TestMain
+	// (assay_integration_testmain_test.go) already fail-closed the whole
+	// package before any test ran if enforce.Supported() was false, so this
+	// branch is structurally unreachable in the integration tier. It stays
+	// as a hard Fatal -- never a t.Skip -- so the defect this case exists
+	// to close (a skip hidden behind a package-level `ok` line) can never
+	// recur at this name regardless of how a future edit reorders things.
 	if !enforce.Supported() {
-		t.Skip("this host cannot provide external enforcement (Landlock/unshare unavailable); fail-closed behavior is covered by TestV8Case6AssayerFailsClosedWithoutExternalSandbox")
+		t.Fatalf("integration tier reached a test with external enforcement unavailable -- the TestMain should have fail-closed the package first (Sol14 P0-2)")
 	}
 	repo := fixtureAssayerRepo(t)
 

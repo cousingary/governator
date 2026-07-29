@@ -2,6 +2,7 @@ package contextgraph
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -53,6 +54,15 @@ func graphEnv(t *testing.T, mode, bin string) {
 // an explicit trust declaration — see toolregistry). Tests exercising a
 // deliberately untrusted/unregistered provider (report attack 9) must NOT
 // call this.
+//
+// Sol14 P0-2 (rc7 Session 5): this deliberately switches to a FRESH
+// registry (an empty tools.yaml) to prove the trust decision is isolated
+// -- but that fresh registry also drops the unshare enrollment the real
+// Landlock+netns sandbox needs to wrap the launch. In the unit tier that
+// never mattered (these tests skipped before a sandbox was ever built); in
+// the integration tier the sandboxed codegraph launch fails to resolve
+// unshare and refuses. Re-enroll unshare into the same fresh registry so
+// the isolated trust decision and the real sandbox coexist.
 func trustCodegraph(t *testing.T, bin string) {
 	t.Helper()
 	reg := filepath.Join(t.TempDir(), "tools.yaml")
@@ -60,7 +70,105 @@ func trustCodegraph(t *testing.T, bin string) {
 	if _, err := toolregistry.Enroll("codegraph", bin); err != nil {
 		t.Fatal(err)
 	}
+	if unsharePath, err := exec.LookPath("unshare"); err == nil {
+		if canonical, cerr := filepath.EvalSymlinks(unsharePath); cerr == nil {
+			unsharePath = canonical
+		}
+		if _, err := toolregistry.Enroll("unshare", unsharePath); err != nil {
+			t.Fatal(err)
+		}
+	}
 }
+
+// buildCodegraphELF compiles a tiny real ELF binary standing in for a
+// governed graph-provider tool. A compiled binary's own exactReadClosure is
+// self-sufficient under Governator's Landlock sandbox, unlike a #!/bin/sh
+// script whose /bin/sh interpreter is not in the executable's read closure
+// (enforce.exactReadClosure derives a closure only for ELF objects) -- which
+// is exactly how a production graph-provider tool (a real compiled binary)
+// is shaped, and the same approach the redteam corpus's
+// buildFakeCodegraphBinary takes (internal/redteam/harness_test.go).
+//
+// Sol14 P0-2 (rc7 Session 5): these three stage tests previously skipped in
+// the unit tier and never exercised the real sandbox; once the integration
+// tier actually built the sandbox, the shell-script fixtures failed with
+// "exec sandboxed executable: permission denied" because Landlock denied
+// the script's interpreter. An ELF stub fixes that without changing what
+// each test asserts (it still verifies Governator's parsing of codegraph's
+// protocol output). broken drives the TestPrepareAutoDegradesOnProviderFailure
+// shape: version still succeeds (printing "codegraph broken"), but every
+// mutating/diagnostic command writes "build-failed" to stderr and exits 2.
+func buildCodegraphELF(t *testing.T, broken bool) string {
+	t.Helper()
+	dir := t.TempDir()
+	src := filepath.Join(dir, "main.go")
+	out := filepath.Join(secureGraphTempDir(t), "codegraph")
+	versionLine := "codegraph 0.24.0"
+	if broken {
+		versionLine = "codegraph broken"
+	}
+	source := `package main
+
+import (
+	"fmt"
+	"os"
+	"path/filepath"
+)
+
+const versionLine = "` + versionLine + `"
+const broken = ` + fmt.Sprintf("%v", broken) + `
+
+func fail() {
+	fmt.Fprintln(os.Stderr, "build-failed")
+	os.Exit(2)
+}
+
+func main() {
+	if len(os.Args) < 2 {
+		fmt.Println("{}")
+		return
+	}
+	sub := os.Args[1]
+	project := os.Args[len(os.Args)-1]
+	switch sub {
+	case "version":
+		fmt.Println(versionLine)
+	case "init", "sync":
+		if broken {
+			fail()
+		}
+		graphDir := filepath.Join(project, ".codegraph")
+		if err := os.MkdirAll(graphDir, 0o700); err != nil {
+			fail()
+		}
+		if err := os.WriteFile(filepath.Join(graphDir, "codegraph.db"), []byte("deterministic graph db"), 0o600); err != nil {
+			fail()
+		}
+	case "status":
+		if broken {
+			fail()
+		}
+		fmt.Printf("{\"initialized\":true,\"projectPath\":%q,\"indexPath\":%q,\"fileCount\":51,\"nodeCount\":689,\"edgeCount\":1579,\"dbSizeBytes\":22}\n", project, filepath.Join(project, ".codegraph"))
+	case "query":
+		if broken {
+			fail()
+		}
+		fmt.Println("[{\"name\":\"RunRecord\",\"kind\":\"struct\"}]")
+	default:
+		os.Exit(1)
+	}
+}
+`
+	if err := os.WriteFile(src, []byte(source), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	build := exec.Command("go", "build", "-buildvcs=false", "-o", out, src)
+	if combined, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("build codegraph elf: %v: %s", err, combined)
+	}
+	return out
+}
+
 func TestResolveAutoMissing(t *testing.T) {
 	graphEnv(t, "auto", "codegraph-not-present")
 	t.Setenv("PATH", t.TempDir())
@@ -82,15 +190,7 @@ func TestResolveRequiredMissingFails(t *testing.T) {
 }
 
 func TestInspectCodeGraphStatus(t *testing.T) {
-	bin := filepath.Join(secureGraphTempDir(t), "codegraph")
-	script := `#!/bin/sh
-if [ "$1" = version ]; then echo 'codegraph 0.24.0'; exit 0; fi
-if [ "$1" = status ]; then echo '{"version":"0.24.0","initialized":true,"fileCount":51,"nodeCount":689,"edgeCount":1579,"dbSizeBytes":1765376,"languages":["go"]}'; exit 0; fi
-exit 1
-`
-	if err := os.WriteFile(bin, []byte(script), 0755); err != nil {
-		t.Fatal(err)
-	}
+	bin := buildCodegraphELF(t, false)
 	graphEnv(t, "required", bin)
 	requireExternalSandbox(t)
 	trustCodegraph(t, bin)
@@ -112,33 +212,7 @@ exit 1
 }
 
 func TestPrepareBuildsFingerprintAndQueries(t *testing.T) {
-	bin := filepath.Join(secureGraphTempDir(t), "codegraph")
-	script := `#!/bin/sh
-for arg in "$@"; do project="$arg"; done
-case "$1" in
-  version)
-    echo 'codegraph 0.24.0'
-    ;;
-  init|sync)
-    mkdir -p "$project/.codegraph"
-    printf 'deterministic graph db' > "$project/.codegraph/codegraph.db"
-    ;;
-  status)
-    if [ -f "$project/.codegraph/codegraph.db" ]; then
-      printf '{"initialized":true,"projectPath":"%s","indexPath":"%s/.codegraph","fileCount":51,"nodeCount":689,"edgeCount":1579,"dbSizeBytes":22}\n' "$project" "$project"
-    else
-      printf '{"initialized":false}\n'
-    fi
-    ;;
-  query)
-    printf '[{"name":"RunRecord","kind":"struct"}]\n'
-    ;;
-  *) exit 1 ;;
-esac
-`
-	if err := os.WriteFile(bin, []byte(script), 0755); err != nil {
-		t.Fatal(err)
-	}
+	bin := buildCodegraphELF(t, false)
 	graphEnv(t, "required", bin)
 	requireExternalSandbox(t)
 	trustCodegraph(t, bin)
@@ -172,10 +246,7 @@ esac
 }
 
 func TestPrepareAutoDegradesOnProviderFailure(t *testing.T) {
-	bin := filepath.Join(secureGraphTempDir(t), "codegraph")
-	if err := os.WriteFile(bin, []byte("#!/bin/sh\nif [ \"$1\" = version ]; then echo 'codegraph broken'; exit 0; fi\necho build-failed >&2\nexit 2\n"), 0755); err != nil {
-		t.Fatal(err)
-	}
+	bin := buildCodegraphELF(t, true)
 	graphEnv(t, "auto", bin)
 	requireExternalSandbox(t)
 	trustCodegraph(t, bin)

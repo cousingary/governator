@@ -16,22 +16,11 @@ import (
 	"github.com/cousingary/governator/internal/toolregistry"
 )
 
-// TestMain forces enforce.Supported() false for this package's whole test
-// run. This suite verifies Evaluate's wire protocol (JSON parsing, timeout,
-// sha-mismatch, nonzero-exit handling) against ad hoc stub `cli.py` scripts
-// in t.TempDir() -- it was never meant to exercise real Landlock
-// containment, which needs a real `gov` binary wired up via
-// enforce.SelfExeOverride the way internal/redteam's corpus does (that
-// corpus, not this package, owns cases 11/12's actual containment
-// assertions). Without this, a host that genuinely has Landlock/unshare
-// (this sandbox does) makes Evaluate's now-real enforce.Plan active, which
-// then requires `gov __sandbox_exec` -- unavailable from a plain `go test`
-// binary -- and every stub-based test here fails for an environmental
-// reason unrelated to what it actually checks.
-func TestMain(m *testing.M) {
-	enforce.ForceUnsupported = true
-	os.Exit(m.Run())
-}
+// TestMain for the unit tier lives in assay_unit_testmain_test.go
+// (//go:build !integration). The integration tier's TestMain lives in
+// assay_integration_testmain_test.go (//go:build integration). See the
+// package-level note in assay_integration_testmain_test.go for why this
+// split is the Sol14 P0-2 fix.
 
 // fixtureRepo returns testdata/assayer_fixture's absolute path -- shared by
 // every test in this package that needs a real cli.py/assayer/*.py tree to
@@ -144,12 +133,23 @@ print(json.dumps({"verdict":"pass","failed_checks":[],"had_error":False,"trace_i
 	path, sha := writeArtifact(t, artifactDir, "original content")
 	req := baseRequest(sha)
 
+	// Sol14 P0-2 (rc7 Session 5): build the snapshot BEFORE starting the
+	// mutation goroutine. Evaluate's sha pre-check is its first action, but
+	// buildTestSnapshot (sealing the memfd, resolving read closures) runs
+	// first when it is inlined in the Evaluate call -- under the real
+	// Landlock sandbox this integration tier now actually exercises, that
+	// snapshot work took longer than the goroutine's 100ms timer, so the
+	// mutation landed before the pre-check and was reported "before
+	// evaluation" instead of "after". Building the snapshot first makes the
+	// pre-check immediate again, so the 100ms mutation lands during the
+	// stub's 0.3s sleep and the post-evaluation re-check catches it.
+	snap := buildTestSnapshot(t, stubDir)
 	go func() {
 		time.Sleep(100 * time.Millisecond)
 		_ = os.WriteFile(path, []byte("mutated content"), 0o644)
 	}()
 
-	v := Evaluate(context.Background(), Config{Repo: stubDir, Python: "python3"}, req, path, buildTestSnapshot(t, stubDir))
+	v := Evaluate(context.Background(), Config{Repo: stubDir, Python: "python3"}, req, path, snap)
 	if v.Verdict != VerdictError {
 		t.Fatalf("expected error verdict, got %+v", v)
 	}

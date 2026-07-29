@@ -1837,6 +1837,31 @@ cases:
     session: rc7-u14-s4
     required: true
     status: implemented
+  - case: 320
+    name: TestV14Case319IntegrationTestMainDoesNotForceEnforcementUnsupported
+    session: rc7-u14-s5
+    required: true
+    status: implemented
+  - case: 321
+    name: TestV14Case320IntegrationTierWithZeroTestsIsRejected
+    session: rc7-u14-s5
+    required: true
+    status: implemented
+  - case: 322
+    name: TestV14Case321IntegrationTierWithAnySkipIsRejected
+    session: rc7-u14-s5
+    required: true
+    status: implemented
+  - case: 323
+    name: TestV14Case322RealGovernatorSandboxHelperExecutes
+    session: rc7-u14-s5
+    required: true
+    status: implemented
+  - case: 324
+    name: TestV14Case323ContextGraphInitSyncAndQueryThroughRealSandbox
+    session: rc7-u14-s5
+    required: true
+    status: implemented
 
 # Case 296 is not one of Sol13's original 51 findings (which occupy 245-295).
 # It closes a gap the rc6-upg13 S3 exclusion audit found: TestV6Case29's own

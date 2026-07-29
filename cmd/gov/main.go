@@ -434,6 +434,8 @@ func run(args []string) int {
 		return claimsCmd(args[1:])
 	case "redteam-gate":
 		return redteamGateCmd(args[1:])
+	case "integration-gate":
+		return integrationGateCmd(args[1:])
 	case "version":
 		return versionCmd(args[1:])
 	case "--version", "-version":
@@ -2452,6 +2454,110 @@ func readInventoryFile(path string) ([]string, error) {
 		names = append(names, line)
 	}
 	return names, nil
+}
+
+// integrationGateCmd verifies the machine-readable result of the mandatory
+// integration tier. It deliberately accepts only structured go test JSON and
+// recorded harness evidence; a package-level zero exit is insufficient.
+func integrationGateCmd(args []string) int {
+	// Sol14 P0-2 (rc7 Session 5): the integration-tier release gate. The
+	// redteam gate (redteamGateCmd) parses `go test -v` text and checks
+	// identity against internal/redteam/manifest.yaml; this gate parses a
+	// `go test -json` integration-tier log and checks it against the exact
+	// compiler-determined expected test names. A package-level zero exit is
+	// no longer sufficient evidence: the prior tier's sole test always
+	// skipped behind `ok ... 0.026s`. See internal/redteamgate.
+	usage := "usage: gov integration-gate verify --log <path> --expected-names <path> [--harness-evidence <dir> --governator-binary <path> --expected-packages <path>]"
+	if len(args) < 1 || args[0] != "verify" {
+		return bad(usage)
+	}
+	logPath := ""
+	expectedNamesPath := ""
+	harnessEvidencePath := ""
+	governorBinaryPath := ""
+	expectedPackagesPath := ""
+	rest := args[1:]
+	for len(rest) > 0 {
+		switch rest[0] {
+		case "--log":
+			if len(rest) < 2 {
+				return bad(usage)
+			}
+			logPath = rest[1]
+			rest = rest[2:]
+		case "--expected-names":
+			if len(rest) < 2 {
+				return bad(usage)
+			}
+			expectedNamesPath = rest[1]
+			rest = rest[2:]
+		case "--harness-evidence":
+			if len(rest) < 2 {
+				return bad(usage)
+			}
+			harnessEvidencePath = rest[1]
+			rest = rest[2:]
+		case "--governator-binary":
+			if len(rest) < 2 {
+				return bad(usage)
+			}
+			governorBinaryPath = rest[1]
+			rest = rest[2:]
+		case "--expected-packages":
+			if len(rest) < 2 {
+				return bad(usage)
+			}
+			expectedPackagesPath = rest[1]
+			rest = rest[2:]
+		default:
+			return bad(usage)
+		}
+	}
+	if logPath == "" || expectedNamesPath == "" {
+		fmt.Fprintln(os.Stderr, "integration-gate: --log and --expected-names are both required")
+		return bad(usage)
+	}
+	expected, err := readInventoryFile(expectedNamesPath)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "integration-gate: --expected-names:", err)
+		return 1
+	}
+	logData, err := os.ReadFile(logPath)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "integration-gate: --log:", err)
+		return 1
+	}
+	expectedPackages := []string(nil)
+	if expectedPackagesPath != "" {
+		expectedPackages, err = readInventoryFile(expectedPackagesPath)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "integration-gate: --expected-packages:", err)
+			return 1
+		}
+	}
+	governorBinarySHA := ""
+	if governorBinaryPath != "" {
+		data, readErr := os.ReadFile(governorBinaryPath)
+		if readErr != nil {
+			fmt.Fprintln(os.Stderr, "integration-gate: --governator-binary:", readErr)
+			return 1
+		}
+		sum := sha256.Sum256(data)
+		governorBinarySHA = hex.EncodeToString(sum[:])
+	}
+	result := redteamgate.EvaluateIntegrationWithOptions(string(logData), expected, redteamgate.IntegrationOptions{
+		HarnessEvidencePath:          harnessEvidencePath,
+		ExpectedGovernorBinarySHA256: governorBinarySHA,
+		ExpectedEvidencePackages:     expectedPackages,
+	})
+	if err := json.NewEncoder(os.Stdout).Encode(result); err != nil {
+		fmt.Fprintln(os.Stderr, "integration-gate:", err)
+		return 1
+	}
+	if !result.OK {
+		return 1
+	}
+	return 0
 }
 
 // recoverDoctorGatedBreakers runs the backend doctor probes and closes any
