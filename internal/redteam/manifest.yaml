@@ -1563,6 +1563,17 @@ cases:
     session: rc6-u13-s3
     required: true
     status: implemented
+  # Case 265 was never allocated by the rc6-u13-s3 corpus, leaving a permanent
+  # hole that made the manifest's case count (297) trail its maximum case
+  # number (298). rc7-u14-s1 continued from the maximum, so every rc7-u14 case
+  # through s6 carries a number one above the case number embedded in its own
+  # test name; s6 ran out of room and duplicated 330. Reclaiming 265 here
+  # closes the hole and the duplicate at once, and restores count == maximum.
+  - case: 265
+    name: TestV14Case329PostEvaluationArtifactMutationIsDetected
+    session: rc7-u14-s6
+    required: true
+    status: implemented
   - case: 266
     name: TestV13Case21FakeMinisignReturningSuccessIsRejected
     session: rc6-u13-s4
@@ -1888,11 +1899,6 @@ cases:
     required: true
     status: implemented
   - case: 330
-    name: TestV14Case329PostEvaluationArtifactMutationIsDetected
-    session: rc7-u14-s6
-    required: true
-    status: implemented
-  - case: 330
     name: TestV14Case330AssayerCheckoutCommitMustEqualReleaseCommit
     session: rc7-u14-s6
     required: true
@@ -1955,6 +1961,16 @@ cases:
   - case: 342
     name: TestV14Case342HookConfigurationMismatchIsRejected
     session: rc7-u14-s8
+    required: true
+    status: implemented
+  - case: 343
+    name: TestV14Case343OpenGapTestSkipFailsTheReleaseGate
+    session: rc7-u14-s9
+    required: true
+    status: implemented
+  - case: 344
+    name: TestV14Case344UnmanifestedIntegrationSecuritySkipFailsTheReleaseGate
+    session: rc7-u14-s9
     required: true
     status: implemented
 

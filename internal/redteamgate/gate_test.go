@@ -33,7 +33,7 @@ func TestLoadManifestRejectsBlankName(t *testing.T) {
 
 // TestLoadManifestAcceptsRealManifest is a regression check that
 // internal/redteam/manifest.yaml (the actual release-gating manifest, not a
-// fixture) parses cleanly under the Sol12 strict decoder: 330
+// fixture) parses cleanly under the Sol12 strict decoder: 342
 // uniquely-numbered, uniquely-named required cases (the rc5 upgrade-12
 // Session 1 corpus, cases 196-205, Session 2's cases 206-208, Session 3's
 // cases 209-214, Session 4's cases 215-221, Session 5's cases 222-226, and
@@ -57,15 +57,28 @@ func TestLoadManifestRejectsBlankName(t *testing.T) {
 // 311-317), plus two Sol14 S4 cases (TestV14Case317-318, manifest ids
 // 318-319), plus the documented non-production exclusions that let the authoritative
 // inventory account for every //go:build redteam-tagged security test (P0-2),
-// plus Sol14 S5's five cases and S6's seven release-bound Assayer cases.
+// plus Sol14 S5's five cases (TestV14Case319-323, manifest ids 320-324) and
+// S6's seven release-bound Assayer cases. S6 exhausted the drifted numbering:
+// its seven tests (TestV14Case324-330) needed ids 325-331, but 331 was already
+// S7's, so 1b28f42 duplicated id 330 and broke manifest load. The duplicate is
+// resolved by reclaiming id 265 -- never allocated by the rc6-u13-s3 corpus,
+// and the original source of the count/maximum skew that caused the drift --
+// for TestV14Case329PostEvaluationArtifactMutationIsDetected. The corpus is
+// now contiguous 1-342 with count == maximum, so Sol14 S7's six cases
+// (TestV14Case331-336) and S8's six (TestV14Case337-342) are name-aligned and
+// S9 appends 343-344 for a final total of 344.
+//
+// This constant was not updated by S7 or S8; it read 330 (the post-S6 count)
+// while the manifest held 342, so this package failed before the duplicate
+// landed. Update it in every session that enrolls cases.
 func TestLoadManifestAcceptsRealManifest(t *testing.T) {
 	path := filepath.Join("..", "redteam", "manifest.yaml")
 	m, err := LoadManifest(path)
 	if err != nil {
 		t.Fatalf("LoadManifest(%s): %v", path, err)
 	}
-	if len(m.Cases) != 330 {
-		t.Fatalf("expected 330 cases in the mandatory final attack corpus, got %d", len(m.Cases))
+	if len(m.Cases) != 344 {
+		t.Fatalf("expected 344 cases in the mandatory final attack corpus, got %d", len(m.Cases))
 	}
 	seen := make(map[int]bool)
 	for _, c := range m.Cases {
