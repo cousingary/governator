@@ -451,8 +451,20 @@ EOF_INTEGRATION_PACKAGES
   # triggers the `redteam` build tag. redteam/redteam_race below are the
   # exact commands the v6 report requires.
   printf 'corpus\t%s\tgo test -run '"'"'Sol3'"'"' -v -p %s -parallel %s -count=1 ./...\n' "$CORPUS_LOG" "$GO_TEST_PARALLELISM" "$GO_TEST_PARALLELISM"
-  printf 'redteam\t%s\tgo test -v -timeout=30m -tags redteam -p %s -parallel %s -count=1 ./...\n' "$REDTEAM_LOG" "$GO_TEST_PARALLELISM" "$GO_TEST_PARALLELISM"
-  printf 'redteam_race\t%s\tgo test -v -race -timeout=30m -tags redteam -p %s -parallel %s -count=1 ./...\n' "$REDTEAM_RACE_LOG" "$GO_TEST_PARALLELISM" "$GO_TEST_PARALLELISM"
+  # Sol14 P0-2/P0-3 (rc7 Session 10): the redteam tiers MUST carry the same
+  # ASSAYER_REPO/commit binding the integration tier above does. The S5/S6
+  # corpus cases (TestV14Case322-329) spawn a nested real integration tier,
+  # and internal/redteam/v14_s5_integration_harness_test.go deliberately
+  # falls back to the SIBLING checkout (<repo>/../assayer) only for a
+  # standalone local run. A release runs from a detached scratch worktree
+  # under $(mktemp -d), where that sibling is /tmp/tmp.XXXX/assayer and does
+  # not exist -- so all eight cases failed closed (correctly: S5 made this
+  # tier fail rather than skip) on the first end-to-end rc7 attempt. The
+  # tests were only ever exercised by hand from the real checkout, where the
+  # sibling fallback happens to resolve. Same defect class as every other
+  # rc6/rc7 release blocker: a path that had never executed end to end.
+  printf 'redteam\t%s\tASSAYER_REPO=%q GOV_INTEGRATION_ASSAYER_COMMIT=%q go test -v -timeout=30m -tags redteam -p %s -parallel %s -count=1 ./...\n' "$REDTEAM_LOG" "$ASSAYER_REPO" "$ASSAYER_COMMIT" "$GO_TEST_PARALLELISM" "$GO_TEST_PARALLELISM"
+  printf 'redteam_race\t%s\tASSAYER_REPO=%q GOV_INTEGRATION_ASSAYER_COMMIT=%q go test -v -race -timeout=30m -tags redteam -p %s -parallel %s -count=1 ./...\n' "$REDTEAM_RACE_LOG" "$ASSAYER_REPO" "$ASSAYER_COMMIT" "$GO_TEST_PARALLELISM" "$GO_TEST_PARALLELISM"
 } >"$MAIN_TIER_SPEC"
 
 MAIN_TIER_JSONL="$OUT_DIR/.tier-pipeline-main.jsonl"
