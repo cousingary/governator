@@ -20,6 +20,8 @@ REQUIRED_SUBSTRINGS = [
     "fingerprint",
     "out-of-band",
     "minisign -V",
+    "signed platform archive",
+    "source-archive",
 ]
 
 

@@ -9,9 +9,16 @@ what was actually installed. This script produces a cryptographically signed,
 machine-verifiable installation record that closes that gap.
 
 The evidence record carries (Sol13 report's exact shape):
-  installed_path, installed_sha256, installed_mode, version, source_commit,
-  dirty, hook_configuration_path, hook_command, hook_configuration_sha256,
+  installed_path, installed_sha256, installed_mode, source_archive,
+  source_archive_sha256, version, source_commit, dirty,
+  hook_configuration_path, hook_command, hook_configuration_sha256,
   installed_at, installer_identity, release_manifest_sha256, signature
+
+Sol14 P2: source_archive and source_archive_sha256 bind the installed binary
+to the exact signed platform tarball it was extracted from. Installation from
+the loose file in the outer ZIP is rejected: the outer ZIP flattens executable
+mode, and only the signed platform archive preserves 0755 and is covered by
+checksums.txt and its minisign signature.
 
 Signing uses the same Ed25519 scheme as the S2 capability attestations:
 the signature covers the canonical sorted-key JSON of every field except
@@ -37,6 +44,7 @@ Usage:
   install_evidence.py generate \
     --installed-path PATH --release-manifest PATH \
     --hook-config PATH --signing-key HEXKEY \
+    --source-archive PATH \
     [--installer-identity ID] [--out PATH]
 
   install_evidence.py verify \
@@ -52,6 +60,7 @@ import json
 import os
 import pathlib
 import platform
+import re
 import stat
 import subprocess
 import sys
@@ -64,6 +73,8 @@ CANARY_FIELDS = (
     "canary_malformed_patch_denies",
     "canary_binary_hash_matches",
 )
+
+PLATFORM_ARCHIVE_PATTERN = re.compile(r"^gov_.+_.+\.tar\.gz$")
 
 
 def current_platform_id() -> str:
@@ -280,6 +291,21 @@ def cmd_generate(args: argparse.Namespace) -> int:
         )
         return 1
 
+    source_archive = pathlib.Path(args.source_archive)
+    if not source_archive.is_file():
+        print(f"install_evidence: SOURCE_ARCHIVE_NOT_FOUND: {source_archive}", file=sys.stderr)
+        return 1
+    archive_name = source_archive.name
+    if not PLATFORM_ARCHIVE_PATTERN.match(archive_name):
+        print(
+            f"install_evidence: LOOSE_FILE_INSTALL_REJECTED: source archive {archive_name!r} does not match "
+            "the signed platform archive pattern gov_<version>_<platform>.tar.gz -- installation must use "
+            "a signed platform tarball, never the loose binary from the outer ZIP",
+            file=sys.stderr,
+        )
+        return 1
+    source_archive_sha256 = sha256_file(str(source_archive))
+
     canary = run_hook_canary(str(installed_path), str(hook_config_path))
 
     if release_binary_sha256 is not None:
@@ -307,6 +333,8 @@ def cmd_generate(args: argparse.Namespace) -> int:
         "installed_path": str(installed_path),
         "installed_sha256": installed_sha256,
         "installed_mode": installed_mode,
+        "source_archive": archive_name,
+        "source_archive_sha256": source_archive_sha256,
         "version": version,
         "source_commit": source_commit,
         "dirty": dirty,
@@ -344,10 +372,20 @@ def cmd_verify(args: argparse.Namespace) -> int:
         print(f"install_evidence: {msg}", file=sys.stderr)
         return 1
 
-    required = ("installed_path", "installed_sha256", "installed_mode", "hook_configuration_path", "hook_configuration_sha256", "release_manifest_sha256", "signing_key_id", *CANARY_FIELDS)
+    required = ("installed_path", "installed_sha256", "installed_mode", "source_archive", "source_archive_sha256", "hook_configuration_path", "hook_configuration_sha256", "release_manifest_sha256", "signing_key_id", *CANARY_FIELDS)
     absent = [field for field in required if record.get(field) in (None, "")]
     if absent:
         print(f"install_evidence: INSTALL_EVIDENCE_MISSING_FIELDS: {', '.join(absent)}", file=sys.stderr)
+        return 1
+
+    source_archive = record["source_archive"]
+    if not PLATFORM_ARCHIVE_PATTERN.match(source_archive):
+        print(
+            f"install_evidence: LOOSE_FILE_INSTALL_REJECTED: source_archive {source_archive!r} does not match "
+            "the signed platform archive pattern gov_<version>_<platform>.tar.gz -- installation must use "
+            "a signed platform tarball, never the loose binary from the outer ZIP",
+            file=sys.stderr,
+        )
         return 1
 
     release_manifest = pathlib.Path(args.release_manifest)
@@ -424,6 +462,8 @@ def main(argv: list[str]) -> int:
     gen.add_argument("--hook-config", required=True, help="path to the hook configuration file")
     gen.add_argument("--signing-key", required=True, help="64-byte hex Ed25519 private key")
     gen.add_argument("--installer-identity", default=None, help="identity of the installer (defaults to $USER)")
+    gen.add_argument("--source-archive", required=True,
+                     help="path to the signed platform tarball (gov_<version>_<platform>.tar.gz) the binary was extracted from")
     gen.add_argument("--out", default=None, help="output path (defaults to <installed-dir>/install-evidence.json)")
 
     ver = sub.add_parser("verify", help="verify signed installation evidence")

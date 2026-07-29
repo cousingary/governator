@@ -64,6 +64,11 @@ func s14LiveEvidenceFixture(t *testing.T) (dir, dist, commit, arch, evidence, go
 	if err != nil {
 		t.Fatalf("generate evidence: %v\n%s", err, out)
 	}
+	archiveName := fmt.Sprintf("gov_1.0.2-rc6_%s.tar.gz", s8HostPlatform())
+	srcArchive := filepath.Join(dir, archiveName)
+	if err := os.WriteFile(filepath.Join(dist, archiveName), mustReadS14(t, srcArchive), 0o644); err != nil {
+		t.Fatal(err)
+	}
 	binSum := sha256.Sum256(mustReadS14(t, govBin))
 	hookSum := sha256.Sum256(mustReadS14(t, hookConfig))
 	arch = s14WriteLiveArch(t, dir, evidence, pub, true, hex.EncodeToString(binSum[:]), hex.EncodeToString(hookSum[:]))

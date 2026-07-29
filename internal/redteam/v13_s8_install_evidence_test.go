@@ -9,6 +9,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -147,13 +148,25 @@ func s8WriteHookConfig(t *testing.T, dir string) string {
 	return path
 }
 
+func s8WriteFakeArchive(t *testing.T, dir, version string) string {
+	t.Helper()
+	name := fmt.Sprintf("gov_%s_%s.tar.gz", version, s8HostPlatform())
+	path := filepath.Join(dir, name)
+	if err := os.WriteFile(path, []byte("fake-archive"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
 func s8GenerateEvidence(t *testing.T, govBin, manifest, hookConfig, privHex, out string) (string, error) {
 	t.Helper()
+	archive := s8WriteFakeArchive(t, filepath.Dir(govBin), "1.0.2-rc6")
 	cmd := exec.Command("python3", s8Script(t, "install_evidence.py"), "generate",
 		"--installed-path", govBin,
 		"--release-manifest", manifest,
 		"--hook-config", hookConfig,
 		"--signing-key", privHex,
+		"--source-archive", archive,
 		"--out", out,
 	)
 	outBytes, err := cmd.CombinedOutput()
