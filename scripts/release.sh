@@ -1506,6 +1506,15 @@ rm -rf "$OUT_DIR"/stage-*
 # check (below) would otherwise flag as unlisted.
 rm -f "$MAIN_TIER_JSONL" "$OUT_DIR/.checkpoint-aggregate.json"
 rm -f "$OUT_DIR/.redteam-gate.json" "$OUT_DIR/.redteam-gate.stderr" "$OUT_DIR/.redteam-inventory.txt"
+# Sol14 rc7 Session 10: .integration-gate.json is the same shape of working
+# scratch as .redteam-gate.json directly above -- the integration gate's
+# parsed verdict, already folded into test-summary.json's
+# suites.integration.identity_gate (alongside expected_tests,
+# harness_evidence and log_sha256, all of which ARE checksummed). Added to
+# $OUT_DIR by this cycle's Session 5 without being removed here or listed
+# below, so the first rc7 release to reach packaging failed the coverage
+# check on it.
+rm -f "$INTEGRATION_GATE_JSON"
 
 CHECKSUMS="$OUT_DIR/checksums.txt"
 # Sol13 rc6 Session 9: attestations/ exists only when the operator supplied
@@ -1534,11 +1543,22 @@ CHECKSUMS="$OUT_DIR/checksums.txt"
     *.tar.gz build-manifest.json architecture-build-metadata.json sbom.json
     claims.yaml test-summary.json acceptance-summary.json claims-verify-report.txt
     preflight.json toolset.json gov *.log.gz redteam-source-identity.json
+    integration-gov integration-expected-names.txt integration-expected-packages.txt
   )
   for attestation_file in attestations/*.json; do
     [ -e "$attestation_file" ] || break
     checksum_inputs+=("$attestation_file")
   done
+  # Sol14 rc7 Session 10: integration-gov and the two expected-name lists are
+  # shipped evidence and are covered above. integration-gov is NOT a duplicate
+  # of the loose `gov` beside it -- it is built early, before the tiers, with
+  # this release's own -trimpath/-ldflags, and its sha256 is what every
+  # integration-evidence record binds to as governor_binary_sha256. Without
+  # its bytes in the signed manifest, that binding names an object the release
+  # does not carry, and "the integration tier exercised the rc candidate"
+  # would be asserted rather than verifiable. The expected-name/package lists
+  # are the literal inputs `gov integration-gate verify` consumed.
+  #
   # Sol14 P0-2 (rc7 Session 5): the per-package integration TestMain records
   # the candidate-binary identity, Assayer identity, and real sandbox
   # mechanism here. They are release evidence, not disposable scratch, so
