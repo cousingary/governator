@@ -41,7 +41,16 @@ func v14S5CandidateAndTier(t *testing.T, pattern string, packages ...string) (st
 	args = append(args, packages...)
 	tier := exec.Command("go", args...)
 	tier.Dir = root
-	assayerRepo := filepath.Join(filepath.Dir(root), "assayer")
+	// A release runs this corpus from an isolated Governator worktree, so
+	// Assayer is not its sibling there. Honor the exact checkout the release
+	// pinned; retain the sibling default only for a standalone local run.
+	assayerRepo := os.Getenv("ASSAYER_REPO")
+	if assayerRepo == "" {
+		assayerRepo = filepath.Join(filepath.Dir(root), "assayer")
+	}
+	if info, statErr := os.Stat(assayerRepo); statErr != nil || !info.IsDir() {
+		t.Fatalf("required ASSAYER_REPO %q is not a readable directory: %v", assayerRepo, statErr)
+	}
 	tier.Env = append(os.Environ(), "ASSAYER_REPO="+assayerRepo, "GOV_INTEGRATION_GOV_BIN="+candidate, "GOV_INTEGRATION_EVIDENCE_OUT="+evidenceDir)
 	output, err := tier.CombinedOutput()
 	if err != nil {

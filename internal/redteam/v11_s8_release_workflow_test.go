@@ -5,6 +5,7 @@ package redteam
 import (
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 )
@@ -161,10 +162,10 @@ func TestV11Case47CanonicalGitHubWorkflowReproducesOnCleanRunner(t *testing.T) {
 // this corpus case exists to catch) would break fact #2's assertion here
 // and would also hit release.sh's hard-fail gate at runtime.
 func TestV11Case48ReleaseWorkflowWithoutAssayerCheckoutFails(t *testing.T) {
-	// Fact 1: assayer.lock exists and declares a pinned ref.
+	// Fact 1: assayer.lock exists and declares an immutable full commit.
 	lock := s8AssayerLock(t)
-	if !strings.Contains(lock, "ref=v") {
-		t.Fatalf("assayer.lock does not declare a ref=v... entry -- the Assayer pin is absent:\n%s", lock)
+	if !regexp.MustCompile(`(?m)^ref=[0-9a-f]{40}$`).MatchString(lock) {
+		t.Fatalf("assayer.lock does not declare an immutable 40-hex commit ref -- the Assayer pin is absent or movable:\n%s", lock)
 	}
 
 	// Fact 2: the workflow reads assayer.lock and checks out Assayer at the
