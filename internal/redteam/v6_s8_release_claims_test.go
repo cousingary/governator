@@ -21,6 +21,7 @@ package redteam
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -217,18 +218,32 @@ func TestV6Case36UntaggedPostV1TagSourcePackagedAsV1IsRejected(t *testing.T) {
 	repoRoot := governatorRepoRoot(t)
 	head := repoHeadCommit(t, repoRoot)
 
-	describeOut, err := exec.Command("git", "-C", repoRoot, "describe", "--tags", "--long", head).Output()
-	if err != nil {
-		t.Skipf("no reachable tag to compare against in this checkout: %v", err)
+	// Sol14 S9a (P1-2): this case used to read the live checkout's tag state
+	// via `git describe`, and skipped whenever that state did not happen to be
+	// "several commits past a reachable tag" -- on a checkout sitting exactly
+	// at a tag, or a clone fetched without tags. It was an OPEN GAP exclusion
+	// that merely happened to pass on whichever machine last ran it.
+	//
+	// The VersionTagSourceForTesting seam supplies the tag->commit lookup
+	// directly, so the scenario is now constructed rather than discovered: tag
+	// v1.0.0 points at some earlier commit, HEAD is a different commit, and the
+	// claim ships HEAD while declaring version 1.0.0. Only the lookup is
+	// injected -- the provenance rule itself runs for real. claims.Verify still
+	// operates against the real project tree, so the implemented/tested tiers
+	// are satisfied genuinely and a rejection here can only come from the
+	// version/tag mismatch under test.
+	const tag = "v1.0.0"
+	taggedCommit := strings.Repeat("a", 40)
+	if taggedCommit == head {
+		t.Fatalf("fixture commit collided with real HEAD %s", head)
 	}
-	describe := strings.TrimSpace(string(describeOut))
-	// "<tag>-<N>-g<sha>": N==0 means HEAD IS the tag, nothing ambiguous to
-	// prove here.
-	parts := strings.Split(describe, "-")
-	if len(parts) < 3 || parts[len(parts)-2] == "0" {
-		t.Skipf("HEAD is exactly at its nearest tag (%s); this case needs a checkout several commits past a tag", describe)
+	claims.VersionTagSourceForTesting = func(_, requested string) (string, error) {
+		if requested != tag {
+			return "", fmt.Errorf("no such tag %q", requested)
+		}
+		return taggedCommit, nil
 	}
-	tag := strings.Join(parts[:len(parts)-2], "-")
+	t.Cleanup(func() { claims.VersionTagSourceForTesting = nil })
 
 	evidence := map[string]any{
 		"source_commit": head,
@@ -236,10 +251,9 @@ func TestV6Case36UntaggedPostV1TagSourcePackagedAsV1IsRejected(t *testing.T) {
 	evidenceRel := writeOutsideRepoJSON(t, repoRoot, evidence)
 
 	claim := v6BaseShippedClaim(t, repoRoot, "v6-case36-version-tag-provenance")
-	// Version claims the ORIGINAL tag even though head sits several commits
-	// past it -- exactly the report's "six post-tag security commits ship
-	// under the original 1.0.0" scenario, reproduced against this
-	// repository's real state.
+	// Version claims the ORIGINAL tag even though the shipped commit is a
+	// different one -- exactly the report's "six post-tag security commits ship
+	// under the original 1.0.0" scenario.
 	claim.BinaryBuildEvidence = &claims.BinaryEvidence{EvidenceFile: evidenceRel, Commit: head, Version: strings.TrimPrefix(tag, "v")}
 
 	results, err := claims.Verify(repoRoot, claims.Document{Version: 1, Claims: []claims.Claim{claim}})
@@ -249,8 +263,21 @@ func TestV6Case36UntaggedPostV1TagSourcePackagedAsV1IsRejected(t *testing.T) {
 	if len(results) != 1 {
 		t.Fatalf("expected 1 result, got %d", len(results))
 	}
-	if !results[0].OK() {
-		return
+	if results[0].OK() {
+		t.Fatalf("claims verification accepted binary_build_evidence.version=%q for commit %s while tag %s points at %s -- version/tag provenance ambiguity must be rejected or flagged: %+v", claim.BinaryBuildEvidence.Version, head, tag, taggedCommit, results[0])
 	}
-	t.Fatalf("claims verification accepted binary_build_evidence.version=%q for a commit %s commits past that tag (%s) -- version/tag provenance ambiguity must be rejected or flagged: %+v", claim.BinaryBuildEvidence.Version, parts[len(parts)-2], describe, results[0])
+	// Sol14 S9a: assert the rejection is THIS defect. The pre-enrollment form
+	// returned as soon as OK() was false, so any unrelated verification failure
+	// (a moved symbol, a renamed test, a missing artifact) would have passed the
+	// case vacuously. An enrolled, required case must fail for its own reason.
+	var found bool
+	for _, p := range results[0].Problems {
+		if strings.Contains(p, "binary_build_evidence.version") && strings.Contains(p, tag) && strings.Contains(p, taggedCommit) {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("claim was rejected, but not for the version/tag provenance mismatch under test -- problems: %q", results[0].Problems)
+	}
 }

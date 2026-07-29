@@ -283,6 +283,32 @@ var ForceDegradedScopeForTesting atomic.Bool
 // under test is the real one.
 var ScopeSelectionForceUnavailableForTesting atomic.Bool
 
+// UnitMaterializationForceUnobservedForTesting is a TEST-ONLY seam (Sol14 rc7
+// Session 9a, P1-2). When set, resolveCgroupFromPID reports the SAME
+// "generated systemd unit was never confirmed" resolve error the deadline loop
+// produces when a transient scope registers with systemd but its cgroup never
+// materializes for the launched pid -- immediately, without waiting out the
+// 2-second deadline and without depending on this host having (or lacking) a
+// live systemd --user manager.
+//
+// Before this seam, TestV6Case28SystemdUnitNeverMaterializingFailsClosed could
+// only assert its property on a host with NO systemd --user manager, because
+// forcing "unit registers but is never observed within deadline" on a host that
+// genuinely has systemd requires adversarial control over systemd the red-team
+// package cannot exercise. It therefore skipped on every systemd host and was
+// carried as an OPEN GAP exclusion -- "excluded but happened to pass" is not
+// durable release policy (Sol14 P1-2). With the seam the case is deterministic
+// on both host classes: the run must fail closed rather than reach APPROVED
+// backed by a scope identity it never actually confirmed.
+//
+// The forced error fires at the same logical point, with the same message and
+// the same resolveErr field, that a genuinely non-materializing unit produces,
+// so the fail-closed invariant under test is the real one -- only the trigger
+// is deterministic. Production code MUST NEVER set this; only _test.go code and
+// the redteam corpus (behind the redteam build tag) flip it, exactly like
+// ScopeSelectionForceUnavailableForTesting above.
+var UnitMaterializationForceUnobservedForTesting atomic.Bool
+
 // ExtinguishGateForTesting is a TEST-ONLY synchronization seam (Sol12 rc5
 // Session 2, P0-1). When non-nil, Scope.Extinguish invokes it and blocks until
 // it returns BEFORE beginning any kill/freeze logic, so a red-team fixture can
@@ -732,6 +758,15 @@ func (s *Scope) Started(pid int) {
 }
 
 func (s *Scope) resolveCgroupFromPID(pid int) {
+	// Sol14 S9a: deterministic "unit registered but never materialized" seam.
+	// Fires before the observation loop, producing the identical resolveErr the
+	// loop sets when its deadline expires with the unit unconfirmed.
+	if UnitMaterializationForceUnobservedForTesting.Load() {
+		s.mu.Lock()
+		s.resolveErr = fmt.Errorf("containment: generated systemd unit %q was never confirmed for pid %d; observed cgroup %q is not accepted as a fallback kill target", s.unitName, pid, "")
+		s.mu.Unlock()
+		return
+	}
 	deadline := time.Now().Add(2 * time.Second)
 	for {
 		path, err := cgroupPathForPID(pid)

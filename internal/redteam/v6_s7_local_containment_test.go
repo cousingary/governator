@@ -27,6 +27,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cousingary/governator/internal/containment"
 	"github.com/cousingary/governator/internal/enforce"
 	govruntime "github.com/cousingary/governator/internal/runtime"
 )
@@ -257,23 +258,40 @@ func TestV6Case28SystemdUnitNeverMaterializingFailsClosed(t *testing.T) {
 	if runtime.GOOS != "linux" {
 		t.Skip("systemd transient scopes are Linux-only")
 	}
-	if _, err := os.Stat("/run/systemd/system"); err == nil {
-		t.Skip("this host has a live systemd --user manager; forcing 'unit registers but never observed within deadline' requires adversarial control over systemd this black-box package cannot exercise here")
-	}
+
+	// Sol14 S9a (P1-2): this case used to skip on any host WITH a live systemd
+	// --user manager, because forcing "unit registers but is never observed
+	// within deadline" against real systemd is not something this black-box
+	// package can drive. That made it an OPEN GAP exclusion that merely
+	// happened to pass wherever systemd was absent. The
+	// UnitMaterializationForceUnobservedForTesting seam produces exactly the
+	// resolve error a non-materializing unit produces, so the property is now
+	// asserted deterministically on both host classes:
+	//
+	//   - systemd host:    a scope IS selected, but its unit never confirms.
+	//   - no-systemd host: no strong primitive is confirmable at all.
+	//
+	// Either way a high-risk run must fail closed rather than reach APPROVED
+	// backed by a scope identity that was never verified. The seam is inert on
+	// the no-systemd path (resolveCgroupFromPID is only reached for a systemd
+	// scope), so setting it unconditionally is correct on both.
+	containment.UnitMaterializationForceUnobservedForTesting.Store(true)
+	t.Cleanup(func() { containment.UnitMaterializationForceUnobservedForTesting.Store(false) })
 
 	root := fixtureRepo(t)
 	c := baseContract(root)
 	c.RiskClass = "high"
 	bin := fakeBackend(t, standardBackendBody(""))
 
-	rec := runGoverned(t, t.TempDir(), bin, c)
-	// Fail-closed is an acceptable (indeed expected, per the report) outcome
-	// on a high-risk run with no confirmable strong descendant-owning
-	// primitive; what must NEVER happen is a silently fabricated systemd-scope
-	// identity backing an APPROVED run whose extinction proof was never
-	// actually checked against the real generated unit.
-	if rec.Status == "APPROVED" {
-		t.Fatal("high-risk run reached APPROVED without a systemd --user manager present to confirm exact transient-unit identity -- containment must fail closed rather than fabricate/assume a scope it never verified")
+	// Fail-closed is the expected outcome, so the run is allowed to return an
+	// error: refusing to complete IS the property under test. Using the
+	// fatal-on-error helper here would mark that refusal as a harness failure.
+	rec, err := runGovernedAllowError(t, t.TempDir(), bin, c)
+	// What must NEVER happen is a silently fabricated systemd-scope identity
+	// backing an APPROVED run whose extinction proof was never actually checked
+	// against the real generated unit.
+	if err == nil && rec.Status == "APPROVED" {
+		t.Fatal("high-risk run reached APPROVED without confirming exact transient-unit identity -- containment must fail closed rather than fabricate/assume a scope it never verified")
 	}
 }
 

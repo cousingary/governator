@@ -932,6 +932,28 @@ func verifyRedteamSuite(suite map[string]any, commit string) (bool, []string) {
 	return ok, problems
 }
 
+// VersionTagSourceForTesting is a TEST-ONLY seam (Sol14 rc7 Session 9a, P1-2).
+// When non-nil, verifyVersionTagProvenance resolves a version's tag through it
+// instead of `git rev-parse <tag>^{commit}` against repoRoot, so the
+// version/tag provenance COMPARISON can be exercised deterministically on any
+// checkout. It must return the commit the tag points at, or an error meaning
+// "no such tag" (which this function treats as nothing to compare, exactly as
+// a failing git rev-parse does).
+//
+// Before this seam, TestV6Case36UntaggedPostV1TagSourcePackagedAsV1IsRejected
+// depended on the live checkout happening to have a reachable tag with HEAD
+// several commits past it -- it skipped on a checkout sitting exactly at a tag,
+// and on any clone fetched without tags. It was therefore carried as an OPEN
+// GAP exclusion, which Sol14 P1-2 rejects as durable release policy.
+//
+// The seam replaces only the tag->commit LOOKUP. The provenance rule under test
+// -- a version naming a tag whose commit differs from the evidence commit must
+// be rejected -- still runs for real against the injected pair, so the assertion
+// is the production one. Production code MUST NEVER set this; only _test.go
+// code and the redteam corpus assign it (and defer restoring nil), mirroring
+// containment.ExtinguishGateForTesting.
+var VersionTagSourceForTesting func(repoRoot, tag string) (string, error)
+
 func verifyVersionTagProvenance(repoRoot, commit, version string, portable bool) (bool, []string) {
 	v := strings.TrimSpace(version)
 	if v == "" || strings.Contains(v, "candidate") || strings.Contains(v, "+") {
@@ -941,11 +963,20 @@ func verifyVersionTagProvenance(repoRoot, commit, version string, portable bool)
 	if !strings.HasPrefix(tag, "v") {
 		tag = "v" + tag
 	}
-	out, err := gitOutput(repoRoot, portable, "rev-parse", tag+"^{commit}")
-	if err != nil {
-		return true, nil
+	var tagCommit string
+	if resolve := VersionTagSourceForTesting; resolve != nil {
+		resolved, err := resolve(repoRoot, tag)
+		if err != nil {
+			return true, nil
+		}
+		tagCommit = strings.TrimSpace(resolved)
+	} else {
+		out, err := gitOutput(repoRoot, portable, "rev-parse", tag+"^{commit}")
+		if err != nil {
+			return true, nil
+		}
+		tagCommit = strings.TrimSpace(string(out))
 	}
-	tagCommit := strings.TrimSpace(string(out))
 	if tagCommit != "" && commit != "" && tagCommit != commit {
 		return false, []string{fmt.Sprintf("absent from shipped binary: binary_build_evidence.version %s names tag %s at %s, but evidence commit is %s", version, tag, tagCommit, commit)}
 	}
