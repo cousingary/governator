@@ -479,7 +479,14 @@ func (Executor) Run(ctx context.Context, spec StageSpec) (StageResult, error) {
 		go func() { done <- cmd.Wait() }()
 		select {
 		case err := <-done:
-			if err != nil {
+			// The copy goroutine may hit the required-complete limit and
+			// cancel ctx just as cmd.Wait wins this select. Preserve the
+			// limiter's fail-closed verdict even when the subprocess has
+			// already exited before the cancellation branch observes ctx.
+			if captureMode == CaptureRequiredComplete && limiter.Exceeded() {
+				exit = -1
+				runErr = ErrOutputLimitExceeded
+			} else if err != nil {
 				if ee, ok := err.(*exec.ExitError); ok {
 					exit = ee.ExitCode()
 				} else {
