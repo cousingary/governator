@@ -376,16 +376,17 @@ type Options struct {
 	Attestations *AggregationResult
 
 	// ExactManifests is the set of name-inventoried, no-case-number security
-	// manifests (Sol14 rc7 Session 9b) that Session 9d enforces "zero
-	// unaccounted skips" across, alongside the numbered corpus. S9b ships the
-	// ExactManifest/ManifestSet schema and loader (internal/redteamgate/
-	// exact_manifest.go) wired to ZERO manifests: this field is populated only
-	// when a caller passes one or more --exact-manifest paths, and S9b's
-	// EvaluateWithOptions does NOT consume it, so a current-corpus release run
-	// (no exact manifests) is byte-for-byte identical to the pre-S9b gate.
-	// S9d is the session that reads this field and folds exact-manifest
-	// accounting into OK. Leaving it read-but-unused here is the deliberate
-	// infrastructure-only boundary of S9b.
+	// manifests (Sol14 rc7 Session 9b) that the gate accounts for alongside the
+	// numbered corpus. S9b shipped the ExactManifest/ManifestSet schema and
+	// loader (internal/redteamgate/exact_manifest.go) wired to ZERO manifests.
+	// S9c populates the manifests and consumes this field at the NAME level
+	// only: a test listed by any exact manifest is "accounted for by name" and
+	// is therefore not unmanifested drift (P0-2), so an exclusion drained into
+	// an exact manifest cannot widen the gate. S9c does NOT yet enforce skips
+	// across the set -- that "zero unaccounted skips" enforcement (capability
+	// evidence per skip, RequireZeroSkips across every manifest) is S9d's work.
+	// A zero-manifest caller (no exact manifests supplied) is byte-for-byte
+	// identical to the pre-S9b gate; the field is read but never widens OK.
 	ExactManifests []ExactManifest
 }
 
@@ -416,6 +417,24 @@ func EvaluateWithOptions(manifest Manifest, log string, capabilities map[string]
 	excluded := make(map[string]ExclusionEntry, len(manifest.Exclusions))
 	for _, e := range manifest.Exclusions {
 		excluded[e.Name] = e
+	}
+	// exactAccounted is the name set S9c drains the former exclusions into:
+	// every test listed by any supplied exact manifest is "accounted for by
+	// name" (Sol14 P1-2). At the name level this is the same accounting role a
+	// documented exclusion played -- a test in this set that appears in the log
+	// is not unmanifested drift (P0-2) -- so draining an exclusion into an exact
+	// manifest cannot widen what the gate waves through. The DIFFERENCE from an
+	// exclusion (and from a corpus case) is enforced in S9d, not here: S9c only
+	// stops these names being flagged UnexpectedTests; it does not yet require
+	// capability-evidence-backed skip accounting across the set (that is the
+	// "zero unaccounted skips" enforcement S9d owns). A test that FAILS is still
+	// added to FailedTests above this branch, so an exact-manifest test that
+	// fails still blocks the release; only its SKIP is tolerated pending S9d.
+	exactAccounted := make(map[string]bool)
+	for _, em := range opts.ExactManifests {
+		for _, name := range em.Tests {
+			exactAccounted[name] = true
+		}
 	}
 	inventory := make(map[string]bool, len(opts.DiscoveredTests))
 	for _, n := range opts.DiscoveredTests {
@@ -464,9 +483,14 @@ func EvaluateWithOptions(manifest Manifest, log string, capabilities map[string]
 		}
 		if !knownCase {
 			// In the inventory but not a corpus case: it must be a
-			// documented exclusion, or it is unmanifested drift (P0-2).
+			// documented exclusion OR an exact-manifest entry, or it is
+			// unmanifested drift (P0-2). S9c folds exact-manifest names in
+			// here so draining an exclusion into an exact manifest cannot
+			// widen the gate -- the test stays accounted, by name.
 			if _, isExcluded := excluded[name]; !isExcluded {
-				res.UnexpectedTests = append(res.UnexpectedTests, name)
+				if _, isExact := exactAccounted[name]; !isExact {
+					res.UnexpectedTests = append(res.UnexpectedTests, name)
+				}
 			}
 			continue
 		}

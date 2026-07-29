@@ -181,26 +181,63 @@ func TestLoadManifestSetAcceptsValidCombination(t *testing.T) {
 	}
 }
 
-// TestEvaluateWithOptionsIgnoresExactManifestsInS9b is the unit-level proof
-// of S9b's "must not change a single verdict" boundary: the ExactManifests
-// option is a populated-but-unconsumed wiring point in S9b, so a Result
-// computed with exact manifests present must be byte-for-byte equal to one
-// computed without them, for any corpus/log/capabilities. S9d is the session
-// that begins reading ExactManifests; if it does so without also changing
-// this property for the corpus-only case, this test stays green.
-func TestEvaluateWithOptionsIgnoresExactManifestsInS9b(t *testing.T) {
-	manifest := Manifest{Cases: []CaseEntry{{Case: 1, Name: "TestC1", Required: true}}}
-	log := "=== RUN   TestC1\n--- PASS: TestC1 (0.00s)\n"
+// TestEvaluateWithOptionsAccountsForExactManifestTests is the S9c unit-level
+// proof that draining an exclusion into an exact manifest cannot widen the
+// gate. EvaluateWithOptions consumes opts.ExactManifests at the NAME level: a
+// test listed by any exact manifest is "accounted for" and is therefore not
+// flagged unmanifested drift (P0-2), exactly as a documented exclusion was --
+// so moving a test from exclusions into an exact manifest leaves the verdict
+// unchanged for a passing test, while a test that is NEITHER a corpus case,
+// NOR excluded, NOR in an exact manifest is still flagged UnexpectedTests.
+//
+// (S9b shipped the field read-but-unused; S9c begins reading it. Skip-evidence
+// enforcement across the set remains S9d's work: a SKIP in an exact-manifest
+// test is still tolerated here, not yet required to prove capability evidence.
+// A FAIL, however, still blocks the release -- the fold accounts for the name
+// only, it never waives a failure.)
+func TestEvaluateWithOptionsAccountsForExactManifestTests(t *testing.T) {
+	manifest := Manifest{Cases: []CaseEntry{{Case: 1, Name: "TestCorpusOne", Required: true}}}
+	// TestExactExtra is in the inventory but is neither a corpus case nor an
+	// exclusion: without an exact manifest it is unmanifested drift; with one
+	// it is accounted.
+	passLog := "=== RUN   TestCorpusOne\n--- PASS: TestCorpusOne (0.00s)\n" +
+		"=== RUN   TestExactExtra\n--- PASS: TestExactExtra (0.00s)\n"
 	caps := map[string]CapabilityRecord{}
-	without := EvaluateWithOptions(manifest, log, caps, Options{})
-	withExact := EvaluateWithOptions(manifest, log, caps, Options{
+	inventory := []string{"TestCorpusOne", "TestExactExtra"}
+
+	without := EvaluateWithOptions(manifest, passLog, caps, Options{DiscoveredTests: inventory})
+	if without.OK || len(without.UnexpectedTests) != 1 || without.UnexpectedTests[0] != "TestExactExtra" {
+		t.Fatalf("without an exact manifest, TestExactExtra must be unmanifested drift: %+v", without)
+	}
+
+	withExact := EvaluateWithOptions(manifest, passLog, caps, Options{
+		DiscoveredTests: inventory,
 		ExactManifests: []ExactManifest{{
-			Name:                 "irrelevant-in-s9b",
+			Name:                 "extras",
 			RequiredCapabilities: []string{"linux"},
-			Tests:                []string{"TestC1"}, // even a shadow-like name must not matter: not consumed
+			Tests:                []string{"TestExactExtra"},
 		}},
 	})
-	if !reflect.DeepEqual(without, withExact) {
-		t.Fatalf("S9b must not let ExactManifests affect the verdict:\nwithout=%+v\nwithExact=%+v", without, withExact)
+	if !withExact.OK {
+		t.Fatalf("with TestExactExtra in an exact manifest, the gate must be OK: %+v", withExact)
+	}
+	if len(withExact.UnexpectedTests) != 0 {
+		t.Fatalf("exact-manifest test must not appear in UnexpectedTests: %+v", withExact)
+	}
+
+	// A FAILING exact-manifest test still blocks the release: the fold accounts
+	// for the name only; it does not waive failures.
+	failLog := "=== RUN   TestCorpusOne\n--- PASS: TestCorpusOne (0.00s)\n" +
+		"=== RUN   TestExactExtra\n--- FAIL: TestExactExtra (0.00s)\n"
+	withExactFail := EvaluateWithOptions(manifest, failLog, caps, Options{
+		DiscoveredTests: inventory,
+		ExactManifests: []ExactManifest{{
+			Name:                 "extras",
+			RequiredCapabilities: []string{"linux"},
+			Tests:                []string{"TestExactExtra"},
+		}},
+	})
+	if withExactFail.OK || len(withExactFail.FailedTests) != 1 || withExactFail.FailedTests[0] != "TestExactExtra" {
+		t.Fatalf("a failing exact-manifest test must still block the gate: %+v", withExactFail)
 	}
 }

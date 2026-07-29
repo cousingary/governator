@@ -1,0 +1,21 @@
+# Sol14 rc7 Session 9c exact manifest (Sol14 P1-2).
+# Governator<->Assayer bridge integration (cross-repo Assayer properties plus the real-Assayer bridge tests). Name-inventoried only -- no case numbers (see
+# internal/redteamgate/exact_manifest.go). S9d enforces zero
+# unaccounted skips across the manifest set; S9c populates it and
+# proves every //go:build redteam-tagged test is accounted for in
+# exactly one manifest.
+name: assayer-integration
+required_capabilities:
+  - linux
+tests:
+  - TestAttack13TwoAssayerWorkersReclaimOneExpiredLease
+  - TestAttack14DownstreamInsertSucceedsBeforeOutboxWorkerCrashes
+  - TestAttack16InventedAssayerLanguagePasses
+  - TestEvaluateNonzeroExitIsError
+  - TestEvaluateShaMismatchAfterEvaluationIsError
+  - TestEvaluateTimeout
+  - TestEvaluateUnparseableStdoutIsError
+  - TestSol3ArtifactDeclaredPathReachesRealAssayerFilePathCheck
+  - TestV6Case31AssayerLeaseRenewedThroughSlowDownstreamCallPreventsDuplicate
+  - TestV6Case32UnknownOutboxOperationIsDeadLettered
+  - TestV7AssayerVersionTagPointsAtWrongCommitBlocksRelease

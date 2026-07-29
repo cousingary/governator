@@ -1,0 +1,50 @@
+# Sol14 rc7 Session 9c exact manifest (Sol14 P1-2).
+# red-team security attacks requiring no special host capability beyond a Linux release host. Name-inventoried only -- no case numbers (see
+# internal/redteamgate/exact_manifest.go). S9d enforces zero
+# unaccounted skips across the manifest set; S9c populates it and
+# proves every //go:build redteam-tagged test is accounted for in
+# exactly one manifest.
+name: red-team-attacks
+required_capabilities:
+  - linux
+tests:
+  - TestAttack17DoctrineChangesBetweenEvaluationAndIdentity
+  - TestAttack18SecondOneShotApprovalConsumptionFails
+  - TestAttack19NewlinePathspecFilenameHandledLiterally
+  - TestAttack1HostilePreCommitHookNeverStagesForbiddenFile
+  - TestAttack20SpendSettleRacesExpiry
+  - TestAttack21HugeTimeoutCausesDurationOverflow
+  - TestAttack23NonGitMergeFailureHalfwayThrough
+  - TestAttack25ReleaseBinaryCommitDiffersFromSourceAndClaims
+  - TestAttack27BackendExecutableWithUntrustedWritableParentIsQuarantined
+  - TestAttack2HostileGlobalHooksPathNeverStagesForbiddenFile
+  - TestAttack3PathspecMagicFilenameNeverStagesInternalPath
+  - TestAttack4CleanFilterNeverAltersCommittedContent
+  - TestAttack5FakeBackendBehavesSafelyOnlyDuringAttestation
+  - TestV6Case11RegistryEntryMissingSHA256IsRejected
+  - TestV6Case12DuplicateTrustedToolRegistryNamesRejected
+  - TestV6Case13ConcurrentRegistryUpdatesDoNotLoseWrites
+  - TestV6Case14GitObjectDirectoryRedirectionDoesNotEscapeRepository
+  - TestV6Case15GitAlternateObjectDirectoriesRedirectionDoesNotEscapeRepository
+  - TestV6Case16GitDirWorkTreeInjectionDoesNotRedirectApprovedCommit
+  - TestV6Case17QuarantinePreCommitHookNeverFires
+  - TestV6Case18QuarantineCleanFilterNeverRuns
+  - TestV6Case19ShadowAllowNeverOverridesGoDeny
+  - TestV6Case1LowRiskContractForbidsNetworkButBackendOpensSocket
+  - TestV6Case20ShadowEmptyOutputNeverOverridesGoDeny
+  - TestV6Case21ShadowScriptChangeBetweenReplaysIsDetected
+  # Case 28 requires no systemd capability AFTER S9a: its only skip guard is
+  # non-Linux, and the UnitMaterializationForceUnobservedForTesting seam asserts
+  # the fail-closed property on BOTH host classes (systemd present and absent).
+  # Filing it under live-systemd would let S9d excuse it as "outside the claimed
+  # platform" on a no-systemd host -- silently undoing exactly what S9a bought.
+  - TestV6Case28SystemdUnitNeverMaterializingFailsClosed
+  - TestV6Case2BackendOmitsNetworkEventFromTranscript
+  # Case 30 likewise needs no live systemd: it deliberately starves PATH so
+  # systemd-run/unshare cannot ambient-resolve, which is the precondition of the
+  # degrade-path property it asserts.
+  - TestV6Case30LowRiskEffectfulJobStillGetsStrongDescendantContainment
+  - TestV6Case36UntaggedPostV1TagSourcePackagedAsV1IsRejected
+  - TestV6Case3ValidatorSetsidDelayedWriterCannotWriteAfterApproval
+  - TestV6Case6BashEnvControllerInjectionNeverExecutes
+  - TestV6Case7LDPreloadControllerInjectionNeverExecutes

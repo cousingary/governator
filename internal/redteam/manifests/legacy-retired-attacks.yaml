@@ -1,0 +1,33 @@
+# Sol14 rc7 Session 9c exact manifest (Sol14 P1-2).
+# legacy attacks superseded by stronger enrolled corpus cases (kept runnable for regression; accounted, not excluded). Name-inventoried only -- no case numbers (see
+# internal/redteamgate/exact_manifest.go). S9d enforces zero
+# unaccounted skips across the manifest set; S9c populates it and
+# proves every //go:build redteam-tagged test is accounted for in
+# exactly one manifest.
+name: legacy-retired-attacks
+required_capabilities:
+  - linux
+tests:
+  - TestAttack10FakeGitInjectedThroughPathIsRejected
+  - TestAttack15MalformedGateCheckInputFailsClosed
+  - TestAttack22SymlinkParentReplacedBetweenScanAndOpen
+  - TestAttack24ExtractedReleaseBinaryHasWrongMode
+  - TestAttack26DirtyReleaseBinaryReportsAContradictoryRelease
+  - TestAttack26FakeBashInjectedThroughPathIsRejected
+  - TestAttack6BackendReplacementBetweenHashAndLaunchIsDetected
+  - TestAttack7PathResolvedBinaryReplacedBetweenRuns
+  - TestAttack8DetachedSetsidChildCannotWriteAfterApproval
+  - TestAttack9GraphHelperCannotWriteOutsideRepository
+  - TestV6Case10PathPinnedToolReplacedWithDifferentContentIsRejected
+  - TestV6Case22ConsumedArtifactChangeBeforeConsumerReplayInvalidatesReplay
+  - TestV6Case24GraphProviderChangeBeforeReplayInvalidatesReplay
+  - TestV6Case25BackendCannotReadUndeclaredHostSecretUnderLandlock
+  - TestV6Case26BackendPathReplacedBeforeWrappedLaunchNeverRuns
+  - TestV6Case27GovernatorPathReplacedBeforeSandboxReexecNeverRuns
+  - TestV6Case29PIDCheckEPERMIsNotTreatedAsExtinctionProof
+  - TestV6Case33AssayerPytestExitsCleanlyOnSupportedPythonVersions
+  - TestV6Case34ReleaseWithoutRedteamTagIsRejected
+  - TestV6Case35ReleaseTestCountBelowMinimumIsRejected
+  - TestV6Case4CleanupValidatorDetachedChildCannotWriteAfterApproval
+  - TestV6Case8FakeBashFirstInPathOnFreshHomeIsRejected
+  - TestV6Case9FakeGitFirstInPathOnFreshHomeIsRejected

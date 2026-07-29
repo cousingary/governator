@@ -1,0 +1,14 @@
+# Sol14 rc7 Session 9c exact manifest (Sol14 P1-2).
+# context-graph sandbox/prepare integration. Name-inventoried only -- no case numbers (see
+# internal/redteamgate/exact_manifest.go). S9d enforces zero
+# unaccounted skips across the manifest set; S9c populates it and
+# proves every //go:build redteam-tagged test is accounted for in
+# exactly one manifest.
+name: context-graph-integration
+required_capabilities:
+  - linux
+tests:
+  - TestInspectCodeGraphStatus
+  - TestPrepareAutoDegradesOnProviderFailure
+  - TestPrepareBuildsFingerprintAndQueries
+  - TestV6Case5GraphProviderDetachedChildCannotWriteAfterApproval

@@ -559,6 +559,28 @@ fi
 # name via the manifest's allowed_skip predicate+reason. See
 # agents/governator-sol-upgrade7-plan.md Session 7.
 REDTEAM_MANIFEST="internal/redteam/manifest.yaml"
+# Sol14 rc7 Session 9c (P1-2): the name-inventoried exact manifests that drain
+# the former exclusion list. Every *.yaml under internal/redteam/manifests/ is
+# passed to the gate as --exact-manifest; the gate accounts for each listed test
+# by name (not unmanifested drift) and S9d will enforce zero unaccounted skips
+# across the set. An empty directory leaves the array empty and aborts the
+# release below, so a release cannot accidentally run with a missing manifest
+# set. NUL-delimited collection (mapfile -d '') is required: a plain `mapfile -t`
+# over NUL-separated input silently collapses the whole list to one entry, which
+# would pass only the first manifest and make the other five look like drift.
+REDTEAM_EXACT_MANIFEST_DIR="internal/redteam/manifests"
+mapfile -d '' -t REDTEAM_EXACT_MANIFEST_ARGS < <(
+  shopt -s nullglob
+  for f in "$REDTEAM_EXACT_MANIFEST_DIR"/*.yaml; do printf '%s\0' "$f"; done
+)
+if [ "${#REDTEAM_EXACT_MANIFEST_ARGS[@]}" -eq 0 ]; then
+  echo "release: no exact manifests found in $REDTEAM_EXACT_MANIFEST_DIR (Sol14 S9c requires the manifest set)" >&2
+  exit 1
+fi
+REDTEAM_EXACT_MANIFEST_FLAGS=()
+for f in "${REDTEAM_EXACT_MANIFEST_ARGS[@]}"; do
+  REDTEAM_EXACT_MANIFEST_FLAGS+=(--exact-manifest "$f")
+done
 # Sol12 rc5 Session 1 (P0-3): capability evidence is tri-state (present |
 # absent | unknown). The gate now requires EVERY predicate the manifest
 # references to be proven present/absent in this record, or it refuses with
@@ -604,7 +626,7 @@ if [ -n "$ATTESTATIONS_DIR" ]; then
   REDTEAM_GATE_EXTRA_ARGS+=(--attestations "$ATTESTATIONS_DIR" --attestation-governator-commit "$COMMIT" --attestation-assayer-commit "$ASSAYER_COMMIT_ATTEST" --attestation-release-version "$VERSION" --attestation-source-identity "$REDTEAM_SOURCE_IDENTITY" --attestation-toolchain-hash "$TOOLCHAIN_HASH" --attestation-release-time "$RELEASE_ATTESTATION_TIME" --attestation-max-age "24h")
 fi
 REDTEAM_GATE_JSON="$OUT_DIR/.redteam-gate.json"
-if go run ./cmd/gov redteam-gate verify --manifest "$REDTEAM_MANIFEST" --log "$REDTEAM_LOG" --capabilities "$REDTEAM_CAPABILITIES_JSON" --inventory "$REDTEAM_INVENTORY" "${REDTEAM_GATE_EXTRA_ARGS[@]}" >"$REDTEAM_GATE_JSON" 2>"$OUT_DIR/.redteam-gate.stderr"; then
+if go run ./cmd/gov redteam-gate verify --manifest "$REDTEAM_MANIFEST" --log "$REDTEAM_LOG" --capabilities "$REDTEAM_CAPABILITIES_JSON" --inventory "$REDTEAM_INVENTORY" "${REDTEAM_EXACT_MANIFEST_FLAGS[@]}" "${REDTEAM_GATE_EXTRA_ARGS[@]}" >"$REDTEAM_GATE_JSON" 2>"$OUT_DIR/.redteam-gate.stderr"; then
   REDTEAM_GATE_OK=true
 else
   REDTEAM_GATE_OK=false

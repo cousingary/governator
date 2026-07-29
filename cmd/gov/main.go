@@ -2445,8 +2445,11 @@ func redteamGateCmd(args []string) int {
 		RequireZeroSkips: requireZeroSkips,
 		DiscoveredTests:  discovered,
 		Attestations:     aggResult,
-		// S9b: populated and validated, but EvaluateWithContext does not yet
-		// enforce across them. S9d folds exact-manifest accounting into OK.
+		// S9c: exact manifests are now consumed at the name level -- a test
+		// listed by any exact manifest is "accounted for" and is not flagged
+		// unmanifested drift, so draining an exclusion into an exact manifest
+		// cannot widen the gate. Skip-evidence enforcement across the set
+		// (RequireZeroSkips with capability evidence) remains S9d's work.
 		ExactManifests: manifestSet.ExactManifests,
 	})
 	if err := json.NewEncoder(os.Stdout).Encode(result); err != nil {
