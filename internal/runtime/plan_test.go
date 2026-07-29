@@ -107,15 +107,19 @@ func TestRunBatchOrderedRunsLevelsSeriallyAndParallelWithin(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer db.Close()
-	var levelARun, levelCRun struct{ Created string }
-	if err := db.QueryRow(`SELECT created FROM runs WHERE job_id='ordered-a'`).Scan(&levelARun.Created); err != nil {
+	// SQLite rowid is the ledger's monotonic insertion ordering. Wall-clock
+	// `created` text is not a serial-order proof: the system clock may move
+	// backward between levels, and RFC3339Nano text is deliberately not used
+	// for ordering elsewhere in this package.
+	var levelARowID, levelCRowID int64
+	if err := db.QueryRow(`SELECT rowid FROM runs WHERE job_id='ordered-a'`).Scan(&levelARowID); err != nil {
 		t.Fatal(err)
 	}
-	if err := db.QueryRow(`SELECT created FROM runs WHERE job_id='ordered-c'`).Scan(&levelCRun.Created); err != nil {
+	if err := db.QueryRow(`SELECT rowid FROM runs WHERE job_id='ordered-c'`).Scan(&levelCRowID); err != nil {
 		t.Fatal(err)
 	}
-	if levelCRun.Created < levelARun.Created {
-		t.Fatalf("expected the dependent job's run to start after level 0 finished: a=%s c=%s", levelARun.Created, levelCRun.Created)
+	if levelCRowID <= levelARowID {
+		t.Fatalf("expected the dependent job's run to be inserted after level 0 finished: a rowid=%d c rowid=%d", levelARowID, levelCRowID)
 	}
 	var batchRows int
 	if err := db.QueryRow(`SELECT COUNT(*) FROM batches`).Scan(&batchRows); err != nil {
