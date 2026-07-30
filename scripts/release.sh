@@ -70,7 +70,7 @@ release_tool_value() {
   return 1
 }
 
-for release_tool in go python3 python3.12 sha256sum tar gzip minisign git bash date awk env cp rm mkdir find sort mktemp dirname pwd grep uname cat chmod stat basename timeout mv ls systemctl docker; do
+for release_tool in go python3 python3.12 sha256sum tar gzip minisign git bash date awk env cp rm mkdir find sort mktemp dirname pwd grep uname cat chmod stat basename timeout mv ls systemctl docker tail; do
   release_tool_path=$(release_tool_value "$release_tool" path) || {
     echo "release: approved tool ${release_tool} is absent from ${RELEASE_TOOL_POLICY}" >&2
     exit 1
@@ -107,6 +107,7 @@ for release_tool in go python3 python3.12 sha256sum tar gzip minisign git bash d
     ls) LS_TOOL=$release_tool_path ;;
     systemctl) SYSTEMCTL_TOOL=$release_tool_path ;;
     docker) DOCKER_TOOL=$release_tool_path ;;
+    tail) TAIL_TOOL=$release_tool_path ;;
   esac
 done
 
@@ -202,6 +203,7 @@ MV_TOOL="$TOOLBIN_DIR/mv"
 LS_TOOL="$TOOLBIN_DIR/ls"
 SYSTEMCTL_TOOL="$TOOLBIN_DIR/systemctl"
 DOCKER_TOOL="$TOOLBIN_DIR/docker"
+TAIL_TOOL="$TOOLBIN_DIR/tail"
 
 require_clean_tree() {
   local stage=${1:-release}
@@ -948,7 +950,7 @@ print(json.dumps(hashes, sort_keys=True))
     fi
     ASSAYER_CASE_ENDED=$(date -u +%Y-%m-%dT%H:%M:%SZ)
     ASSAYER_CASE_END_EPOCH=$(date +%s)
-    ASSAYER_CASE_SUMMARY=$(tail -1 "$ASSAYER_CASE_LOG")
+    ASSAYER_CASE_SUMMARY=$("$TAIL_TOOL" -1 "$ASSAYER_CASE_LOG")
     ASSAYER_CASE_LOG_SHA=$(sha256sum "$ASSAYER_CASE_LOG" | awk '{print $1}')
     # P1-4 (Sol10 rc4 Session 8): a published hash with no retrievable
     # object behind it proves nothing. Ship the log itself, gzip-
@@ -1033,7 +1035,7 @@ if [ -d "$ASSAYER_REPO" ]; then
     ASSAYER_VERSION_TAG_RESULT=FAIL
     cat "$ASSAYER_VERSION_TAG_LOG" >&2
   fi
-  ASSAYER_VERSION_TAG_SUMMARY=$(tail -1 "$ASSAYER_VERSION_TAG_LOG")
+  ASSAYER_VERSION_TAG_SUMMARY=$("$TAIL_TOOL" -1 "$ASSAYER_VERSION_TAG_LOG")
 else
   ASSAYER_VERSION_TAG_RESULT=SKIPPED
   ASSAYER_VERSION_TAG_SUMMARY="ASSAYER_REPO ${ASSAYER_REPO} not present on this machine"

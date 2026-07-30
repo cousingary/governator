@@ -20,7 +20,7 @@ DEFAULT_TOOLS = [
     "go", "python3", "python3.12", "git", "bash", "sha256sum", "tar", "gzip", "minisign",
     "date", "awk", "env", "cp", "rm", "mkdir", "find", "sort", "mktemp",
     "dirname", "pwd", "grep", "uname", "cat", "chmod", "stat", "basename",
-    "timeout", "mv", "ls", "systemctl", "docker",
+    "timeout", "mv", "ls", "systemctl", "docker", "tail",
 ]
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 

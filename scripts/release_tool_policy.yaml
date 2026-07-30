@@ -92,3 +92,6 @@ tools:
   docker:
     path: /usr/bin/docker
     sha256: 4fd41ecac3ec0f8a6067f8da79cbce516ed0572d1081e4767db764c84d32257b
+  tail:
+    path: /usr/bin/tail
+    sha256: 8ea2a713eba8a4140fad5e453c9d8129fb5d4d30d79de384639c306f626eca90
