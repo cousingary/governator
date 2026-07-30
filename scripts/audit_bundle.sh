@@ -72,6 +72,8 @@ while [ $# -gt 0 ]; do
 done
 
 REF=${REF:-HEAD}
+VERSION=${VERSION:-}
+ASSAYER_REPO=${ASSAYER_REPO:-/mnt/e/downloads/assayer}
 AUDIT_BUNDLE_MODE=${AUDIT_BUNDLE_MODE:-release}
 case "$AUDIT_BUNDLE_MODE" in
   release|source-only) ;;
@@ -262,6 +264,59 @@ SOURCE_CLAIMS_SHA=$("$SHA256SUM_BIN" "$OUT_DIR/source/docs/claims.yaml" | "$AWK_
     echo "dist/claims.yaml: absent (no dist/ tier populated for this bundle -- run scripts/release.sh first if a frozen release copy is needed)."
   fi
 } >"$CLAIMS_PROVENANCE"
+
+# ---------------------------------------------------------------------------
+# rc8-upg15 S5 (Sol15 P0-2 + P1-3 + P1-4): source-closure objects. The
+# signed set previously covered only platform archives, build-manifest,
+# checksums and signatures — source/, architecture/ and install-evidence
+# were unbound. This section produces the six closure objects Sol names and
+# a Git bundle for portable claims, so the one-command offline verifier
+# (scripts/bundle_verify.py) can reject any tampered source, architecture,
+# Assayer, install-record or trust-anchor byte.
+# ---------------------------------------------------------------------------
+"$MKDIR_BIN" -p "$OUT_DIR/closure"
+
+GOV_VERSION_LABEL="${VERSION:-$("$GIT_BIN" describe --tags --always "$REF" 2>/dev/null || echo "$REF")}"
+GOV_SOURCE_ARCHIVE="$OUT_DIR/closure/governator-source-${GOV_VERSION_LABEL}.tar.gz"
+GOV_SOURCE_TREE="$OUT_DIR/closure/governator-source-${GOV_VERSION_LABEL}.tree.json"
+if ! "$PYTHON_BIN" "$ROOT/scripts/source_closure.py" generate \
+  --repo "$ROOT" --ref "$REF" \
+  --out-archive "$GOV_SOURCE_ARCHIVE" --out-tree "$GOV_SOURCE_TREE" \
+  --git-bin "$GIT_BIN" --tar-bin "$TAR_BIN"; then
+  echo "audit_bundle: source-closure generation failed for governator at ${REF}" >&2
+  exit 1
+fi
+
+if [ -d "$ASSAYER_REPO" ] && [ -d "$ASSAYER_REPO/.git" ]; then
+  ASSAYER_VERSION_LABEL=$("$GIT_BIN" -C "$ASSAYER_REPO" describe --tags --exact-match HEAD 2>/dev/null || "$GIT_BIN" -C "$ASSAYER_REPO" rev-parse --short HEAD)
+  ASSAYER_SOURCE_ARCHIVE="$OUT_DIR/closure/assayer-source-${ASSAYER_VERSION_LABEL}.tar.gz"
+  ASSAYER_SOURCE_TREE="$OUT_DIR/closure/assayer-source-${ASSAYER_VERSION_LABEL}.tree.json"
+  if ! "$PYTHON_BIN" "$ROOT/scripts/source_closure.py" generate \
+    --repo "$ASSAYER_REPO" --ref HEAD \
+    --out-archive "$ASSAYER_SOURCE_ARCHIVE" --out-tree "$ASSAYER_SOURCE_TREE" \
+    --git-bin "$GIT_BIN" --tar-bin "$TAR_BIN"; then
+    echo "audit_bundle: source-closure generation failed for assayer" >&2
+    exit 1
+  fi
+else
+  echo "audit_bundle: WARNING: ASSAYER_REPO=${ASSAYER_REPO} is not a git checkout -- skipping Assayer source closure" >&2
+fi
+
+if [ -f "$OUT_DIR/architecture/$("$BASENAME_BIN" "$ARCHITECTURE_DOC" 2>/dev/null || true)" ]; then
+  "$CP_BIN" "$OUT_DIR/architecture/$("$BASENAME_BIN" "$ARCHITECTURE_DOC")" "$OUT_DIR/closure/"
+fi
+if [ -f "$OUT_DIR/evidence/install-evidence.json" ]; then
+  "$CP_BIN" "$OUT_DIR/evidence/install-evidence.json" "$OUT_DIR/closure/"
+fi
+
+# P1-4: portable Git bundle containing the release commit and its ancestry.
+GIT_BUNDLE="$OUT_DIR/closure/governator-release.bundle"
+if "$GIT_BIN" bundle create "$GIT_BUNDLE" "$REF" --not --remotes=origin 2>/dev/null || \
+   "$GIT_BIN" bundle create "$GIT_BUNDLE" "$REF" 2>/dev/null; then
+  :
+else
+  echo "audit_bundle: WARNING: git bundle creation failed -- portable claims will not be verifiable offline" >&2
+fi
 
 # ---------------------------------------------------------------------------
 # Post-build contamination scan (belt-and-suspenders): the exact categories

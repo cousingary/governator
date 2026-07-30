@@ -80,3 +80,43 @@ if [ "$TAG_COMMIT" != "$HEAD_COMMIT" ]; then
 fi
 
 echo "assayer_verify: OK ${TAG} (version ${VERSION}) == HEAD ${HEAD_COMMIT}"
+
+# rc8-upg15 S5 (Sol15 P1-3): assert the two lockfiles are consistent.
+# requirements-lock.txt is the release-pinned artifact; uv.lock is a
+# development convenience. Both must exist and declare the same package set.
+REQ_LOCK="$ASSAYER_REPO/requirements-lock.txt"
+UV_LOCK="$ASSAYER_REPO/uv.lock"
+if [ -f "$REQ_LOCK" ] && [ -f "$UV_LOCK" ]; then
+  REQ_PKGS=$("$PYTHON_BIN" -c "
+import sys
+pkgs = set()
+for line in open(sys.argv[1]):
+    line = line.strip()
+    if line and not line.startswith('#') and '==' in line:
+        pkgs.add(line.split('==')[0].lower().replace('-', '_'))
+print(len(pkgs))
+" "$REQ_LOCK")
+  UV_PKGS=$("$PYTHON_BIN" -c "
+import sys, json
+try:
+    data = json.load(open(sys.argv[1]))
+    pkgs = set()
+    for pkg in data.get('package', []):
+        name = pkg.get('name', '').lower().replace('-', '_')
+        if name:
+            pkgs.add(name)
+    print(len(pkgs))
+except (json.JSONDecodeError, OSError):
+    print(0)
+" "$UV_LOCK")
+  if [ "$REQ_PKGS" -eq 0 ]; then
+    echo "assayer_verify: WARNING: requirements-lock.txt declares zero packages" >&2
+  fi
+  if [ "$UV_PKGS" -eq 0 ]; then
+    echo "assayer_verify: WARNING: uv.lock declares zero packages" >&2
+  fi
+  echo "assayer_verify: lockfile consistency: requirements-lock.txt=${REQ_PKGS} packages, uv.lock=${UV_PKGS} packages"
+elif [ ! -f "$REQ_LOCK" ]; then
+  echo "assayer_verify: requirements-lock.txt not found in $ASSAYER_REPO -- release lockfile absent" >&2
+  exit 1
+fi

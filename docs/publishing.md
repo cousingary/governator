@@ -22,4 +22,39 @@ No production signing key has been generated for this project yet (`GOV_RELEASE_
 8. Run the legacy-gate shadow cutover described in [migration.md](migration.md).
 9. After the live cutover has run clean for one month, prepare and tag `v1.0.0`.
 
+## Two-layer signing contract (rc8-upg15 S5)
+
+The release carries two independent signed layers with an explicit ordering:
+
+1. **Layer 1 — `checksums.txt` + `checksums.txt.minisig`.** Produced during the
+   release build, before installation. Covers platform archives, build manifest,
+   test evidence, toolset, release environment, and the acceptance binary. Signed
+   by Minisign (Ed25519).
+
+2. **Layer 2 — `closure-manifest.json` + `closure-manifest.json.minisig`.**
+   Produced after installation, by `scripts/closure_manifest.py generate`. Binds
+   `checksums.txt`'s own SHA-256 plus the six closure objects that necessarily
+   come into existence after layer 1 is signed:
+   - `governator-source-<version>.tar.gz` + `.tree.json` (source closure)
+   - `governator_architecture.md`
+   - `install-evidence.json`
+   - `assayer-source-<version>.tar.gz` + `.tree.json` (Assayer closure)
+
+   The closure manifest also binds the trust anchor
+   (`source/docs/TRUSTED_SIGNING_KEYS.txt`) so an attacker cannot replace both
+   the evidence and its verification key.
+
+**Ordering contract:** layer 1 is signed first (during the release build); layer
+2 references layer 1's hash and is signed second (after installation). A
+verifier must check both layers and confirm layer 2's `checksums_sha256` matches
+the actual `checksums.txt` bytes.
+
+## One-command offline verification
+
+`scripts/bundle_verify.py --bundle-dir DIR` verifies the complete binding
+offline in a clean room: source closure, architecture, install evidence,
+checksums, closure manifest, trust anchor, and the portable Git bundle. It names
+each specific unbound object on failure. This is the entry point Sol's next
+audit pass will run.
+
 Do not publish generated databases, `.env` files, `PROGRESS.md`, local binaries, credentials, or machine-specific paths.

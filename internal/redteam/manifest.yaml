@@ -2138,6 +2138,56 @@ cases:
     session: rc8-u15-s4
     required: true
     status: implemented
+  - case: 378
+    name: TestV15Case378SingleModifiedSourceByteFailsClosureVerification
+    session: rc8-u15-s5
+    required: true
+    status: implemented
+  - case: 379
+    name: TestV15Case379ChangedSourceFileModeFailsClosureVerification
+    session: rc8-u15-s5
+    required: true
+    status: implemented
+  - case: 380
+    name: TestV15Case380AddedUntrackedSourceFileFailsClosureVerification
+    session: rc8-u15-s5
+    required: true
+    status: implemented
+  - case: 381
+    name: TestV15Case381ReplacedSymlinkTargetFailsClosureVerification
+    session: rc8-u15-s5
+    required: true
+    status: implemented
+  - case: 382
+    name: TestV15Case382ModifiedArchitectureSignerKeyFailsClosureVerification
+    session: rc8-u15-s5
+    required: true
+    status: implemented
+  - case: 383
+    name: TestV15Case383ReplacedInstallEvidenceWithItsOwnPublicKeyFailsClosureVerification
+    session: rc8-u15-s5
+    required: true
+    status: implemented
+  - case: 384
+    name: TestV15Case384SwappedAssayerSourceRetainingVersionLabelFailsClosureVerification
+    session: rc8-u15-s5
+    required: true
+    status: implemented
+  - case: 385
+    name: TestV15Case385ReorderedOrDuplicatedTreeManifestEntriesAreRejected
+    session: rc8-u15-s5
+    required: true
+    status: implemented
+  - case: 386
+    name: TestV15Case386PortableClaimsVerifyInCleanRoomWithoutOriginalCheckout
+    session: rc8-u15-s5
+    required: true
+    status: implemented
+  - case: 387
+    name: TestV15Case387PortableVerifierFailsClosedWhenGitBundleObjectsAreAbsent
+    session: rc8-u15-s5
+    required: true
+    status: implemented
 
 # Case 296 is not one of Sol13's original 51 findings (which occupy 245-295).
 # It closes a gap the rc6-upg13 S3 exclusion audit found: TestV6Case29's own
