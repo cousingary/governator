@@ -388,17 +388,20 @@ PLATFORMS=${PLATFORMS:-"linux/amd64 linux/arm64 darwin/amd64 darwin/arm64"}
 # further down defaulted true for anything that didn't literally start with
 # "darwin_", so an unsupported platform would have shipped silently marked
 # fully approving. Refuse outright instead: every requested platform's GOOS
-# must be exactly "linux" (fully approving) or "darwin" (explicitly
-# non-approving/degraded, never silently trusted) -- mirrors
+# must be exactly "linux" or "darwin" -- mirrors
 # internal/redteamgate.ApprovedPlatforms/ClassifyPlatform, the one Go-side
 # source of truth TestV12Case36 tests directly. Kept in sync by hand: this
 # script cannot import the Go package it is building.
+# Sol15 P1-2: this guard is a BUILD eligibility check only. Approval is
+# keyed on executed acceptance evidence per platform (see the artifact
+# labeling block below): only the host platform that ran the acceptance
+# check is approving; cross-compiled platforms are non-approving.
 for platform in $PLATFORMS; do
   platform_goos=${platform%/*}
   case "$platform_goos" in
     linux|darwin) ;;
     *)
-      echo "release: refusing to build unsupported platform '${platform}' -- GOOS '${platform_goos}' is not in the approved set (linux: fully approving; darwin: explicitly non-approving/degraded). See docs/security.md's Session 6 closure entry (Sol12 P1-1) and internal/redteamgate.ClassifyPlatform." >&2
+      echo "release: refusing to build unsupported platform '${platform}' -- GOOS '${platform_goos}' is not in the recognized set (linux, darwin). See docs/security.md's Session 6 closure entry (Sol12 P1-1) and internal/redteamgate.ClassifyPlatform." >&2
       exit 1
       ;;
   esac
@@ -676,15 +679,24 @@ for platform in $PLATFORMS; do
   python3 -c "
 import json, sys
 platform_id = sys.argv[1]
-# Sol12 P1-1: explicit allow-list, not a 'darwin_ means limited, everything
-# else defaults approving' fallback -- the PLATFORMS validation loop above
-# already refuses any GOOS outside {linux, darwin} before this ever runs,
-# so an unrecognized platform_id here means that guard was bypassed; fail
-# loud rather than silently mislabeling it approving.
+host_platform_id = sys.argv[6]
+# Sol15 P1-2: approval is keyed on executed acceptance evidence, not on
+# GOOS. Only the host platform (which ran the acceptance check: extract,
+# mode, hash, version, commit, claims, dirty) has evidence. Cross-compiled
+# platforms ship as build artifacts but are non-approving.
+# Sol12 P1-1: the PLATFORMS validation loop above already refuses any GOOS
+# outside {linux, darwin} before this ever runs, so an unrecognized
+# platform_id here means that guard was bypassed; fail loud.
 if platform_id.startswith('linux_'):
-    feature_limited = False
+    if platform_id == host_platform_id:
+        feature_limited = False
+        degraded_modes = []
+    else:
+        feature_limited = True
+        degraded_modes = ['cross-compiled-no-native-acceptance']
 elif platform_id.startswith('darwin_'):
     feature_limited = True
+    degraded_modes = ['non-approving']
 else:
     sys.exit('release: unrecognized platform_id %r reached artifact labeling despite the PLATFORMS guard (internal/redteamgate.ClassifyPlatform, Sol12 P1-1) -- refusing to default it to approving' % platform_id)
 print(json.dumps({
@@ -697,8 +709,8 @@ print(json.dumps({
     'size_bytes': int(sys.argv[5]),
     'feature_limited': feature_limited,
     'approving': not feature_limited,
-    'known_degraded_modes': ['non-approving'] if feature_limited else [],
-}))" "$PLATFORM_ID" "$ARCHIVE_NAME" "$ARCHIVE_SHA" "$BIN_SHA" "$SIZE" >>"$ARTIFACTS_JSON"
+    'known_degraded_modes': degraded_modes,
+}))" "$PLATFORM_ID" "$ARCHIVE_NAME" "$ARCHIVE_SHA" "$BIN_SHA" "$SIZE" "$HOST_PLATFORM_ID" >>"$ARTIFACTS_JSON"
   echo "release: built ${ARCHIVE_NAME} (${ARCHIVE_SHA})" >&2
   if [ "$PLATFORM_ID" = "$HOST_PLATFORM_ID" ]; then
     HOST_ARCHIVE_NAME=$ARCHIVE_NAME
@@ -1663,18 +1675,24 @@ fi
 ARCHITECTURE_METADATA="$OUT_DIR/architecture-build-metadata.json"
 ASSAYER_COMMIT=$(git -C "$ASSAYER_REPO" rev-parse HEAD)
 ASSAYER_VERSION=$(git -C "$ASSAYER_REPO" describe --tags --exact-match HEAD 2>/dev/null || echo "untagged-${ASSAYER_COMMIT}")
-python3 - "$ARCHITECTURE_METADATA" "$VERSION" "$COMMIT" "$ASSAYER_COMMIT" "$ASSAYER_VERSION" "$PLATFORMS" <<'PYARCH'
+python3 - "$ARCHITECTURE_METADATA" "$VERSION" "$COMMIT" "$ASSAYER_COMMIT" "$ASSAYER_VERSION" "$PLATFORMS" "$HOST_PLATFORM_ID" <<'PYARCH'
 import json, pathlib, sys
-metadata_path, version, commit, assayer_commit, assayer_version, platforms = sys.argv[1:]
+metadata_path, version, commit, assayer_commit, assayer_version, platforms, host_platform_id = sys.argv[1:]
 platform_list = [p for p in platforms.split() if p]
 degraded = []
 for platform in platform_list:
     # Sol12 P1-1: same explicit allow-list as the artifact-labeling block
     # above -- the PLATFORMS guard already refuses anything outside
     # {linux, darwin} before this runs.
+    pid = platform.replace('/', '_')
     if platform.startswith('darwin/'):
-        degraded.append({'platform': platform.replace('/', '_'), 'mode': 'non-approving'})
-    elif not platform.startswith('linux/'):
+        degraded.append({'platform': pid, 'mode': 'non-approving'})
+    elif platform.startswith('linux/'):
+        # Sol15 P1-2: a linux platform that is not the host has no native
+        # acceptance evidence and is non-approving.
+        if pid != host_platform_id:
+            degraded.append({'platform': pid, 'mode': 'cross-compiled-no-native-acceptance'})
+    else:
         sys.exit('release: unrecognized platform %r reached architecture metadata despite the PLATFORMS guard (Sol12 P1-1) -- refusing' % platform)
 pathlib.Path(metadata_path).write_text(json.dumps({
     'version': version,

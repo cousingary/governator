@@ -49,7 +49,12 @@ var degradedPlatforms = map[string]bool{
 	"darwin": true,
 }
 
-// ClassifyPlatform reports goos's PlatformStatus.
+// ClassifyPlatform reports goos's PlatformStatus. This is the GOOS-level
+// build-eligibility classification used by the gate's release-scope
+// exemption logic (SkipOutOfReleaseScope). It answers "may this GOOS
+// participate in a release at all", not "is this specific platform
+// artifact approving" -- the latter requires executed acceptance evidence
+// and is answered by ClassifyPlatformWithEvidence (Sol15 P1-2).
 func ClassifyPlatform(goos string) PlatformStatus {
 	if approvingPlatforms[goos] {
 		return PlatformApproving
@@ -58,6 +63,37 @@ func ClassifyPlatform(goos string) PlatformStatus {
 		return PlatformNonApproving
 	}
 	return PlatformUnsupported
+}
+
+// ClassifyPlatformWithEvidence reports a specific platform artifact's
+// status keyed on executed acceptance evidence, not on GOOS alone (Sol15
+// P1-2: "Linux ARM64 is declared approving without native acceptance
+// evidence"). A platform is approving only if its GOOS is in the
+// approving set AND evidencePlatforms contains its platform ID (e.g.
+// "linux_amd64"). Cross-compiled platforms without native acceptance
+// evidence are non-approving with a specific reason, never approving.
+func ClassifyPlatformWithEvidence(platformID string, evidencePlatforms map[string]bool) (PlatformStatus, string) {
+	goos := ""
+	for i := 0; i < len(platformID); i++ {
+		if platformID[i] == '_' {
+			goos = platformID[:i]
+			break
+		}
+	}
+	if goos == "" {
+		goos = platformID
+	}
+	switch ClassifyPlatform(goos) {
+	case PlatformUnsupported:
+		return PlatformUnsupported, fmt.Sprintf("platform %q is not a recognized release target at all (refusing rather than defaulting an unknown platform to approving)", platformID)
+	case PlatformNonApproving:
+		return PlatformNonApproving, fmt.Sprintf("platform %q is explicitly non-approving for this release: it builds and may ship, but carries no native production acceptance evidence (see docs/security.md's Session 6 closure entry, Sol12 P1-1)", platformID)
+	default:
+	}
+	if evidencePlatforms[platformID] {
+		return PlatformApproving, ""
+	}
+	return PlatformNonApproving, fmt.Sprintf("platform %q is cross-compiled without native acceptance evidence: approval requires executed acceptance on the target architecture (Sol15 P1-2)", platformID)
 }
 
 // ApprovedForProduction reports whether goos may claim a fully-approving

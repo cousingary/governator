@@ -82,8 +82,8 @@ func TestLoadManifestAcceptsRealManifest(t *testing.T) {
 	if err != nil {
 		t.Fatalf("LoadManifest(%s): %v", path, err)
 	}
-	if len(m.Cases) != 387 {
-		t.Fatalf("expected 387 cases in the mandatory final attack corpus, got %d", len(m.Cases))
+	if len(m.Cases) != 389 {
+		t.Fatalf("expected 389 cases in the mandatory final attack corpus, got %d", len(m.Cases))
 	}
 	seen := make(map[int]bool)
 	for _, c := range m.Cases {
