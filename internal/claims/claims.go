@@ -114,13 +114,23 @@ type VerifyOptions struct {
 }
 
 type BuildManifest struct {
-	Version               string            `json:"version"`
-	SourceCommit          string            `json:"source_commit"`
-	GoVersion             string            `json:"go_version"`
-	BuildFlags            string            `json:"build_flags"`
-	ArchivePath           string            `json:"archive_path"`
-	ArchiveSHA256         string            `json:"archive_sha256"`
-	ExtractedBinarySHA256 string            `json:"extracted_binary_sha256"`
+	Version       string `json:"version"`
+	SourceCommit  string `json:"source_commit"`
+	GoVersion     string `json:"go_version"`
+	BuildFlags    string `json:"build_flags"`
+	ArchivePath   string `json:"archive_path"`
+	ArchiveSHA256 string `json:"archive_sha256"`
+	// ExecutablePath/ExecutableSHA256 are the rc8-upg15 S3 (Sol15 P2-2)
+	// canonical names: archive_path names an archive, executable_path names
+	// the contained/extracted binary itself -- the ambiguity Sol found in
+	// the old artifact_path/artifact_sha256 pair (one path label serving
+	// both an archive and the binary it contains). ExtractedBinarySHA256 and
+	// ArtifactPath/ArtifactSHA256 remain for one release as deprecated
+	// aliases (see docs/migration.md); expectedExtractedBinarySHA256 prefers
+	// ExecutableSHA256 first.
+	ExecutablePath        string            `json:"executable_path,omitempty"`
+	ExecutableSHA256      string            `json:"executable_sha256,omitempty"`
+	ExtractedBinarySHA256 string            `json:"extracted_binary_sha256,omitempty"`
 	ArtifactPath          string            `json:"artifact_path,omitempty"`
 	ArtifactSHA256        string            `json:"artifact_sha256,omitempty"`
 	BuildInfo             map[string]string `json:"build_info"`
@@ -134,7 +144,7 @@ type BuildManifest struct {
 
 // Claim is one docs/claims.yaml entry.
 func (m BuildManifest) expectedExtractedBinarySHA256() string {
-	return firstNonEmpty(m.ExtractedBinarySHA256, m.ArtifactSHA256)
+	return firstNonEmpty(m.ExecutableSHA256, m.ExtractedBinarySHA256, m.ArtifactSHA256)
 }
 
 type Claim struct {

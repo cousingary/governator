@@ -84,10 +84,14 @@ type IntegrationResult struct {
 // so the release gate binds the tier to the exact components it claims to
 // have exercised rather than to a self-asserted "ok".
 type HarnessEvidence struct {
-	GovernorBinarySHA256   string `json:"governor_binary_sha256"`
-	GovernorBinarySource   string `json:"governor_binary_source"`
-	EnforceSupported       bool   `json:"enforce_supported"`
-	SandboxMechanism       string `json:"sandbox_mechanism"`
+	GovernorBinarySHA256 string `json:"governor_binary_sha256"`
+	GovernorBinarySource string `json:"governor_binary_source"`
+	EnforceSupported     bool   `json:"enforce_supported"`
+	SandboxMechanism     string `json:"sandbox_mechanism"`
+	// SelfExeRoute must equal requiredSelfExeRoute (rc8-upg15 S3, Sol15
+	// P0-4 B): enforce.SelfExeRouteFDOverride, duplicated here as a literal
+	// so this package need not import internal/enforce.
+	SelfExeRoute           string `json:"self_exe_route,omitempty"`
 	AssayerSource          string `json:"assayer_source"`
 	AssayerCommit          string `json:"assayer_commit"`
 	AssayerVersion         string `json:"assayer_version,omitempty"`
@@ -109,6 +113,14 @@ type IntegrationOptions struct {
 	ExpectedEvidencePackages     []string
 	ExpectedAssayerCommit        string
 }
+
+// requiredSelfExeRoute is checked unconditionally against every evidence
+// record's SelfExeRoute (rc8-upg15 S3, Sol15 P0-4 B): the mandatory
+// integration tier must always exercise the fd-backed self-exec route, never
+// SelfExeOverride's sealed-copy pathname route. Must equal
+// enforce.SelfExeRouteFDOverride -- duplicated as a literal to avoid this
+// package importing internal/enforce.
+const requiredSelfExeRoute = "fd-override"
 
 // EvaluateIntegration checks a parsed `go test -json` integration-tier log
 // against the exact set of expected test names. It enforces (Sol14 P0-2):
@@ -195,8 +207,20 @@ func EvaluateIntegrationWithOptions(log string, expected []string, opts Integrat
 				check(hev.GovernorBinarySource == "env" || hev.GovernorBinarySource == "built", fmt.Sprintf("unrecognized governator_binary_source %q", hev.GovernorBinarySource))
 				if opts.ExpectedGovernorBinarySHA256 != "" {
 					check(hev.GovernorBinarySHA256 == opts.ExpectedGovernorBinarySHA256, "evidence governator_binary_sha256 does not match the exact rc-candidate binary")
+					// rc8-upg15 S3 (Sol15 P0-4, "integration executable from
+					// unpackaged path is rejected"): a release cut always
+					// supplies ExpectedGovernorBinarySHA256 (the archive-
+					// extracted, release-bound candidate's hash). In that
+					// context governor_binary_source must be "env" -- the
+					// release passed GOV_INTEGRATION_GOV_BIN explicitly -- and
+					// never "built", which means the TestMain fell back to
+					// compiling its own throwaway candidate for a standalone
+					// developer run. A matching hash alone is not proof of
+					// packaged provenance.
+					check(hev.GovernorBinarySource == "env", fmt.Sprintf("release-bound integration evidence records governor_binary_source %q, want \"env\" (the release-extracted, packaged candidate) -- a self-built/unpackaged binary must never satisfy the mandatory release gate", hev.GovernorBinarySource))
 				}
 				check(hev.SandboxMechanism == "landlock+unshare (enforce.Supported)", fmt.Sprintf("evidence records non-proven sandbox_mechanism %q", hev.SandboxMechanism))
+				check(hev.SelfExeRoute == requiredSelfExeRoute, fmt.Sprintf("evidence records self_exe_route %q, want %q (the production fd-backed self-exec route was not exercised)", hev.SelfExeRoute, requiredSelfExeRoute))
 				// S5 requires an Assayer identity was recorded; S6 will require it
 				// equal the released Assayer checkout. The contextgraph package
 				// legitimately records assayer_source "n/a (contextgraph)" with an
@@ -256,6 +280,29 @@ func EvaluateIntegrationWithOptions(log string, expected []string, opts Integrat
 	}
 	res.Problems = append(res.Problems, res.HarnessProblems...)
 	return res
+}
+
+// VerifyArtifactUnchanged fails when currentSHA256 no longer equals
+// recordedSHA256 for the named artifact -- the release-mandatory guard
+// against any rebuild happening after the integration tier already bound an
+// artifact's identity into the release checkpoint (rc8-upg15 S3, Sol15
+// P0-4: "rerun final acceptance after integration without rebuilding").
+// label names the artifact in the error for release operators (e.g.
+// "linux_amd64 archive", "host executable"). release.sh's own no-rebuild
+// guard re-hashes each build artifact immediately before writing
+// build-manifest.json and compares against the hash recorded at build time,
+// following this exact contract.
+func VerifyArtifactUnchanged(label, recordedSHA256, currentSHA256 string) error {
+	if strings.TrimSpace(recordedSHA256) == "" {
+		return fmt.Errorf("%s: no recorded sha256 to compare against", label)
+	}
+	if strings.TrimSpace(currentSHA256) == "" {
+		return fmt.Errorf("%s: no current sha256 to compare", label)
+	}
+	if recordedSHA256 != currentSHA256 {
+		return fmt.Errorf("%s: sha256 changed from %s to %s -- a rebuild occurred after the integration tier bound this artifact's identity", label, recordedSHA256, currentSHA256)
+	}
+	return nil
 }
 
 func readHarnessEvidenceDir(dir string) ([]HarnessEvidence, []string, bool) {

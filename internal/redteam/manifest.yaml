@@ -2058,6 +2058,41 @@ cases:
     session: rc8-u15-s2b
     required: true
     status: implemented
+  - case: 362
+    name: TestV15Case362IntegrationExecutableDifferingByOneByteFailsTheGate
+    session: rc8-u15-s3
+    required: true
+    status: implemented
+  - case: 363
+    name: TestV15Case363IntegrationExecutableWithDifferentCGOSettingFailsTheGate
+    session: rc8-u15-s3
+    required: true
+    status: implemented
+  - case: 364
+    name: TestV15Case364IntegrationExecutableFromUnpackagedPathIsRejected
+    session: rc8-u15-s3
+    required: true
+    status: implemented
+  - case: 365
+    name: TestV15Case365RebuildAfterIntegrationFailsTheRelease
+    session: rc8-u15-s3
+    required: true
+    status: implemented
+  - case: 366
+    name: TestV15Case366PathnameHelperSwappedDuringTestIsDetected
+    session: rc8-u15-s3
+    required: true
+    status: implemented
+  - case: 367
+    name: TestV15Case367ProcSelfExeDescriptorRouteIsRequiredInMandatoryIntegration
+    session: rc8-u15-s3
+    required: true
+    status: implemented
+  - case: 368
+    name: TestV15Case368ArchiveBinaryAndManifestBinaryMismatchFailsTheRelease
+    session: rc8-u15-s3
+    required: true
+    status: implemented
 
 # Case 296 is not one of Sol13's original 51 findings (which occupy 245-295).
 # It closes a gap the rc6-upg13 S3 exclusion audit found: TestV6Case29's own

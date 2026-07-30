@@ -249,12 +249,19 @@ def cmd_generate(args: argparse.Namespace) -> int:
     # in "/gov" -- the entry is the bare name "gov", so neither ever matched and
     # release_binary_sha256 was always None, hard-failing canary_binary_hash_matches
     # even when every hash agreed. Never executed until rc6 Session 9.
+    #
+    # rc8-upg15 S3 (Sol15 P2-2): executable_sha256 is the new canonical key
+    # (archive_path/archive_sha256 name the archive; executable_path/
+    # executable_sha256 name the contained binary) -- checked first, with
+    # binary_sha256/extracted_binary_sha256/sha256 retained as deprecated
+    # aliases for one release (see docs/migration.md).
     release_binary_sha256 = None
     host_platform = current_platform_id()
     for artifact in manifest.get("artifacts", []):
         if artifact.get("platform") == host_platform:
             release_binary_sha256 = (
-                artifact.get("binary_sha256")
+                artifact.get("executable_sha256")
+                or artifact.get("binary_sha256")
                 or artifact.get("extracted_binary_sha256")
                 or artifact.get("sha256")
             )

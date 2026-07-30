@@ -219,6 +219,31 @@ require_clean_tree() {
   fi
 }
 
+# redteamgate_verify_artifact_unchanged LABEL RECORDED_SHA256 CURRENT_SHA256
+# Prints an error and returns non-zero when CURRENT_SHA256 no longer equals
+# RECORDED_SHA256 for the named artifact (rc8-upg15 S3, Sol15 P0-4: "rerun
+# final acceptance after integration without rebuilding"). This is the bash
+# release-time enforcement of the exact same contract
+# internal/redteamgate.VerifyArtifactUnchanged defines and
+# internal/redteam/v15_s3_exact_artifact_test.go's TestV15Case365 unit-tests
+# -- one property, one Go spec, one bash enforcement point.
+redteamgate_verify_artifact_unchanged() {
+  local label=$1 recorded=$2 current=$3
+  if [ -z "$recorded" ]; then
+    echo "${label}: no recorded sha256 to compare against"
+    return 1
+  fi
+  if [ -z "$current" ]; then
+    echo "${label}: no current sha256 to compare"
+    return 1
+  fi
+  if [ "$recorded" != "$current" ]; then
+    echo "${label}: sha256 changed from ${recorded} to ${current} -- a rebuild occurred after the integration tier bound this artifact's identity"
+    return 1
+  fi
+  return 0
+}
+
 if [ "${GOV_RELEASE_IN_SCRATCH:-0}" != 1 ]; then
   require_clean_tree "source checkout"
   SOURCE_ROOT=$ROOT
@@ -577,6 +602,232 @@ TEST_RUN_ID="go-test-${COMMIT}"
 ACCEPTANCE_RUN_ID="version-self-check-${COMMIT}"
 LDFLAGS="-s -w -X main.version=${VERSION} -X main.sourceCommit=${COMMIT} -X main.buildTimestamp=${BUILD_TS} -X main.claimsHash=${CLAIMS_HASH} -X main.adapterProtocolVersion=${ADAPTER_PROTOCOL_VERSION}"
 
+# ---------------------------------------------------------------------------
+# rc8-upg15 S3 (Sol15 P0-4, required correction): build the final release
+# archives FIRST, using final release flags, and extract+verify the host
+# platform's BEFORE any test tier runs. Before this session, the mandatory
+# Assayer/context-graph integration tier tested a SEPARATE binary
+# (dist/integration-gov, built with default CGO -- dynamically linked) while
+# the shipped release binary (CGO_ENABLED=0, statically linked) never
+# participated in mandatory evidence at all: the integration and final SHAs
+# diverged by construction (fb70a417... vs d3592a92...). Building here means
+# the exact bytes that go into the test tiers below are the exact bytes that
+# ship -- one executable identity across build, archive, extraction,
+# integration, and acceptance. No second "equivalent" Governator binary
+# participates in mandatory release evidence.
+#
+# Sol12 P1-4: re-verify toolset identity before the build phase -- a tool
+# substituted between preflight and build would produce artifacts whose
+# toolset_hash claim is a lie.
+# ---------------------------------------------------------------------------
+if ! python3 "$ROOT/scripts/release_toolset.py" --policy "$RELEASE_TOOL_POLICY" --verify "$OUT_DIR/toolset.json"; then
+  echo "release: refusing to build -- a release tool changed identity since preflight (Sol12 P1-4)" >&2
+  exit 1
+fi
+HOST_PLATFORM_ID="$("$GO_TOOL" env GOOS)_$("$GO_TOOL" env GOARCH)"
+HOST_ARCHIVE_NAME=""
+HOST_ARCHIVE_SHA=""
+HOST_BIN_SHA=""
+
+ARTIFACTS_JSON="$OUT_DIR/.artifacts.jsonl"
+: >"$ARTIFACTS_JSON"
+for platform in $PLATFORMS; do
+  require_clean_tree "before build ${platform}"
+  GOOS_VALUE=${platform%/*}
+  GOARCH_VALUE=${platform#*/}
+  PLATFORM_ID="${GOOS_VALUE}_${GOARCH_VALUE}"
+  STAGE="$OUT_DIR/stage-${PLATFORM_ID}"
+  mkdir -p "$STAGE"
+  # Found 2026-07-14 (Session 1 of the post-v4 hardening plan): OUT_DIR can
+  # sit on a filesystem that does not honor Unix permission bits at all
+  # (e.g. WSL's DrvFs mount for a Windows drive -- chmod exits 0 but every
+  # file reports 777 regardless). tar bakes in whatever mode stat() reports
+  # at archive time, so a binary built/chmod'd directly under such an
+  # OUT_DIR ships with the wrong mode no matter what chmod says -- this is
+  # exactly the "shipped at mode 0777" shape the acceptance check below
+  # (report attack 24) exists to catch, except self-inflicted by the build
+  # itself rather than a hostile archive. Build and chmod in a native-fs
+  # temp dir instead (same mktemp -d pattern the acceptance smoke test
+  # below already uses for extraction) and tar from there -- only the
+  # binary INSIDE the archive needs a real Unix mode; the .tar.gz written
+  # into OUT_DIR is opaque data and unaffected by the host mount's
+  # permission quirks. A copy also lands at $STAGE/gov (whatever OUT_DIR's
+  # mount reports for it) purely for the other places in this script that
+  # read it by content -- hash comparisons, or a local convenience binary
+  # -- never as a tar source.
+  NATIVE_STAGE=$(mktemp -d)
+  BIN="$NATIVE_STAGE/gov"
+  GOOS=$GOOS_VALUE GOARCH=$GOARCH_VALUE CGO_ENABLED=0 "$GO_TOOL" build -trimpath -ldflags "$LDFLAGS" -o "$BIN" ./cmd/gov
+  chmod 0755 "$BIN"
+  cp "$BIN" "$STAGE/gov"
+  ARCHIVE_NAME="gov_${VERSION}_${PLATFORM_ID}.tar.gz"
+  ARCHIVE="$OUT_DIR/${ARCHIVE_NAME}"
+  # Explicit owner/perm normalization: tar preserves the source file's mode
+  # (0755, just chmod'd above) by default, but --owner/--group/--numeric-owner
+  # keep the archive reproducible across build machines instead of baking in
+  # whichever uid/gid happened to run this script (audit: "several outer ZIP
+  # ELF files stored without executable permission" — normalize instead of
+  # trusting the ambient umask).
+  tar --numeric-owner --owner=0 --group=0 -czf "$ARCHIVE" -C "$NATIVE_STAGE" gov
+  rm -rf "$NATIVE_STAGE"
+  ARCHIVE_SHA=$(sha256sum "$ARCHIVE" | awk '{print $1}')
+  BIN_SHA=$(sha256sum "$STAGE/gov" | awk '{print $1}')
+  SIZE=$(stat -c%s "$ARCHIVE" 2>/dev/null || stat -f%z "$ARCHIVE")
+  python3 -c "
+import json, sys
+platform_id = sys.argv[1]
+# Sol12 P1-1: explicit allow-list, not a 'darwin_ means limited, everything
+# else defaults approving' fallback -- the PLATFORMS validation loop above
+# already refuses any GOOS outside {linux, darwin} before this ever runs,
+# so an unrecognized platform_id here means that guard was bypassed; fail
+# loud rather than silently mislabeling it approving.
+if platform_id.startswith('linux_'):
+    feature_limited = False
+elif platform_id.startswith('darwin_'):
+    feature_limited = True
+else:
+    sys.exit('release: unrecognized platform_id %r reached artifact labeling despite the PLATFORMS guard (internal/redteamgate.ClassifyPlatform, Sol12 P1-1) -- refusing to default it to approving' % platform_id)
+print(json.dumps({
+    'platform': platform_id,
+    'archive_path': sys.argv[2],
+    'archive_sha256': sys.argv[3],
+    'extracted_binary_sha256': sys.argv[4],
+    'archive': sys.argv[2],
+    'binary_sha256': sys.argv[4],
+    'size_bytes': int(sys.argv[5]),
+    'feature_limited': feature_limited,
+    'approving': not feature_limited,
+    'known_degraded_modes': ['non-approving'] if feature_limited else [],
+}))" "$PLATFORM_ID" "$ARCHIVE_NAME" "$ARCHIVE_SHA" "$BIN_SHA" "$SIZE" >>"$ARTIFACTS_JSON"
+  echo "release: built ${ARCHIVE_NAME} (${ARCHIVE_SHA})" >&2
+  if [ "$PLATFORM_ID" = "$HOST_PLATFORM_ID" ]; then
+    HOST_ARCHIVE_NAME=$ARCHIVE_NAME
+    HOST_ARCHIVE_SHA=$ARCHIVE_SHA
+    HOST_BIN_SHA=$BIN_SHA
+  fi
+done
+
+# Host-platform binary stays unpacked in the staging root too, so any local
+# `./dist/gov version` doesn't need to extract an archive just to sanity-
+# check the build that matches this machine.
+if [ -f "$OUT_DIR/stage-${HOST_PLATFORM_ID}/gov" ]; then
+  cp "$OUT_DIR/stage-${HOST_PLATFORM_ID}/gov" "$OUT_DIR/gov"
+fi
+
+HOST_ARCHIVE="$OUT_DIR/gov_${VERSION}_${HOST_PLATFORM_ID}.tar.gz"
+
+# run_acceptance_check EXTRACT_DIR OUT_JSON RUN_ID
+# Extracts $HOST_ARCHIVE into a clean EXTRACT_DIR and verifies mode, hash
+# (against $HOST_BIN_SHA, recorded above), and self-reported
+# version/commit/claims/dirty. Sets ACCEPTANCE_RESULT and writes OUT_JSON.
+# rc8-upg15 S3 (Sol15 P0-4 required correction #3/#4): this deliberately
+# stops at binary self-consistency -- it does NOT call `gov claims verify`
+# itself (P0-7 / report attack 25: that used to happen here, without
+# --artifact/--manifest, which is exactly how a claims-verify gap stayed
+# invisible). Full claims verification against the finalized manifest is its
+# own, later, independently release-blocking stage.
+run_acceptance_check() {
+  local extract_dir=$1 out_json=$2 run_id=$3
+  rm -rf "$extract_dir"
+  mkdir -p "$extract_dir"
+  local notes_file
+  notes_file=$(mktemp)
+  : >"$notes_file"
+  local accept_ok=true executable_bit_ok=true hash_match_ok=true version_match_ok=true archive_extracted=false
+  if [ -f "$HOST_ARCHIVE" ]; then
+    archive_extracted=true
+    # -p: without it, a restrictive umask on the extracting machine silently
+    # masks a hostile archived mode bit, making the mode assertion below
+    # meaningless.
+    tar -xzf "$HOST_ARCHIVE" -C "$extract_dir" -p
+    local extracted_bin="$extract_dir/gov"
+    # Report attack 24: the archived binary shipped at mode 0777. Assert the
+    # EXACT mode after extraction (not "is it executable at all" — 0777 is
+    # also executable) and fail on any group/world write bit.
+    local extracted_mode
+    extracted_mode=$(stat -c '%a' "$extracted_bin" 2>/dev/null || stat -f '%OLp' "$extracted_bin")
+    if [ "$extracted_mode" != "755" ]; then
+      accept_ok=false
+      executable_bit_ok=false
+      echo "extracted binary mode is ${extracted_mode}, must be exactly 755 (no group/world write bit)" >>"$notes_file"
+    fi
+    local extracted_sha
+    extracted_sha=$(sha256sum "$extracted_bin" | awk '{print $1}')
+    if [ "$extracted_sha" != "$HOST_BIN_SHA" ]; then
+      accept_ok=false
+      hash_match_ok=false
+      echo "extracted binary hash (${extracted_sha}) does not match the built binary (${HOST_BIN_SHA})" >>"$notes_file"
+    fi
+    local version_out reported_version reported_commit reported_claims reported_dirty
+    if version_out=$("$extracted_bin" version --json 2>&1); then
+      reported_version=$(python3 -c "import json,sys; print(json.loads(sys.argv[1]).get('version',''))" "$version_out" 2>/dev/null || echo "")
+      reported_commit=$(python3 -c "import json,sys; print(json.loads(sys.argv[1]).get('source_commit',''))" "$version_out" 2>/dev/null || echo "")
+      reported_claims=$(python3 -c "import json,sys; print(json.loads(sys.argv[1]).get('claims_hash',''))" "$version_out" 2>/dev/null || echo "")
+      reported_dirty=$(python3 -c "import json,sys; v=json.loads(sys.argv[1]); print(v.get('dirty', '__missing__'))" "$version_out" 2>/dev/null || echo "__missing__")
+      if [ "$reported_version" != "$VERSION" ] || [ "$reported_commit" != "$COMMIT" ] || [ "$reported_claims" != "$CLAIMS_HASH" ]; then
+        accept_ok=false
+        version_match_ok=false
+        echo "gov version --json (${reported_version}/${reported_commit}/${reported_claims}) does not match build-manifest.json (${VERSION}/${COMMIT}/${CLAIMS_HASH})" >>"$notes_file"
+      fi
+      if [ "$reported_dirty" != "False" ] && [ "$reported_dirty" != "false" ]; then
+        accept_ok=false
+        version_match_ok=false
+        echo "gov version --json reports dirty=${reported_dirty}; release artifacts must report dirty=false" >>"$notes_file"
+      fi
+    else
+      accept_ok=false
+      version_match_ok=false
+      echo "gov version --json failed: ${version_out}" >>"$notes_file"
+    fi
+  else
+    accept_ok=false
+    executable_bit_ok=false
+    hash_match_ok=false
+    version_match_ok=false
+    echo "no archive built for this host's platform (${HOST_PLATFORM_ID}); nothing to extract and smoke-test" >>"$notes_file"
+  fi
+  if [ "$accept_ok" = true ]; then ACCEPTANCE_RESULT=PASS; else ACCEPTANCE_RESULT=FAIL; fi
+  python3 - "$out_json" "$run_id" "$ACCEPTANCE_RESULT" "$HOST_PLATFORM_ID" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$archive_extracted" "$executable_bit_ok" "$hash_match_ok" "$version_match_ok" "$notes_file" <<'PYACCEPT'
+import json, pathlib, sys
+
+(path, run_id, result, platform, generated_at,
+ archive_extracted, executable_bit_ok, hash_match_ok, version_match_ok, notes_file) = sys.argv[1:]
+
+notes = [line for line in pathlib.Path(notes_file).read_text().splitlines() if line.strip()]
+
+def as_bool(s):
+    return s == "true"
+
+data = {
+    "generated_at": generated_at,
+    "acceptance_run_id": run_id,
+    "extracted_platform": platform,
+    "checks": {
+        "archive_extracted": as_bool(archive_extracted),
+        "executable_bit_preserved": as_bool(executable_bit_ok),
+        "binary_hash_matches_build": as_bool(hash_match_ok),
+        "version_json_matches_manifest": as_bool(version_match_ok),
+    },
+    "notes": notes,
+    "overall_result": result,
+}
+pathlib.Path(path).write_text(json.dumps(data, indent=2, sort_keys=True) + "\n")
+PYACCEPT
+  rm -f "$notes_file"
+}
+
+# First acceptance pass: extract into a DURABLE directory (not a throwaway
+# mktemp -- GOV_INTEGRATION_GOV_BIN below must remain a stable path for the
+# entire test-tier run) and require it PASS before any test tier is allowed
+# to start. This IS the exact executable the mandatory integration tier
+# tests (required correction #5).
+PRE_INTEGRATION_ACCEPTANCE="$OUT_DIR/.acceptance-pre-integration.json"
+run_acceptance_check "$OUT_DIR/acceptance" "$PRE_INTEGRATION_ACCEPTANCE" "${ACCEPTANCE_RUN_ID}-pre-integration"
+if [ "$ACCEPTANCE_RESULT" != PASS ]; then
+  echo "release: acceptance smoke test FAILED before the test tiers ever ran — see ${PRE_INTEGRATION_ACCEPTANCE}" >&2
+  exit 1
+fi
+
 echo "release: version=${VERSION} commit=${COMMIT} go=${GO_VERSION} release_attempt_id=${RELEASE_ATTEMPT_ID}" >&2
 
 # ---------------------------------------------------------------------------
@@ -600,7 +851,18 @@ UNIT_LOG="$OUT_DIR/test-unit.log"
 RACE_LOG="$OUT_DIR/test-race.log"
 INTEGRATION_LOG="$OUT_DIR/test-integration.log"
 INTEGRATION_JSON_LOG="$OUT_DIR/.integration.jsonl"
-INTEGRATION_GOV_BIN="$OUT_DIR/integration-gov"
+# rc8-upg15 S3 (Sol15 P0-4, required corrections #5/#6/#8/#9): this is the
+# EXACT executable the acceptance check above already extracted from the
+# host archive and verified (mode/hash/version/commit) -- never a separately
+# built "integration-gov". Each integration TestMain receives this path
+# through GOV_INTEGRATION_GOV_BIN, points enforce.SelfExeFDOverride at it
+# (the fd-backed route, not the pathname-copy SelfExeOverride route), and
+# records its SHA-256; `gov integration-gate verify` below requires that
+# recorded identity to equal $HOST_BIN_SHA. One executable identity now
+# holds across build, archive, extraction, integration, and acceptance; no
+# second "equivalent" Governator binary participates in mandatory release
+# evidence.
+INTEGRATION_GOV_BIN="$OUT_DIR/acceptance/gov"
 INTEGRATION_EVIDENCE_DIR="$OUT_DIR/integration-evidence"
 INTEGRATION_EXPECTED_NAMES="$OUT_DIR/integration-expected-names.txt"
 INTEGRATION_EXPECTED_PACKAGES="$OUT_DIR/integration-expected-packages.txt"
@@ -610,14 +872,21 @@ REDTEAM_LOG="$OUT_DIR/test-redteam.log"
 REDTEAM_RACE_LOG="$OUT_DIR/test-redteam-race.log"
 
 MAIN_TIER_SPEC=$(mktemp)
-# Sol14 P0-2 (rc7 Session 5): build ONE exact candidate binary before the
-# integration tier. Each integration TestMain receives this path through
-# GOV_INTEGRATION_GOV_BIN, re-execs it as `gov __sandbox_exec`, and records
-# its SHA-256. `gov integration-gate verify` below compares the recorded
-# identities to this object, so a package-level green line cannot stand in
-# for a real governed execution.
 if [ ! -f "$INTEGRATION_GOV_BIN" ]; then
-  "$GO_TOOL" build -trimpath -ldflags "$LDFLAGS" -o "$INTEGRATION_GOV_BIN" ./cmd/gov
+  echo "release: ${INTEGRATION_GOV_BIN} is missing -- the pre-integration acceptance extraction (which must run before the test tiers) did not produce it" >&2
+  exit 1
+fi
+# Sol15 P0-4 required correction #6: the integration tier's candidate SHA
+# must equal the host artifact's recorded executable identity, asserted
+# explicitly here rather than merely relying on "it happens to be the same
+# path" -- this is release.sh's half of the SHA-equality gate;
+# internal/redteamgate's ExpectedGovernorBinarySHA256 check (fed this exact
+# hash via --governator-binary below) is the other half, re-verified against
+# the harness evidence after the tier runs.
+INTEGRATION_GOV_BIN_SHA=$(sha256sum "$INTEGRATION_GOV_BIN" | awk '{print $1}')
+if [ "$INTEGRATION_GOV_BIN_SHA" != "$HOST_BIN_SHA" ]; then
+  echo "release: refusing to run the integration tier -- ${INTEGRATION_GOV_BIN} sha256 (${INTEGRATION_GOV_BIN_SHA}) does not equal the host artifact's recorded executable_sha256 (${HOST_BIN_SHA})" >&2
+  exit 1
 fi
 mkdir -p "$INTEGRATION_EVIDENCE_DIR"
 cat >"$INTEGRATION_EXPECTED_NAMES" <<'EOF_INTEGRATION_NAMES'
@@ -1115,104 +1384,31 @@ if [ "$ASSAYER_VERSION_TAG_RESULT" != PASS ]; then
 fi
 
 # ---------------------------------------------------------------------------
-# Build every platform into the same empty staging directory.
-# Sol12 P1-4: re-verify toolset identity before the build phase -- a tool
-# substituted between test tiers and the build would produce artifacts whose
-# toolset_hash claim is a lie.
+# rc8-upg15 S3 (Sol15 P0-4, required correction #10: "rerun final acceptance
+# after integration without rebuilding"). Every platform archive and the host
+# executable were built and extracted BEFORE the test tiers ran (see the
+# build+acceptance block above, right after LDFLAGS) precisely so the
+# mandatory integration tier could test the exact final bytes. This is the
+# other half of that guarantee: re-hash every recorded artifact now, after
+# every tier and gate above has passed, and refuse to package if a single
+# byte differs from what was recorded at build time -- there is no rebuild
+# step below this point, and this proves it, rather than merely asserting it
+# by the absence of a second `go build` call.
 # ---------------------------------------------------------------------------
-if ! python3 "$ROOT/scripts/release_toolset.py" --policy "$RELEASE_TOOL_POLICY" --verify "$OUT_DIR/toolset.json"; then
-  echo "release: refusing to build -- a release tool changed identity since preflight (Sol12 P1-4)" >&2
-  exit 1
-fi
-HOST_PLATFORM_ID="$("$GO_TOOL" env GOOS)_$("$GO_TOOL" env GOARCH)"
-HOST_ARCHIVE_NAME=""
-HOST_ARCHIVE_SHA=""
-HOST_BIN_SHA=""
-
-ARTIFACTS_JSON="$OUT_DIR/.artifacts.jsonl"
-: >"$ARTIFACTS_JSON"
-for platform in $PLATFORMS; do
-  require_clean_tree "before build ${platform}"
-  GOOS_VALUE=${platform%/*}
-  GOARCH_VALUE=${platform#*/}
-  PLATFORM_ID="${GOOS_VALUE}_${GOARCH_VALUE}"
-  STAGE="$OUT_DIR/stage-${PLATFORM_ID}"
-  mkdir -p "$STAGE"
-  # Found 2026-07-14 (Session 1 of the post-v4 hardening plan): OUT_DIR can
-  # sit on a filesystem that does not honor Unix permission bits at all
-  # (e.g. WSL's DrvFs mount for a Windows drive -- chmod exits 0 but every
-  # file reports 777 regardless). tar bakes in whatever mode stat() reports
-  # at archive time, so a binary built/chmod'd directly under such an
-  # OUT_DIR ships with the wrong mode no matter what chmod says -- this is
-  # exactly the "shipped at mode 0777" shape the acceptance check below
-  # (report attack 24) exists to catch, except self-inflicted by the build
-  # itself rather than a hostile archive. Build and chmod in a native-fs
-  # temp dir instead (same mktemp -d pattern the acceptance smoke test
-  # below already uses for extraction) and tar from there -- only the
-  # binary INSIDE the archive needs a real Unix mode; the .tar.gz written
-  # into OUT_DIR is opaque data and unaffected by the host mount's
-  # permission quirks. A copy also lands at $STAGE/gov (whatever OUT_DIR's
-  # mount reports for it) purely for the other places in this script that
-  # read it by content -- hash comparisons, or a local convenience binary
-  # -- never as a tar source.
-  NATIVE_STAGE=$(mktemp -d)
-  BIN="$NATIVE_STAGE/gov"
-  GOOS=$GOOS_VALUE GOARCH=$GOARCH_VALUE CGO_ENABLED=0 "$GO_TOOL" build -trimpath -ldflags "$LDFLAGS" -o "$BIN" ./cmd/gov
-  chmod 0755 "$BIN"
-  cp "$BIN" "$STAGE/gov"
-  ARCHIVE_NAME="gov_${VERSION}_${PLATFORM_ID}.tar.gz"
-  ARCHIVE="$OUT_DIR/${ARCHIVE_NAME}"
-  # Explicit owner/perm normalization: tar preserves the source file's mode
-  # (0755, just chmod'd above) by default, but --owner/--group/--numeric-owner
-  # keep the archive reproducible across build machines instead of baking in
-  # whichever uid/gid happened to run this script (audit: "several outer ZIP
-  # ELF files stored without executable permission" — normalize instead of
-  # trusting the ambient umask).
-  tar --numeric-owner --owner=0 --group=0 -czf "$ARCHIVE" -C "$NATIVE_STAGE" gov
-  rm -rf "$NATIVE_STAGE"
-  ARCHIVE_SHA=$(sha256sum "$ARCHIVE" | awk '{print $1}')
-  BIN_SHA=$(sha256sum "$STAGE/gov" | awk '{print $1}')
-  SIZE=$(stat -c%s "$ARCHIVE" 2>/dev/null || stat -f%z "$ARCHIVE")
-  python3 -c "
-import json, sys
-platform_id = sys.argv[1]
-# Sol12 P1-1: explicit allow-list, not a 'darwin_ means limited, everything
-# else defaults approving' fallback -- the PLATFORMS validation loop above
-# already refuses any GOOS outside {linux, darwin} before this ever runs,
-# so an unrecognized platform_id here means that guard was bypassed; fail
-# loud rather than silently mislabeling it approving.
-if platform_id.startswith('linux_'):
-    feature_limited = False
-elif platform_id.startswith('darwin_'):
-    feature_limited = True
-else:
-    sys.exit('release: unrecognized platform_id %r reached artifact labeling despite the PLATFORMS guard (internal/redteamgate.ClassifyPlatform, Sol12 P1-1) -- refusing to default it to approving' % platform_id)
-print(json.dumps({
-    'platform': platform_id,
-    'archive_path': sys.argv[2],
-    'archive_sha256': sys.argv[3],
-    'extracted_binary_sha256': sys.argv[4],
-    'archive': sys.argv[2],
-    'binary_sha256': sys.argv[4],
-    'size_bytes': int(sys.argv[5]),
-    'feature_limited': feature_limited,
-    'approving': not feature_limited,
-    'known_degraded_modes': ['non-approving'] if feature_limited else [],
-}))" "$PLATFORM_ID" "$ARCHIVE_NAME" "$ARCHIVE_SHA" "$BIN_SHA" "$SIZE" >>"$ARTIFACTS_JSON"
-  echo "release: built ${ARCHIVE_NAME} (${ARCHIVE_SHA})" >&2
-  if [ "$PLATFORM_ID" = "$HOST_PLATFORM_ID" ]; then
-    HOST_ARCHIVE_NAME=$ARCHIVE_NAME
-    HOST_ARCHIVE_SHA=$ARCHIVE_SHA
-    HOST_BIN_SHA=$BIN_SHA
+while IFS= read -r artifact_line; do
+  [ -z "$artifact_line" ] && continue
+  RECORDED_ARCHIVE=$(python3 -c "import json,sys; print(json.loads(sys.argv[1])['archive_path'])" "$artifact_line")
+  RECORDED_ARCHIVE_SHA=$(python3 -c "import json,sys; print(json.loads(sys.argv[1])['archive_sha256'])" "$artifact_line")
+  CURRENT_ARCHIVE_SHA=$(sha256sum "$OUT_DIR/${RECORDED_ARCHIVE}" | awk '{print $1}')
+  if ! ARTIFACT_UNCHANGED_ERR=$(redteamgate_verify_artifact_unchanged "archive ${RECORDED_ARCHIVE}" "$RECORDED_ARCHIVE_SHA" "$CURRENT_ARCHIVE_SHA"); then
+    echo "release: refusing to package — $ARTIFACT_UNCHANGED_ERR" >&2
+    exit 1
   fi
-done
-
-# Host-platform binary stays unpacked in the staging root too, so the
-# acceptance smoke test below (and any local `./dist/gov version`) doesn't
-# need to extract an archive just to sanity-check the build that matches
-# this machine.
-if [ -f "$OUT_DIR/stage-${HOST_PLATFORM_ID}/gov" ]; then
-  cp "$OUT_DIR/stage-${HOST_PLATFORM_ID}/gov" "$OUT_DIR/gov"
+done <"$ARTIFACTS_JSON"
+CURRENT_HOST_BIN_SHA=$(sha256sum "$INTEGRATION_GOV_BIN" | awk '{print $1}')
+if ! ARTIFACT_UNCHANGED_ERR=$(redteamgate_verify_artifact_unchanged "host executable (${INTEGRATION_GOV_BIN})" "$HOST_BIN_SHA" "$CURRENT_HOST_BIN_SHA"); then
+  echo "release: refusing to package — $ARTIFACT_UNCHANGED_ERR" >&2
+  exit 1
 fi
 
 # ---------------------------------------------------------------------------
@@ -1429,107 +1625,26 @@ done
 rm -f "$FUZZ_RESULTS_JSON" "$UNIT_LOG" "$RACE_LOG" "$INTEGRATION_LOG" "$INTEGRATION_JSON_LOG" "$CORPUS_LOG" "$REDTEAM_LOG" "$REDTEAM_RACE_LOG" "$ASSAYER_LOG" "$ASSAYER_VERSION_TAG_LOG" "$ASSAYER_MATRIX_JSON" "$OUT_DIR"/test-assayer-py*.log "$OUT_DIR"/test-fuzz-*.log
 
 # ---------------------------------------------------------------------------
-# Acceptance smoke test: extract the exact distributable archive for THIS
-# host's platform on a clean path (never trust the staging tree we just
-# built from), then exercise it exactly like an operator installing it would.
-# This step deliberately stops at binary self-consistency (mode, hash,
-# self-reported version/commit/claims-hash) — it does NOT call
-# `gov claims verify` itself (P0-7 / report attack 25: that used to happen
-# here, without --artifact/--manifest, which is exactly how a claims-verify
-# gap stayed invisible). Full claims verification against the finalized
-# manifest is its own, later, independently release-blocking stage below.
+# Final acceptance pass: rerun the EXACT SAME check the pre-integration pass
+# ran (extract the exact distributable archive for THIS host's platform on a
+# clean path, then exercise it exactly like an operator installing it
+# would), now that every test tier and gate above has passed. This is Sol15
+# P0-4 required correction #10 ("rerun final acceptance after integration
+# without rebuilding") -- run_acceptance_check and its no-rebuild sibling
+# (redteamgate_verify_artifact_unchanged, checked above, right after the
+# test-tier gates) are what jointly prove no rebuild happened: the archive
+# on disk did not change, so re-extracting and re-checking it here reaches
+# the identical verdict as the pre-integration pass. This step deliberately
+# stops at binary self-consistency (mode, hash, self-reported
+# version/commit/claims-hash) — it does NOT call `gov claims verify` itself
+# (P0-7 / report attack 25: that used to happen here, without
+# --artifact/--manifest, which is exactly how a claims-verify gap stayed
+# invisible). Full claims verification against the finalized manifest is its
+# own, later, independently release-blocking stage below.
 # ---------------------------------------------------------------------------
 ACCEPTANCE="$OUT_DIR/acceptance-summary.json"
-SMOKE_DIR=$(mktemp -d)
-trap 'rm -rf "$SMOKE_DIR"' EXIT
-HOST_ARCHIVE="$OUT_DIR/gov_${VERSION}_${HOST_PLATFORM_ID}.tar.gz"
-NOTES_FILE="$OUT_DIR/.acceptance-notes.txt"
-: >"$NOTES_FILE"
-ACCEPT_OK=true
-EXECUTABLE_BIT_OK=true
-HASH_MATCH_OK=true
-VERSION_MATCH_OK=true
-ARCHIVE_EXTRACTED=false
-if [ -f "$HOST_ARCHIVE" ]; then
-  ARCHIVE_EXTRACTED=true
-  # -p: see scripts/release_verify.sh's identical comment -- without it, a
-  # restrictive umask on the extracting machine silently masks a hostile
-  # archived mode bit, making the mode assertion below meaningless.
-  tar -xzf "$HOST_ARCHIVE" -C "$SMOKE_DIR" -p
-  EXTRACTED_BIN="$SMOKE_DIR/gov"
-  # Report attack 24: the archived binary shipped at mode 0777. Assert the
-  # EXACT mode after extraction (not "is it executable at all" — 0777 is
-  # also executable) and fail on any group/world write bit.
-  EXTRACTED_MODE=$(stat -c '%a' "$EXTRACTED_BIN" 2>/dev/null || stat -f '%OLp' "$EXTRACTED_BIN")
-  if [ "$EXTRACTED_MODE" != "755" ]; then
-    ACCEPT_OK=false
-    EXECUTABLE_BIT_OK=false
-    echo "extracted binary mode is ${EXTRACTED_MODE}, must be exactly 755 (no group/world write bit)" >>"$NOTES_FILE"
-  fi
-  EXTRACTED_SHA=$(sha256sum "$EXTRACTED_BIN" | awk '{print $1}')
-  STAGE_SHA=$(sha256sum "$OUT_DIR/stage-${HOST_PLATFORM_ID}/gov" | awk '{print $1}')
-  if [ "$EXTRACTED_SHA" != "$STAGE_SHA" ]; then
-    ACCEPT_OK=false
-    HASH_MATCH_OK=false
-    echo "extracted binary hash ($EXTRACTED_SHA) does not match the built binary ($STAGE_SHA)" >>"$NOTES_FILE"
-  fi
-  if VERSION_OUT=$("$EXTRACTED_BIN" version --json 2>&1); then
-    REPORTED_VERSION=$(python3 -c "import json,sys; print(json.loads(sys.argv[1]).get('version',''))" "$VERSION_OUT" 2>/dev/null || echo "")
-    REPORTED_COMMIT=$(python3 -c "import json,sys; print(json.loads(sys.argv[1]).get('source_commit',''))" "$VERSION_OUT" 2>/dev/null || echo "")
-    REPORTED_CLAIMS=$(python3 -c "import json,sys; print(json.loads(sys.argv[1]).get('claims_hash',''))" "$VERSION_OUT" 2>/dev/null || echo "")
-    REPORTED_DIRTY=$(python3 -c "import json,sys; v=json.loads(sys.argv[1]); print(v.get('dirty', '__missing__'))" "$VERSION_OUT" 2>/dev/null || echo "__missing__")
-    if [ "$REPORTED_VERSION" != "$VERSION" ] || [ "$REPORTED_COMMIT" != "$COMMIT" ] || [ "$REPORTED_CLAIMS" != "$CLAIMS_HASH" ]; then
-      ACCEPT_OK=false
-      VERSION_MATCH_OK=false
-      echo "gov version --json ($REPORTED_VERSION/$REPORTED_COMMIT/$REPORTED_CLAIMS) does not match build-manifest.json ($VERSION/$COMMIT/$CLAIMS_HASH)" >>"$NOTES_FILE"
-    fi
-    if [ "$REPORTED_DIRTY" != "False" ] && [ "$REPORTED_DIRTY" != "false" ]; then
-      ACCEPT_OK=false
-      VERSION_MATCH_OK=false
-      echo "gov version --json reports dirty=$REPORTED_DIRTY; release artifacts must report dirty=false" >>"$NOTES_FILE"
-    fi
-  else
-    ACCEPT_OK=false
-    VERSION_MATCH_OK=false
-    echo "gov version --json failed: $VERSION_OUT" >>"$NOTES_FILE"
-  fi
-else
-  ACCEPT_OK=false
-  EXECUTABLE_BIT_OK=false
-  HASH_MATCH_OK=false
-  VERSION_MATCH_OK=false
-  echo "no archive built for this host's platform (${HOST_PLATFORM_ID}); nothing to extract and smoke-test" >>"$NOTES_FILE"
-fi
-
-if [ "$ACCEPT_OK" = true ]; then ACCEPTANCE_RESULT=PASS; else ACCEPTANCE_RESULT=FAIL; fi
-
-python3 - "$ACCEPTANCE" "$ACCEPTANCE_RUN_ID" "$ACCEPTANCE_RESULT" "$HOST_PLATFORM_ID" "$BUILD_TS" "$ARCHIVE_EXTRACTED" "$EXECUTABLE_BIT_OK" "$HASH_MATCH_OK" "$VERSION_MATCH_OK" "$NOTES_FILE" <<'PYACCEPT'
-import json, pathlib, sys
-
-(path, run_id, result, platform, generated_at,
- archive_extracted, executable_bit_ok, hash_match_ok, version_match_ok, notes_file) = sys.argv[1:]
-
-notes = [line for line in pathlib.Path(notes_file).read_text().splitlines() if line.strip()]
-
-def as_bool(s):
-    return s == "true"
-
-data = {
-    "generated_at": generated_at,
-    "acceptance_run_id": run_id,
-    "extracted_platform": platform,
-    "checks": {
-        "archive_extracted": as_bool(archive_extracted),
-        "executable_bit_preserved": as_bool(executable_bit_ok),
-        "binary_hash_matches_build": as_bool(hash_match_ok),
-        "version_json_matches_manifest": as_bool(version_match_ok),
-    },
-    "notes": notes,
-    "overall_result": result,
-}
-pathlib.Path(path).write_text(json.dumps(data, indent=2, sort_keys=True) + "\n")
-PYACCEPT
-rm -f "$NOTES_FILE"
+run_acceptance_check "$OUT_DIR/.acceptance-final" "$ACCEPTANCE" "$ACCEPTANCE_RUN_ID"
+rm -rf "$OUT_DIR/.acceptance-final"
 
 if [ "$ACCEPTANCE_RESULT" != PASS ]; then
   echo "release: acceptance smoke test FAILED — see ${ACCEPTANCE}" >&2
@@ -1573,13 +1688,13 @@ PYARCH
 
 MANIFEST="$OUT_DIR/build-manifest.json"
 python3 - "$MANIFEST" "$VERSION" "$COMMIT" "$BUILD_TS" "$GO_VERSION" "$LDFLAGS" "$CLAIMS_HASH" "$ADAPTER_PROTOCOL_VERSION" "$ARTIFACTS_JSON" \
-  "$HOST_ARCHIVE_NAME" "$HOST_ARCHIVE_SHA" "$HOST_BIN_SHA" "$TEST_RUN_ID" "$TEST_SUMMARY" "$ACCEPTANCE_RUN_ID" "$ACCEPTANCE_RESULT" "$(basename "$ARCHITECTURE_METADATA")" "$RELEASE_ATTEMPT_ID" \
+  "$HOST_ARCHIVE_NAME" "$HOST_ARCHIVE_SHA" "$HOST_BIN_SHA" "$(basename "$INTEGRATION_GOV_BIN")" "$TEST_RUN_ID" "$TEST_SUMMARY" "$ACCEPTANCE_RUN_ID" "$ACCEPTANCE_RESULT" "$(basename "$ARCHITECTURE_METADATA")" "$RELEASE_ATTEMPT_ID" \
   "$TOOLSET_HASH" "$ASSAYER_LOCKED_REF" "$ASSAYER_VERSION" <<'PYMANIFEST'
 import json, pathlib, sys
 
 (manifest, version, commit, build_ts, go_version, build_flags, claims_hash,
  adapter_protocol_version, artifacts_path,
- host_archive_name, host_archive_sha, host_bin_sha, test_run_id, test_summary_path, acceptance_run_id, acceptance_result, architecture_metadata_path,
+ host_archive_name, host_archive_sha, host_bin_sha, executable_path, test_run_id, test_summary_path, acceptance_run_id, acceptance_result, architecture_metadata_path,
  release_attempt_id,
  toolset_hash, assayer_locked_ref, assayer_version) = sys.argv[1:]
 
@@ -1598,11 +1713,20 @@ data = {
     "adapter_protocol_version": adapter_protocol_version,
     "artifacts": artifacts,
     # Host-platform artifact identity: the specific archive/binary the
-    # acceptance smoke test and the full claims-verification stage below
-    # both extract and inspect. internal/claims.verifyArtifactManifest reads
-    # archive_path/extracted_binary_sha256 directly off this manifest.
+    # acceptance smoke test, the mandatory integration tier, and the full
+    # claims-verification stage below all extract, test, and inspect.
+    # rc8-upg15 S3 (Sol15 P2-2): archive_path/archive_sha256 name the
+    # ARCHIVE; executable_path/executable_sha256 name the CONTAINED BINARY
+    # itself -- the ambiguity Sol found in the old artifact_path/
+    # artifact_sha256 pair (one path label serving both). Kept for one
+    # release as deprecated aliases (see docs/migration.md);
+    # internal/claims.verifyArtifactManifest's expectedExtractedBinarySHA256
+    # prefers executable_sha256 first, then extracted_binary_sha256, then
+    # artifact_sha256.
     "archive_path": host_archive_name,
     "archive_sha256": host_archive_sha,
+    "executable_path": executable_path,
+    "executable_sha256": host_bin_sha,
     "extracted_binary_sha256": host_bin_sha,
     "artifact_path": host_archive_name,
     "artifact_sha256": host_bin_sha,
@@ -1719,21 +1843,24 @@ CHECKSUMS="$OUT_DIR/checksums.txt"
     *.tar.gz build-manifest.json architecture-build-metadata.json sbom.json
     claims.yaml test-summary.json acceptance-summary.json claims-verify-report.txt
     preflight.json toolset.json release-environment.json gov *.log.gz redteam-source-identity.json
-    integration-gov integration-expected-names.txt integration-expected-packages.txt
+    acceptance/gov integration-expected-names.txt integration-expected-packages.txt
   )
   for attestation_file in attestations/*.json; do
     [ -e "$attestation_file" ] || break
     checksum_inputs+=("$attestation_file")
   done
-  # Sol14 rc7 Session 10: integration-gov and the two expected-name lists are
-  # shipped evidence and are covered above. integration-gov is NOT a duplicate
-  # of the loose `gov` beside it -- it is built early, before the tiers, with
-  # this release's own -trimpath/-ldflags, and its sha256 is what every
-  # integration-evidence record binds to as governor_binary_sha256. Without
-  # its bytes in the signed manifest, that binding names an object the release
-  # does not carry, and "the integration tier exercised the rc candidate"
-  # would be asserted rather than verifiable. The expected-name/package lists
-  # are the literal inputs `gov integration-gate verify` consumed.
+  # rc8-upg15 S3 (Sol15 P0-4): the separate dist/integration-gov build is
+  # gone -- acceptance/gov (the archive-extracted, mode/hash/version-verified
+  # host executable, built before any test tier ran) is what every
+  # integration-evidence record binds to as governor_binary_sha256 now, and
+  # it is also the exact contained binary of the host .tar.gz already listed
+  # above and the loose `gov` convenience copy beside it (all three are the
+  # same bytes by construction -- see the no-rebuild guard above). Its
+  # presence here, alongside the two expected-name/package lists that are the
+  # literal inputs `gov integration-gate verify` consumed, is what makes
+  # "the integration tier exercised the rc candidate" verifiable rather than
+  # merely asserted: without it in the signed manifest, that binding would
+  # name an object the release does not carry.
   #
   # Sol14 P0-2 (rc7 Session 5): the per-package integration TestMain records
   # the candidate-binary identity, Assayer identity, and real sandbox

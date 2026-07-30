@@ -121,8 +121,8 @@ func TestLoadManifestSetZeroExactIsCorpusOnly(t *testing.T) {
 	if len(set.ExactManifests) != 0 {
 		t.Fatalf("expected zero exact manifests, got %d", len(set.ExactManifests))
 	}
-	if len(set.Corpus.Cases) != 361 {
-		t.Fatalf("expected the 361-case corpus, got %d", len(set.Corpus.Cases))
+	if len(set.Corpus.Cases) != 368 {
+		t.Fatalf("expected the 368-case corpus, got %d", len(set.Corpus.Cases))
 	}
 	if set.ExactManifestTestNames() != nil {
 		t.Fatalf("ExactManifestTestNames must be nil for an empty set")

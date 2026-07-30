@@ -29,7 +29,10 @@ func secureGraphTempDir(t *testing.T) string {
 
 func requireExternalSandbox(t *testing.T) {
 	t.Helper()
-	if enforce.SelfExeOverride == "" {
+	// rc8-upg15 S3: the mandatory integration harness now sets
+	// enforce.SelfExeFDOverride (fd-backed), not enforce.SelfExeOverride
+	// (pathname); either one means a real harness wired a candidate binary.
+	if enforce.SelfExeOverride == "" && enforce.SelfExeFDOverride == "" {
 		t.Skip("contextgraph stage tests require a real gov sandbox harness")
 	}
 	if unsharePath, err := exec.LookPath("unshare"); err == nil {

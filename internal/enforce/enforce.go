@@ -22,6 +22,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sync"
 
 	"github.com/cousingary/governator/internal/toolregistry"
 )
@@ -164,6 +165,60 @@ func (p *Plan) Close() error {
 // helper) and point this at it. Never set outside a test.
 var SelfExeOverride string
 
+// SelfExeFDOverride is a test-only seam for the mandatory release
+// integration tier (rc8-upg15 S3, Sol15 P0-4 part B), distinct from
+// SelfExeOverride above. Sol found that SelfExeOverride's route -- open the
+// candidate once, copy it into a fresh sealed 0500 file, and pass that copy
+// as a literal argv path string -- never exercises the production Linux
+// fd-backed /proc/self/exe route: the mandatory suite validated a
+// substitute mechanism while claiming to test self-reexecution.
+//
+// The calling process during the integration tier is a `go test` binary,
+// never gov itself, so a literal read of "/proc/self/exe" can never name
+// the exact candidate under test -- that seam is genuinely unavoidable (Sol's
+// required correction #9: "use an inherited open file descriptor or handle
+// for any unavoidable test seam"). SelfExeFDOverride names that candidate's
+// path and NewPlanForExecutable resolves it through openExecutableFile --
+// the SAME ELF-verifying helper production Linux uses for /proc/self/exe --
+// so Wrap threads it through WrapWith's selfExeFile-backed
+// /proc/self/fd/<n> argument exactly like production, instead of falling
+// back to SelfExeOverride's sealed-copy pathname argument. Takes precedence
+// over SelfExeOverride when both are set. Never set outside a test.
+var SelfExeFDOverride string
+
+// The SelfExeRoute* constants name which resolution branch
+// NewPlanForExecutable actually took, recorded via recordSelfExeRoute and
+// readable through LastSelfExeRoute for the mandatory integration tier's
+// permanent assertion that fd-backed semantics -- never the pathname-copy
+// route -- were exercised (rc8-upg15 S3). Test introspection only; never
+// consulted for any policy decision. internal/redteamgate duplicates the
+// FDOverride value as its own literal (avoiding an import of this package)
+// -- keep the two in sync.
+const (
+	SelfExeRouteFDProcSelfExe = "fd-proc-self-exe"
+	SelfExeRouteFDOverride    = "fd-override"
+	SelfExeRoutePathname      = "pathname"
+)
+
+var (
+	selfExeRouteMu sync.Mutex
+	selfExeRoute   string
+)
+
+func recordSelfExeRoute(route string) {
+	selfExeRouteMu.Lock()
+	selfExeRoute = route
+	selfExeRouteMu.Unlock()
+}
+
+// LastSelfExeRoute reports which route (see the SelfExeRoute* constants) the
+// most recent NewPlanForExecutable call took. Test introspection only.
+func LastSelfExeRoute() string {
+	selfExeRouteMu.Lock()
+	defer selfExeRouteMu.Unlock()
+	return selfExeRoute
+}
+
 // selfExePath is the string-based fallback used only for the
 // SelfExeOverride test seam and non-Linux hosts. It must never be called for
 // the production Linux path -- see openSelfExecutable, which that path uses
@@ -177,16 +232,16 @@ func selfExePath() (string, error) {
 	return os.Executable()
 }
 
-// openSelfExecutable opens Governator's own running executable in THIS
-// process, before any wrapper is composed (Sol v9 P0-1's required
-// correction). Opened here, "/proc/self/exe" is unambiguous: self is
-// Governator. The returned descriptor is what Wrap threads through the
-// launch chain as /proc/self/fd/<n> -- never a path string a wrapper
-// process would resolve for itself.
-func openSelfExecutable() (*os.File, error) {
-	f, err := os.Open("/proc/self/exe")
+// openExecutableFile opens path (verifying it is an ELF binary on Linux,
+// mirroring sealedExecutableCopy's own magic check) and rewinds it, ready to
+// be threaded through Wrap as an inherited /proc/self/fd/<n> descriptor.
+// openSelfExecutable and SelfExeFDOverride's resolution both share this one
+// implementation, so "fd-backed" always means the exact same open+verify+
+// rewind sequence regardless of which path named the executable.
+func openExecutableFile(path string) (*os.File, error) {
+	f, err := os.Open(path)
 	if err != nil {
-		return nil, fmt.Errorf("open running gov executable: %w", err)
+		return nil, fmt.Errorf("open executable for fd-backed self-exec: %w", err)
 	}
 	ok := false
 	defer func() {
@@ -196,16 +251,26 @@ func openSelfExecutable() (*os.File, error) {
 	}()
 	var magic [4]byte
 	if _, err := io.ReadFull(f, magic[:]); err != nil {
-		return nil, fmt.Errorf("read running gov executable magic: %w", err)
+		return nil, fmt.Errorf("read executable magic for fd-backed self-exec: %w", err)
 	}
 	if magic != [4]byte{0x7f, 'E', 'L', 'F'} {
-		return nil, fmt.Errorf("running gov executable is not an ELF binary")
+		return nil, fmt.Errorf("fd-backed self-exec target is not an ELF binary")
 	}
 	if _, err := f.Seek(0, io.SeekStart); err != nil {
-		return nil, fmt.Errorf("rewind running gov executable: %w", err)
+		return nil, fmt.Errorf("rewind executable for fd-backed self-exec: %w", err)
 	}
 	ok = true
 	return f, nil
+}
+
+// openSelfExecutable opens Governator's own running executable in THIS
+// process, before any wrapper is composed (Sol v9 P0-1's required
+// correction). Opened here, "/proc/self/exe" is unambiguous: self is
+// Governator. The returned descriptor is what Wrap threads through the
+// launch chain as /proc/self/fd/<n> -- never a path string a wrapper
+// process would resolve for itself.
+func openSelfExecutable() (*os.File, error) {
+	return openExecutableFile("/proc/self/exe")
 }
 
 func sealedExecutableCopy(src, pattern string) (string, error) {
@@ -331,16 +396,28 @@ func NewPlanForExecutable(active bool, workspace string, readOnly, allowNetwork,
 	// selfExeFile (production Linux, SelfExeOverride unset) is the fd-backed
 	// fix for P0-1; selfExe (everything else) is the pre-existing
 	// string-based path, unchanged. See openSelfExecutable's doc comment.
+	// SelfExeFDOverride (rc8-upg15 S3, P0-4 B) takes precedence over both: it
+	// is the mandatory integration tier's fd-backed substitute for a true
+	// /proc/self/exe read, which can never name the candidate under test
+	// since the calling process is a go test binary, not gov itself.
 	var self string
 	var selfFile *os.File
-	if runtime.GOOS == "linux" && SelfExeOverride == "" {
+	var route string
+	switch {
+	case SelfExeFDOverride != "":
+		selfFile, err = openExecutableFile(SelfExeFDOverride)
+		route = SelfExeRouteFDOverride
+	case runtime.GOOS == "linux" && SelfExeOverride == "":
 		selfFile, err = openSelfExecutable()
-	} else {
+		route = SelfExeRouteFDProcSelfExe
+	default:
 		self, err = selfExePath()
+		route = SelfExeRoutePathname
 	}
 	if err != nil {
 		return Plan{}, fmt.Errorf("enforce: resolve gov executable for sandbox wrapper: %w", err)
 	}
+	recordSelfExeRoute(route)
 	if selfFile != nil {
 		defer func() {
 			if closeOnErr {

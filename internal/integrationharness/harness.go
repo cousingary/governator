@@ -70,10 +70,16 @@ var (
 // checkout; S5 records whatever the tier actually used -- honestly, never
 // over-claimed.
 type Evidence struct {
-	GovernorBinarySHA256   string `json:"governor_binary_sha256"`
-	GovernorBinarySource   string `json:"governor_binary_source"`
-	EnforceSupported       bool   `json:"enforce_supported"`
-	SandboxMechanism       string `json:"sandbox_mechanism"`
+	GovernorBinarySHA256 string `json:"governor_binary_sha256"`
+	GovernorBinarySource string `json:"governor_binary_source"`
+	EnforceSupported     bool   `json:"enforce_supported"`
+	SandboxMechanism     string `json:"sandbox_mechanism"`
+	// SelfExeRoute records which enforce.SelfExeRoute* branch the governed
+	// launch(es) inside this test binary actually took (rc8-upg15 S3, Sol15
+	// P0-4 B) -- populated after run() completes, from
+	// enforce.LastSelfExeRoute(), so it reflects what the real test run
+	// exercised rather than Setup's own pre-run resolution.
+	SelfExeRoute           string `json:"self_exe_route,omitempty"`
 	AssayerSource          string `json:"assayer_source"`
 	AssayerCommit          string `json:"assayer_commit"`
 	AssayerVersion         string `json:"assayer_version,omitempty"`
@@ -280,8 +286,12 @@ func Setup(run func() int, pkgName string, assayer AssayerIdentity, assayerErr e
 	}
 	govSHA, _ := SHA256File(govPath)
 
-	enforce.SelfExeOverride = govPath
-	defer func() { enforce.SelfExeOverride = "" }()
+	// rc8-upg15 S3 (Sol15 P0-4 B): SelfExeFDOverride, not SelfExeOverride --
+	// see enforce.SelfExeFDOverride's doc comment. The prior SelfExeOverride
+	// wiring here made every mandatory-tier governed launch take the
+	// sealed-copy pathname route, never the production fd-backed one.
+	enforce.SelfExeFDOverride = govPath
+	defer func() { enforce.SelfExeFDOverride = "" }()
 	EnrollUnshare()
 
 	if !enforce.Supported() {
@@ -300,6 +310,11 @@ func Setup(run func() int, pkgName string, assayer AssayerIdentity, assayerErr e
 	evidence.GovernorBinarySource = govSource
 	evidence.EnforceSupported = true
 	evidence.SandboxMechanism = "landlock+unshare (enforce.Supported)"
+	// Evidence is written AFTER run() (not before, as it was before rc8-upg15
+	// S3): SelfExeRoute can only be known once a governed launch inside run()
+	// has actually called enforce.NewPlanForExecutable at least once.
+	code := run()
+	evidence.SelfExeRoute = enforce.LastSelfExeRoute()
 	writeEvidence(pkgName, evidence)
-	return run()
+	return code
 }

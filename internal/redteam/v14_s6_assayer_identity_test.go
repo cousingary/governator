@@ -18,7 +18,7 @@ func v14S6PassingLog(name string) string {
 func v14S6Evidence(t *testing.T, commit string) string {
 	t.Helper()
 	dir := t.TempDir()
-	write := `{"governor_binary_sha256":"gov","governor_binary_source":"env","enforce_supported":true,"sandbox_mechanism":"landlock+unshare (enforce.Supported)","assayer_source":"ASSAYER_REPO","assayer_commit":"` + commit + `","assayer_version":"1.1.10","assayer_tag":"v1.1.10","assayer_package_tree_hash":"tree","assayer_schema_version":"0004","assayer_python_runtime":"Python 3.12","assayer_clean":true}`
+	write := `{"governor_binary_sha256":"gov","governor_binary_source":"env","enforce_supported":true,"sandbox_mechanism":"landlock+unshare (enforce.Supported)","self_exe_route":"fd-override","assayer_source":"ASSAYER_REPO","assayer_commit":"` + commit + `","assayer_version":"1.1.10","assayer_tag":"v1.1.10","assayer_package_tree_hash":"tree","assayer_schema_version":"0004","assayer_python_runtime":"Python 3.12","assayer_clean":true}`
 	if err := os.WriteFile(filepath.Join(dir, "assay.json"), []byte(write), 0o644); err != nil {
 		t.Fatal(err)
 	}

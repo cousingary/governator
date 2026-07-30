@@ -56,3 +56,25 @@ Restore the legacy hook command and stop launching new Governator jobs. Existing
 | Interactive integration | Claude dialect plus neutral `gov gate check` | Claude-specific hook payload | Reuse one decision core across harnesses |
 | Evidence | Run, hook, parity, eval, routing, and repair data share one SQLite schema | Multiple logs and ledgers | Make audit and routing evidence queryable |
 | Failure handling | Contract violations quarantine the run; unsupported actions fail contract validation | Wrapper circuit breaker governed arbitrary action retries | Governator governs bounded jobs, not every shell action on a workstation |
+
+## Deprecated release manifest keys (rc8-upg15 S3, Sol15 P2-2)
+
+`build-manifest.json`'s `artifact_path` / `artifact_sha256` were ambiguous: the
+path named an archive while the hash named the binary the archive contains.
+Starting with `v1.0.2-rc8`, the canonical keys are:
+
+| Canonical key | Meaning |
+|---|---|
+| `archive_path` | Path to the `.tar.gz` archive |
+| `archive_sha256` | SHA-256 of the archive |
+| `executable_path` | Path to the extracted, contained `gov` binary |
+| `executable_sha256` | SHA-256 of the extracted, contained `gov` binary |
+
+`artifact_path` / `artifact_sha256` (and the pre-existing
+`extracted_binary_sha256`) are emitted alongside the canonical keys, with the
+same values, for exactly one release (`v1.0.2-rc8`) as a deprecated
+compatibility alias. `internal/claims.BuildManifest.expectedExtractedBinarySHA256`
+already prefers `executable_sha256`, falling back to `extracted_binary_sha256`
+then `artifact_sha256` in that order. A verifier reading `build-manifest.json`
+directly should migrate to the canonical keys before the alias is removed in
+the release after rc8.
