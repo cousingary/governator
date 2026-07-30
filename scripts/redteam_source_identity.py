@@ -34,12 +34,12 @@ def file_record(root: Path, path: Path) -> dict[str, str]:
     return {"path": path.relative_to(root).as_posix(), "sha256": sha256_bytes(path.read_bytes())}
 
 
-def go_output(root: Path, *args: str) -> str:
-    return subprocess.run(["go", *args], cwd=root, check=True, capture_output=True, text=True).stdout
+def go_output(root: Path, go_bin: str, *args: str) -> str:
+    return subprocess.run([go_bin, *args], cwd=root, check=True, capture_output=True, text=True).stdout
 
 
-def go_packages(root: Path) -> list[dict[str, Any]]:
-    output = go_output(root, "list", "-tags", "redteam", "-json", "./...")
+def go_packages(root: Path, go_bin: str) -> list[dict[str, Any]]:
+    output = go_output(root, go_bin, "list", "-tags", "redteam", "-json", "./...")
     decoder = json.JSONDecoder()
     packages: list[dict[str, Any]] = []
     offset = 0
@@ -53,10 +53,10 @@ def go_packages(root: Path) -> list[dict[str, Any]]:
     return packages
 
 
-def test_names(root: Path, source_paths: list[Path]) -> list[str]:
+def test_names(root: Path, go_bin: str, source_paths: list[Path]) -> list[str]:
     extractor = root / "scripts/redteam_test_names.go"
     result = subprocess.run(
-        ["go", "run", "-p", "2", str(extractor), "--", *(str(path) for path in source_paths)],
+        [go_bin, "run", "-p", "2", str(extractor), "--", *(str(path) for path in source_paths)],
         cwd=root,
         check=True,
         capture_output=True,
@@ -65,7 +65,7 @@ def test_names(root: Path, source_paths: list[Path]) -> list[str]:
     return sorted(set(result.stdout.splitlines()))
 
 
-def tagged_sources(root: Path, packages: list[dict[str, Any]]) -> tuple[list[dict[str, str]], dict[str, list[str]], list[str]]:
+def tagged_sources(root: Path, go_bin: str, packages: list[dict[str, Any]]) -> tuple[list[dict[str, str]], dict[str, list[str]], list[str]]:
     sources: list[dict[str, str]] = []
     package_sources: dict[str, list[str]] = {}
     tagged_test_sources: list[Path] = []
@@ -88,7 +88,7 @@ def tagged_sources(root: Path, packages: list[dict[str, Any]]) -> tuple[list[dic
                 tagged_test_sources.append(path)
         if selected_sources:
             package_sources[package["ImportPath"]] = selected_sources
-    return sorted(sources, key=lambda entry: entry["path"]), package_sources, test_names(root, tagged_test_sources)
+    return sorted(sources, key=lambda entry: entry["path"]), package_sources, test_names(root, go_bin, tagged_test_sources)
 
 
 def bound_inputs(root: Path) -> list[dict[str, str]]:
@@ -112,7 +112,7 @@ def bound_inputs(root: Path) -> list[dict[str, str]]:
     return sorted((file_record(root, path) for path in paths), key=lambda entry: entry["path"])
 
 
-def compiled_binaries(root: Path, package_sources: dict[str, list[str]]) -> list[dict[str, str]]:
+def compiled_binaries(root: Path, go_bin: str, package_sources: dict[str, list[str]]) -> list[dict[str, str]]:
     records: list[dict[str, str]] = []
     with tempfile.TemporaryDirectory(prefix="governator-redteam-binaries-") as temp:
         for index, package in enumerate(sorted(package_sources)):
@@ -120,7 +120,7 @@ def compiled_binaries(root: Path, package_sources: dict[str, list[str]]) -> list
             # Build one package at a time and cap Go's package scheduler. This
             # identity step runs during release evidence collection, where a
             # host-wide compile burst must not compete with the test tiers.
-            subprocess.run(["go", "test", "-c", "-p", "2", "-tags", "redteam", "-o", str(output), package], cwd=root, check=True, capture_output=True, text=True)
+            subprocess.run([go_bin, "test", "-c", "-p", "2", "-tags", "redteam", "-o", str(output), package], cwd=root, check=True, capture_output=True, text=True)
             records.append({"package": package, "sha256": sha256_bytes(output.read_bytes())})
     return records
 
@@ -130,19 +130,21 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--repo-root", default=".")
     parser.add_argument("--out", required=True)
     parser.add_argument("--inventory-out")
+    parser.add_argument("--go-bin", default="go", help="absolute approved Go executable supplied by release.sh")
     args = parser.parse_args(argv)
 
     root = Path(args.repo_root).resolve()
-    packages = go_packages(root)
-    sources, package_sources, inventory = tagged_sources(root, packages)
+    go_bin = str(Path(args.go_bin).resolve())
+    packages = go_packages(root, go_bin)
+    sources, package_sources, inventory = tagged_sources(root, go_bin, packages)
     if not sources:
         raise SystemExit("redteam source identity: no redteam-tagged source files selected")
-    binaries = compiled_binaries(root, package_sources)
+    binaries = compiled_binaries(root, go_bin, package_sources)
     build_constraints = {
         "tags": ["redteam"],
-        "goos": go_output(root, "env", "GOOS").strip(),
-        "goarch": go_output(root, "env", "GOARCH").strip(),
-        "go_version": go_output(root, "version").strip(),
+        "goos": go_output(root, go_bin, "env", "GOOS").strip(),
+        "goarch": go_output(root, go_bin, "env", "GOARCH").strip(),
+        "go_version": go_output(root, go_bin, "version").strip(),
     }
     source_inputs = {
         "redteam_sources": sources,

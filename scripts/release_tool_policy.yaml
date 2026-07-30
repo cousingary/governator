@@ -5,6 +5,9 @@ tools:
   python3:
     path: /usr/bin/python3
     sha256: 1643dacd9feaedc58f3cc581e4d22577dfe25c09b10282936186ccf0f2e61118
+  python3.12:
+    path: /usr/bin/python3.12
+    sha256: 1643dacd9feaedc58f3cc581e4d22577dfe25c09b10282936186ccf0f2e61118
   sha256sum:
     path: /usr/bin/sha256sum
     sha256: e484c36c0613879fbd11058f7a2e194783bced59d4805d64c3d4b0d7f664094d
@@ -20,3 +23,72 @@ tools:
   git:
     path: /home/lam/bin/git
     sha256: 8970929d521fc03906aa81e1dd3e7870da17eb26235ae42ab5453338a027d256
+  bash:
+    path: /usr/bin/bash
+    sha256: bc5945feb8bd26203ebfafea5ce1878bb2e32cb8fb50ab7ae395cfb1e1aaaef1
+  date:
+    path: /usr/bin/date
+    sha256: 423e1cf8af70dd477a56d019912e13660199df3a01420f5ced7dadcc2b786bdc
+  awk:
+    path: /usr/bin/awk
+    sha256: 9150b42e78b22231bd83131e1db2530a7a7fa0677e189ac7c5cc1520c42c9e88
+  env:
+    path: /usr/bin/env
+    sha256: 595f3912fa7d5f91b45cac22a4a772b23232ace24ff9d82ee47cc762c59be5e1
+  cp:
+    path: /usr/bin/cp
+    sha256: fd4fc0c009e06b550970f7f5b9d0197825d521105271af38f9f577f5c32a2090
+  rm:
+    path: /usr/bin/rm
+    sha256: 42d99e8ead91f30586a0f689178e8bd3db5fadb1e995681aaf4b418cbeffab99
+  mkdir:
+    path: /usr/bin/mkdir
+    sha256: 9a403934bdc186e5780e065f33c63628fdfe947d5c3207c6ff456aff97a83fdb
+  find:
+    path: /usr/bin/find
+    sha256: ac1ea1c5391de921aca1572f1bf25d03707beb3887b27c16a5b4948fd553941b
+  sort:
+    path: /usr/bin/sort
+    sha256: 24063991f5d9592901d1ca438dffcfbbb385c4e054c48ceabb55c0d6f903a826
+  mktemp:
+    path: /usr/bin/mktemp
+    sha256: 7258721fb887f4cef21e7013b0f6d970ed4ca58390ac5116d426679d13a80806
+  dirname:
+    path: /usr/bin/dirname
+    sha256: d01cf8ce08030f23e6c5372fff12604f6ba1ca3ea8c5230a960dbd3ae9645e67
+  pwd:
+    path: /usr/bin/pwd
+    sha256: fc9ed1b441dd244fb64f4f6299fd3172fb0524b90cbbe6b03948de4560c6c84e
+  grep:
+    path: /usr/bin/grep
+    sha256: 20a35a4c18f2fe9e6305c1cbf866b9c0fcc3f957132ae66028c99ec353bb0a80
+  uname:
+    path: /usr/bin/uname
+    sha256: bb14ae3642557de05471bdd2402f64d5047f8c98378de49563471f3a059c8912
+  cat:
+    path: /usr/bin/cat
+    sha256: 90c9437a02857838ccc0ce1ff8652691181bfb67135a1173dd276f91fa57d7ec
+  chmod:
+    path: /usr/bin/chmod
+    sha256: 4158cfdb26fb11602bebf64dc585bea557f2b7287eb49ad51c54f1f8897acada
+  stat:
+    path: /usr/bin/stat
+    sha256: b64f0b5c0bf28bd802a70949c556b0e7d0b56a42134585ca4457912dc8b02fe6
+  basename:
+    path: /usr/bin/basename
+    sha256: 5625aeb79f14c3af28dfd62fe32ebed1a2b7dd5d99c477b375dc59d116474705
+  timeout:
+    path: /usr/bin/timeout
+    sha256: 375eaa8774baf7667515932c4d6fa2e31a2c21e9c50f152a27c4c6a718374ebe
+  mv:
+    path: /usr/bin/mv
+    sha256: 31be03602835c3a6d9b0b11ab1fe52e99bfe91638a3f3b151a8bb0d9d1998b41
+  ls:
+    path: /usr/bin/ls
+    sha256: 0148f5ab3062a905281d8deb9645363da5131011c9e7b6dcaa38b504e41b68ea
+  systemctl:
+    path: /usr/bin/systemctl
+    sha256: 7ba82b5ba146759c710e1b80fadaa3fdbc0f9b85c8fb2c8c3196b7b1a0037ef8
+  docker:
+    path: /usr/bin/docker
+    sha256: 4fd41ecac3ec0f8a6067f8da79cbce516ed0572d1081e4767db764c84d32257b

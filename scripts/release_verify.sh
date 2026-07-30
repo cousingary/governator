@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+#!/usr/bin/bash
 # Sol redteam v4 S8 (P0-7, report attacks 24/25): the hard, release-blocking
 # gate that closes the gap the audit found -- a shipped binary two security
 # commits behind the submitted source, packaged at mode 0777, with full
@@ -13,7 +13,7 @@
 # commit drifts from the manifest) and assert this script refuses both.
 #
 # Usage:
-#   scripts/release_verify.sh --out-dir <dir> --repo <repo-root> --platform <platform_id> --python-bin <path> --tar-bin <path> [--gov-bin <path>]
+#   scripts/release_verify.sh --out-dir <dir> --repo <repo-root> --platform <platform_id> --python-bin <path> --tar-bin <path> [--gov-bin <path> --mktemp-bin <path> --rm-bin <path> --stat-bin <path>]
 #
 # --out-dir   the release staging directory (release.sh's $OUT_DIR / "dist"):
 #             must already contain claims.yaml, build-manifest.json, and
@@ -46,6 +46,9 @@ PLATFORM=""
 GOV_BIN_OVERRIDE=""
 PYTHON_BIN=""
 TAR_BIN=""
+MKTEMP_BIN=mktemp
+RM_BIN=rm
+STAT_BIN=stat
 while [ $# -gt 0 ]; do
   case "$1" in
   --out-dir)
@@ -72,6 +75,9 @@ while [ $# -gt 0 ]; do
     TAR_BIN=$2
     shift 2
     ;;
+  --mktemp-bin) MKTEMP_BIN=$2; shift 2 ;;
+  --rm-bin) RM_BIN=$2; shift 2 ;;
+  --stat-bin) STAT_BIN=$2; shift 2 ;;
   *)
     usage
     ;;
@@ -88,8 +94,8 @@ VERSION=$("$PYTHON_BIN" -c "import json; print(json.load(open('$MANIFEST'))['ver
 ARCHIVE="$OUT_DIR/gov_${VERSION}_${PLATFORM}.tar.gz"
 [ -f "$ARCHIVE" ] || { echo "release_verify: $ARCHIVE not found" >&2; exit 1; }
 
-EXTRACT_DIR=$(mktemp -d)
-trap 'rm -rf "$EXTRACT_DIR"' EXIT
+EXTRACT_DIR=$("$MKTEMP_BIN" -d)
+trap '"$RM_BIN" -rf "$EXTRACT_DIR"' EXIT
 # -p/--preserve-permissions: without it, GNU tar applies the EXTRACTING
 # user's umask to the archived mode bits when run as a non-root user --
 # verified empirically on this host (umask 0022 silently turns an archived
@@ -107,7 +113,7 @@ EXTRACTED_BIN="$EXTRACT_DIR/gov"
 # in-staging binary before archiving, which is what let this slip through
 # originally (tar's own owner/perm bits, or a hand-edited archive, can still
 # diverge from what was chmod'd before packaging).
-MODE=$(stat -c '%a' "$EXTRACTED_BIN" 2>/dev/null || stat -f '%OLp' "$EXTRACTED_BIN")
+MODE=$("$STAT_BIN" -c '%a' "$EXTRACTED_BIN" 2>/dev/null || "$STAT_BIN" -f '%OLp' "$EXTRACTED_BIN")
 if [ "$MODE" != "755" ]; then
   echo "release_verify: extracted binary mode is $MODE, must be exactly 755 (no group/world write bit)" >&2
   exit 1

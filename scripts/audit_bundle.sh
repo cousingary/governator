@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+#!/usr/bin/bash
 # scripts/audit_bundle.sh — Sol9 P2-2 / Sol11 P0-2: the single, canonical
 # audit/source bundle generator.
 #
@@ -40,8 +40,36 @@
 #   evidence/      claims.yaml + release/test/acceptance evidence for REF
 set -euo pipefail
 
-ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+ROOT=$(cd "${BASH_SOURCE[0]%/*}/.." && pwd -P)
 cd "$ROOT"
+
+PYTHON_BIN=python3
+GIT_BIN=git
+TAR_BIN=tar
+SHA256SUM_BIN=sha256sum
+AWK_BIN=awk
+CP_BIN=cp
+RM_BIN=rm
+MKDIR_BIN=mkdir
+FIND_BIN=find
+BASENAME_BIN=basename
+LS_BIN=ls
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --python-bin) PYTHON_BIN=$2; shift 2 ;;
+    --git-bin) GIT_BIN=$2; shift 2 ;;
+    --tar-bin) TAR_BIN=$2; shift 2 ;;
+    --sha256sum-bin) SHA256SUM_BIN=$2; shift 2 ;;
+    --awk-bin) AWK_BIN=$2; shift 2 ;;
+    --cp-bin) CP_BIN=$2; shift 2 ;;
+    --rm-bin) RM_BIN=$2; shift 2 ;;
+    --mkdir-bin) MKDIR_BIN=$2; shift 2 ;;
+    --find-bin) FIND_BIN=$2; shift 2 ;;
+    --basename-bin) BASENAME_BIN=$2; shift 2 ;;
+    --ls-bin) LS_BIN=$2; shift 2 ;;
+    *) echo "audit_bundle: unsupported argument $1" >&2; exit 2 ;;
+  esac
+done
 
 REF=${REF:-HEAD}
 AUDIT_BUNDLE_MODE=${AUDIT_BUNDLE_MODE:-release}
@@ -62,12 +90,12 @@ OUT_DIR=${OUT_DIR:-"$(cd "$ROOT/.." && pwd)/governator-audit-bundle"}
 DIST_DIR=${DIST_DIR:-dist}
 ARCHITECTURE_DOC=${GOV_ARCHITECTURE_DOC:-$ROOT/../agents/governator_architecture.md}
 
-if [ -n "$(git status --porcelain --untracked-files=all)" ]; then
+if [ -n "$("$GIT_BIN" status --porcelain --untracked-files=all)" ]; then
   echo "audit_bundle: refusing to bundle a dirty tree (uncommitted/untracked changes present) -- commit or stash first" >&2
   exit 1
 fi
 
-OUT_DIR_ABS=$(python3 -c 'import os,sys; print(os.path.abspath(sys.argv[1]))' "$OUT_DIR")
+OUT_DIR_ABS=$("$PYTHON_BIN" -c 'import os,sys; print(os.path.abspath(sys.argv[1]))' "$OUT_DIR")
 case "$OUT_DIR_ABS" in
   "$ROOT"|"$ROOT"/*)
     echo "audit_bundle: refusing to generate the bundle inside the source checkout (${OUT_DIR_ABS} is under ${ROOT}) -- set OUT_DIR to a sibling or /tmp path (P1-6)" >&2
@@ -76,11 +104,11 @@ case "$OUT_DIR_ABS" in
 esac
 OUT_DIR=$OUT_DIR_ABS
 
-rm -rf "$OUT_DIR"
-mkdir -p "$OUT_DIR/source" "$OUT_DIR/dist" "$OUT_DIR/architecture" "$OUT_DIR/evidence"
+"$RM_BIN" -rf "$OUT_DIR"
+"$MKDIR_BIN" -p "$OUT_DIR/source" "$OUT_DIR/dist" "$OUT_DIR/architecture" "$OUT_DIR/evidence"
 
 # --- source/: exactly the tracked tree at REF, nothing else is possible ----
-git archive --format=tar "$REF" | tar -x -C "$OUT_DIR/source"
+"$GIT_BIN" archive --format=tar "$REF" | "$TAR_BIN" -x -C "$OUT_DIR/source"
 
 # --- dist/: whatever scripts/release.sh already produced, verbatim --------
 # Exception: dist/assayer-venvs/ is BUILD SCAFFOLDING, not release evidence.
@@ -92,20 +120,20 @@ git archive --format=tar "$REF" | tar -x -C "$OUT_DIR/source"
 # evidence is assayer-python*.log.gz, which IS copied. Copying them in made a
 # release-mode bundle impossible (rc6 Session 9 -- first cycle to ever get a
 # release-mode bundle this far).
-if [ -d "$DIST_DIR" ] && [ -n "$(ls -A "$DIST_DIR" 2>/dev/null)" ]; then
-  cp -a "$DIST_DIR"/. "$OUT_DIR/dist/"
-  rm -rf "$OUT_DIR/dist/assayer-venvs"
+if [ -d "$DIST_DIR" ] && [ -n "$("$LS_BIN" -A "$DIST_DIR" 2>/dev/null)" ]; then
+  "$CP_BIN" -a "$DIST_DIR"/. "$OUT_DIR/dist/"
+  "$RM_BIN" -rf "$OUT_DIR/dist/assayer-venvs"
 else
   echo "audit_bundle: WARNING: $DIST_DIR is empty or absent -- run scripts/release.sh first for a populated dist/ tier" >&2
 fi
 # A stray previous audit_bundle.sh output nested inside dist/ (from running
 # this script with OUT_DIR unset, twice, into the default location under the
 # repo root) must never recurse into itself.
-rm -rf "$OUT_DIR/dist/$(basename "$OUT_DIR")"
+"$RM_BIN" -rf "$OUT_DIR/dist/$("$BASENAME_BIN" "$OUT_DIR")"
 # A prior release attempt's checkpoint state directory (scripts/
 # release_checkpoint.py, P1-5) is internal working state, not shipped
 # release evidence -- never part of an audit bundle.
-rm -rf "$OUT_DIR/dist/.checkpoints"
+"$RM_BIN" -rf "$OUT_DIR/dist/.checkpoints"
 
 # S8: a machine-readable live-install claim must carry its signed record in
 # the bundle itself. An operator may supply the live record outside dist/;
@@ -129,7 +157,7 @@ if [ -n "${INSTALL_EVIDENCE:-}" ]; then
     echo "audit_bundle: INSTALL_EVIDENCE does not name a file: $INSTALL_EVIDENCE" >&2
     exit 1
   fi
-  cp "$INSTALL_EVIDENCE" "$OUT_DIR/evidence/install-evidence.json"
+  "$CP_BIN" "$INSTALL_EVIDENCE" "$OUT_DIR/evidence/install-evidence.json"
 fi
 
 if [ "$AUDIT_BUNDLE_MODE" = source-only ]; then
@@ -153,8 +181,8 @@ fi
 
 # --- architecture/: the standalone doc + its build metadata ---------------
 if [ -f "$ARCHITECTURE_DOC" ]; then
-  cp "$ARCHITECTURE_DOC" "$OUT_DIR/architecture/"
-  if ! python3 "$ROOT/scripts/check_architecture_doc.py" "$OUT_DIR/architecture/$(basename "$ARCHITECTURE_DOC")" --repo "$ROOT" --dist-dir "$OUT_DIR/dist"; then
+  "$CP_BIN" "$ARCHITECTURE_DOC" "$OUT_DIR/architecture/"
+  if ! "$PYTHON_BIN" "$ROOT/scripts/check_architecture_doc.py" "$OUT_DIR/architecture/$("$BASENAME_BIN" "$ARCHITECTURE_DOC")" --repo "$ROOT" --dist-dir "$OUT_DIR/dist"; then
     echo "audit_bundle: refusing to ship a bundle with a stale/contradictory architecture doc (see above)" >&2
     exit 1
   fi
@@ -162,7 +190,7 @@ else
   echo "audit_bundle: WARNING: architecture doc not found at $ARCHITECTURE_DOC" >&2
 fi
 if [ -f "$OUT_DIR/dist/architecture-build-metadata.json" ]; then
-  cp "$OUT_DIR/dist/architecture-build-metadata.json" "$OUT_DIR/architecture/"
+  "$CP_BIN" "$OUT_DIR/dist/architecture-build-metadata.json" "$OUT_DIR/architecture/"
 fi
 
 # --- release mode (P0-2, default): the dist/ tier just copied above must be
@@ -171,10 +199,10 @@ fi
 # was found against) fails LOUDLY here, before any further processing, with
 # INCOMPLETE_RELEASE_EVIDENCE naming exactly what's missing.
 if [ "$AUDIT_BUNDLE_MODE" = release ]; then
-  RELEASE_COMMIT=$(git rev-parse "$REF")
+  RELEASE_COMMIT=$("$GIT_BIN" rev-parse "$REF")
   ARCH_DOC_FOR_VALIDATE=""
-  if [ -f "$OUT_DIR/architecture/$(basename "$ARCHITECTURE_DOC" 2>/dev/null || true)" ]; then
-    ARCH_DOC_FOR_VALIDATE="$OUT_DIR/architecture/$(basename "$ARCHITECTURE_DOC")"
+  if [ -f "$OUT_DIR/architecture/$("$BASENAME_BIN" "$ARCHITECTURE_DOC" 2>/dev/null || true)" ]; then
+    ARCH_DOC_FOR_VALIDATE="$OUT_DIR/architecture/$("$BASENAME_BIN" "$ARCHITECTURE_DOC")"
   fi
   VALIDATE_ARGS=(--dist-dir "$OUT_DIR/dist" --repo "$ROOT" --release-commit "$RELEASE_COMMIT")
   if [ -n "$ARCH_DOC_FOR_VALIDATE" ]; then
@@ -187,7 +215,7 @@ if [ "$AUDIT_BUNDLE_MODE" = release ]; then
   if [ -f "$INSTALL_EVIDENCE_FILE" ]; then
     VALIDATE_ARGS+=(--install-evidence "$INSTALL_EVIDENCE_FILE")
   fi
-  if ! python3 "$ROOT/scripts/audit_bundle_validate.py" "${VALIDATE_ARGS[@]}"; then
+  if ! "$PYTHON_BIN" "$ROOT/scripts/audit_bundle_validate.py" "${VALIDATE_ARGS[@]}"; then
     echo "audit_bundle: refusing to ship a release-mode bundle over incomplete/unverified release evidence -- set AUDIT_BUNDLE_MODE=source-only for an explicit, clearly-labeled source-only bundle instead" >&2
     exit 1
   fi
@@ -200,7 +228,7 @@ fi
 for f in test-summary.json acceptance-summary.json claims-verify-report.txt \
   build-manifest.json checksums.txt checksums.txt.minisig checksums.txt.hmac; do
   if [ -f "$OUT_DIR/dist/$f" ]; then
-    cp "$OUT_DIR/dist/$f" "$OUT_DIR/evidence/$f"
+    "$CP_BIN" "$OUT_DIR/dist/$f" "$OUT_DIR/evidence/$f"
   fi
 done
 
@@ -219,11 +247,11 @@ done
 # for what.
 # ---------------------------------------------------------------------------
 CLAIMS_PROVENANCE="$OUT_DIR/evidence/CLAIMS_PROVENANCE.txt"
-SOURCE_CLAIMS_SHA=$(sha256sum "$OUT_DIR/source/docs/claims.yaml" | awk '{print $1}')
+SOURCE_CLAIMS_SHA=$("$SHA256SUM_BIN" "$OUT_DIR/source/docs/claims.yaml" | "$AWK_BIN" '{print $1}')
 {
   echo "source/docs/claims.yaml (current source tree at ${REF}): sha256=${SOURCE_CLAIMS_SHA}"
   if [ -f "$OUT_DIR/dist/claims.yaml" ]; then
-    DIST_CLAIMS_SHA=$(sha256sum "$OUT_DIR/dist/claims.yaml" | awk '{print $1}')
+    DIST_CLAIMS_SHA=$("$SHA256SUM_BIN" "$OUT_DIR/dist/claims.yaml" | "$AWK_BIN" '{print $1}')
     echo "dist/claims.yaml (frozen into the shipped release build, may predate ${REF}): sha256=${DIST_CLAIMS_SHA}"
     if [ "$SOURCE_CLAIMS_SHA" = "$DIST_CLAIMS_SHA" ]; then
       echo "status: identical -- no divergence between current source and the shipped release."
@@ -244,7 +272,7 @@ CONTAMINATION_FOUND=false
 while IFS= read -r -d '' hit; do
   echo "audit_bundle: contamination in bundle: $hit" >&2
   CONTAMINATION_FOUND=true
-done < <(find "$OUT_DIR" \( \
+done < <("$FIND_BIN" "$OUT_DIR" \( \
   -name '.venv' -o -name 'venv' -o -name '__pycache__' -o -name '*.egg-info' \
   -o -name '.codegraph' -o -name '.tmp_debug_*' -o -name 'gov.bak-*' \
   -o -path '*/bin/gov' \
@@ -255,4 +283,4 @@ if [ "$CONTAMINATION_FOUND" = true ]; then
 fi
 
 echo "audit_bundle: OK (mode=${AUDIT_BUNDLE_MODE}) — $OUT_DIR" >&2
-find "$OUT_DIR" -maxdepth 2 >&2
+"$FIND_BIN" "$OUT_DIR" -maxdepth 2 >&2

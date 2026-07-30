@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+#!/usr/bin/bash
 # scripts/release_tier_pipeline.sh -- Sol11 rc5 Session 3 (P1-5): runs a
 # sequence of named tiers, each backed by an atomic, identity-scoped
 # checkpoint (scripts/release_checkpoint.py), with fail-fast semantics: the
@@ -17,6 +17,7 @@
 #
 # Usage:
 #   release_tier_pipeline.sh run --state-dir DIR --identity-file FILE --spec SPECFILE
+#     --python-bin PATH --bash-bin PATH --sha256sum-bin PATH --date-bin PATH --awk-bin PATH
 #
 # SPECFILE: one tier per line, TAB-separated: name<TAB>logfile<TAB>command
 # (command is executed via `bash -c "$command"`). Blank lines and lines
@@ -30,11 +31,11 @@
 # emitted.
 set -euo pipefail
 
-ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+ROOT=$(cd "${BASH_SOURCE[0]%/*}/.." && pwd -P)
 CHECKPOINT_PY="$ROOT/scripts/release_checkpoint.py"
 
 usage() {
-  echo "usage: $0 run --state-dir DIR --identity-file FILE --spec SPECFILE" >&2
+  echo "usage: $0 run --state-dir DIR --identity-file FILE --spec SPECFILE [--python-bin PATH --bash-bin PATH --sha256sum-bin PATH --date-bin PATH --awk-bin PATH]" >&2
   exit 2
 }
 
@@ -44,24 +45,44 @@ shift
 STATE_DIR=""
 IDENTITY_FILE=""
 SPEC=""
+PYTHON_BIN=python3
+BASH_BIN=bash
+SHA256SUM_BIN=sha256sum
+DATE_BIN=date
+AWK_BIN=awk
+MKDIR_BIN=mkdir
+MKTEMP_BIN=mktemp
+RM_BIN=rm
+DIRNAME_BIN=dirname
+CAT_BIN=cat
 while [ $# -gt 0 ]; do
   case "$1" in
     --state-dir) STATE_DIR=$2; shift 2 ;;
     --identity-file) IDENTITY_FILE=$2; shift 2 ;;
     --spec) SPEC=$2; shift 2 ;;
+    --python-bin) PYTHON_BIN=$2; shift 2 ;;
+    --bash-bin) BASH_BIN=$2; shift 2 ;;
+    --sha256sum-bin) SHA256SUM_BIN=$2; shift 2 ;;
+    --date-bin) DATE_BIN=$2; shift 2 ;;
+    --awk-bin) AWK_BIN=$2; shift 2 ;;
+    --mkdir-bin) MKDIR_BIN=$2; shift 2 ;;
+    --mktemp-bin) MKTEMP_BIN=$2; shift 2 ;;
+    --rm-bin) RM_BIN=$2; shift 2 ;;
+    --dirname-bin) DIRNAME_BIN=$2; shift 2 ;;
+    --cat-bin) CAT_BIN=$2; shift 2 ;;
     *) usage ;;
   esac
 done
 [ -n "$STATE_DIR" ] && [ -n "$IDENTITY_FILE" ] && [ -n "$SPEC" ] || usage
 [ -f "$SPEC" ] || { echo "release_tier_pipeline: spec file $SPEC not found" >&2; exit 2; }
-mkdir -p "$STATE_DIR"
+"$MKDIR_BIN" -p "$STATE_DIR"
 
 # emit_json_line: print one JSON object built entirely from argv (never from
 # string-interpolated bash variables inside a python -c body) -- avoids any
 # quoting/injection hazard from a tier name, log path, or command containing
 # characters meaningful to Python source.
 emit_json_line() {
-  python3 - "$@" <<'PY'
+  "$PYTHON_BIN" - "$@" <<'PY'
 import json, sys
 keys = sys.argv[1::2]
 vals = sys.argv[2::2]
@@ -102,38 +123,38 @@ while IFS=$'\t' read -r NAME LOG CMD || [ -n "$NAME" ]; do
   LOGSHA=""
   EXITCODE=0
 
-  CHECK_ERR_FILE=$(mktemp)
-  if CHECK_OUT=$(python3 "$CHECKPOINT_PY" check --checkpoint "$CKPT" --identity-file "$IDENTITY_FILE" --command "$CMD" 2>"$CHECK_ERR_FILE"); then
+  CHECK_ERR_FILE=$("$MKTEMP_BIN")
+  if CHECK_OUT=$("$PYTHON_BIN" "$CHECKPOINT_PY" check --checkpoint "$CKPT" --identity-file "$IDENTITY_FILE" --command "$CMD" 2>"$CHECK_ERR_FILE"); then
     if [ -f "$LOG" ]; then
       RESUMED=true
-      RESULT=$(python3 -c "import json,sys; print(json.load(open(sys.argv[1]))['result'])" "$CKPT")
-      SECONDS_=$(python3 -c "import json,sys; print(json.load(open(sys.argv[1])).get('duration_seconds',0))" "$CKPT")
-      STARTED=$(python3 -c "import json,sys; print(json.load(open(sys.argv[1]))['started'])" "$CKPT")
-      ENDED=$(python3 -c "import json,sys; print(json.load(open(sys.argv[1]))['completed'])" "$CKPT")
-      LOGSHA=$(python3 -c "import json,sys; print(json.load(open(sys.argv[1]))['log_sha256'])" "$CKPT")
-      EXITCODE=$(python3 -c "import json,sys; print(json.load(open(sys.argv[1]))['exit_code'])" "$CKPT")
+      RESULT=$("$PYTHON_BIN" -c "import json,sys; print(json.load(open(sys.argv[1]))['result'])" "$CKPT")
+      SECONDS_=$("$PYTHON_BIN" -c "import json,sys; print(json.load(open(sys.argv[1])).get('duration_seconds',0))" "$CKPT")
+      STARTED=$("$PYTHON_BIN" -c "import json,sys; print(json.load(open(sys.argv[1]))['started'])" "$CKPT")
+      ENDED=$("$PYTHON_BIN" -c "import json,sys; print(json.load(open(sys.argv[1]))['completed'])" "$CKPT")
+      LOGSHA=$("$PYTHON_BIN" -c "import json,sys; print(json.load(open(sys.argv[1]))['log_sha256'])" "$CKPT")
+      EXITCODE=$("$PYTHON_BIN" -c "import json,sys; print(json.load(open(sys.argv[1]))['exit_code'])" "$CKPT")
     else
       echo "release_tier_pipeline: tier ${NAME} checkpoint matches identity but its log ${LOG} is missing on disk -- re-running rather than trusting an unretrievable result" >&2
     fi
   else
-    echo "release_tier_pipeline: tier ${NAME} checkpoint not reusable: $(cat "$CHECK_ERR_FILE")" >&2
+    echo "release_tier_pipeline: tier ${NAME} checkpoint not reusable: $("$CAT_BIN" "$CHECK_ERR_FILE")" >&2
   fi
-  rm -f "$CHECK_ERR_FILE"
+  "$RM_BIN" -f "$CHECK_ERR_FILE"
 
   if [ "$RESUMED" != true ]; then
-    START_EPOCH=$(date +%s)
-    STARTED=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-    mkdir -p "$(dirname "$LOG")"
+    START_EPOCH=$("$DATE_BIN" +%s)
+    STARTED=$("$DATE_BIN" -u +%Y-%m-%dT%H:%M:%SZ)
+    "$MKDIR_BIN" -p "$("$DIRNAME_BIN" "$LOG")"
     set +e
-    bash -c "$CMD" >"$LOG" 2>&1
+    "$BASH_BIN" -c "$CMD" >"$LOG" 2>&1
     EXITCODE=$?
     set -e
     if [ "$EXITCODE" -eq 0 ]; then RESULT=PASS; else RESULT=FAIL; fi
-    END_EPOCH=$(date +%s)
-    ENDED=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+    END_EPOCH=$("$DATE_BIN" +%s)
+    ENDED=$("$DATE_BIN" -u +%Y-%m-%dT%H:%M:%SZ)
     SECONDS_=$((END_EPOCH - START_EPOCH))
-    LOGSHA=$(sha256sum "$LOG" | awk '{print $1}')
-    python3 "$CHECKPOINT_PY" write --checkpoint "$CKPT" --identity-file "$IDENTITY_FILE" \
+    LOGSHA=$("$SHA256SUM_BIN" "$LOG" | "$AWK_BIN" '{print $1}')
+    "$PYTHON_BIN" "$CHECKPOINT_PY" write --checkpoint "$CKPT" --identity-file "$IDENTITY_FILE" \
       --command "$CMD" --started "$STARTED" --completed "$ENDED" \
       --exit-code "$EXITCODE" --log-sha256 "$LOGSHA" --result "$RESULT" --duration-seconds "$SECONDS_" >/dev/null
   fi
@@ -169,8 +190,8 @@ if [ "$ABORTED" = true ]; then
       found=true
     fi
   done
-  SKIPPED_JSON=$(python3 -c "import json,sys; print(json.dumps(sys.argv[1:]))" "${SKIPPED[@]}")
-  python3 -c "
+  SKIPPED_JSON=$("$PYTHON_BIN" -c "import json,sys; print(json.dumps(sys.argv[1:]))" "${SKIPPED[@]}")
+  "$PYTHON_BIN" -c "
 import json, sys
 print(json.dumps({'tier': '__pipeline__', 'aborted': True, 'failed_tier': sys.argv[1], 'skipped_tiers': json.loads(sys.argv[2])}))
 " "$FAILED_TIER" "$SKIPPED_JSON"

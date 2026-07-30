@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+#!/usr/bin/bash
 # Sol redteam v7 S8 (corpus case 37): Assayer's declared version must have a
 # matching Git tag in its own repo, pointing at the exact commit that
 # actually shipped. Sol's audit found Assayer at declared version 1.1.0 with
@@ -12,7 +12,7 @@
 # refuses both a missing tag and a tag pointing at the wrong commit.
 #
 # Usage:
-#   scripts/assayer_verify.sh --assayer-repo <path>
+#   scripts/assayer_verify.sh --assayer-repo <path> [--python-bin <path> --git-bin <path>]
 #
 # --assayer-repo   root of the Assayer checkout: must contain pyproject.toml
 #                  with a `[project]` `version = "X.Y.Z"` field, and be a Git
@@ -28,12 +28,16 @@ usage() {
 }
 
 ASSAYER_REPO=""
+PYTHON_BIN=python3
+GIT_BIN=git
 while [ $# -gt 0 ]; do
   case "$1" in
   --assayer-repo)
     ASSAYER_REPO=$2
     shift 2
     ;;
+  --python-bin) PYTHON_BIN=$2; shift 2 ;;
+  --git-bin) GIT_BIN=$2; shift 2 ;;
   *)
     usage
     ;;
@@ -44,7 +48,7 @@ done
 PYPROJECT="$ASSAYER_REPO/pyproject.toml"
 [ -f "$PYPROJECT" ] || { echo "assayer_verify: $PYPROJECT not found" >&2; exit 1; }
 
-VERSION=$(python3 -c "
+VERSION=$("$PYTHON_BIN" -c "
 import re, sys
 text = open(sys.argv[1]).read()
 m = re.search(r'(?m)^\s*version\s*=\s*\"([^\"]+)\"', text)
@@ -54,11 +58,11 @@ print(m.group(1))
 " "$PYPROJECT")
 [ -n "$VERSION" ] || { echo "assayer_verify: pyproject.toml declares an empty version" >&2; exit 1; }
 
-HEAD_COMMIT=$(git -C "$ASSAYER_REPO" rev-parse HEAD)
+HEAD_COMMIT=$("$GIT_BIN" -C "$ASSAYER_REPO" rev-parse HEAD)
 
 TAG=""
 for candidate in "v${VERSION}" "${VERSION}"; do
-  if git -C "$ASSAYER_REPO" rev-parse --verify -q "refs/tags/${candidate}^{commit}" >/dev/null; then
+  if "$GIT_BIN" -C "$ASSAYER_REPO" rev-parse --verify -q "refs/tags/${candidate}^{commit}" >/dev/null; then
     TAG="$candidate"
     break
   fi
@@ -69,7 +73,7 @@ if [ -z "$TAG" ]; then
   exit 1
 fi
 
-TAG_COMMIT=$(git -C "$ASSAYER_REPO" rev-parse "refs/tags/${TAG}^{commit}")
+TAG_COMMIT=$("$GIT_BIN" -C "$ASSAYER_REPO" rev-parse "refs/tags/${TAG}^{commit}")
 if [ "$TAG_COMMIT" != "$HEAD_COMMIT" ]; then
   echo "assayer_verify: tag ${TAG} for declared version ${VERSION} points at ${TAG_COMMIT}, but HEAD is ${HEAD_COMMIT}" >&2
   exit 1

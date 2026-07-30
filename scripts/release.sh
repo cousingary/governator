@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+#!/usr/bin/bash
 # Sol redteam v3 S14 (finding #20 / P2.2): the single, canonical release
 # pipeline. Before this session, two incompatible generations existed side
 # by side: this script (single-platform, real ldflags identity, no
@@ -16,7 +16,7 @@
 # "signature" and stopped writing an "UNSIGNED" placeholder when absent).
 set -euo pipefail
 
-ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+ROOT=$(cd "${BASH_SOURCE[0]%/*}/.." && pwd -P)
 cd "$ROOT"
 
 # Sol13 P0-2/P1-4: the checked-in policy is the independent trust root for
@@ -55,7 +55,7 @@ release_tool_value() {
   return 1
 }
 
-for release_tool in go python3 sha256sum tar gzip minisign git; do
+for release_tool in go python3 python3.12 sha256sum tar gzip minisign git bash date awk env cp rm mkdir find sort mktemp dirname pwd grep uname cat chmod stat basename timeout mv ls systemctl docker; do
   release_tool_path=$(release_tool_value "$release_tool" path) || {
     echo "release: approved tool ${release_tool} is absent from ${RELEASE_TOOL_POLICY}" >&2
     exit 1
@@ -63,29 +63,85 @@ for release_tool in go python3 sha256sum tar gzip minisign git; do
   case "$release_tool" in
     go) GO_TOOL=$release_tool_path ;;
     python3) PYTHON_TOOL=$release_tool_path ;;
+    python3.12) PYTHON312_TOOL=$release_tool_path ;;
     sha256sum) SHA256SUM_TOOL=$release_tool_path ;;
     tar) TAR_TOOL=$release_tool_path ;;
     gzip) GZIP_TOOL=$release_tool_path ;;
     minisign) MINISIGN_TOOL=$release_tool_path ;;
     git) GIT_TOOL=$release_tool_path ;;
+    bash) BASH_TOOL=$release_tool_path ;;
+    date) DATE_TOOL=$release_tool_path ;;
+    awk) AWK_TOOL=$release_tool_path ;;
+    env) ENV_TOOL=$release_tool_path ;;
+    cp) CP_TOOL=$release_tool_path ;;
+    rm) RM_TOOL=$release_tool_path ;;
+    mkdir) MKDIR_TOOL=$release_tool_path ;;
+    find) FIND_TOOL=$release_tool_path ;;
+    sort) SORT_TOOL=$release_tool_path ;;
+    mktemp) MKTEMP_TOOL=$release_tool_path ;;
+    dirname) DIRNAME_TOOL=$release_tool_path ;;
+    pwd) PWD_TOOL=$release_tool_path ;;
+    grep) GREP_TOOL=$release_tool_path ;;
+    uname) UNAME_TOOL=$release_tool_path ;;
+    cat) CAT_TOOL=$release_tool_path ;;
+    chmod) CHMOD_TOOL=$release_tool_path ;;
+    stat) STAT_TOOL=$release_tool_path ;;
+    basename) BASENAME_TOOL=$release_tool_path ;;
+    timeout) TIMEOUT_TOOL=$release_tool_path ;;
+    mv) MV_TOOL=$release_tool_path ;;
+    ls) LS_TOOL=$release_tool_path ;;
+    systemctl) SYSTEMCTL_TOOL=$release_tool_path ;;
+    docker) DOCKER_TOOL=$release_tool_path ;;
   esac
 done
 
-BOOTSTRAP_TOOLSET=$(mktemp)
-if ! "$PYTHON_TOOL" "$ROOT/scripts/release_toolset.py" --policy "$RELEASE_TOOL_POLICY" --out "$BOOTSTRAP_TOOLSET" >/dev/null; then
-  rm -f "$BOOTSTRAP_TOOLSET"
+RELEASE_OUT_BOOTSTRAP=${OUT_DIR:-dist}
+TOOLBIN_DIR=$("$PYTHON_TOOL" -c 'import os,sys; root,out=sys.argv[1:3]; print(os.path.join(root, out, "toolbin") if not os.path.isabs(out) else os.path.join(out, "toolbin"))' "$ROOT" "$RELEASE_OUT_BOOTSTRAP")
+BOOTSTRAP_TOOLSET=$("$PYTHON_TOOL" -c 'import tempfile; print(tempfile.mkstemp(prefix="governator-release-toolset-")[1])')
+if ! "$PYTHON_TOOL" "$ROOT/scripts/release_toolset.py" --policy "$RELEASE_TOOL_POLICY" --out "$BOOTSTRAP_TOOLSET" --toolbin "$TOOLBIN_DIR" >/dev/null; then
+  "$PYTHON_TOOL" -c 'import os,sys; os.unlink(sys.argv[1])' "$BOOTSTRAP_TOOLSET"
   echo "release: approved release-tool policy verification failed" >&2
   exit 1
 fi
-rm -f "$BOOTSTRAP_TOOLSET"
-
-go() { "$GO_TOOL" "$@"; }
-python3() { "$PYTHON_TOOL" "$@"; }
-sha256sum() { "$SHA256SUM_TOOL" "$@"; }
-tar() { "$TAR_TOOL" "$@"; }
-gzip() { "$GZIP_TOOL" "$@"; }
-minisign() { "$MINISIGN_TOOL" "$@"; }
-git() { "$GIT_TOOL" "$@"; }
+"$PYTHON_TOOL" -c 'import os,sys; os.unlink(sys.argv[1])' "$BOOTSTRAP_TOOLSET"
+if ! "$PYTHON_TOOL" "$ROOT/scripts/release_toolset.py" --policy "$RELEASE_TOOL_POLICY" --check-release-scripts "$ROOT"; then
+  echo "release: release command inventory is not fully covered by the approved tool policy" >&2
+  exit 1
+fi
+export PATH="$TOOLBIN_DIR"
+# From this point, explicit child arguments use the private directory's
+# verified links, never a policy-path symlink or a caller-provided PATH entry.
+GO_TOOL="$TOOLBIN_DIR/go"
+PYTHON_TOOL="$TOOLBIN_DIR/python3"
+PYTHON312_TOOL="$TOOLBIN_DIR/python3.12"
+SHA256SUM_TOOL="$TOOLBIN_DIR/sha256sum"
+TAR_TOOL="$TOOLBIN_DIR/tar"
+GZIP_TOOL="$TOOLBIN_DIR/gzip"
+MINISIGN_TOOL="$TOOLBIN_DIR/minisign"
+GIT_TOOL="$TOOLBIN_DIR/git"
+BASH_TOOL="$TOOLBIN_DIR/bash"
+DATE_TOOL="$TOOLBIN_DIR/date"
+AWK_TOOL="$TOOLBIN_DIR/awk"
+ENV_TOOL="$TOOLBIN_DIR/env"
+CP_TOOL="$TOOLBIN_DIR/cp"
+RM_TOOL="$TOOLBIN_DIR/rm"
+MKDIR_TOOL="$TOOLBIN_DIR/mkdir"
+FIND_TOOL="$TOOLBIN_DIR/find"
+SORT_TOOL="$TOOLBIN_DIR/sort"
+MKTEMP_TOOL="$TOOLBIN_DIR/mktemp"
+DIRNAME_TOOL="$TOOLBIN_DIR/dirname"
+PWD_TOOL="$TOOLBIN_DIR/pwd"
+GREP_TOOL="$TOOLBIN_DIR/grep"
+UNAME_TOOL="$TOOLBIN_DIR/uname"
+CAT_TOOL="$TOOLBIN_DIR/cat"
+CHMOD_TOOL="$TOOLBIN_DIR/chmod"
+STAT_TOOL="$TOOLBIN_DIR/stat"
+BASENAME_TOOL="$TOOLBIN_DIR/basename"
+TIMEOUT_TOOL="$TOOLBIN_DIR/timeout"
+MV_TOOL="$TOOLBIN_DIR/mv"
+LS_TOOL="$TOOLBIN_DIR/ls"
+SYSTEMCTL_TOOL="$TOOLBIN_DIR/systemctl"
+DOCKER_TOOL="$TOOLBIN_DIR/docker"
 
 require_clean_tree() {
   local stage=${1:-release}
@@ -98,8 +154,8 @@ require_clean_tree() {
 if [ "${GOV_RELEASE_IN_SCRATCH:-0}" != 1 ]; then
   require_clean_tree "source checkout"
   SOURCE_ROOT=$ROOT
-  OUT_DIR_ABS=$(python3 -c 'import os,sys; root,out=sys.argv[1:3]; print(out if os.path.isabs(out) else os.path.join(root, out))' "$SOURCE_ROOT" "${OUT_DIR:-dist}")
-  SCRATCH_PARENT=$(mktemp -d)
+  OUT_DIR_ABS=$("$PYTHON_TOOL" -c 'import os,sys; root,out=sys.argv[1:3]; print(out if os.path.isabs(out) else os.path.join(root, out))' "$SOURCE_ROOT" "${OUT_DIR:-dist}")
+  SCRATCH_PARENT=$("$MKTEMP_TOOL" -d)
   SCRATCH_TREE="$SCRATCH_PARENT/governator-release"
   cleanup() {
     git -C "$SOURCE_ROOT" worktree remove --force "$SCRATCH_TREE" >/dev/null 2>&1 || rm -rf "$SCRATCH_PARENT"
@@ -113,7 +169,7 @@ if [ "${GOV_RELEASE_IN_SCRATCH:-0}" != 1 ]; then
   if [ -z "${GOV_ARCHITECTURE_DOC:-}" ] && [ -f "$ARCH_DOC_DEFAULT" ]; then
     export GOV_ARCHITECTURE_DOC="$ARCH_DOC_DEFAULT"
   fi
-  (cd "$SCRATCH_TREE" && "$SCRATCH_TREE/scripts/release.sh")
+  (cd "$SCRATCH_TREE" && "$BASH_TOOL" "$SCRATCH_TREE/scripts/release.sh")
   exit $?
 fi
 
@@ -219,7 +275,7 @@ fi
 BUILD_TS=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 CLAIMS_HASH=$(sha256sum docs/claims.yaml | awk '{print $1}')
 ADAPTER_PROTOCOL_VERSION=${ADAPTER_PROTOCOL_VERSION:-adapter-protocol-v1}
-GO_VERSION=$(go version | awk '{print $3}')
+GO_VERSION=$("$GO_TOOL" version | awk '{print $3}')
 FUZZ_SECONDS=${FUZZ_SECONDS:-15}
 # Attempt 1/2 of the rc3 cut (2026-07-20) both failed on host contention, not
 # code defects: with Docker fully quiet, the default go test concurrency
@@ -323,7 +379,7 @@ TOOLSET_HASH=$(python3 "$ROOT/scripts/release_toolset.py" --policy "$RELEASE_TOO
 # just go/python version strings -- a checkpoint from an attempt whose go
 # binary changed underneath it (same go version string, different binary)
 # is correctly invalidated.
-TOOLCHAIN_HASH=$(printf '%s|%s|%s\n' "$(go version)" "$(python3 --version 2>&1)" "$TOOLSET_HASH" | sha256sum | awk '{print $1}')
+TOOLCHAIN_HASH=$(printf '%s|%s|%s\n' "$("$GO_TOOL" version)" "$(python3 --version 2>&1)" "$TOOLSET_HASH" | sha256sum | awk '{print $1}')
 ENVIRONMENT_HASH=$(printf '%s|GOMAXPROCS=%s|parallelism=%s|platforms=%s\n' "$(uname -a)" "${GOMAXPROCS:-}" "$GO_TEST_PARALLELISM" "$PLATFORMS" | sha256sum | awk '{print $1}')
 # Sol14 rc7 Session 10: host CAPABILITY STATE is part of release identity.
 # A red-team tier's result is a function of which capabilities the host
@@ -340,7 +396,7 @@ ENVIRONMENT_HASH=$(printf '%s|GOMAXPROCS=%s|parallelism=%s|platforms=%s\n' "$(un
 # carries a probe timestamp and host identity, and folding those in would
 # change the hash on every invocation and make every checkpoint permanently
 # unreusable -- defeating the resumable-checkpoint design (P1-5).
-RELEASE_CAPABILITIES_JSON=$(python3 "$ROOT/scripts/redteam_capabilities.py")
+RELEASE_CAPABILITIES_JSON=$("$PYTHON_TOOL" "$ROOT/scripts/redteam_capabilities.py" --git-bin "$GIT_TOOL" --docker-bin "$DOCKER_TOOL" --systemctl-bin "$SYSTEMCTL_TOOL")
 CAPABILITIES_HASH=$(printf '%s' "$RELEASE_CAPABILITIES_JSON" | python3 -c "
 import hashlib, json, sys
 records = json.load(sys.stdin)
@@ -379,9 +435,13 @@ else
   # (corpus case 16: "mixed tier evidence from two release attempts").
   RELEASE_ATTEMPT_ID=$(python3 -c "import uuid; print(uuid.uuid4())")
   echo "release: starting a FRESH release_attempt_id=${RELEASE_ATTEMPT_ID} (no matching prior attempt identity) -- wiping ${OUT_DIR}" >&2
-  rm -rf "$OUT_DIR"
-  mkdir -p "$CHECKPOINT_STATE_DIR"
+  "$RM_TOOL" -rf "$OUT_DIR"
+  "$MKDIR_TOOL" -p "$CHECKPOINT_STATE_DIR"
 fi
+"$RM_TOOL" -f "$TOOLSET_JSON_TEMP"
+"$RM_TOOL" -rf "$TOOLBIN_DIR"
+"$PYTHON_TOOL" "$ROOT/scripts/release_toolset.py" --policy "$RELEASE_TOOL_POLICY" --out "$OUT_DIR/toolset.json" --toolbin "$TOOLBIN_DIR" >/dev/null
+export PATH="$TOOLBIN_DIR"
 IDENTITY_FILE="$CHECKPOINT_STATE_DIR/identity.json"
 python3 "$ROOT/scripts/release_checkpoint.py" init --state-dir "$CHECKPOINT_STATE_DIR" --identity-file "$CANDIDATE_IDENTITY" --attempt-id "$RELEASE_ATTEMPT_ID" >/dev/null
 rm -f "$CANDIDATE_IDENTITY"
@@ -389,7 +449,6 @@ rm -f "$CANDIDATE_IDENTITY"
 # P1-6: now that OUT_DIR is settled (either reused from a matching prior
 # attempt or freshly wiped+recreated), materialize the toolset record that
 # was computed against the temp file above into its shipped location.
-mv "$TOOLSET_JSON_TEMP" "$OUT_DIR/toolset.json"
 
 # ---------------------------------------------------------------------------
 # Stability preflight (Sol11 P1-5): record the exact host conditions this
@@ -447,7 +506,7 @@ MAIN_TIER_SPEC=$(mktemp)
 # identities to this object, so a package-level green line cannot stand in
 # for a real governed execution.
 if [ ! -f "$INTEGRATION_GOV_BIN" ]; then
-  go build -trimpath -ldflags "$LDFLAGS" -o "$INTEGRATION_GOV_BIN" ./cmd/gov
+  "$GO_TOOL" build -trimpath -ldflags "$LDFLAGS" -o "$INTEGRATION_GOV_BIN" ./cmd/gov
 fi
 mkdir -p "$INTEGRATION_EVIDENCE_DIR"
 cat >"$INTEGRATION_EXPECTED_NAMES" <<'EOF_INTEGRATION_NAMES'
@@ -466,15 +525,15 @@ assay
 contextgraph
 EOF_INTEGRATION_PACKAGES
 {
-  printf 'unit\t%s\tgo test -p %s -parallel %s -count=1 ./...\n' "$UNIT_LOG" "$GO_TEST_PARALLELISM" "$GO_TEST_PARALLELISM"
-  printf 'race\t%s\tgo test -race -timeout=30m -p %s -parallel %s -count=1 ./...\n' "$RACE_LOG" "$GO_TEST_PARALLELISM" "$GO_TEST_PARALLELISM"
-  printf 'integration\t%s\tASSAYER_REPO=%q GOV_INTEGRATION_ASSAYER_COMMIT=%q GOV_INTEGRATION_GOV_BIN=%q GOV_INTEGRATION_EVIDENCE_OUT=%q go test -json -tags integration -p %s -parallel %s -count=1 ./internal/assay/... ./internal/contextgraph/... > %q && %q integration-gate verify --log %q --expected-names %q --harness-evidence %q --governator-binary %q --expected-packages %q --assayer-commit %q > %q && cat %q\n' "$INTEGRATION_LOG" "$ASSAYER_REPO" "$ASSAYER_COMMIT" "$INTEGRATION_GOV_BIN" "$INTEGRATION_EVIDENCE_DIR" "$GO_TEST_PARALLELISM" "$GO_TEST_PARALLELISM" "$INTEGRATION_JSON_LOG" "$INTEGRATION_GOV_BIN" "$INTEGRATION_JSON_LOG" "$INTEGRATION_EXPECTED_NAMES" "$INTEGRATION_EVIDENCE_DIR" "$INTEGRATION_GOV_BIN" "$INTEGRATION_EXPECTED_PACKAGES" "$ASSAYER_COMMIT" "$INTEGRATION_GATE_JSON" "$INTEGRATION_JSON_LOG"
+  printf 'unit\t%s\t%q test -p %s -parallel %s -count=1 ./...\n' "$UNIT_LOG" "$GO_TOOL" "$GO_TEST_PARALLELISM" "$GO_TEST_PARALLELISM"
+  printf 'race\t%s\t%q test -race -timeout=30m -p %s -parallel %s -count=1 ./...\n' "$RACE_LOG" "$GO_TOOL" "$GO_TEST_PARALLELISM" "$GO_TEST_PARALLELISM"
+  printf 'integration\t%s\tASSAYER_REPO=%q GOV_INTEGRATION_ASSAYER_COMMIT=%q GOV_INTEGRATION_GOV_BIN=%q GOV_INTEGRATION_EVIDENCE_OUT=%q %q test -json -tags integration -p %s -parallel %s -count=1 ./internal/assay/... ./internal/contextgraph/... > %q && %q integration-gate verify --log %q --expected-names %q --harness-evidence %q --governator-binary %q --expected-packages %q --assayer-commit %q > %q && %q %q\n' "$INTEGRATION_LOG" "$ASSAYER_REPO" "$ASSAYER_COMMIT" "$INTEGRATION_GOV_BIN" "$INTEGRATION_EVIDENCE_DIR" "$GO_TOOL" "$GO_TEST_PARALLELISM" "$GO_TEST_PARALLELISM" "$INTEGRATION_JSON_LOG" "$INTEGRATION_GOV_BIN" "$INTEGRATION_JSON_LOG" "$INTEGRATION_EXPECTED_NAMES" "$INTEGRATION_EVIDENCE_DIR" "$INTEGRATION_GOV_BIN" "$INTEGRATION_EXPECTED_PACKAGES" "$ASSAYER_COMMIT" "$INTEGRATION_GATE_JSON" "$CAT_TOOL" "$INTEGRATION_JSON_LOG"
   # Sol redteam v6 S0 (P0-18, partial): the build-tagged internal/redteam/
   # corpus was never actually compiled by any release or CI command --
   # "black_box_corpus" here only runs Sol3-prefixed tests, which never
   # triggers the `redteam` build tag. redteam/redteam_race below are the
   # exact commands the v6 report requires.
-  printf 'corpus\t%s\tgo test -run '"'"'Sol3'"'"' -v -p %s -parallel %s -count=1 ./...\n' "$CORPUS_LOG" "$GO_TEST_PARALLELISM" "$GO_TEST_PARALLELISM"
+  printf 'corpus\t%s\t%q test -run '"'"'Sol3'"'"' -v -p %s -parallel %s -count=1 ./...\n' "$CORPUS_LOG" "$GO_TOOL" "$GO_TEST_PARALLELISM" "$GO_TEST_PARALLELISM"
   # Sol14 P0-2/P0-3 (rc7 Session 10): the redteam tiers MUST carry the same
   # ASSAYER_REPO/commit binding the integration tier above does. The S5/S6
   # corpus cases (TestV14Case322-329) spawn a nested real integration tier,
@@ -487,8 +546,8 @@ EOF_INTEGRATION_PACKAGES
   # tests were only ever exercised by hand from the real checkout, where the
   # sibling fallback happens to resolve. Same defect class as every other
   # rc6/rc7 release blocker: a path that had never executed end to end.
-  printf 'redteam\t%s\tASSAYER_REPO=%q GOV_INTEGRATION_ASSAYER_COMMIT=%q go test -v -timeout=30m -tags redteam -p %s -parallel %s -count=1 ./...\n' "$REDTEAM_LOG" "$ASSAYER_REPO" "$ASSAYER_COMMIT" "$GO_TEST_PARALLELISM" "$GO_TEST_PARALLELISM"
-  printf 'redteam_race\t%s\tASSAYER_REPO=%q GOV_INTEGRATION_ASSAYER_COMMIT=%q go test -v -race -timeout=30m -tags redteam -p %s -parallel %s -count=1 ./...\n' "$REDTEAM_RACE_LOG" "$ASSAYER_REPO" "$ASSAYER_COMMIT" "$GO_TEST_PARALLELISM" "$GO_TEST_PARALLELISM"
+  printf 'redteam\t%s\tASSAYER_REPO=%q GOV_INTEGRATION_ASSAYER_COMMIT=%q %q test -v -timeout=30m -tags redteam -p %s -parallel %s -count=1 ./...\n' "$REDTEAM_LOG" "$ASSAYER_REPO" "$ASSAYER_COMMIT" "$GO_TOOL" "$GO_TEST_PARALLELISM" "$GO_TEST_PARALLELISM"
+  printf 'redteam_race\t%s\tASSAYER_REPO=%q GOV_INTEGRATION_ASSAYER_COMMIT=%q %q test -v -race -timeout=30m -tags redteam -p %s -parallel %s -count=1 ./...\n' "$REDTEAM_RACE_LOG" "$ASSAYER_REPO" "$ASSAYER_COMMIT" "$GO_TOOL" "$GO_TEST_PARALLELISM" "$GO_TEST_PARALLELISM"
 } >"$MAIN_TIER_SPEC"
 
 MAIN_TIER_JSONL="$OUT_DIR/.tier-pipeline-main.jsonl"
@@ -501,7 +560,7 @@ if ! python3 "$ROOT/scripts/release_toolset.py" --policy "$RELEASE_TOOL_POLICY" 
   echo "release: refusing to run test tiers -- a release tool changed identity since preflight (Sol12 P1-4)" >&2
   exit 1
 fi
-if ! bash "$ROOT/scripts/release_tier_pipeline.sh" run --state-dir "$CHECKPOINT_STATE_DIR" --identity-file "$IDENTITY_FILE" --spec "$MAIN_TIER_SPEC" >"$MAIN_TIER_JSONL"; then
+if ! "$BASH_TOOL" "$ROOT/scripts/release_tier_pipeline.sh" run --state-dir "$CHECKPOINT_STATE_DIR" --identity-file "$IDENTITY_FILE" --spec "$MAIN_TIER_SPEC" --python-bin "$PYTHON_TOOL" --bash-bin "$BASH_TOOL" --sha256sum-bin "$SHA256SUM_TOOL" --date-bin "$DATE_TOOL" --awk-bin "$AWK_TOOL" --mkdir-bin "$MKDIR_TOOL" --mktemp-bin "$MKTEMP_TOOL" --rm-bin "$RM_TOOL" --dirname-bin "$DIRNAME_TOOL" --cat-bin "$CAT_TOOL" >"$MAIN_TIER_JSONL"; then
   MAIN_TIER_PIPELINE_OK=false
 fi
 rm -f "$MAIN_TIER_SPEC"
@@ -640,7 +699,7 @@ REDTEAM_CAPABILITIES_JSON=$RELEASE_CAPABILITIES_JSON
 # bound into a capability attestation.
 REDTEAM_SOURCE_IDENTITY="$OUT_DIR/redteam-source-identity.json"
 REDTEAM_INVENTORY="$OUT_DIR/.redteam-inventory.txt"
-python3 scripts/redteam_source_identity.py --repo-root . --out "$REDTEAM_SOURCE_IDENTITY" --inventory-out "$REDTEAM_INVENTORY"
+"$PYTHON_TOOL" scripts/redteam_source_identity.py --repo-root . --out "$REDTEAM_SOURCE_IDENTITY" --inventory-out "$REDTEAM_INVENTORY" --go-bin "$GO_TOOL"
 # Sol12 P1-3 (rc5 Session 7): REQUIRE_ZERO_SKIPS is already set by the
 # version-derived strictness block above (production versions always get 1,
 # development versions default to 0 but the operator can opt in via
@@ -660,7 +719,7 @@ ATTESTATIONS_DIR="${GOV_ATTESTATIONS_DIR:-}"
 ASSAYER_COMMIT_ATTEST=$(git -C "${ASSAYER_REPO:-$SOURCE_ROOT/../assayer}" rev-parse HEAD 2>/dev/null || echo "unknown")
 TEST_SOURCE_HASH=$(python3 -c "import json; print(json.load(open('$REDTEAM_SOURCE_IDENTITY'))['test_source_hash'])")
 TEST_BINARY_SHA256=$(python3 -c "import json; print(json.load(open('$REDTEAM_SOURCE_IDENTITY'))['test_binary_sha256'])")
-TOOLCHAIN_HASH=$(go version | sha256sum | awk '{print $1}')
+TOOLCHAIN_HASH=$("$GO_TOOL" version | sha256sum | awk '{print $1}')
 if [ -n "$ATTESTATIONS_DIR" ]; then
   if [ ! -d "$ATTESTATIONS_DIR" ]; then
     echo "release: GOV_ATTESTATIONS_DIR is not a directory: $ATTESTATIONS_DIR" >&2
@@ -670,7 +729,7 @@ if [ -n "$ATTESTATIONS_DIR" ]; then
   REDTEAM_GATE_EXTRA_ARGS+=(--attestations "$ATTESTATIONS_DIR" --attestation-governator-commit "$COMMIT" --attestation-assayer-commit "$ASSAYER_COMMIT_ATTEST" --attestation-release-version "$VERSION" --attestation-source-identity "$REDTEAM_SOURCE_IDENTITY" --attestation-toolchain-hash "$TOOLCHAIN_HASH" --attestation-release-time "$RELEASE_ATTESTATION_TIME" --attestation-max-age "24h")
 fi
 REDTEAM_GATE_JSON="$OUT_DIR/.redteam-gate.json"
-if go run ./cmd/gov redteam-gate verify --manifest "$REDTEAM_MANIFEST" --log "$REDTEAM_LOG" --capabilities "$REDTEAM_CAPABILITIES_JSON" --inventory "$REDTEAM_INVENTORY" "${REDTEAM_EXACT_MANIFEST_FLAGS[@]}" "${REDTEAM_GATE_EXTRA_ARGS[@]}" >"$REDTEAM_GATE_JSON" 2>"$OUT_DIR/.redteam-gate.stderr"; then
+if "$GO_TOOL" run ./cmd/gov redteam-gate verify --manifest "$REDTEAM_MANIFEST" --log "$REDTEAM_LOG" --capabilities "$REDTEAM_CAPABILITIES_JSON" --inventory "$REDTEAM_INVENTORY" "${REDTEAM_EXACT_MANIFEST_FLAGS[@]}" "${REDTEAM_GATE_EXTRA_ARGS[@]}" >"$REDTEAM_GATE_JSON" 2>"$OUT_DIR/.redteam-gate.stderr"; then
   REDTEAM_GATE_OK=true
 else
   REDTEAM_GATE_OK=false
@@ -699,7 +758,7 @@ for entry in "${FUZZ_TARGETS[@]}"; do
   fn=${entry#* }
   flog="$OUT_DIR/test-fuzz-${fn}.log"
   fstart=$(date +%s)
-  if go test -run "^${fn}\$" -fuzz "^${fn}\$" -fuzztime "${FUZZ_SECONDS}s" "./${pkg}" >"$flog" 2>&1; then
+  if "$GO_TOOL" test -run "^${fn}\$" -fuzz "^${fn}\$" -fuzztime "${FUZZ_SECONDS}s" "./${pkg}" >"$flog" 2>&1; then
     fresult=PASS
   else
     fresult=FAIL
@@ -895,7 +954,7 @@ fi
 # internal/redteam/v7_pending_cases_test.go's TestV7Case37.
 ASSAYER_VERSION_TAG_LOG="$OUT_DIR/test-assayer-version-tag.log"
 if [ -d "$ASSAYER_REPO" ]; then
-  if bash "$ROOT/scripts/assayer_verify.sh" --assayer-repo "$ASSAYER_REPO" >"$ASSAYER_VERSION_TAG_LOG" 2>&1; then
+  if "$BASH_TOOL" "$ROOT/scripts/assayer_verify.sh" --assayer-repo "$ASSAYER_REPO" --python-bin "$PYTHON_TOOL" --git-bin "$GIT_TOOL" >"$ASSAYER_VERSION_TAG_LOG" 2>&1; then
     ASSAYER_VERSION_TAG_RESULT=PASS
   else
     ASSAYER_VERSION_TAG_RESULT=FAIL
@@ -948,7 +1007,7 @@ if ! python3 "$ROOT/scripts/release_toolset.py" --policy "$RELEASE_TOOL_POLICY" 
   echo "release: refusing to build -- a release tool changed identity since preflight (Sol12 P1-4)" >&2
   exit 1
 fi
-HOST_PLATFORM_ID="$(go env GOOS)_$(go env GOARCH)"
+HOST_PLATFORM_ID="$("$GO_TOOL" env GOOS)_$("$GO_TOOL" env GOARCH)"
 HOST_ARCHIVE_NAME=""
 HOST_ARCHIVE_SHA=""
 HOST_BIN_SHA=""
@@ -981,7 +1040,7 @@ for platform in $PLATFORMS; do
   # -- never as a tar source.
   NATIVE_STAGE=$(mktemp -d)
   BIN="$NATIVE_STAGE/gov"
-  GOOS=$GOOS_VALUE GOARCH=$GOARCH_VALUE CGO_ENABLED=0 go build -trimpath -ldflags "$LDFLAGS" -o "$BIN" ./cmd/gov
+  GOOS=$GOOS_VALUE GOARCH=$GOARCH_VALUE CGO_ENABLED=0 "$GO_TOOL" build -trimpath -ldflags "$LDFLAGS" -o "$BIN" ./cmd/gov
   chmod 0755 "$BIN"
   cp "$BIN" "$STAGE/gov"
   ARCHIVE_NAME="gov_${VERSION}_${PLATFORM_ID}.tar.gz"
@@ -1051,7 +1110,7 @@ cp docs/claims.yaml "$OUT_DIR/claims.yaml"
 # script must not silently reach out to the network to install one).
 # ---------------------------------------------------------------------------
 SBOM="$OUT_DIR/sbom.json"
-go list -m -json all >"$OUT_DIR/.modules.json"
+"$GO_TOOL" list -m -json all >"$OUT_DIR/.modules.json"
 python3 - "$SBOM" "$VERSION" "$COMMIT" "$BUILD_TS" <<'PYSBOM'
 import json, pathlib, sys
 
@@ -1479,7 +1538,7 @@ rm -f "$ARTIFACTS_JSON"
 # without --artifact/--manifest.
 # ---------------------------------------------------------------------------
 CLAIMS_VERIFY_REPORT="$OUT_DIR/claims-verify-report.txt"
-if ! "$ROOT/scripts/release_verify.sh" --out-dir "$OUT_DIR" --repo "$ROOT" --platform "$HOST_PLATFORM_ID" --python-bin "$PYTHON_TOOL" --tar-bin "$TAR_TOOL" >"$CLAIMS_VERIFY_REPORT" 2>&1; then
+if ! "$BASH_TOOL" "$ROOT/scripts/release_verify.sh" --out-dir "$OUT_DIR" --repo "$ROOT" --platform "$HOST_PLATFORM_ID" --python-bin "$PYTHON_TOOL" --tar-bin "$TAR_TOOL" --mktemp-bin "$MKTEMP_TOOL" --rm-bin "$RM_TOOL" --stat-bin "$STAT_TOOL" >"$CLAIMS_VERIFY_REPORT" 2>&1; then
   echo "release: full claims verification FAILED — see ${CLAIMS_VERIFY_REPORT}" >&2
   cat "$CLAIMS_VERIFY_REPORT" >&2
   exit 1
