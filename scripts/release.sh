@@ -96,14 +96,14 @@ for release_tool in go python3 python3.12 sha256sum tar gzip minisign git bash d
 done
 
 # Bootstrap copies, captured before the toolbin-routed reassignment below
-# overwrites these names. The toolbin lives inside $OUT_DIR (per this
-# session's design) and a fresh release attempt wipes $OUT_DIR wholesale,
-# which deletes the toolbin -- including whatever tool the wipe's very next
-# command would need to rebuild it. These three bootstrap paths are the
-# only ones ever used after such a wipe, exactly the single documented
+# overwrites these names. A fresh release attempt wipes $OUT_DIR wholesale
+# and immediately needs to recreate a directory under it; using these
+# bootstrap (policy-resolved, pre-toolbin) paths rather than the
+# toolbin-routed ones means that step never depends on the toolbin's own
+# location or lifecycle at all -- exactly the single documented
 # ambient-resolution exception already established for the initial
-# preflight build above (P0-1 work item 7): rebuilding the hermetic
-# toolchain cannot itself be routed through the hermetic toolchain.
+# preflight build above (P0-1 work item 7): the one place hermetic tooling
+# cannot be routed through the hermetic toolchain itself.
 BOOTSTRAP_PYTHON_TOOL=$PYTHON_TOOL
 BOOTSTRAP_RM_TOOL=$RM_TOOL
 BOOTSTRAP_MKDIR_TOOL=$MKDIR_TOOL
@@ -463,13 +463,21 @@ else
   "$BOOTSTRAP_RM_TOOL" -rf "$OUT_DIR"
   "$BOOTSTRAP_MKDIR_TOOL" -p "$CHECKPOINT_STATE_DIR"
 fi
-# The toolbin lives inside $OUT_DIR and the FRESH branch above just deleted
-# it wholesale; the RESUMED branch's own rm -rf "$TOOLBIN_DIR" immediately
-# below deletes it too. Rebuilding it can only use the bootstrap tools
-# captured before any toolbin existed -- the toolbin-routed $RM_TOOL /
-# $PYTHON_TOOL are themselves inside the directory being removed / rebuilt.
+# The FRESH branch above deletes $OUT_DIR wholesale, so rebuilding whatever
+# lives there can only use the bootstrap tools captured before any toolbin
+# existed. The toolbin itself is no longer inside $OUT_DIR (it now lives on
+# a native filesystem, mkdtemp'd earlier in this script) and does NOT get
+# rm -rf'd here: its mode-0500 lockdown is now real (this is the whole
+# point of moving it off the 9p/drvfs mount), and a genuinely read-only
+# directory cannot have its entries unlinked -- rm -rf would fail on its
+# own prior output. release_toolset.py's write_toolset/build_toolbin is
+# already idempotent against an existing toolbin whose entries exactly
+# match the requested set (re-verifies, re-chmods, returns); the identical
+# --tools default is requested every call this script makes, so calling it
+# again here is a no-op re-verification, not a rebuild, and a genuine
+# mismatch still fails loudly rather than being silently papered over by a
+# wipe-and-recreate.
 "$BOOTSTRAP_RM_TOOL" -f "$TOOLSET_JSON_TEMP"
-"$BOOTSTRAP_RM_TOOL" -rf "$TOOLBIN_DIR"
 "$BOOTSTRAP_PYTHON_TOOL" "$ROOT/scripts/release_toolset.py" --policy "$RELEASE_TOOL_POLICY" --out "$OUT_DIR/toolset.json" --toolbin "$TOOLBIN_DIR" >/dev/null
 export PATH="$TOOLBIN_DIR"
 IDENTITY_FILE="$CHECKPOINT_STATE_DIR/identity.json"
