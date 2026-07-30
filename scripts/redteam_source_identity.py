@@ -13,6 +13,7 @@ import argparse
 import hashlib
 import json
 import os
+import shutil
 import subprocess
 import tempfile
 from pathlib import Path
@@ -134,7 +135,21 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     root = Path(args.repo_root).resolve()
-    go_bin = str(Path(args.go_bin).resolve())
+    # A bare command name (the "go" default -- callers that predate this
+    # flag and never pass --go-bin) must be resolved via PATH search, not
+    # treated as a filesystem path: Path("go").resolve() makes it absolute
+    # relative to the CURRENT WORKING DIRECTORY regardless of PATH, which
+    # silently produced nonsense like "<cwd>/go" and broke every existing
+    # caller that relies on the documented default. Anything containing a
+    # path separator (release.sh's own explicit --go-bin) is an actual
+    # path and is resolved as one, unchanged from before.
+    if os.sep in args.go_bin or (os.altsep and os.altsep in args.go_bin):
+        go_bin = str(Path(args.go_bin).resolve())
+    else:
+        resolved = shutil.which(args.go_bin)
+        if resolved is None:
+            raise SystemExit(f"redteam source identity: {args.go_bin!r} not found on PATH; pass --go-bin with an explicit path")
+        go_bin = resolved
     packages = go_packages(root, go_bin)
     sources, package_sources, inventory = tagged_sources(root, go_bin, packages)
     if not sources:
