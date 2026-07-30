@@ -108,8 +108,20 @@ BOOTSTRAP_PYTHON_TOOL=$PYTHON_TOOL
 BOOTSTRAP_RM_TOOL=$RM_TOOL
 BOOTSTRAP_MKDIR_TOOL=$MKDIR_TOOL
 
-RELEASE_OUT_BOOTSTRAP=${OUT_DIR:-dist}
-TOOLBIN_DIR=$("$PYTHON_TOOL" -c 'import os,sys; root,out=sys.argv[1:3]; print(os.path.join(root, out, "toolbin") if not os.path.isabs(out) else os.path.join(out, "toolbin"))' "$ROOT" "$RELEASE_OUT_BOOTSTRAP")
+# The toolbin's mode 0500 is the enforcement primitive (P0-1): a directory
+# whose permission bits genuinely cannot be widened is what makes "only
+# verified entries are reachable via PATH" a real property rather than a
+# claim. $ROOT (and therefore $OUT_DIR, which lives under it) can be a 9p
+# (drvfs) mount when this repo's working copy sits on a mounted Windows
+# drive -- chmod there silently no-ops instead of erroring, so a toolbin
+# nested under $OUT_DIR would report mode 0500 immediately after chmod but
+# read back as the mount's fixed mode (777 observed) on every later
+# verification, permanently failing Sol12 P1-4's re-check with no way to
+# satisfy it by fixing anything in this script. tempfile.mkdtemp honors
+# $TMPDIR (real tmpfs/ext4 in this environment) precisely so the toolbin
+# lands somewhere chmod actually holds, decoupling its enforcement from
+# wherever the source checkout happens to be mounted.
+TOOLBIN_DIR=$("$PYTHON_TOOL" -c 'import tempfile; print(tempfile.mkdtemp(prefix="governator-release-toolbin-"))')
 BOOTSTRAP_TOOLSET=$("$PYTHON_TOOL" -c 'import tempfile; print(tempfile.mkstemp(prefix="governator-release-toolset-")[1])')
 if ! "$PYTHON_TOOL" "$ROOT/scripts/release_toolset.py" --policy "$RELEASE_TOOL_POLICY" --out "$BOOTSTRAP_TOOLSET" --toolbin "$TOOLBIN_DIR" >/dev/null; then
   "$PYTHON_TOOL" -c 'import os,sys; os.unlink(sys.argv[1])' "$BOOTSTRAP_TOOLSET"
