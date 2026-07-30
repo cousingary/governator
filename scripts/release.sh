@@ -95,6 +95,19 @@ for release_tool in go python3 python3.12 sha256sum tar gzip minisign git bash d
   esac
 done
 
+# Bootstrap copies, captured before the toolbin-routed reassignment below
+# overwrites these names. The toolbin lives inside $OUT_DIR (per this
+# session's design) and a fresh release attempt wipes $OUT_DIR wholesale,
+# which deletes the toolbin -- including whatever tool the wipe's very next
+# command would need to rebuild it. These three bootstrap paths are the
+# only ones ever used after such a wipe, exactly the single documented
+# ambient-resolution exception already established for the initial
+# preflight build above (P0-1 work item 7): rebuilding the hermetic
+# toolchain cannot itself be routed through the hermetic toolchain.
+BOOTSTRAP_PYTHON_TOOL=$PYTHON_TOOL
+BOOTSTRAP_RM_TOOL=$RM_TOOL
+BOOTSTRAP_MKDIR_TOOL=$MKDIR_TOOL
+
 RELEASE_OUT_BOOTSTRAP=${OUT_DIR:-dist}
 TOOLBIN_DIR=$("$PYTHON_TOOL" -c 'import os,sys; root,out=sys.argv[1:3]; print(os.path.join(root, out, "toolbin") if not os.path.isabs(out) else os.path.join(out, "toolbin"))' "$ROOT" "$RELEASE_OUT_BOOTSTRAP")
 BOOTSTRAP_TOOLSET=$("$PYTHON_TOOL" -c 'import tempfile; print(tempfile.mkstemp(prefix="governator-release-toolset-")[1])')
@@ -435,12 +448,17 @@ else
   # (corpus case 16: "mixed tier evidence from two release attempts").
   RELEASE_ATTEMPT_ID=$(python3 -c "import uuid; print(uuid.uuid4())")
   echo "release: starting a FRESH release_attempt_id=${RELEASE_ATTEMPT_ID} (no matching prior attempt identity) -- wiping ${OUT_DIR}" >&2
-  "$RM_TOOL" -rf "$OUT_DIR"
-  "$MKDIR_TOOL" -p "$CHECKPOINT_STATE_DIR"
+  "$BOOTSTRAP_RM_TOOL" -rf "$OUT_DIR"
+  "$BOOTSTRAP_MKDIR_TOOL" -p "$CHECKPOINT_STATE_DIR"
 fi
-"$RM_TOOL" -f "$TOOLSET_JSON_TEMP"
-"$RM_TOOL" -rf "$TOOLBIN_DIR"
-"$PYTHON_TOOL" "$ROOT/scripts/release_toolset.py" --policy "$RELEASE_TOOL_POLICY" --out "$OUT_DIR/toolset.json" --toolbin "$TOOLBIN_DIR" >/dev/null
+# The toolbin lives inside $OUT_DIR and the FRESH branch above just deleted
+# it wholesale; the RESUMED branch's own rm -rf "$TOOLBIN_DIR" immediately
+# below deletes it too. Rebuilding it can only use the bootstrap tools
+# captured before any toolbin existed -- the toolbin-routed $RM_TOOL /
+# $PYTHON_TOOL are themselves inside the directory being removed / rebuilt.
+"$BOOTSTRAP_RM_TOOL" -f "$TOOLSET_JSON_TEMP"
+"$BOOTSTRAP_RM_TOOL" -rf "$TOOLBIN_DIR"
+"$BOOTSTRAP_PYTHON_TOOL" "$ROOT/scripts/release_toolset.py" --policy "$RELEASE_TOOL_POLICY" --out "$OUT_DIR/toolset.json" --toolbin "$TOOLBIN_DIR" >/dev/null
 export PATH="$TOOLBIN_DIR"
 IDENTITY_FILE="$CHECKPOINT_STATE_DIR/identity.json"
 python3 "$ROOT/scripts/release_checkpoint.py" init --state-dir "$CHECKPOINT_STATE_DIR" --identity-file "$CANDIDATE_IDENTITY" --attempt-id "$RELEASE_ATTEMPT_ID" >/dev/null
