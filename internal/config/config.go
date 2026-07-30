@@ -14,6 +14,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/cousingary/governator/internal/dbtime"
 	"github.com/cousingary/governator/internal/policy"
 	"gopkg.in/yaml.v3"
 )
@@ -391,7 +392,7 @@ func LoadStrict() (Config, error) {
 	if cfg.Spend.DailyCapUSD < 0 {
 		return Config{}, fmt.Errorf("invalid spend.daily_cap_usd %v (want >= 0, 0 = unlimited)", cfg.Spend.DailyCapUSD)
 	}
-	for _, q := range cfg.Quotas {
+	for i, q := range cfg.Quotas {
 		if !finite(q.EstimatedLimit) {
 			return Config{}, fmt.Errorf("invalid quota estimated_limit %v for backend %q (want a finite number)", q.EstimatedLimit, q.Backend)
 		}
@@ -411,11 +412,18 @@ func LoadStrict() (Config, error) {
 		// through to quota.parseTimeOrZero, which silently substitutes the
 		// zero time for anything it can't parse — a typo'd timestamp would
 		// quietly reset the window's clock instead of failing to load.
-		if s := strings.TrimSpace(q.WindowStartedAt); s != "" && !parsableTimestamp(s) {
-			return Config{}, fmt.Errorf("invalid quota window_started_at %q for backend %q (want RFC3339 or YYYY-MM-DD)", q.WindowStartedAt, q.Backend)
+		// Sol15 P0-3: parseability alone is insufficient — a value that
+		// parses but falls outside dbtime's signed Unix-nanosecond range
+		// (e.g. "9999-01-01") used to sail through this check and panic
+		// deep inside quota.SeedFromConfig instead. Both fields are
+		// range-checked here, naming the exact field path, the rejected
+		// value, and the supported range, so a bad value never reaches the
+		// seeder at all.
+		if err := validateQuotaTimestamp("window_started_at", i, q.WindowStartedAt, q.Backend); err != nil {
+			return Config{}, err
 		}
-		if s := strings.TrimSpace(q.ResetAt); s != "" && !parsableTimestamp(s) {
-			return Config{}, fmt.Errorf("invalid quota reset_at %q for backend %q (want RFC3339 or YYYY-MM-DD)", q.ResetAt, q.Backend)
+		if err := validateQuotaTimestamp("reset_at", i, q.ResetAt, q.Backend); err != nil {
+			return Config{}, err
 		}
 	}
 	for _, root := range cfg.Credentials.Roots {
@@ -821,15 +829,59 @@ func finite(f float64) bool {
 // quotaTimestampLayouts mirrors internal/quota's parseTimeOrZero accepted
 // formats exactly, so a timestamp LoadStrict accepts is guaranteed to be one
 // quota.SeedFromConfig can actually parse (rather than silently zeroing).
+// Sol15 P0-3: parseability alone is NOT sufficient for LoadStrict to accept a
+// value — see validateQuotaTimestamp, which additionally range-checks
+// against dbtime's supported Unix-nanosecond range. A value can parse under
+// every layout here and still panic deep in quota.SeedFromConfig if that
+// second check is skipped; that gap is exactly what the pre-Session-1
+// version of this file's comment implied was already closed.
 var quotaTimestampLayouts = []string{time.RFC3339Nano, time.RFC3339, "2006-01-02 15:04:05", "2006-01-02"}
 
 func parsableTimestamp(s string) bool {
+	_, err := parseQuotaTimestamp(s)
+	return err == nil
+}
+
+// parseQuotaTimestamp tries every layout quota.parseTimeOrZero accepts.
+func parseQuotaTimestamp(s string) (time.Time, error) {
 	for _, layout := range quotaTimestampLayouts {
-		if _, err := time.Parse(layout, s); err == nil {
-			return true
+		if t, err := time.Parse(layout, s); err == nil {
+			return t.UTC(), nil
 		}
 	}
-	return false
+	return time.Time{}, fmt.Errorf("does not match RFC3339 or YYYY-MM-DD")
+}
+
+// validateQuotaTimestamp rejects a quota timestamp that either doesn't parse
+// or parses but falls outside dbtime's supported Unix-nanosecond range
+// (Sol15 P0-3). fieldName is the bare YAML key ("window_started_at" or
+// "reset_at" — kept literal so error text stays byte-identical to the
+// pre-Session-1 parse-failure message); index names the quotas[] entry so
+// the range-failure message also carries the exact field path.
+func validateQuotaTimestamp(fieldName string, index int, raw, backend string) error {
+	s := strings.TrimSpace(raw)
+	if s == "" {
+		return nil
+	}
+	t, err := parseQuotaTimestamp(s)
+	if err != nil {
+		return fmt.Errorf("invalid quota %s %q for backend %q (want RFC3339 or YYYY-MM-DD)", fieldName, raw, backend)
+	}
+	// Sol15 P0-3 case #1 (0001-01-01): that literal date parses to exactly
+	// Go's zero time.Time value, and dbtime.ToUnixNano special-cases
+	// t.IsZero() as the UnsetUnixNano sentinel with no error -- so without
+	// this check, an operator's *explicit* "0001-01-01" would silently
+	// collapse into "not configured" instead of being rejected as out of
+	// range. An empty string already means "not configured" above; a
+	// written-out zero-time literal must not reach that same fallback by
+	// accident.
+	if t.IsZero() {
+		return fmt.Errorf("invalid quota %s %q for backend %q (quotas[%d].%s): outside supported range (%s)", fieldName, raw, backend, index, fieldName, dbtime.SupportedRangeString())
+	}
+	if _, err := dbtime.ToUnixNano(t); err != nil {
+		return fmt.Errorf("invalid quota %s %q for backend %q (quotas[%d].%s): outside supported range (%s)", fieldName, raw, backend, index, fieldName, dbtime.SupportedRangeString())
+	}
+	return nil
 }
 
 // validateRawSuppliedValues re-decodes data generically (no struct, no

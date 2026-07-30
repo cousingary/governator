@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"time"
@@ -291,7 +292,21 @@ func dispatchReconcile(ctx context.Context, db *sql.DB, cfg config.Config, item 
 		if err := json.Unmarshal([]byte(item.Payload), &p); err != nil {
 			return err
 		}
-		return quota.ApplyResetHint(db, p.Agent, p.Account, p.ResetAt, time.Now().UTC())
+		if err := quota.ApplyResetHint(db, p.Agent, p.Account, p.ResetAt, time.Now().UTC()); err != nil {
+			// Sol15 P0-3 case 351: an out-of-range provider hint can never
+			// become valid on a later attempt, so retrying it is pure
+			// waste — worse, a hostile provider could use it to keep this
+			// row perpetually retrying. Log it to stderr (the row's own
+			// last_error already carries it into operational_errors from
+			// the original noteOperationalFailure call) and drop it: the
+			// caller treats this as done, not as a failure to retry.
+			if errors.Is(err, quota.ErrResetHintOutOfRange) {
+				fmt.Fprintf(os.Stderr, "governator: dropping out-of-range quota reset hint (op=%s run=%s agent=%s account=%s): %v\n", item.OpKind, item.RunID, p.Agent, p.Account, err)
+				return nil
+			}
+			return err
+		}
+		return nil
 	case opQuotaRelease:
 		var p quotaReleasePayload
 		if err := json.Unmarshal([]byte(item.Payload), &p); err != nil {

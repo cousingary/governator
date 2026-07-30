@@ -1973,6 +1973,51 @@ cases:
     session: rc7-u14-s9
     required: true
     status: implemented
+  - case: 345
+    name: TestV15Case345QuotaConfigResetAtYear9999IsRejectedAtLoadNotPanicked
+    session: rc8-u15-s1
+    required: true
+    status: implemented
+  - case: 346
+    name: TestV15Case346QuotaConfigResetAtYear0001IsRejectedAtLoadNotPanicked
+    session: rc8-u15-s1
+    required: true
+    status: implemented
+  - case: 347
+    name: TestV15Case347NanosecondUpperBoundMinusOneIsAccepted
+    session: rc8-u15-s1
+    required: true
+    status: implemented
+  - case: 348
+    name: TestV15Case348NanosecondUpperBoundPlusOneIsRejected
+    session: rc8-u15-s1
+    required: true
+    status: implemented
+  - case: 349
+    name: TestV15Case349NegativeQuotaTTLIsRejectedAtConfigLoad
+    session: rc8-u15-s1
+    required: true
+    status: implemented
+  - case: 350
+    name: TestV15Case350MaximumDurationAdditionReturnsOverflowErrorNotWrappedTime
+    session: rc8-u15-s1
+    required: true
+    status: implemented
+  - case: 351
+    name: TestV15Case351MalformedProviderResetHintIsDroppedWithoutFailingTheRun
+    session: rc8-u15-s1
+    required: true
+    status: implemented
+  - case: 352
+    name: TestV15Case352CorruptNumericLedgerTimestampReturnsTypedCorruptionError
+    session: rc8-u15-s1
+    required: true
+    status: implemented
+  - case: 353
+    name: TestV15Case353MigratedOutOfRangeTextualTimestampFailsClosed
+    session: rc8-u15-s1
+    required: true
+    status: implemented
 
 # Case 296 is not one of Sol13's original 51 findings (which occupy 245-295).
 # It closes a gap the rc6-upg13 S3 exclusion audit found: TestV6Case29's own

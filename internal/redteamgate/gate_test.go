@@ -66,7 +66,9 @@ func TestLoadManifestRejectsBlankName(t *testing.T) {
 // for TestV14Case329PostEvaluationArtifactMutationIsDetected. The corpus is
 // now contiguous 1-342 with count == maximum, so Sol14 S7's six cases
 // (TestV14Case331-336) and S8's six (TestV14Case337-342) are name-aligned and
-// S9 appends 343-344 for a final total of 344.
+// S9 appends 343-344 for a final total of 344. rc8-upg15 S1 (Sol15 P0-3)
+// appends 345-353 (the quota-timestamp-panic corpus) for a final total of
+// 353.
 //
 // This constant was not updated by S7 or S8; it read 330 (the post-S6 count)
 // while the manifest held 342, so this package failed before the duplicate
@@ -77,8 +79,8 @@ func TestLoadManifestAcceptsRealManifest(t *testing.T) {
 	if err != nil {
 		t.Fatalf("LoadManifest(%s): %v", path, err)
 	}
-	if len(m.Cases) != 344 {
-		t.Fatalf("expected 344 cases in the mandatory final attack corpus, got %d", len(m.Cases))
+	if len(m.Cases) != 353 {
+		t.Fatalf("expected 353 cases in the mandatory final attack corpus, got %d", len(m.Cases))
 	}
 	seen := make(map[int]bool)
 	for _, c := range m.Cases {

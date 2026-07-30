@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"os"
 	"strings"
 	"time"
 
@@ -94,10 +95,27 @@ func SeedFromConfig(db *sql.DB, cfg config.Config, now time.Time) error {
 		if confidence > 1 {
 			confidence = 1
 		}
+		// Sol15 P0-3: config.LoadStrict already range-checks the operator's
+		// window_started_at/reset_at, but SeedFromConfig also computes
+		// started/reset *from* now (windowStart/nextReset above) when the
+		// operator left them unset, so this still converts and returns a
+		// typed error rather than trusting the check happened upstream.
+		startedNanos, err := dbtime.ToUnixNano(started)
+		if err != nil {
+			return fmt.Errorf("quota config for backend %q account %q: window_started_at %s: %w", backend, account, formatTime(started), err)
+		}
+		resetNanos, err := dbtime.ToUnixNano(reset)
+		if err != nil {
+			return fmt.Errorf("quota config for backend %q account %q: reset_at %s: %w", backend, account, formatTime(reset), err)
+		}
+		nowNanos, err := dbtime.ToUnixNano(now)
+		if err != nil {
+			return err
+		}
 		if _, err := db.Exec(`INSERT INTO quota_windows(backend,account,window_type,window_started_at,reset_at,estimated_limit,measured_usage,reserved_usage,confidence,source,updated_at,window_started_unix_nano,reset_unix_nano,updated_unix_nano)
 VALUES(?,?,?,?,?,?,0,0,?,'config',?,?,?,?)
 ON CONFLICT(backend,account,window_type) DO UPDATE SET estimated_limit=excluded.estimated_limit, reset_at=excluded.reset_at, confidence=excluded.confidence, source='config', updated_at=excluded.updated_at, reset_unix_nano=excluded.reset_unix_nano, updated_unix_nano=excluded.updated_unix_nano`,
-			backend, account, windowType, formatTime(started), formatTime(reset), q.EstimatedLimit, confidence, formatTime(now), mustNanos(started), mustNanos(reset), mustNanos(now)); err != nil {
+			backend, account, windowType, formatTime(started), formatTime(reset), q.EstimatedLimit, confidence, formatTime(now), startedNanos, resetNanos, nowNanos); err != nil {
 			return err
 		}
 	}
@@ -134,6 +152,10 @@ func Reserve(db *sql.DB, backend, account, runID string, usage float64, ttl time
 	if len(windows) == 0 {
 		return Reservation{}, nil
 	}
+	nowNanos, err := dbtime.ToUnixNano(now)
+	if err != nil {
+		return Reservation{}, err
+	}
 	tx, err := db.Begin()
 	if err != nil {
 		return Reservation{}, err
@@ -143,7 +165,7 @@ func Reserve(db *sql.DB, backend, account, runID string, usage float64, ttl time
 		res, err := tx.Exec(`UPDATE quota_windows SET reserved_usage=reserved_usage+?, updated_at=?, updated_unix_nano=?
 WHERE backend=? AND account=? AND window_type=?
   AND (estimated_limit<=0 OR measured_usage+reserved_usage+?<=estimated_limit)`,
-			usage, formatTime(now), mustNanos(now), backend, account, w.WindowType, usage)
+			usage, formatTime(now), nowNanos, backend, account, w.WindowType, usage)
 		if err != nil {
 			return Reservation{}, err
 		}
@@ -155,8 +177,18 @@ WHERE backend=? AND account=? AND window_type=?
 			return Reservation{}, fmt.Errorf("%w: %s/%s remaining %.0f < estimate %.0f (reset %s)", ErrNoHeadroom, backend, w.WindowType, remaining(w), usage, formatTime(w.ResetAt))
 		}
 	}
+	// Sol15 P0-3: TTL is caller-supplied (runtime.go derives it from
+	// operator config already validated > 0, but this must not trust that)
+	// and now+ttl must not silently wrap; dbtime.ToUnixNano is the
+	// overflow-safe boundary — a TTL large enough to push past
+	// MaxSupportedTime fails the reservation instead of storing a corrupt
+	// expiry.
 	expires := now.Add(ttl)
-	res, err := tx.Exec(`INSERT INTO quota_reservations(run_id,backend,account,usage,expires_at,created_at,settled_at,expires_unix_nano,created_unix_nano,settled_unix_nano) VALUES(?,?,?,?,?,?,'',?,?,?)`, runID, backend, account, usage, formatTime(expires), formatTime(now), mustNanos(expires), mustNanos(now), dbtime.UnsetUnixNano)
+	expiresNanos, err := dbtime.ToUnixNano(expires)
+	if err != nil {
+		return Reservation{}, fmt.Errorf("quota reservation for %s/%s: expires_at %s: %w", backend, account, formatTime(expires), err)
+	}
+	res, err := tx.Exec(`INSERT INTO quota_reservations(run_id,backend,account,usage,expires_at,created_at,settled_at,expires_unix_nano,created_unix_nano,settled_unix_nano) VALUES(?,?,?,?,?,?,'',?,?,?)`, runID, backend, account, usage, formatTime(expires), formatTime(now), expiresNanos, nowNanos, dbtime.UnsetUnixNano)
 	if err != nil {
 		return Reservation{}, err
 	}
@@ -250,7 +282,11 @@ func Release(db *sql.DB, reservationID int64, now time.Time) error {
 	if !ok {
 		return nil
 	}
-	if _, err := tx.Exec(`UPDATE quota_windows SET reserved_usage=MAX(reserved_usage-?,0), updated_at=?, updated_unix_nano=? WHERE backend=? AND account=?`, reserved, formatTime(now), mustNanos(now), backend, account); err != nil {
+	nowNanos, err := dbtime.ToUnixNano(now)
+	if err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`UPDATE quota_windows SET reserved_usage=MAX(reserved_usage-?,0), updated_at=?, updated_unix_nano=? WHERE backend=? AND account=?`, reserved, formatTime(now), nowNanos, backend, account); err != nil {
 		return err
 	}
 	return tx.Commit()
@@ -281,7 +317,11 @@ func Settle(db *sql.DB, reservationID int64, measuredUsage float64, now time.Tim
 	if _, err := tx.Exec(`UPDATE quota_reservations SET measured_usage=? WHERE id=?`, measuredUsage, reservationID); err != nil {
 		return err
 	}
-	if _, err := tx.Exec(`UPDATE quota_windows SET reserved_usage=MAX(reserved_usage-?,0), measured_usage=measured_usage+?, updated_at=?, updated_unix_nano=? WHERE backend=? AND account=?`, reserved, measuredUsage, formatTime(now), mustNanos(now), backend, account); err != nil {
+	nowNanos, err := dbtime.ToUnixNano(now)
+	if err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`UPDATE quota_windows SET reserved_usage=MAX(reserved_usage-?,0), measured_usage=measured_usage+?, updated_at=?, updated_unix_nano=? WHERE backend=? AND account=?`, reserved, measuredUsage, formatTime(now), nowNanos, backend, account); err != nil {
 		return err
 	}
 	return tx.Commit()
@@ -333,7 +373,11 @@ func expireOne(db *sql.DB, reservationID int64, now time.Time) error {
 	if !ok {
 		return nil
 	}
-	if _, err := tx.Exec(`UPDATE quota_windows SET reserved_usage=MAX(reserved_usage-?,0), updated_at=?, updated_unix_nano=? WHERE backend=? AND account=?`, reserved, formatTime(now), mustNanos(now), backend, account); err != nil {
+	nowNanos, err := dbtime.ToUnixNano(now)
+	if err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`UPDATE quota_windows SET reserved_usage=MAX(reserved_usage-?,0), updated_at=?, updated_unix_nano=? WHERE backend=? AND account=?`, reserved, formatTime(now), nowNanos, backend, account); err != nil {
 		return err
 	}
 	return tx.Commit()
@@ -370,7 +414,7 @@ func Windows(db *sql.DB, now time.Time) ([]Window, error) {
 	if err := rolloverExpired(db, now); err != nil {
 		return nil, err
 	}
-	rows, err := db.Query(`SELECT backend,account,window_type,window_started_at,reset_at,estimated_limit,measured_usage,reserved_usage,confidence,source,updated_at FROM quota_windows ORDER BY backend,account,window_type`)
+	rows, err := db.Query(`SELECT ` + windowSelectColumns + ` FROM quota_windows ORDER BY backend,account,window_type`)
 	if err != nil {
 		return nil, err
 	}
@@ -379,6 +423,17 @@ func Windows(db *sql.DB, now time.Time) ([]Window, error) {
 	for rows.Next() {
 		w, err := scanWindow(rows)
 		if err != nil {
+			// Sol15 P0-3: Windows() backs the operator-facing `gov quota`
+			// listing — a read path that can afford to skip a corrupt row
+			// and show the rest, rather than hiding every window's status
+			// behind the one bad row. windowsFor (Reserve/Headroom, an
+			// authority path whose decision the router trusts) does not
+			// get this treatment: it propagates the same error and fails
+			// closed.
+			if errors.Is(err, dbtime.ErrCorruptTimestamp) {
+				fmt.Fprintf(os.Stderr, "quota: skipping corrupt quota_windows row: %v\n", err)
+				continue
+			}
 			return nil, err
 		}
 		out = append(out, w)
@@ -386,17 +441,33 @@ func Windows(db *sql.DB, now time.Time) ([]Window, error) {
 	return out, rows.Err()
 }
 
+// ErrResetHintOutOfRange reports a provider-supplied quota reset hint whose
+// timestamp falls outside dbtime's supported range (Sol15 P0-3, "validate
+// provider reset hints before persistence"). A provider response is
+// adversarial input by definition — a malformed or hostile hint must not be
+// able to crash or stall a run, so callers should log this and drop the
+// hint rather than fail whatever operation produced it.
+var ErrResetHintOutOfRange = errors.New("quota: reset hint timestamp outside supported range")
+
 func ApplyResetHint(db *sql.DB, backend, account string, resetAt time.Time, now time.Time) error {
 	backend = normalize(backend)
 	account = normalizeAccount(account)
 	if db == nil || backend == "" || resetAt.IsZero() || !resetAt.After(now) {
 		return nil
 	}
+	resetNanos, err := dbtime.ToUnixNano(resetAt)
+	if err != nil {
+		return fmt.Errorf("%w: %s/%s reset hint %s: %v", ErrResetHintOutOfRange, backend, account, formatTime(resetAt), err)
+	}
+	nowNanos, err := dbtime.ToUnixNano(now)
+	if err != nil {
+		return err
+	}
 	windowType := inferWindowType(now, resetAt)
-	_, err := db.Exec(`INSERT INTO quota_windows(backend,account,window_type,window_started_at,reset_at,estimated_limit,measured_usage,reserved_usage,confidence,source,updated_at,window_started_unix_nano,reset_unix_nano,updated_unix_nano)
+	_, err = db.Exec(`INSERT INTO quota_windows(backend,account,window_type,window_started_at,reset_at,estimated_limit,measured_usage,reserved_usage,confidence,source,updated_at,window_started_unix_nano,reset_unix_nano,updated_unix_nano)
 VALUES(?,?,?,?,?,0,0,0,0.9,'error_hint',?,?,?,?)
 ON CONFLICT(backend,account,window_type) DO UPDATE SET reset_at=excluded.reset_at, confidence=MAX(confidence,0.9), source='error_hint', updated_at=excluded.updated_at, reset_unix_nano=excluded.reset_unix_nano, updated_unix_nano=excluded.updated_unix_nano`,
-		backend, account, windowType, formatTime(now), formatTime(resetAt), formatTime(now), mustNanos(now), mustNanos(resetAt), mustNanos(now))
+		backend, account, windowType, formatTime(now), formatTime(resetAt), formatTime(now), nowNanos, resetNanos, nowNanos)
 	return err
 }
 
@@ -420,7 +491,7 @@ func windowsFor(db *sql.DB, backend, account string, now time.Time) ([]Window, e
 	if err := rolloverExpired(db, now); err != nil {
 		return nil, err
 	}
-	rows, err := db.Query(`SELECT backend,account,window_type,window_started_at,reset_at,estimated_limit,measured_usage,reserved_usage,confidence,source,updated_at FROM quota_windows WHERE backend=? AND account=? ORDER BY window_type`, backend, account)
+	rows, err := db.Query(`SELECT `+windowSelectColumns+` FROM quota_windows WHERE backend=? AND account=? ORDER BY window_type`, backend, account)
 	if err != nil {
 		return nil, err
 	}
@@ -438,14 +509,37 @@ func windowsFor(db *sql.DB, backend, account string, now time.Time) ([]Window, e
 
 type scanner interface{ Scan(dest ...any) error }
 
+// windowSelectColumns is shared by Windows and windowsFor. Sol15 P0-3
+// ("database values outside the valid range" / "corrupt database numeric
+// timestamp"): scanWindow reads both the legacy text columns and the
+// numeric _unix_nano columns so it can cross-check them — a bare range
+// check on the numeric column alone can never fail (MinSupportedTime..
+// MaxSupportedTime spans the full int64 range apart from the reserved
+// sentinel), so the only way to detect a genuinely corrupt numeric value is
+// dbtime.VerifyLegacyRoundTrip against the text mirror every writer sets in
+// the same statement.
+const windowSelectColumns = "backend,account,window_type,window_started_at,reset_at,estimated_limit,measured_usage,reserved_usage,confidence,source,updated_at,window_started_unix_nano,reset_unix_nano,updated_unix_nano"
+
 func scanWindow(s scanner) (Window, error) {
 	var w Window
 	var started, reset, updated string
-	err := s.Scan(&w.Backend, &w.Account, &w.WindowType, &started, &reset, &w.EstimatedLimit, &w.MeasuredUsage, &w.ReservedUsage, &w.Confidence, &w.Source, &updated)
-	w.WindowStartedAt = parseTimeOrZero(started)
-	w.ResetAt = parseTimeOrZero(reset)
-	w.UpdatedAt = parseTimeOrZero(updated)
-	return w, err
+	var startedNanos, resetNanos, updatedNanos int64
+	if err := s.Scan(&w.Backend, &w.Account, &w.WindowType, &started, &reset, &w.EstimatedLimit, &w.MeasuredUsage, &w.ReservedUsage, &w.Confidence, &w.Source, &updated, &startedNanos, &resetNanos, &updatedNanos); err != nil {
+		return Window{}, err
+	}
+	if err := dbtime.VerifyLegacyRoundTrip(started, startedNanos); err != nil {
+		return Window{}, fmt.Errorf("quota_windows %s/%s/%s.window_started_unix_nano: %w", w.Backend, w.Account, w.WindowType, err)
+	}
+	if err := dbtime.VerifyLegacyRoundTrip(reset, resetNanos); err != nil {
+		return Window{}, fmt.Errorf("quota_windows %s/%s/%s.reset_unix_nano: %w", w.Backend, w.Account, w.WindowType, err)
+	}
+	if err := dbtime.VerifyLegacyRoundTrip(updated, updatedNanos); err != nil {
+		return Window{}, fmt.Errorf("quota_windows %s/%s/%s.updated_unix_nano: %w", w.Backend, w.Account, w.WindowType, err)
+	}
+	w.WindowStartedAt = dbtime.FromUnixNano(startedNanos)
+	w.ResetAt = dbtime.FromUnixNano(resetNanos)
+	w.UpdatedAt = dbtime.FromUnixNano(updatedNanos)
+	return w, nil
 }
 
 func rolloverExpired(db *sql.DB, now time.Time) error {
@@ -518,14 +612,6 @@ func clamp(v float64) float64 {
 
 func formatTime(t time.Time) string {
 	return dbtime.FormatLegacy(t)
-}
-
-func mustNanos(t time.Time) int64 {
-	n, err := dbtime.ToUnixNano(t)
-	if err != nil {
-		panic(err)
-	}
-	return n
 }
 
 func parseTimeOrZero(s string) time.Time {

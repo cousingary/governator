@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cousingary/governator/internal/dbtime"
 	"github.com/cousingary/governator/internal/observability"
 	"github.com/cousingary/governator/internal/quota"
 )
@@ -31,12 +32,26 @@ func recoveryFixture(t *testing.T) (db *sql.DB, home, root string) {
 
 // seedQuotaWindow gives backend enough estimated headroom for quota.Reserve
 // to actually create a reservation row (an empty windows table makes Reserve
-// a silent no-op), so tests can verify the reservation is released.
+// a silent no-op), so tests can verify the reservation is released. The
+// numeric _unix_nano columns must be set alongside their legacy text mirrors
+// -- Sol15 P0-3's dbtime.VerifyLegacyRoundTrip (wired into quota.scanWindow)
+// treats a row whose numeric column is left at its zero-value default while
+// its text column holds a real timestamp as ledger corruption, which is
+// exactly what omitting them here used to produce silently.
 func seedQuotaWindow(t *testing.T, db *sql.DB, backend string, now time.Time) {
 	t.Helper()
-	_, err := db.Exec(`INSERT INTO quota_windows(backend,account,window_type,window_started_at,reset_at,estimated_limit,measured_usage,reserved_usage,confidence,source,updated_at)
-VALUES(?,?,?,?,?,?,0,0,0.9,'test',?) ON CONFLICT(backend,account,window_type) DO NOTHING`,
-		backend, quota.DefaultAccount, "daily", now.Format(time.RFC3339Nano), now.Add(24*time.Hour).Format(time.RFC3339Nano), 1000000.0, now.Format(time.RFC3339Nano))
+	reset := now.Add(24 * time.Hour)
+	nowNanos, err := dbtime.ToUnixNano(now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resetNanos, err := dbtime.ToUnixNano(reset)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = db.Exec(`INSERT INTO quota_windows(backend,account,window_type,window_started_at,reset_at,estimated_limit,measured_usage,reserved_usage,confidence,source,updated_at,window_started_unix_nano,reset_unix_nano,updated_unix_nano)
+VALUES(?,?,?,?,?,?,0,0,0.9,'test',?,?,?,?) ON CONFLICT(backend,account,window_type) DO NOTHING`,
+		backend, quota.DefaultAccount, "daily", now.Format(time.RFC3339Nano), reset.Format(time.RFC3339Nano), 1000000.0, now.Format(time.RFC3339Nano), nowNanos, resetNanos, nowNanos)
 	if err != nil {
 		t.Fatalf("seed quota window: %v", err)
 	}
