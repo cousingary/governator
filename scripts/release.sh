@@ -19,6 +19,21 @@ set -euo pipefail
 ROOT=$(cd "${BASH_SOURCE[0]%/*}/.." && pwd -P)
 cd "$ROOT"
 
+# Captured once, on the very first invocation, before anything narrows
+# $PATH -- and deliberately NOT re-captured on the detached-scratch
+# re-invocation below, which inherits this from the outer process's
+# environment. Without the already-set guard, the inner script would
+# capture $PATH *after* the outer script already narrowed it to its own
+# toolbin (a fresh mkdtemp path, gone once that process exits), so
+# TEST_TIER_PATH further down would end up as one dead toolbin path
+# concatenated with another live one -- never the real ambient PATH. This
+# happened in practice: the first attempt at broadening the test-tier PATH
+# recorded PATH=<outer-toolbin>:<inner-toolbin> in the unit checkpoint,
+# with no system directory in it at all.
+if [ -z "${GOV_RELEASE_AMBIENT_PATH:-}" ]; then
+  export GOV_RELEASE_AMBIENT_PATH="$PATH"
+fi
+
 # Sol13 P0-2/P1-4: the checked-in policy is the independent trust root for
 # every release tool. Parse its deliberately narrow YAML shape using bash
 # builtins, then execute the policy's Python directly to hash every approved
@@ -133,8 +148,11 @@ if ! "$PYTHON_TOOL" "$ROOT/scripts/release_toolset.py" --policy "$RELEASE_TOOL_P
   echo "release: release command inventory is not fully covered by the approved tool policy" >&2
   exit 1
 fi
-# Captured before the narrowing below. The narrow toolbin is the right PATH
-# for this SCRIPT's own evidence-producing invocations (build, hash, sign,
+# Built from GOV_RELEASE_AMBIENT_PATH (captured at the top of this script,
+# before any narrowing, and preserved across the detached-scratch
+# re-invocation) rather than the current $PATH, which by this point may
+# already be narrowed. The narrow toolbin is the right PATH for this
+# SCRIPT's own evidence-producing invocations (build, hash, sign,
 # archive) -- exactly Sol12 P0-1's threat model. It is the WRONG PATH for
 # the `go test` tiers below: those run governor's own application/test
 # code, which legitimately shells out to arbitrary host controller tools
@@ -149,7 +167,7 @@ fi
 # isn't reachable. TEST_TIER_PATH below is used only for the tier commands
 # themselves (release_tier_pipeline.sh's --spec), never for this script's
 # own direct tool invocations.
-TEST_TIER_PATH="$TOOLBIN_DIR:$PATH"
+TEST_TIER_PATH="$TOOLBIN_DIR:$GOV_RELEASE_AMBIENT_PATH"
 export PATH="$TOOLBIN_DIR"
 # From this point, explicit child arguments use the private directory's
 # verified links, never a policy-path symlink or a caller-provided PATH entry.
