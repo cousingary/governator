@@ -2018,6 +2018,46 @@ cases:
     session: rc8-u15-s1
     required: true
     status: implemented
+  - case: 354
+    name: TestV15Case354FakeGoReturningSuccessWithoutCompilingIsNeverInvoked
+    session: rc8-u15-s2b
+    required: true
+    status: implemented
+  - case: 355
+    name: TestV15Case355FakePython3WritingFabricatedEvidenceIsNeverInvoked
+    session: rc8-u15-s2b
+    required: true
+    status: implemented
+  - case: 356
+    name: TestV15Case356FakeGitReportingAttackerSelectedCommitIsNeverInvoked
+    session: rc8-u15-s2b
+    required: true
+    status: implemented
+  - case: 357
+    name: TestV15Case357FakeSha256sumApprovingInvalidHashesIsNeverInvoked
+    session: rc8-u15-s2b
+    required: true
+    status: implemented
+  - case: 358
+    name: TestV15Case358FakeTarInjectingExtraArchiveMembersIsNeverInvoked
+    session: rc8-u15-s2b
+    required: true
+    status: implemented
+  - case: 359
+    name: TestV15Case359FakeBashAlteringCommandExecutionIsNeverInvoked
+    session: rc8-u15-s2b
+    required: true
+    status: implemented
+  - case: 360
+    name: TestV15Case360ToolExecutableReplacedAfterPreflightFailsTheTier
+    session: rc8-u15-s2b
+    required: true
+    status: implemented
+  - case: 361
+    name: TestV15Case361SymlinkedToolTargetChangedAfterResolutionFailsTheTier
+    session: rc8-u15-s2b
+    required: true
+    status: implemented
 
 # Case 296 is not one of Sol13's original 51 findings (which occupy 245-295).
 # It closes a gap the rc6-upg13 S3 exclusion audit found: TestV6Case29's own

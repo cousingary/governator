@@ -213,6 +213,17 @@ def cmd_write(argv: list[str]) -> int:
     p.add_argument("--result", required=True, choices=["PASS", "FAIL"])
     p.add_argument("--duration-seconds", type=int, default=0)
     p.add_argument("--inject-delay-before-rename", type=float, default=0.0, help="TEST ONLY: sleep this many seconds between fsync and rename")
+    # Sol15 P0-1 (rc8-upg15 S2b): per-tier evidence that the release toolset
+    # was independently re-verified (scripts/release_toolset.py --verify)
+    # immediately before and immediately after THIS tier's own command ran --
+    # closing the window a single pipeline-wide preflight check cannot: a
+    # same-UID tool substitution between two tiers, or during one tier's own
+    # execution. "SKIPPED" (the default) is what every pre-S2b call site --
+    # including this script's own existing test corpus -- continues to
+    # record, since release_tier_pipeline.sh only supplies real PASS/FAIL
+    # values when it was itself given --policy/--toolset-json.
+    p.add_argument("--tool-identity-pre", default="SKIPPED", choices=["PASS", "FAIL", "SKIPPED"])
+    p.add_argument("--tool-identity-post", default="SKIPPED", choices=["PASS", "FAIL", "SKIPPED"])
     args = p.parse_args(argv)
 
     identity = load_json(pathlib.Path(args.identity_file))
@@ -225,6 +236,8 @@ def cmd_write(argv: list[str]) -> int:
         log_sha256=args.log_sha256,
         result=args.result,
         duration_seconds=args.duration_seconds,
+        tool_identity_pre=args.tool_identity_pre,
+        tool_identity_post=args.tool_identity_post,
     )
     atomic_write_json(pathlib.Path(args.checkpoint), data, inject_delay_before_rename=args.inject_delay_before_rename)
     print(json.dumps(data, indent=2, sort_keys=True))

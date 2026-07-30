@@ -18,6 +18,26 @@
 # Usage:
 #   release_tier_pipeline.sh run --state-dir DIR --identity-file FILE --spec SPECFILE
 #     --python-bin PATH --bash-bin PATH --sha256sum-bin PATH --date-bin PATH --awk-bin PATH
+#     [--policy PATH --toolset-json PATH --toolset-py PATH]
+#
+# Sol15 P0-1 (rc8-upg15 S2b): when --policy and --toolset-json are BOTH
+# supplied, every tier that actually runs (never one reused from a matching
+# checkpoint) is bracketed by an independent
+# `release_toolset.py --policy POLICY --verify TOOLSET_JSON` re-verification,
+# once immediately before the tier's command starts and once immediately
+# after it returns. This is deliberately per-tier, not a single pipeline-wide
+# check: release.sh already re-verifies once before this whole pipeline
+# starts (Sol12 P1-4) and again after it ends, but neither catches a same-UID
+# tool substitution that happens BETWEEN two tiers or DURING one tier's own
+# execution -- exactly Sol15's "tool executable replaced after preflight" and
+# "symlinked tool target changed after resolution" attacks. A pre-check
+# failure fails the tier WITHOUT ever invoking its command (the substituted
+# tool is never given a chance to run); a post-check failure overrides an
+# otherwise-PASSing tier to FAIL (a tier cannot buy trust by swapping tools
+# back before this script notices, because the swap already happened while
+# untrusted). Omitting both flags reproduces the exact pre-S2b behavior,
+# which existing callers (internal/redteam/v11_s3_release_checkpoint_test.go)
+# depend on.
 #
 # SPECFILE: one tier per line, TAB-separated: name<TAB>logfile<TAB>command
 # (command is executed via `bash -c "$command"`). Blank lines and lines
@@ -35,7 +55,7 @@ ROOT=$(cd "${BASH_SOURCE[0]%/*}/.." && pwd -P)
 CHECKPOINT_PY="$ROOT/scripts/release_checkpoint.py"
 
 usage() {
-  echo "usage: $0 run --state-dir DIR --identity-file FILE --spec SPECFILE [--python-bin PATH --bash-bin PATH --sha256sum-bin PATH --date-bin PATH --awk-bin PATH]" >&2
+  echo "usage: $0 run --state-dir DIR --identity-file FILE --spec SPECFILE [--python-bin PATH --bash-bin PATH --sha256sum-bin PATH --date-bin PATH --awk-bin PATH] [--policy PATH --toolset-json PATH --toolset-py PATH]" >&2
   exit 2
 }
 
@@ -55,6 +75,9 @@ MKTEMP_BIN=mktemp
 RM_BIN=rm
 DIRNAME_BIN=dirname
 CAT_BIN=cat
+POLICY=""
+TOOLSET_JSON=""
+TOOLSET_PY="$ROOT/scripts/release_toolset.py"
 while [ $# -gt 0 ]; do
   case "$1" in
     --state-dir) STATE_DIR=$2; shift 2 ;;
@@ -70,6 +93,9 @@ while [ $# -gt 0 ]; do
     --rm-bin) RM_BIN=$2; shift 2 ;;
     --dirname-bin) DIRNAME_BIN=$2; shift 2 ;;
     --cat-bin) CAT_BIN=$2; shift 2 ;;
+    --policy) POLICY=$2; shift 2 ;;
+    --toolset-json) TOOLSET_JSON=$2; shift 2 ;;
+    --toolset-py) TOOLSET_PY=$2; shift 2 ;;
     *) usage ;;
   esac
 done
@@ -122,6 +148,8 @@ while IFS=$'\t' read -r NAME LOG CMD || [ -n "$NAME" ]; do
   ENDED=""
   LOGSHA=""
   EXITCODE=0
+  TOOL_IDENTITY_PRE=""
+  TOOL_IDENTITY_POST=""
 
   CHECK_ERR_FILE=$("$MKTEMP_BIN")
   if CHECK_OUT=$("$PYTHON_BIN" "$CHECKPOINT_PY" check --checkpoint "$CKPT" --identity-file "$IDENTITY_FILE" --command "$CMD" 2>"$CHECK_ERR_FILE"); then
@@ -145,18 +173,49 @@ while IFS=$'\t' read -r NAME LOG CMD || [ -n "$NAME" ]; do
     START_EPOCH=$("$DATE_BIN" +%s)
     STARTED=$("$DATE_BIN" -u +%Y-%m-%dT%H:%M:%SZ)
     "$MKDIR_BIN" -p "$("$DIRNAME_BIN" "$LOG")"
-    set +e
-    "$BASH_BIN" -c "$CMD" >"$LOG" 2>&1
-    EXITCODE=$?
-    set -e
-    if [ "$EXITCODE" -eq 0 ]; then RESULT=PASS; else RESULT=FAIL; fi
+
+    TOOL_IDENTITY_PRE="SKIPPED"
+    TOOL_IDENTITY_POST="SKIPPED"
+    RUN_COMMAND=true
+    if [ -n "$POLICY" ] && [ -n "$TOOLSET_JSON" ]; then
+      if "$PYTHON_BIN" "$TOOLSET_PY" --policy "$POLICY" --verify "$TOOLSET_JSON" >"$LOG" 2>&1; then
+        TOOL_IDENTITY_PRE="PASS"
+      else
+        TOOL_IDENTITY_PRE="FAIL"
+        RUN_COMMAND=false
+        echo "release_tier_pipeline: tier ${NAME} refused -- release tool identity differs from the approved toolset BEFORE this tier ran (Sol15 P0-1 S2b); the tier command was never executed" >>"$LOG"
+      fi
+    else
+      : >"$LOG"
+    fi
+
+    if [ "$RUN_COMMAND" = true ]; then
+      set +e
+      "$BASH_BIN" -c "$CMD" >>"$LOG" 2>&1
+      EXITCODE=$?
+      set -e
+    else
+      EXITCODE=97
+    fi
+
+    if [ "$RUN_COMMAND" = true ] && [ -n "$POLICY" ] && [ -n "$TOOLSET_JSON" ]; then
+      if "$PYTHON_BIN" "$TOOLSET_PY" --policy "$POLICY" --verify "$TOOLSET_JSON" >>"$LOG" 2>&1; then
+        TOOL_IDENTITY_POST="PASS"
+      else
+        TOOL_IDENTITY_POST="FAIL"
+        echo "release_tier_pipeline: tier ${NAME} release tool identity changed DURING execution (Sol15 P0-1 S2b) -- forcing FAIL regardless of the tier's own exit code" >>"$LOG"
+      fi
+    fi
+
+    if [ "$EXITCODE" -eq 0 ] && [ "$TOOL_IDENTITY_POST" != "FAIL" ]; then RESULT=PASS; else RESULT=FAIL; fi
     END_EPOCH=$("$DATE_BIN" +%s)
     ENDED=$("$DATE_BIN" -u +%Y-%m-%dT%H:%M:%SZ)
     SECONDS_=$((END_EPOCH - START_EPOCH))
     LOGSHA=$("$SHA256SUM_BIN" "$LOG" | "$AWK_BIN" '{print $1}')
     "$PYTHON_BIN" "$CHECKPOINT_PY" write --checkpoint "$CKPT" --identity-file "$IDENTITY_FILE" \
       --command "$CMD" --started "$STARTED" --completed "$ENDED" \
-      --exit-code "$EXITCODE" --log-sha256 "$LOGSHA" --result "$RESULT" --duration-seconds "$SECONDS_" >/dev/null
+      --exit-code "$EXITCODE" --log-sha256 "$LOGSHA" --result "$RESULT" --duration-seconds "$SECONDS_" \
+      --tool-identity-pre "$TOOL_IDENTITY_PRE" --tool-identity-post "$TOOL_IDENTITY_POST" >/dev/null
   fi
 
   echo "release_tier_pipeline: tier ${NAME} $([ "$RESUMED" = true ] && echo REUSED || echo RAN) result=${RESULT} (${SECONDS_}s)" >&2
@@ -171,7 +230,9 @@ while IFS=$'\t' read -r NAME LOG CMD || [ -n "$NAME" ]; do
     completed "$ENDED" \
     log_sha256 "$LOGSHA" \
     exit_code "$EXITCODE" \
-    log_path "$LOG"
+    log_path "$LOG" \
+    tool_identity_pre "$TOOL_IDENTITY_PRE" \
+    tool_identity_post "$TOOL_IDENTITY_POST"
 
   if [ "$RESULT" != PASS ]; then
     ABORTED=true

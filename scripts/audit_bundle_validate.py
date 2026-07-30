@@ -49,6 +49,7 @@ REQUIRED_TOP_LEVEL_FILES = (
     "claims-verify-report.txt",
     "preflight.json",
     "toolset.json",
+    "release-environment.json",
 )
 REQUIRED_TEST_EVIDENCE_LOGS = (
     "unit.log.gz",

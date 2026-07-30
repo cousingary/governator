@@ -532,6 +532,36 @@ rm -f "$CANDIDATE_IDENTITY"
 # was computed against the temp file above into its shipped location.
 
 # ---------------------------------------------------------------------------
+# Sol15 P0-1 (rc8-upg15 S2b): declare the hermetic builder. This is the one
+# object binding "every tool release_tier_pipeline.sh actually verified" to
+# "the exact PATH and host that ran the release" in one place -- toolset.json
+# alone records tool identities, not the builder they ran on or the narrowed
+# PATH they ran under. Best-effort like preflight.json above (libc detection
+# via the stdlib, no bare subprocess call): a probe this host can't answer
+# never blocks the release.
+# ---------------------------------------------------------------------------
+"$PYTHON_TOOL" -c '
+import json, pathlib, platform, sys
+toolset_path, path_in_force, toolbin_dir, out_path = sys.argv[1:5]
+toolset = json.loads(pathlib.Path(toolset_path).read_text())
+libc_name, libc_version = platform.libc_ver()
+document = {
+    "builder": {
+        "hostname": platform.node(),
+        "system": platform.system(),
+        "machine": platform.machine(),
+    },
+    "kernel": platform.uname().release,
+    "libc": {"name": libc_name or "unknown", "version": libc_version or "unknown"},
+    "path_in_force": path_in_force,
+    "toolbin": toolbin_dir,
+    "toolset_hash": toolset.get("toolset_hash"),
+    "tools": toolset.get("tools", []),
+}
+pathlib.Path(out_path).write_text(json.dumps(document, indent=2, sort_keys=True) + "\n")
+' "$OUT_DIR/toolset.json" "$TOOLBIN_DIR" "$TOOLBIN_DIR" "$OUT_DIR/release-environment.json"
+
+# ---------------------------------------------------------------------------
 # Stability preflight (Sol11 P1-5): record the exact host conditions this
 # attempt started under, before any tier runs -- so an abnormal termination
 # leaves a human enough evidence on disk to distinguish "the code is wrong"
@@ -641,7 +671,13 @@ if ! python3 "$ROOT/scripts/release_toolset.py" --policy "$RELEASE_TOOL_POLICY" 
   echo "release: refusing to run test tiers -- a release tool changed identity since preflight (Sol12 P1-4)" >&2
   exit 1
 fi
-if ! "$BASH_TOOL" "$ROOT/scripts/release_tier_pipeline.sh" run --state-dir "$CHECKPOINT_STATE_DIR" --identity-file "$IDENTITY_FILE" --spec "$MAIN_TIER_SPEC" --python-bin "$PYTHON_TOOL" --bash-bin "$BASH_TOOL" --sha256sum-bin "$SHA256SUM_TOOL" --date-bin "$DATE_TOOL" --awk-bin "$AWK_TOOL" --mkdir-bin "$MKDIR_TOOL" --mktemp-bin "$MKTEMP_TOOL" --rm-bin "$RM_TOOL" --dirname-bin "$DIRNAME_TOOL" --cat-bin "$CAT_TOOL" >"$MAIN_TIER_JSONL"; then
+# Sol15 P0-1 (rc8-upg15 S2b): --policy/--toolset-json make
+# release_tier_pipeline.sh re-verify the approved toolset itself,
+# immediately before and immediately after EVERY tier it actually runs --
+# closing the window this one pipeline-wide preflight check (above) cannot:
+# a same-UID substitution between two tiers, or during one tier's own
+# execution.
+if ! "$BASH_TOOL" "$ROOT/scripts/release_tier_pipeline.sh" run --state-dir "$CHECKPOINT_STATE_DIR" --identity-file "$IDENTITY_FILE" --spec "$MAIN_TIER_SPEC" --python-bin "$PYTHON_TOOL" --bash-bin "$BASH_TOOL" --sha256sum-bin "$SHA256SUM_TOOL" --date-bin "$DATE_TOOL" --awk-bin "$AWK_TOOL" --mkdir-bin "$MKDIR_TOOL" --mktemp-bin "$MKTEMP_TOOL" --rm-bin "$RM_TOOL" --dirname-bin "$DIRNAME_TOOL" --cat-bin "$CAT_TOOL" --policy "$RELEASE_TOOL_POLICY" --toolset-json "$OUT_DIR/toolset.json" --toolset-py "$ROOT/scripts/release_toolset.py" >"$MAIN_TIER_JSONL"; then
   MAIN_TIER_PIPELINE_OK=false
 fi
 rm -f "$MAIN_TIER_SPEC"
@@ -1682,7 +1718,7 @@ CHECKSUMS="$OUT_DIR/checksums.txt"
   checksum_inputs=(
     *.tar.gz build-manifest.json architecture-build-metadata.json sbom.json
     claims.yaml test-summary.json acceptance-summary.json claims-verify-report.txt
-    preflight.json toolset.json gov *.log.gz redteam-source-identity.json
+    preflight.json toolset.json release-environment.json gov *.log.gz redteam-source-identity.json
     integration-gov integration-expected-names.txt integration-expected-packages.txt
   )
   for attestation_file in attestations/*.json; do

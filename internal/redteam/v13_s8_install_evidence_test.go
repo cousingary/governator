@@ -230,6 +230,7 @@ func s8WriteCompleteDist(t *testing.T, dir, commit string) {
 	write("claims-verify-report.txt", "ok\n")
 	write("preflight.json", "{}")
 	write("toolset.json", "{}")
+	write("release-environment.json", "{}")
 	for _, log := range []string{"unit.log.gz", "race.log.gz", "integration.log.gz", "corpus.log.gz", "redteam.log.gz", "redteam-race.log.gz"} {
 		s8WriteGzLog(t, dir, log)
 	}
