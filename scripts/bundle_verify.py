@@ -11,11 +11,22 @@ objects, no producer-specific paths, no tools outside the declared closure.
 
 Usage:
   bundle_verify.py --bundle-dir DIR \
+    [--trusted-fingerprints-file FILE] \
     [--trusted-public-keys-dir DIR] \
     [--closure-minisig PATH] \
     [--skip-git-bundle]
 
 Exit 0 on success. Exit 1 with diagnostics naming each unbound object.
+
+Trust-anchor sourcing (Sol15 P2-3): external sourcing is the documented
+default. --trusted-fingerprints-file should be obtained through a channel
+independent of the bundle (docs/signing_key.md names the published
+channels); the checksums signature's signer fingerprint is cross-checked
+against it. Without it, trust-anchor verification is bundle-local only --
+integrity is proven but origin authentication is WEAK, and the verifier
+says so loudly. A fingerprints file resolving inside the bundle is
+bundle-local and requires the explicit --allow-bundle-local-trust-anchor
+opt-in (with a warning).
 """
 import argparse
 import hashlib
@@ -151,16 +162,75 @@ def verify_git_bundle(bundle: pathlib.Path, failures: list[str]) -> None:
             failures.append(f"UNBOUND: git bundle verification failed: {proc.stderr.strip()}")
 
 
-def verify_trust_anchor(bundle: pathlib.Path, failures: list[str]) -> None:
+def verify_trust_anchor(bundle: pathlib.Path, failures: list[str],
+                        warnings: list[str],
+                        trusted_fingerprints_file: str | None,
+                        allow_bundle_local: bool) -> None:
     trust_file = bundle / "source" / "docs" / "TRUSTED_SIGNING_KEYS.txt"
     if not trust_file.is_file():
         failures.append("UNBOUND: source/docs/TRUSTED_SIGNING_KEYS.txt absent — trust anchor not in signed source")
+
+    # Sol15 P2-3: the bundle-local anchor above proves the trust root is
+    # bound into the signed source -- integrity. Origin authentication
+    # requires cross-checking the signer fingerprint against a fingerprints
+    # file obtained OUTSIDE the bundle. Without it this verifier must say
+    # so loudly rather than presenting a green verdict as fully trusted.
+    if not trusted_fingerprints_file:
+        warnings.append(
+            "WEAK_ORIGIN_AUTHENTICATION: no --trusted-fingerprints-file supplied — trust-anchor verification "
+            "is bundle-local only; integrity is proven but origin authentication is WEAK because the key "
+            "travelled beside the payload. Obtain the expected fingerprint through an independent channel "
+            "(docs/signing_key.md names the published channels) and re-run with --trusted-fingerprints-file")
+        return
+
+    from release_policy import bundle_local_trust_sources, load_trusted_fingerprints, minisig_signer_fingerprint
+    inside = bundle_local_trust_sources(str(bundle), trusted_fingerprints_file, "")
+    if inside:
+        if not allow_bundle_local:
+            failures.append(
+                "UNBOUND: BUNDLE_LOCAL_TRUST_ANCHOR: --trusted-fingerprints-file resolves inside the bundle — "
+                "a fingerprints file that travels beside the payload proves nothing about origin (Sol15 P2-3); "
+                "supply one obtained externally, or pass --allow-bundle-local-trust-anchor to accept weak "
+                "origin authentication with an explicit warning")
+            return
+        warnings.append(
+            "WEAK_ORIGIN_AUTHENTICATION: bundle-local fingerprints file accepted by explicit opt-in — "
+            "origin authentication is WEAK (Sol15 P2-3)")
+
+    external = load_trusted_fingerprints(pathlib.Path(trusted_fingerprints_file))
+    if not external:
+        failures.append(f"UNBOUND: {trusted_fingerprints_file} names no trusted signing-key fingerprint")
+        return
+
+    minisig = None
+    for candidate in (bundle / "evidence" / "checksums.txt.minisig",
+                      bundle / "dist" / "checksums.txt.minisig"):
+        if candidate.is_file():
+            minisig = candidate
+            break
+    if minisig is None:
+        failures.append("UNBOUND: checksums.txt.minisig absent — cannot cross-check signer fingerprint "
+                        "against the external trust anchor")
+        return
+    try:
+        actual = minisig_signer_fingerprint(minisig)
+    except ValueError as exc:
+        failures.append(f"UNBOUND: signer fingerprint unreadable from {minisig.name}: {exc}")
+        return
+    if actual not in external:
+        failures.append(
+            f"UNBOUND: bundle signature was produced by key {actual}, which is NOT in the external "
+            f"trust anchor {trusted_fingerprints_file} — origin authentication failed (Sol15 P2-3)")
 
 
 def main(argv: list[str]) -> int:
     p = argparse.ArgumentParser(description="One-command offline audit-bundle verifier")
     p.add_argument("--bundle-dir", required=True)
+    p.add_argument("--trusted-fingerprints-file", default=None,
+                   help="externally obtained signer fingerprints (the documented default trust source; Sol15 P2-3)")
     p.add_argument("--trusted-public-keys-dir", default=None)
+    p.add_argument("--allow-bundle-local-trust-anchor", action="store_true",
+                   help="explicit, warned opt-in to a fingerprints file that resolves inside the bundle (Sol15 P2-3)")
     p.add_argument("--closure-minisig", default=None)
     p.add_argument("--skip-git-bundle", action="store_true")
     args = p.parse_args(argv)
@@ -171,15 +241,20 @@ def main(argv: list[str]) -> int:
         return 1
 
     failures: list[str] = []
+    warnings: list[str] = []
 
     verify_source_closure(bundle, failures)
     verify_architecture(bundle, failures)
     verify_install_evidence(bundle, failures)
     verify_checksums(bundle, failures)
     verify_closure_manifest(bundle, failures, args.trusted_public_keys_dir, args.closure_minisig)
-    verify_trust_anchor(bundle, failures)
+    verify_trust_anchor(bundle, failures, warnings, args.trusted_fingerprints_file,
+                        args.allow_bundle_local_trust_anchor)
     if not args.skip_git_bundle:
         verify_git_bundle(bundle, failures)
+
+    for w in warnings:
+        print(f"bundle_verify: WARNING: {w}", file=sys.stderr)
 
     if failures:
         print(f"bundle_verify: FAILED — {len(failures)} unbound object(s):", file=sys.stderr)
@@ -187,7 +262,10 @@ def main(argv: list[str]) -> int:
             print(f"  {f}", file=sys.stderr)
         return 1
 
-    print(f"bundle_verify: OK — {bundle} is a fully bound, offline-verifiable audit bundle", file=sys.stderr)
+    if warnings:
+        print(f"bundle_verify: OK WITH WARNINGS — {bundle} is a fully bound audit bundle, but with weak origin authentication (see warnings above)", file=sys.stderr)
+    else:
+        print(f"bundle_verify: OK — {bundle} is a fully bound, offline-verifiable audit bundle", file=sys.stderr)
     return 0
 
 

@@ -64,11 +64,15 @@ func s3InitRepo(t *testing.T) (repo, commit string) {
 }
 
 // s3RunAuditValidate runs the real scripts/audit_bundle_validate.py against
-// distDir and returns its combined output + error.
+// distDir and returns its combined output + error. The synthetic fixtures
+// carry no real signature, so they pass the Sol15 P2-3 trust-posture gate
+// through its explicit, warned-about dry-run opt-in rather than through the
+// old silent skip (which no longer exists).
 func s3RunAuditValidate(t *testing.T, distDir, repo, releaseCommit string) (string, error) {
 	t.Helper()
 	cmd := exec.Command("python3", s3AuditValidateScript(t),
-		"--dist-dir", distDir, "--repo", repo, "--release-commit", releaseCommit)
+		"--dist-dir", distDir, "--repo", repo, "--release-commit", releaseCommit,
+		"--allow-unverified-signature")
 	out, err := cmd.CombinedOutput()
 	return string(out), err
 }
@@ -147,10 +151,10 @@ var s3TierNames = []string{"unit", "race", "integration", "corpus", "redteam", "
 
 // s3BuildCompleteDist assembles a synthetic dist/ directory that satisfies
 // EVERY release-mode requirement audit_bundle_validate.py checks (short of
-// cryptographic signature, which is only checked when
-// --trusted-fingerprints-file/--trusted-public-keys-dir are passed -- these
-// tests omit them, exactly like a local unsigned dry-run release). Returns
-// the dist dir; callers corrupt/omit specific pieces per case.
+// cryptographic signature: s3RunAuditValidate passes the Sol15 P2-3
+// --allow-unverified-signature dry-run opt-in, since these fixtures carry no
+// real signature -- the old silent skip no longer exists). Returns the dist
+// dir; callers corrupt/omit specific pieces per case.
 func s3BuildCompleteDist(t *testing.T, commit string) string {
 	t.Helper()
 	dist := t.TempDir()

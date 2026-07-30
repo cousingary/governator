@@ -66,6 +66,12 @@ func buildAuditBundleFixtureRepo(t *testing.T) string {
 	mustWrite(".gitignore", "dist/\naudit-out*/\n")
 	mustWrite("scripts/audit_bundle.sh", readRealFile(t, filepath.Join(repoRoot, "scripts", "audit_bundle.sh")))
 	mustWrite("scripts/check_architecture_doc.py", readRealFile(t, filepath.Join(repoRoot, "scripts", "check_architecture_doc.py")))
+	// rc8-upg15 S5/S7: audit_bundle.sh generates the signed source closure
+	// (source_closure.py, which imports safe_extract at module level) --
+	// the fixture must carry both or the closure step fails before the
+	// behavior under test is ever reached.
+	mustWrite("scripts/source_closure.py", readRealFile(t, filepath.Join(repoRoot, "scripts", "source_closure.py")))
+	mustWrite("scripts/safe_extract.py", readRealFile(t, filepath.Join(repoRoot, "scripts", "safe_extract.py")))
 	if err := os.Chmod(filepath.Join(fixture, "scripts", "audit_bundle.sh"), 0o755); err != nil {
 		t.Fatal(err)
 	}

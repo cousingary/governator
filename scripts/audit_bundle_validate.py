@@ -24,7 +24,19 @@ error naming exactly what is missing -- never a silent "OK".
 Usage:
   audit_bundle_validate.py --dist-dir DIR --repo REPO --release-commit SHA
     [--architecture-doc PATH] [--trusted-fingerprints-file FILE]
-    [--trusted-public-keys-dir DIR]
+    [--trusted-public-keys-dir DIR] [--allow-bundle-local-trust-anchor]
+    [--allow-unverified-signature]
+
+Trust-anchor sourcing (Sol15 P2-3): external sourcing is the documented
+default. A production release verification REQUIRES --trusted-fingerprints-file
+and --trusted-public-keys-dir obtained through a channel independent of the
+bundle (docs/signing_key.md names the published channels). Trust material
+resolving inside --dist-dir is bundle-local and is accepted only with the
+explicit, warned-about --allow-bundle-local-trust-anchor opt-in. Omitting the
+trust anchors entirely skips cryptographic signature verification and is
+accepted only with the explicit, warned-about --allow-unverified-signature
+opt-in (local dry-run parity); a dist "verified" that way carries no origin
+authentication and the OK message says so.
 """
 import argparse
 import gzip
@@ -172,9 +184,55 @@ def main(argv: list[str]) -> int:
     p.add_argument("--architecture-doc", default=None)
     p.add_argument("--trusted-fingerprints-file", default=None)
     p.add_argument("--trusted-public-keys-dir", default=None)
+    p.add_argument("--allow-bundle-local-trust-anchor", action="store_true",
+                   help="explicit, warned opt-in to a trust anchor that resolves inside --dist-dir (Sol15 P2-3)")
+    p.add_argument("--allow-unverified-signature", action="store_true",
+                   help="explicit, warned opt-in to skip cryptographic signature verification (local dry-run parity; Sol15 P2-3)")
     p.add_argument("--install-evidence", default=None,
                    help="signed install-evidence.json; required when the architecture doc claims a live deployment")
     args = p.parse_args(argv)
+
+    # Sol15 P2-3 trust-posture gate, evaluated BEFORE any completeness
+    # check: a bundle-local trust anchor (or none at all) can never
+    # silently produce a "verified release" verdict. External sourcing is
+    # the documented default; both opt-ins warn loudly on stderr.
+    from release_policy import bundle_local_trust_sources
+    signature_unverified = False
+    if not args.trusted_fingerprints_file and not args.trusted_public_keys_dir:
+        if not args.allow_unverified_signature:
+            return fail([
+                "NO_EXTERNAL_TRUST_ANCHOR: production release verification requires --trusted-fingerprints-file "
+                "and --trusted-public-keys-dir sourced through a channel independent of this bundle (Sol15 P2-3) -- "
+                "a signature whose verification key arrives only beside the signed payload provides integrity but "
+                "weak origin authentication. docs/signing_key.md names the published channels; pass "
+                "--allow-unverified-signature for an explicit, clearly-labeled dry-run verification without origin "
+                "authentication"
+            ])
+        signature_unverified = True
+        print(
+            "audit_bundle_validate: WARNING: --allow-unverified-signature set -- cryptographic signature "
+            "verification SKIPPED; this dist carries no origin authentication and must not be treated as a "
+            "production release (Sol15 P2-3)",
+            file=sys.stderr,
+        )
+    else:
+        bundle_local = bundle_local_trust_sources(
+            args.dist_dir, args.trusted_fingerprints_file or "", args.trusted_public_keys_dir or "")
+        if bundle_local:
+            if not args.allow_bundle_local_trust_anchor:
+                return fail([
+                    f"BUNDLE_LOCAL_TRUST_ANCHOR: {' and '.join(bundle_local)} resolve inside the dist directory "
+                    f"{args.dist_dir} -- a verification key that travels beside the payload proves integrity but "
+                    "not origin authentication (Sol15 P2-3). Source the trust anchor externally "
+                    "(docs/signing_key.md names the published channels), or pass "
+                    "--allow-bundle-local-trust-anchor to accept weak origin authentication with an explicit warning"
+                ])
+            print(
+                f"audit_bundle_validate: WARNING: bundle-local trust anchor accepted by explicit opt-in: "
+                f"{' and '.join(bundle_local)} resolve inside {args.dist_dir}; origin authentication is WEAK "
+                "because the key travelled beside the payload (Sol15 P2-3)",
+                file=sys.stderr,
+            )
 
     dist = pathlib.Path(args.dist_dir)
     missing: list[str] = []
@@ -344,6 +402,8 @@ def main(argv: list[str]) -> int:
             "--trusted-public-keys-dir", args.trusted_public_keys_dir,
             "--artifacts-dir", str(dist),
         ]
+        if args.allow_bundle_local_trust_anchor:
+            cmd.append("--allow-bundle-local-trust-anchor")
         proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
         if proc.returncode != 0:
             return fail([f"cryptographic signature verification failed: {proc.stdout.strip()}"])
@@ -363,7 +423,10 @@ def main(argv: list[str]) -> int:
     if missing:
         return fail(missing)
 
-    print(f"audit_bundle_validate: OK -- {dist} is a complete, verified release ({len(archives)} platform archive(s), commit {args.release_commit})", file=sys.stderr)
+    if signature_unverified:
+        print(f"audit_bundle_validate: OK -- {dist} is a complete release ({len(archives)} platform archive(s), commit {args.release_commit}) but its signature was NOT verified (--allow-unverified-signature); it carries NO origin authentication and must not be treated as a production release (Sol15 P2-3)", file=sys.stderr)
+    else:
+        print(f"audit_bundle_validate: OK -- {dist} is a complete, verified release ({len(archives)} platform archive(s), commit {args.release_commit})", file=sys.stderr)
     return 0
 
 

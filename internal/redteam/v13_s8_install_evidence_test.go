@@ -486,6 +486,7 @@ func TestV13Case295LiveInstallClaimWithoutInstallationEvidenceIsRejected(t *test
 		"--repo", repoDir,
 		"--release-commit", commit,
 		"--architecture-doc", archDoc,
+		"--allow-unverified-signature",
 	)
 	outBytes, err := cmd.CombinedOutput()
 	out := string(outBytes)

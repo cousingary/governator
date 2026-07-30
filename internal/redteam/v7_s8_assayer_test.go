@@ -48,7 +48,14 @@ func buildAssayerRepoFixture(t *testing.T, version string) (repoDir string) {
 	if err := os.WriteFile(filepath.Join(repoDir, "pyproject.toml"), []byte(pyproject), 0644); err != nil {
 		t.Fatal(err)
 	}
-	run("git", "add", "pyproject.toml")
+	// rc8-upg15 S5/S7: assayer_verify.sh fails closed when the
+	// release-pinned lockfile is absent; every fixture Assayer repo must
+	// carry one so the gate under test is the tag/version behavior, not
+	// the lockfile requirement.
+	if err := os.WriteFile(filepath.Join(repoDir, "requirements-lock.txt"), []byte("# fixture release lockfile\nsupabase==2.0.0\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	run("git", "add", "pyproject.toml", "requirements-lock.txt")
 	run("git", "commit", "-q", "-m", "init")
 	return repoDir
 }

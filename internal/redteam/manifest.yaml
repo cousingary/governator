@@ -2198,6 +2198,16 @@ cases:
     session: rc8-u15-s6
     required: true
     status: implemented
+  - case: 390
+    name: TestV15Case390LocalNodeBackendCannotProduceApprovingOutcome
+    session: rc8-u15-s7
+    required: true
+    status: implemented
+  - case: 391
+    name: TestV15Case391BundleLocalTrustAnchorAloneIsInsufficientWithoutExternalFingerprint
+    session: rc8-u15-s7
+    required: true
+    status: implemented
 
 # Case 296 is not one of Sol13's original 51 findings (which occupy 245-295).
 # It closes a gap the rc6-upg13 S3 exclusion audit found: TestV6Case29's own

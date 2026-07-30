@@ -80,6 +80,35 @@ def load_pinned_public_keys(dir_path: pathlib.Path) -> dict[str, pathlib.Path]:
     return pinned
 
 
+def bundle_local_trust_sources(artifacts_dir: str, fingerprints_file: str, public_keys_dir: str) -> list[str]:
+    """Sol15 P2-3: names which trust-anchor sources resolve INSIDE the
+    artifacts directory they are meant to verify. A verification key that
+    travels beside the payload proves integrity but not origin -- an
+    attacker controlling the bundle controls its own trust anchor. Returns
+    the flag names whose values resolve inside artifacts_dir (empty when
+    every supplied source is external). Shared by release_policy.py's
+    signature gate and audit_bundle_validate.py's trust-posture gate so the
+    two enforcement points cannot drift."""
+    if not artifacts_dir:
+        return []
+    try:
+        root = pathlib.Path(artifacts_dir).resolve()
+    except OSError:
+        return []
+    inside: list[str] = []
+    for flag, value in (("--trusted-fingerprints-file", fingerprints_file),
+                        ("--trusted-public-keys-dir", public_keys_dir)):
+        if not value:
+            continue
+        try:
+            resolved = pathlib.Path(value).resolve()
+        except OSError:
+            continue
+        if root in resolved.parents or resolved == root:
+            inside.append(flag)
+    return inside
+
+
 def sha256_file(path: pathlib.Path) -> str:
     h = hashlib.sha256()
     with path.open("rb") as f:
@@ -361,6 +390,10 @@ def command_signature(argv: list[str]) -> int:
     p.add_argument("--artifacts-dir", default="")
     p.add_argument("--minisign-bin", default="")
     p.add_argument("--minisign-bin-hash", default="")
+    # Sol15 P2-3: external trust-anchor sourcing is the documented default.
+    # Trust material resolving inside --artifacts-dir is bundle-local --
+    # accepted only with this explicit, warned-about opt-in.
+    p.add_argument("--allow-bundle-local-trust-anchor", action="store_true")
     args = p.parse_args(argv)
 
     require = args.require.strip().lower()
@@ -388,6 +421,33 @@ def command_signature(argv: list[str]) -> int:
         # signature; the cryptographic verification chain below is a
         # production gate.
         return 0
+
+    # --- Sol15 P2-3: trust-anchor sourcing gate. External sourcing is the
+    # documented default; a key that travels beside the payload proves
+    # integrity but NOT origin. Trust material resolving inside the
+    # artifacts directory it verifies is rejected unless explicitly
+    # opted in (with a loud warning). ---
+    bundle_local = bundle_local_trust_sources(
+        args.artifacts_dir, args.trusted_fingerprints_file, args.trusted_public_keys_dir)
+    if bundle_local:
+        if not args.allow_bundle_local_trust_anchor:
+            print(
+                f"release_policy: BUNDLE_LOCAL_TRUST_ANCHOR: {' and '.join(bundle_local)} resolve inside the "
+                f"artifacts directory {args.artifacts_dir} -- a verification key that travels beside the payload "
+                "proves integrity but not origin authentication (Sol15 P2-3). Source the trust anchor through an "
+                "independent channel (docs/signing_key.md names the published channels; docs/publishing.md step 1 "
+                "documents the verifier procedure), or pass --allow-bundle-local-trust-anchor to accept weak "
+                "origin authentication with an explicit warning",
+                file=sys.stderr,
+            )
+            return 1
+        print(
+            f"release_policy: WARNING: bundle-local trust anchor accepted by explicit opt-in: "
+            f"{' and '.join(bundle_local)} resolve inside {args.artifacts_dir}; this verification proves "
+            "integrity only -- origin authentication is WEAK because the key travelled beside the payload "
+            "(Sol15 P2-3)",
+            file=sys.stderr,
+        )
 
     # --- Production release: full cryptographic verification chain. ---
     if not args.trusted_fingerprints_file:

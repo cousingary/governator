@@ -37,7 +37,10 @@ func s14WriteLiveArch(t *testing.T, dir, evidence, pub string, live bool, binary
 
 func s14ValidateLiveInstall(t *testing.T, dist, commit, arch, evidence string) (string, error) {
 	t.Helper()
-	args := []string{s8Script(t, "audit_bundle_validate.py"), "--dist-dir", dist, "--repo", filepath.Dir(dist), "--release-commit", commit, "--architecture-doc", arch}
+	// Synthetic fixtures carry no real signature, so they pass the Sol15
+	// P2-3 trust-posture gate through its explicit, warned-about dry-run
+	// opt-in (the old silent signature skip no longer exists).
+	args := []string{s8Script(t, "audit_bundle_validate.py"), "--dist-dir", dist, "--repo", filepath.Dir(dist), "--release-commit", commit, "--architecture-doc", arch, "--allow-unverified-signature"}
 	if evidence != "" {
 		args = append(args, "--install-evidence", evidence)
 	}
