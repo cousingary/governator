@@ -17,7 +17,8 @@ import sys
 
 
 DEFAULT_TOOLS = [
-    "go", "python3", "python3.12", "git", "bash", "sha256sum", "tar", "gzip", "minisign",
+    "go", "python3", "python3.10", "python3.11", "python3.12", "python3.13",
+    "git", "bash", "sha256sum", "tar", "gzip", "minisign",
     "date", "awk", "env", "cp", "rm", "mkdir", "find", "sort", "mktemp",
     "dirname", "pwd", "grep", "uname", "cat", "chmod", "stat", "basename",
     "timeout", "mv", "ls", "systemctl", "docker", "tail",

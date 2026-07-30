@@ -70,7 +70,7 @@ release_tool_value() {
   return 1
 }
 
-for release_tool in go python3 python3.12 sha256sum tar gzip minisign git bash date awk env cp rm mkdir find sort mktemp dirname pwd grep uname cat chmod stat basename timeout mv ls systemctl docker tail; do
+for release_tool in go python3 python3.10 python3.11 python3.12 python3.13 sha256sum tar gzip minisign git bash date awk env cp rm mkdir find sort mktemp dirname pwd grep uname cat chmod stat basename timeout mv ls systemctl docker tail; do
   release_tool_path=$(release_tool_value "$release_tool" path) || {
     echo "release: approved tool ${release_tool} is absent from ${RELEASE_TOOL_POLICY}" >&2
     exit 1
@@ -78,7 +78,10 @@ for release_tool in go python3 python3.12 sha256sum tar gzip minisign git bash d
   case "$release_tool" in
     go) GO_TOOL=$release_tool_path ;;
     python3) PYTHON_TOOL=$release_tool_path ;;
+    python3.10) PYTHON310_TOOL=$release_tool_path ;;
+    python3.11) PYTHON311_TOOL=$release_tool_path ;;
     python3.12) PYTHON312_TOOL=$release_tool_path ;;
+    python3.13) PYTHON313_TOOL=$release_tool_path ;;
     sha256sum) SHA256SUM_TOOL=$release_tool_path ;;
     tar) TAR_TOOL=$release_tool_path ;;
     gzip) GZIP_TOOL=$release_tool_path ;;
@@ -174,7 +177,10 @@ export PATH="$TOOLBIN_DIR"
 # verified links, never a policy-path symlink or a caller-provided PATH entry.
 GO_TOOL="$TOOLBIN_DIR/go"
 PYTHON_TOOL="$TOOLBIN_DIR/python3"
+PYTHON310_TOOL="$TOOLBIN_DIR/python3.10"
+PYTHON311_TOOL="$TOOLBIN_DIR/python3.11"
 PYTHON312_TOOL="$TOOLBIN_DIR/python3.12"
+PYTHON313_TOOL="$TOOLBIN_DIR/python3.13"
 SHA256SUM_TOOL="$TOOLBIN_DIR/sha256sum"
 TAR_TOOL="$TOOLBIN_DIR/tar"
 GZIP_TOOL="$TOOLBIN_DIR/gzip"

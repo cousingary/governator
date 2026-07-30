@@ -5,9 +5,18 @@ tools:
   python3:
     path: /usr/bin/python3
     sha256: 1643dacd9feaedc58f3cc581e4d22577dfe25c09b10282936186ccf0f2e61118
+  python3.10:
+    path: /home/lam/.local/bin/python3.10
+    sha256: 49b2c58e9fddd98ff9b53f6f7613a91db9053f858c89cae5dcd25ee7828bc0d6
+  python3.11:
+    path: /home/lam/.local/bin/python3.11
+    sha256: 387140463425a3077772bac4433cf3ebef7ca9cff7fb14d7983722b38c665adc
   python3.12:
     path: /usr/bin/python3.12
     sha256: 1643dacd9feaedc58f3cc581e4d22577dfe25c09b10282936186ccf0f2e61118
+  python3.13:
+    path: /home/lam/.local/bin/python3.13
+    sha256: 2fa13dc1ef5d30c51d34c276448eadbacc769d50d14ae0b0ad3ed812691bbc7e
   sha256sum:
     path: /usr/bin/sha256sum
     sha256: e484c36c0613879fbd11058f7a2e194783bced59d4805d64c3d4b0d7f664094d
