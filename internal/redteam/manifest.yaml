@@ -2093,6 +2093,51 @@ cases:
     session: rc8-u15-s3
     required: true
     status: implemented
+  - case: 369
+    name: TestV15Case369DarwinArchiveOnLinuxHostIsRejected
+    session: rc8-u15-s4
+    required: true
+    status: implemented
+  - case: 370
+    name: TestV15Case370Arm64ArchiveOnAmd64HostIsRejected
+    session: rc8-u15-s4
+    required: true
+    status: implemented
+  - case: 371
+    name: TestV15Case371CorrectlyNamedArchiveWithWrongContentsIsRejected
+    session: rc8-u15-s4
+    required: true
+    status: implemented
+  - case: 372
+    name: TestV15Case372ArchiveContainingSymlinkedGovIsRejected
+    session: rc8-u15-s4
+    required: true
+    status: implemented
+  - case: 373
+    name: TestV15Case373DuplicateGovMembersAreRejected
+    session: rc8-u15-s4
+    required: true
+    status: implemented
+  - case: 374
+    name: TestV15Case374PathTraversalMemberIsRejected
+    session: rc8-u15-s4
+    required: true
+    status: implemented
+  - case: 375
+    name: TestV15Case375CorrectExecutablePlusHiddenExtraPayloadIsRejected
+    session: rc8-u15-s4
+    required: true
+    status: implemented
+  - case: 376
+    name: TestV15Case376InstalledFileModifiedAfterExtractionIsDetected
+    session: rc8-u15-s4
+    required: true
+    status: implemented
+  - case: 377
+    name: TestV15Case377CorrectArchiveHashWithWrongContainedModeIsRejected
+    session: rc8-u15-s4
+    required: true
+    status: implemented
 
 # Case 296 is not one of Sol13's original 51 findings (which occupy 245-295).
 # It closes a gap the rc6-upg13 S3 exclusion audit found: TestV6Case29's own

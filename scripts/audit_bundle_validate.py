@@ -35,7 +35,7 @@ import re
 import subprocess
 import sys
 
-from install_evidence import CANARY_FIELDS, PLATFORM_ARCHIVE_PATTERN, sha256_file, verify_record
+from install_evidence import CANARY_FIELDS, sha256_file, verify_record
 
 REQUIRED_TOP_LEVEL_FILES = (
     "checksums.txt",
@@ -117,24 +117,40 @@ def validate_live_install(fm: dict, evidence_path: pathlib.Path | None, manifest
             ok, message = False, str(exc)
         if not ok:
             failures.append(message)
-    required_record = ("installed_path", "installed_sha256", "installed_mode", "source_archive", "source_archive_sha256", "hook_configuration_path", "hook_configuration_sha256", "release_manifest_sha256", *CANARY_FIELDS)
+    required_record = ("installed_path", "installed_sha256", "installed_mode", "source_archive", "source_archive_sha256", "contained_binary_sha256", "hook_configuration_path", "hook_configuration_sha256", "release_manifest_sha256", *CANARY_FIELDS)
     absent_record = [field for field in required_record if evidence.get(field) in (None, "")]
     if absent_record:
         failures.append("INSTALL_EVIDENCE_MISSING_FIELDS: " + ", ".join(absent_record))
     if evidence.get("installed_mode") != "0o755":
         failures.append("INSTALLED_BINARY_MODE_MISMATCH: installed mode must be 0o755")
     source_archive = evidence.get("source_archive", "")
-    if source_archive and not PLATFORM_ARCHIVE_PATTERN.match(source_archive):
-        failures.append(
-            f"LOOSE_FILE_INSTALL_REJECTED: source_archive {source_archive!r} does not match "
-            "the signed platform archive pattern gov_<version>_<platform>.tar.gz"
-        )
-    if source_archive and PLATFORM_ARCHIVE_PATTERN.match(source_archive):
+    if source_archive:
         archive_path = manifest_path.parent / source_archive
         if not archive_path.is_file():
             failures.append(f"SOURCE_ARCHIVE_NOT_IN_DIST: {source_archive} is not present in the release dist/")
         elif evidence.get("source_archive_sha256") != sha256_file(str(archive_path)):
             failures.append("SOURCE_ARCHIVE_HASH_MISMATCH: install evidence is not bound to the shipped platform archive")
+    if evidence.get("installed_sha256") != evidence.get("contained_binary_sha256"):
+        failures.append("INSTALLED_NOT_FROM_ARCHIVE: installed_sha256 != contained_binary_sha256")
+    try:
+        manifest_data = load_json(manifest_path)
+        from install_evidence import current_platform_id
+        host_platform = current_platform_id()
+        for artifact in manifest_data.get("artifacts", []):
+            if artifact.get("platform") == host_platform:
+                manifest_archive_sha = artifact.get("archive_sha256")
+                if manifest_archive_sha and evidence.get("source_archive_sha256") != manifest_archive_sha:
+                    failures.append("ARCHIVE_HASH_MISMATCH: install evidence source_archive_sha256 does not match manifest archive_sha256")
+                manifest_exec_sha = (
+                    artifact.get("executable_sha256")
+                    or artifact.get("binary_sha256")
+                    or artifact.get("extracted_binary_sha256")
+                )
+                if manifest_exec_sha and evidence.get("contained_binary_sha256") != manifest_exec_sha:
+                    failures.append("CONTAINED_BINARY_HASH_MISMATCH: install evidence contained_binary_sha256 does not match manifest executable_sha256")
+                break
+    except (json.JSONDecodeError, OSError):
+        pass
     if evidence.get("release_manifest_sha256") != sha256_file(str(manifest_path)):
         failures.append("RELEASE_MANIFEST_MISMATCH: install evidence is not bound to this build manifest")
     if not failures and public_key is not None:

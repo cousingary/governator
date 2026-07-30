@@ -60,12 +60,13 @@ import json
 import os
 import pathlib
 import platform
-import re
 import stat
 import subprocess
 import sys
 import tempfile
 from datetime import datetime, timezone
+
+from safe_extract import UnsafeArchiveError, safe_extract_tar
 
 CANARY_FIELDS = (
     "canary_benign_allows",
@@ -73,8 +74,6 @@ CANARY_FIELDS = (
     "canary_malformed_patch_denies",
     "canary_binary_hash_matches",
 )
-
-PLATFORM_ARCHIVE_PATTERN = re.compile(r"^gov_.+_.+\.tar\.gz$")
 
 
 def current_platform_id() -> str:
@@ -303,15 +302,81 @@ def cmd_generate(args: argparse.Namespace) -> int:
         print(f"install_evidence: SOURCE_ARCHIVE_NOT_FOUND: {source_archive}", file=sys.stderr)
         return 1
     archive_name = source_archive.name
-    if not PLATFORM_ARCHIVE_PATTERN.match(archive_name):
+    source_archive_sha256 = sha256_file(str(source_archive))
+
+    expected_archive_name = None
+    expected_archive_sha256 = None
+    expected_executable_sha256 = None
+    for artifact in manifest.get("artifacts", []):
+        if artifact.get("platform") == host_platform:
+            expected_archive_name = artifact.get("archive_path")
+            expected_archive_sha256 = artifact.get("archive_sha256")
+            expected_executable_sha256 = (
+                artifact.get("executable_sha256")
+                or artifact.get("binary_sha256")
+                or artifact.get("extracted_binary_sha256")
+            )
+            break
+    if expected_archive_name is None:
         print(
-            f"install_evidence: LOOSE_FILE_INSTALL_REJECTED: source archive {archive_name!r} does not match "
-            "the signed platform archive pattern gov_<version>_<platform>.tar.gz -- installation must use "
-            "a signed platform tarball, never the loose binary from the outer ZIP",
+            f"install_evidence: NO_MANIFEST_ARTIFACE: no artifact for platform {host_platform!r} "
+            f"in {release_manifest} -- cannot validate source archive provenance",
             file=sys.stderr,
         )
         return 1
-    source_archive_sha256 = sha256_file(str(source_archive))
+    if archive_name != expected_archive_name:
+        print(
+            f"install_evidence: WRONG_PLATFORM_ARCHIVE: supplied archive {archive_name!r} does not match "
+            f"the manifest's artifact for platform {host_platform!r} (expected {expected_archive_name!r})",
+            file=sys.stderr,
+        )
+        return 1
+    if expected_archive_sha256 and source_archive_sha256 != expected_archive_sha256:
+        print(
+            f"install_evidence: ARCHIVE_HASH_MISMATCH: supplied archive hashes to {source_archive_sha256} "
+            f"but the manifest records archive_sha256={expected_archive_sha256}",
+            file=sys.stderr,
+        )
+        return 1
+
+    with tempfile.TemporaryDirectory(prefix="gov-install-extract-") as extract_dir:
+        try:
+            extracted = safe_extract_tar(str(source_archive), extract_dir, {"gov"})
+        except UnsafeArchiveError as exc:
+            print(f"install_evidence: UNSAFE_ARCHIVE: {exc}", file=sys.stderr)
+            return 1
+        except (OSError, EOFError) as exc:
+            print(f"install_evidence: ARCHIVE_EXTRACTION_FAILED: {exc}", file=sys.stderr)
+            return 1
+
+        extracted_gov = pathlib.Path(extracted["gov"])
+        contained_binary_sha256 = sha256_file(str(extracted_gov))
+        contained_mode = oct(stat.S_IMODE(extracted_gov.stat().st_mode))
+
+        if contained_mode != "0o755":
+            print(
+                f"install_evidence: WRONG_CONTAINED_MODE: archive member 'gov' has mode {contained_mode}, "
+                "expected 0o755",
+                file=sys.stderr,
+            )
+            return 1
+
+        if expected_executable_sha256 and contained_binary_sha256 != expected_executable_sha256:
+            print(
+                f"install_evidence: CONTAINED_BINARY_HASH_MISMATCH: extracted 'gov' hashes to "
+                f"{contained_binary_sha256} but the manifest records executable_sha256={expected_executable_sha256}",
+                file=sys.stderr,
+            )
+            return 1
+
+        if installed_sha256 != contained_binary_sha256:
+            print(
+                f"install_evidence: INSTALLED_BINARY_NOT_FROM_ARCHIVE: installed binary hashes to "
+                f"{installed_sha256} but the archive's contained 'gov' hashes to {contained_binary_sha256} "
+                "-- the installed binary was not extracted from this archive",
+                file=sys.stderr,
+            )
+            return 1
 
     canary = run_hook_canary(str(installed_path), str(hook_config_path))
 
@@ -342,6 +407,7 @@ def cmd_generate(args: argparse.Namespace) -> int:
         "installed_mode": installed_mode,
         "source_archive": archive_name,
         "source_archive_sha256": source_archive_sha256,
+        "contained_binary_sha256": contained_binary_sha256,
         "version": version,
         "source_commit": source_commit,
         "dirty": dirty,
@@ -379,20 +445,10 @@ def cmd_verify(args: argparse.Namespace) -> int:
         print(f"install_evidence: {msg}", file=sys.stderr)
         return 1
 
-    required = ("installed_path", "installed_sha256", "installed_mode", "source_archive", "source_archive_sha256", "hook_configuration_path", "hook_configuration_sha256", "release_manifest_sha256", "signing_key_id", *CANARY_FIELDS)
+    required = ("installed_path", "installed_sha256", "installed_mode", "source_archive", "source_archive_sha256", "contained_binary_sha256", "hook_configuration_path", "hook_configuration_sha256", "release_manifest_sha256", "signing_key_id", *CANARY_FIELDS)
     absent = [field for field in required if record.get(field) in (None, "")]
     if absent:
         print(f"install_evidence: INSTALL_EVIDENCE_MISSING_FIELDS: {', '.join(absent)}", file=sys.stderr)
-        return 1
-
-    source_archive = record["source_archive"]
-    if not PLATFORM_ARCHIVE_PATTERN.match(source_archive):
-        print(
-            f"install_evidence: LOOSE_FILE_INSTALL_REJECTED: source_archive {source_archive!r} does not match "
-            "the signed platform archive pattern gov_<version>_<platform>.tar.gz -- installation must use "
-            "a signed platform tarball, never the loose binary from the outer ZIP",
-            file=sys.stderr,
-        )
         return 1
 
     release_manifest = pathlib.Path(args.release_manifest)
@@ -405,6 +461,42 @@ def cmd_verify(args: argparse.Namespace) -> int:
                 file=sys.stderr,
             )
             return 1
+        try:
+            manifest = json.loads(release_manifest.read_text(encoding="utf-8"))
+            host_platform = current_platform_id()
+            for artifact in manifest.get("artifacts", []):
+                if artifact.get("platform") == host_platform:
+                    manifest_archive_sha = artifact.get("archive_sha256")
+                    if manifest_archive_sha and record.get("source_archive_sha256") != manifest_archive_sha:
+                        print(
+                            f"install_evidence: ARCHIVE_HASH_MISMATCH: evidence records source_archive_sha256="
+                            f"{record.get('source_archive_sha256')!r} but the manifest records archive_sha256={manifest_archive_sha}",
+                            file=sys.stderr,
+                        )
+                        return 1
+                    manifest_exec_sha = (
+                        artifact.get("executable_sha256")
+                        or artifact.get("binary_sha256")
+                        or artifact.get("extracted_binary_sha256")
+                    )
+                    if manifest_exec_sha and record.get("contained_binary_sha256") != manifest_exec_sha:
+                        print(
+                            f"install_evidence: CONTAINED_BINARY_HASH_MISMATCH: evidence records contained_binary_sha256="
+                            f"{record.get('contained_binary_sha256')!r} but the manifest records executable_sha256={manifest_exec_sha}",
+                            file=sys.stderr,
+                        )
+                        return 1
+                    if record.get("installed_sha256") != record.get("contained_binary_sha256"):
+                        print(
+                            f"install_evidence: INSTALLED_NOT_FROM_ARCHIVE: installed_sha256 "
+                            f"({record.get('installed_sha256')!r}) != contained_binary_sha256 "
+                            f"({record.get('contained_binary_sha256')!r})",
+                            file=sys.stderr,
+                        )
+                        return 1
+                    break
+        except (json.JSONDecodeError, OSError):
+            pass
 
     installed_path = record["installed_path"]
     if not pathlib.Path(installed_path).is_file():

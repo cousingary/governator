@@ -3,6 +3,7 @@
 package redteam
 
 import (
+	"archive/tar"
 	"compress/gzip"
 	"crypto/ed25519"
 	"crypto/rand"
@@ -152,7 +153,25 @@ func s8WriteFakeArchive(t *testing.T, dir, version string) string {
 	t.Helper()
 	name := fmt.Sprintf("gov_%s_%s.tar.gz", version, s8HostPlatform())
 	path := filepath.Join(dir, name)
-	if err := os.WriteFile(path, []byte("fake-archive"), 0o644); err != nil {
+	govPath := filepath.Join(dir, "gov")
+	govData, err := os.ReadFile(govPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	gz := gzip.NewWriter(f)
+	defer gz.Close()
+	tw := tar.NewWriter(gz)
+	defer tw.Close()
+	hdr := &tar.Header{Name: "gov", Mode: 0o755, Size: int64(len(govData)), Typeflag: tar.TypeReg}
+	if err := tw.WriteHeader(hdr); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tw.Write(govData); err != nil {
 		t.Fatal(err)
 	}
 	return path
@@ -161,6 +180,44 @@ func s8WriteFakeArchive(t *testing.T, dir, version string) string {
 func s8GenerateEvidence(t *testing.T, govBin, manifest, hookConfig, privHex, out string) (string, error) {
 	t.Helper()
 	archive := s8WriteFakeArchive(t, filepath.Dir(govBin), "1.0.2-rc6")
+	archiveData, err := os.ReadFile(archive)
+	if err != nil {
+		t.Fatal(err)
+	}
+	archiveSum := sha256.Sum256(archiveData)
+	archiveSHA := hex.EncodeToString(archiveSum[:])
+	govData, err := os.ReadFile(govBin)
+	if err != nil {
+		t.Fatal(err)
+	}
+	govSum := sha256.Sum256(govData)
+	govSHA := hex.EncodeToString(govSum[:])
+
+	manifestData, err := os.ReadFile(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var m map[string]any
+	if err := json.Unmarshal(manifestData, &m); err != nil {
+		t.Fatal(err)
+	}
+	artifacts, _ := m["artifacts"].([]any)
+	if len(artifacts) > 0 {
+		if a, ok := artifacts[0].(map[string]any); ok {
+			a["archive_path"] = filepath.Base(archive)
+			a["archive_sha256"] = archiveSHA
+			a["executable_path"] = "gov"
+			a["executable_sha256"] = govSHA
+		}
+	}
+	patched, err := json.Marshal(m)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(manifest, patched, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
 	cmd := exec.Command("python3", s8Script(t, "install_evidence.py"), "generate",
 		"--installed-path", govBin,
 		"--release-manifest", manifest,
@@ -169,6 +226,7 @@ func s8GenerateEvidence(t *testing.T, govBin, manifest, hookConfig, privHex, out
 		"--source-archive", archive,
 		"--out", out,
 	)
+	cmd.Dir = filepath.Dir(s8Script(t, "install_evidence.py"))
 	outBytes, err := cmd.CombinedOutput()
 	return string(outBytes), err
 }
