@@ -133,6 +133,23 @@ if ! "$PYTHON_TOOL" "$ROOT/scripts/release_toolset.py" --policy "$RELEASE_TOOL_P
   echo "release: release command inventory is not fully covered by the approved tool policy" >&2
   exit 1
 fi
+# Captured before the narrowing below. The narrow toolbin is the right PATH
+# for this SCRIPT's own evidence-producing invocations (build, hash, sign,
+# archive) -- exactly Sol12 P0-1's threat model. It is the WRONG PATH for
+# the `go test` tiers below: those run governor's own application/test
+# code, which legitimately shells out to arbitrary host controller tools
+# (systemd-run, unshare, docker helpers, ...) that have nothing to do with
+# release-evidence production and were never meant to be pinned by
+# release_tool_policy.yaml. Narrowing PATH for the test binaries too was
+# tried and silently degraded a large swath of internal/runtime's
+# containment tests to a weaker code path instead of failing loud -- e.g.
+# TestScopeKillsDetachedSetsidDescendant falls back from
+# "systemd-user-scope" to "process-group-degraded" and then fails its own
+# assertion, not because containment is broken but because systemd-run
+# isn't reachable. TEST_TIER_PATH below is used only for the tier commands
+# themselves (release_tier_pipeline.sh's --spec), never for this script's
+# own direct tool invocations.
+TEST_TIER_PATH="$TOOLBIN_DIR:$PATH"
 export PATH="$TOOLBIN_DIR"
 # From this point, explicit child arguments use the private directory's
 # verified links, never a policy-path symlink or a caller-provided PATH entry.
@@ -563,15 +580,15 @@ assay
 contextgraph
 EOF_INTEGRATION_PACKAGES
 {
-  printf 'unit\t%s\t%q test -p %s -parallel %s -count=1 ./...\n' "$UNIT_LOG" "$GO_TOOL" "$GO_TEST_PARALLELISM" "$GO_TEST_PARALLELISM"
-  printf 'race\t%s\t%q test -race -timeout=30m -p %s -parallel %s -count=1 ./...\n' "$RACE_LOG" "$GO_TOOL" "$GO_TEST_PARALLELISM" "$GO_TEST_PARALLELISM"
-  printf 'integration\t%s\tASSAYER_REPO=%q GOV_INTEGRATION_ASSAYER_COMMIT=%q GOV_INTEGRATION_GOV_BIN=%q GOV_INTEGRATION_EVIDENCE_OUT=%q %q test -json -tags integration -p %s -parallel %s -count=1 ./internal/assay/... ./internal/contextgraph/... > %q && %q integration-gate verify --log %q --expected-names %q --harness-evidence %q --governator-binary %q --expected-packages %q --assayer-commit %q > %q && %q %q\n' "$INTEGRATION_LOG" "$ASSAYER_REPO" "$ASSAYER_COMMIT" "$INTEGRATION_GOV_BIN" "$INTEGRATION_EVIDENCE_DIR" "$GO_TOOL" "$GO_TEST_PARALLELISM" "$GO_TEST_PARALLELISM" "$INTEGRATION_JSON_LOG" "$INTEGRATION_GOV_BIN" "$INTEGRATION_JSON_LOG" "$INTEGRATION_EXPECTED_NAMES" "$INTEGRATION_EVIDENCE_DIR" "$INTEGRATION_GOV_BIN" "$INTEGRATION_EXPECTED_PACKAGES" "$ASSAYER_COMMIT" "$INTEGRATION_GATE_JSON" "$CAT_TOOL" "$INTEGRATION_JSON_LOG"
+  printf 'unit\t%s\tPATH=%q %q test -p %s -parallel %s -count=1 ./...\n' "$UNIT_LOG" "$TEST_TIER_PATH" "$GO_TOOL" "$GO_TEST_PARALLELISM" "$GO_TEST_PARALLELISM"
+  printf 'race\t%s\tPATH=%q %q test -race -timeout=30m -p %s -parallel %s -count=1 ./...\n' "$RACE_LOG" "$TEST_TIER_PATH" "$GO_TOOL" "$GO_TEST_PARALLELISM" "$GO_TEST_PARALLELISM"
+  printf 'integration\t%s\tPATH=%q ASSAYER_REPO=%q GOV_INTEGRATION_ASSAYER_COMMIT=%q GOV_INTEGRATION_GOV_BIN=%q GOV_INTEGRATION_EVIDENCE_OUT=%q %q test -json -tags integration -p %s -parallel %s -count=1 ./internal/assay/... ./internal/contextgraph/... > %q && %q integration-gate verify --log %q --expected-names %q --harness-evidence %q --governator-binary %q --expected-packages %q --assayer-commit %q > %q && %q %q\n' "$INTEGRATION_LOG" "$TEST_TIER_PATH" "$ASSAYER_REPO" "$ASSAYER_COMMIT" "$INTEGRATION_GOV_BIN" "$INTEGRATION_EVIDENCE_DIR" "$GO_TOOL" "$GO_TEST_PARALLELISM" "$GO_TEST_PARALLELISM" "$INTEGRATION_JSON_LOG" "$INTEGRATION_GOV_BIN" "$INTEGRATION_JSON_LOG" "$INTEGRATION_EXPECTED_NAMES" "$INTEGRATION_EVIDENCE_DIR" "$INTEGRATION_GOV_BIN" "$INTEGRATION_EXPECTED_PACKAGES" "$ASSAYER_COMMIT" "$INTEGRATION_GATE_JSON" "$CAT_TOOL" "$INTEGRATION_JSON_LOG"
   # Sol redteam v6 S0 (P0-18, partial): the build-tagged internal/redteam/
   # corpus was never actually compiled by any release or CI command --
   # "black_box_corpus" here only runs Sol3-prefixed tests, which never
   # triggers the `redteam` build tag. redteam/redteam_race below are the
   # exact commands the v6 report requires.
-  printf 'corpus\t%s\t%q test -run '"'"'Sol3'"'"' -v -p %s -parallel %s -count=1 ./...\n' "$CORPUS_LOG" "$GO_TOOL" "$GO_TEST_PARALLELISM" "$GO_TEST_PARALLELISM"
+  printf 'corpus\t%s\tPATH=%q %q test -run '"'"'Sol3'"'"' -v -p %s -parallel %s -count=1 ./...\n' "$CORPUS_LOG" "$TEST_TIER_PATH" "$GO_TOOL" "$GO_TEST_PARALLELISM" "$GO_TEST_PARALLELISM"
   # Sol14 P0-2/P0-3 (rc7 Session 10): the redteam tiers MUST carry the same
   # ASSAYER_REPO/commit binding the integration tier above does. The S5/S6
   # corpus cases (TestV14Case322-329) spawn a nested real integration tier,
@@ -584,8 +601,8 @@ EOF_INTEGRATION_PACKAGES
   # tests were only ever exercised by hand from the real checkout, where the
   # sibling fallback happens to resolve. Same defect class as every other
   # rc6/rc7 release blocker: a path that had never executed end to end.
-  printf 'redteam\t%s\tASSAYER_REPO=%q GOV_INTEGRATION_ASSAYER_COMMIT=%q %q test -v -timeout=30m -tags redteam -p %s -parallel %s -count=1 ./...\n' "$REDTEAM_LOG" "$ASSAYER_REPO" "$ASSAYER_COMMIT" "$GO_TOOL" "$GO_TEST_PARALLELISM" "$GO_TEST_PARALLELISM"
-  printf 'redteam_race\t%s\tASSAYER_REPO=%q GOV_INTEGRATION_ASSAYER_COMMIT=%q %q test -v -race -timeout=30m -tags redteam -p %s -parallel %s -count=1 ./...\n' "$REDTEAM_RACE_LOG" "$ASSAYER_REPO" "$ASSAYER_COMMIT" "$GO_TOOL" "$GO_TEST_PARALLELISM" "$GO_TEST_PARALLELISM"
+  printf 'redteam\t%s\tPATH=%q ASSAYER_REPO=%q GOV_INTEGRATION_ASSAYER_COMMIT=%q %q test -v -timeout=30m -tags redteam -p %s -parallel %s -count=1 ./...\n' "$REDTEAM_LOG" "$TEST_TIER_PATH" "$ASSAYER_REPO" "$ASSAYER_COMMIT" "$GO_TOOL" "$GO_TEST_PARALLELISM" "$GO_TEST_PARALLELISM"
+  printf 'redteam_race\t%s\tPATH=%q ASSAYER_REPO=%q GOV_INTEGRATION_ASSAYER_COMMIT=%q %q test -v -race -timeout=30m -tags redteam -p %s -parallel %s -count=1 ./...\n' "$REDTEAM_RACE_LOG" "$TEST_TIER_PATH" "$ASSAYER_REPO" "$ASSAYER_COMMIT" "$GO_TOOL" "$GO_TEST_PARALLELISM" "$GO_TEST_PARALLELISM"
 } >"$MAIN_TIER_SPEC"
 
 MAIN_TIER_JSONL="$OUT_DIR/.tier-pipeline-main.jsonl"
