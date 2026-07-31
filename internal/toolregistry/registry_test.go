@@ -3,6 +3,7 @@ package toolregistry
 import (
 	"context"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -299,7 +300,11 @@ func TestResolvedHandleExecutesVerifiedObjectAfterPathReplacement(t *testing.T) 
 func TestResolveHandleEnforcesKindAtCallSite(t *testing.T) {
 	dir := secureTempDir(t)
 	bin := filepath.Join(dir, "helper")
-	copyExecutable(t, "/bin/true", bin)
+	truePath, err := exec.LookPath("true")
+	if err != nil {
+		t.Fatalf("locate true: %v", err)
+	}
+	copyExecutable(t, truePath, bin)
 	regFile := filepath.Join(secureTempDir(t), "tools.yaml")
 	t.Setenv("GOV_TOOLREGISTRY_FILE", regFile)
 	if err := os.WriteFile(regFile, []byte("tools:\n  - name: helper\n    kind: sandboxed_helper\n"), 0o600); err != nil {

@@ -19,11 +19,26 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
+      - name: Enroll trusted tools
+        shell: bash
+        run: |
+          mkdir -p "$HOME/.governator"
+          go run ./cmd/gov tools enroll git "$(command -v git)"
+          go run ./cmd/gov tools enroll bash "$(command -v bash)"
+          go run ./cmd/gov tools enroll python3 "$(command -v python3)"
 
       - name: Build
         run: go build ./...
@@ -92,14 +107,32 @@ jobs:
         with:
           python-version: "3.x"
 
-      # This is the blocking Assayer boundary (plan v1.4 Session 2): the real
-      # `cli.py evaluate` subcommand run against the pinned fixture checked
-      # into internal/assay/testdata/assayer_fixture/. Unlike the fast tier
-      # above, there is no t.Skip path left in this test — a missing/broken
-      # fixture or a missing python3 interpreter is a hard test failure
-      # (t.Fatal), so this step fails the job rather than silently passing
-      # green on a boundary that never actually executed.
+      - name: Read pinned Assayer ref from assayer.lock
+        id: assayer-ref
+        run: |
+          ref=$(python3 -c "
+          import sys
+          for line in open(sys.argv[1]):
+              line = line.split('#', 1)[0].strip()
+              if line.startswith('ref='):
+                  print(line[4:]); break
+          " assayer.lock)
+          if [ -z "$ref" ]; then
+            echo "::error::assayer.lock does not declare a ref= entry"
+            exit 1
+          fi
+          echo "ref=$ref" >> "$GITHUB_OUTPUT"
+
+      - name: Check out Assayer at its pinned ref
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ vars.ASSAYER_REPOSITORY || 'cousingary/assayer' }}
+          ref: ${{ steps.assayer-ref.outputs.ref }}
+          path: assayer
+
       - name: Real Assayer CLI integration test
+        env:
+          ASSAYER_REPO: ${{ github.workspace }}/assayer
         run: go test -tags=integration -run TestEvaluateAgainstRealCLIPassAndFail -v ./internal/assay/...
 
   claims:
@@ -109,11 +142,6 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
         with:
-          # internal/claims' "shipped" check runs `git merge-base
-          # --is-ancestor` and `git show <historical-commit>:<file>` against
-          # commits that may predate a shallow clone's default depth-1
-          # history; full history is required for those checks to resolve
-          # correctly rather than false-failing on every CI run.
           fetch-depth: 0
 
       - name: Set up Go
@@ -121,12 +149,11 @@ jobs:
         with:
           go-version-file: go.mod
 
-      # v1.4 Session 6 (Sol Phase 11): every docs/claims.yaml entry is
-      # re-derived from the repository by internal/claims, never trusted
-      # from a hand-written status field. This fails the build the moment a
-      # claim overclaims what it can currently prove — unwired, untested,
-      # missing its acceptance artifact, or absent from the rebuilt/shipped
-      # binary evidence.
+      - name: Enroll trusted git
+        run: |
+          mkdir -p "$HOME/.governator"
+          go run ./cmd/gov tools enroll git "$(command -v git)"
+
       - name: gov claims verify
         run: go run ./cmd/gov claims verify
 
@@ -142,10 +169,11 @@ jobs:
         with:
           go-version-file: go.mod
 
+      - name: Install golangci-lint (built with this Go toolchain)
+        run: go install github.com/golangci/golangci-lint/cmd/golangci-lint@latest
+
       - name: golangci-lint
-        uses: golangci/golangci-lint-action@v6
-        with:
-          version: latest
+        run: golangci-lint run ./...
 
   fuzz:
     name: fuzz (30s per target)

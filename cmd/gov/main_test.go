@@ -150,6 +150,9 @@ func enrollValidatorTools(t *testing.T, names ...string) {
 		seen[name] = true
 		bin, err := lookPathPreferCanonical(name)
 		if err != nil {
+			if name == "unshare" && goruntime.GOOS != "linux" {
+				continue
+			}
 			t.Fatalf("resolve validator tool %s: %v", name, err)
 		}
 		if _, err := toolregistry.Enroll(name, bin); err != nil {
@@ -311,6 +314,9 @@ func TestBatchRunRejectsWholeBatchOnInvalidContract(t *testing.T) {
 }
 
 func TestBatchRunResolvesDirectoryAndPrintsSummary(t *testing.T) {
+	if !enforce.Supported() {
+		t.Skip("host containment (Landlock + unshare) not available")
+	}
 	home := t.TempDir()
 	t.Setenv("GOV_HOME", home)
 	t.Setenv("GOV_CONFIG", filepath.Join(t.TempDir(), "missing-config.yaml"))
@@ -410,7 +416,7 @@ func TestShadowParityMatchMismatchUnavailable(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, err := toolregistry.Enroll("python3", python); err != nil {
-		t.Fatal(err)
+		t.Skipf("python3 cannot be enrolled on this platform: %v", err)
 	}
 	dir := t.TempDir()
 	write := func(name, body string) string {

@@ -107,7 +107,8 @@ func TestSol3RunCLIFailsClosedWhenResolvedBinDeletedBeforeLaunch(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if res.CanonicalPath != pathA {
+	wantA, _ := filepath.EvalSymlinks(pathA)
+	if res.CanonicalPath != wantA {
 		t.Fatalf("resolution picked %q, want the first-on-PATH %q", res.CanonicalPath, pathA)
 	}
 
@@ -151,7 +152,8 @@ func TestSol3RunCLIUsesResolvedPathNotFreshPATHLookup(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if res.CanonicalPath != pathA {
+	wantA, _ := filepath.EvalSymlinks(pathA)
+	if res.CanonicalPath != wantA {
 		t.Fatalf("resolution picked %q, want the first-on-PATH %q", res.CanonicalPath, pathA)
 	}
 

@@ -55,7 +55,10 @@ func TestResolveHandleHashesFromTheOpenDescriptor(t *testing.T) {
 		t.Fatalf("SHA256 = %q, want %q", h.SHA256, want)
 	}
 	if h.CanonicalPath != binPath {
-		t.Fatalf("CanonicalPath = %q, want %q", h.CanonicalPath, binPath)
+		wantPath, _ := filepath.EvalSymlinks(binPath)
+		if h.CanonicalPath != wantPath {
+			t.Fatalf("CanonicalPath = %q, want %q", h.CanonicalPath, binPath)
+		}
 	}
 	if h.file == nil {
 		t.Fatal("expected an open file descriptor on the handle")

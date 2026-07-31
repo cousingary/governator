@@ -13,6 +13,15 @@ import (
 	"github.com/cousingary/governator/internal/enforce"
 )
 
+func truePath(t *testing.T) string {
+	t.Helper()
+	p, err := exec.LookPath("true")
+	if err != nil {
+		t.Fatalf("locate true: %v", err)
+	}
+	return p
+}
+
 func TestExecutorUsesOnlyFrozenEnvironment(t *testing.T) {
 	executable, err := HashExecutable("/bin/sh")
 	if err != nil {
@@ -43,7 +52,7 @@ func TestExecutorUsesOnlyFrozenEnvironment(t *testing.T) {
 }
 
 func TestExecutorRejectsMissingOrMismatchedFrozenEnvironment(t *testing.T) {
-	executable, err := HashExecutable("/bin/true")
+	executable, err := HashExecutable(truePath(t))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -58,7 +67,7 @@ func TestExecutorRejectsMissingOrMismatchedFrozenEnvironment(t *testing.T) {
 }
 
 func TestExecutorRequiresOutputLimitForCapturedStages(t *testing.T) {
-	executable, err := HashExecutable("/bin/true")
+	executable, err := HashExecutable(truePath(t))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -151,7 +160,7 @@ func TestExecutorCaptureNoneDoesNotRetainStreamedOutput(t *testing.T) {
 }
 
 func TestExecutorRejectsAuthorityThatNeedsSandboxWithoutSupport(t *testing.T) {
-	executable, err := HashExecutable("/bin/true")
+	executable, err := HashExecutable(truePath(t))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -174,7 +183,7 @@ func TestExecutorRejectsAuthorityThatNeedsSandboxWithoutSupport(t *testing.T) {
 }
 
 func TestExecutorRejectsAuthorityStrongScopeMismatch(t *testing.T) {
-	executable, err := HashExecutable("/bin/true")
+	executable, err := HashExecutable(truePath(t))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -191,7 +200,7 @@ func TestExecutorRejectsAuthorityStrongScopeMismatch(t *testing.T) {
 }
 
 func TestExecutorRejectsAuthorityPlanContradiction(t *testing.T) {
-	executable, err := HashExecutable("/bin/true")
+	executable, err := HashExecutable(truePath(t))
 	if err != nil {
 		t.Fatal(err)
 	}

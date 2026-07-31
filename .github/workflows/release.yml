@@ -142,10 +142,13 @@ jobs:
         # (an empty MINISIGN_KEY_PATH) when it's absent -- release.sh's own
         # "no key configured" path then correctly skips asymmetric signing
         # rather than failing.
-        if: ${{ secrets.GOV_RELEASE_MINISIGN_KEY_CONTENT != '' }}
         env:
           MINISIGN_KEY_CONTENT: ${{ secrets.GOV_RELEASE_MINISIGN_KEY_CONTENT }}
         run: |
+          if [ -z "$MINISIGN_KEY_CONTENT" ]; then
+            echo "No minisign key configured; skipping asymmetric signing"
+            exit 0
+          fi
           key_path="$RUNNER_TEMP/gov-release-minisign.key"
           printf '%s' "$MINISIGN_KEY_CONTENT" >"$key_path"
           chmod 600 "$key_path"

@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/cousingary/governator/internal/contracts"
+	"github.com/cousingary/governator/internal/enforce"
 	"github.com/cousingary/governator/internal/observability"
 )
 
@@ -96,6 +97,9 @@ func planJobYAML(jobID, root string, dependsOn []string) string {
 }
 
 func TestPlanCommandEndToEndWritesValidatedJobFilesAndShow(t *testing.T) {
+	if !enforce.Supported() {
+		t.Skip("host containment (Landlock + unshare) not available")
+	}
 	home := t.TempDir()
 	t.Setenv("GOV_HOME", home)
 	t.Setenv("GOV_CONFIG", filepath.Join(t.TempDir(), "missing-config.yaml"))
@@ -260,6 +264,9 @@ func TestDetectPanelSpecFindsPanelPlanAlongsideJobFiles(t *testing.T) {
 }
 
 func TestPlanCommandQuarantinesOnCyclicPlanAndWritesNoJobFiles(t *testing.T) {
+	if !enforce.Supported() {
+		t.Skip("host containment (Landlock + unshare) not available")
+	}
 	home := t.TempDir()
 	t.Setenv("GOV_HOME", home)
 	t.Setenv("GOV_CONFIG", filepath.Join(t.TempDir(), "missing-config.yaml"))
@@ -356,6 +363,9 @@ depends_on: %s
 }
 
 func TestBatchRunOrderedCLIRunsDependentJobAfterDependency(t *testing.T) {
+	if !enforce.Supported() {
+		t.Skip("host containment (Landlock + unshare) not available")
+	}
 	home := t.TempDir()
 	t.Setenv("GOV_HOME", home)
 	t.Setenv("GOV_CONFIG", filepath.Join(t.TempDir(), "missing-config.yaml"))
