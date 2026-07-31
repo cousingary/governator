@@ -74,7 +74,7 @@ func AskResolve(id int64, res AskResolution) (observability.PolicyCheckpoint, er
 	if err != nil {
 		return observability.PolicyCheckpoint{}, err
 	}
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback() }()
 
 	var cp observability.PolicyCheckpoint
 	row := tx.QueryRow(`SELECT id,run_id,job_id,target,reason,sources,policy_hash,cost_usd,detail,status,resolved_by,resolution,created_at,resolved_at FROM policy_checkpoints WHERE id=?`, id)

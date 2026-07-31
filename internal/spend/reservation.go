@@ -147,7 +147,7 @@ func SettleGlobal(ledger *sql.DB, reservationID int64, actualUSD float64, costAv
 	if err != nil {
 		return err
 	}
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback() }()
 	var estimated float64
 	err = tx.QueryRow(`UPDATE spend_reservations SET status='settled', settled_at=?, settled_unix_nano=? WHERE id=? AND status='pending' RETURNING estimated_usd`,
 		formatSpendTime(now), nowNanos, reservationID).Scan(&estimated)

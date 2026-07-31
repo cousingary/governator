@@ -293,7 +293,7 @@ func ClaimActivePolicyOverrides(db *sql.DB, scopeKey, now string) ([]PolicyOverr
 	if err != nil {
 		return nil, err
 	}
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback() }()
 	if err := reclaimStaleOneShotReservations(tx, now); err != nil {
 		return nil, err
 	}
@@ -368,7 +368,7 @@ func ConsumePolicyOverrideReservations(db *sql.DB, ids []int64, now string) erro
 	if err != nil {
 		return err
 	}
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback() }()
 	for _, id := range ids {
 		res, err := tx.Exec(`UPDATE policy_overrides SET consumed_at=? WHERE id=? AND one_shot=1 AND reserved_at<>'' AND consumed_at=''`, now, id)
 		if err != nil {

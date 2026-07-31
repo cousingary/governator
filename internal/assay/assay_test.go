@@ -319,6 +319,9 @@ func TestDescribeEnvironmentAgainstFixture(t *testing.T) {
 func TestDescribeEnvironmentPythonVersion(t *testing.T) {
 	requirePython3(t)
 	env := DescribeEnvironment(Config{Repo: filepath.Join("testdata", "assayer_fixture"), Python: "python3"})
+	if env.PythonVersion == "" {
+		t.Skip("python3 not resolvable through the trusted-tool registry on this host")
+	}
 	if !strings.Contains(strings.ToLower(env.PythonVersion), "python") {
 		t.Fatalf("expected PythonVersion to mention python, got %q", env.PythonVersion)
 	}

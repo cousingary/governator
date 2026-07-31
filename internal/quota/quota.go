@@ -160,7 +160,7 @@ func Reserve(db *sql.DB, backend, account, runID string, usage float64, ttl time
 	if err != nil {
 		return Reservation{}, err
 	}
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback() }()
 	for _, w := range windows {
 		res, err := tx.Exec(`UPDATE quota_windows SET reserved_usage=reserved_usage+?, updated_at=?, updated_unix_nano=?
 WHERE backend=? AND account=? AND window_type=?
@@ -274,7 +274,7 @@ func Release(db *sql.DB, reservationID int64, now time.Time) error {
 	if err != nil {
 		return err
 	}
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback() }()
 	backend, account, reserved, ok, err := claimReservation(tx, reservationID, now, true)
 	if err != nil {
 		return err
@@ -303,7 +303,7 @@ func Settle(db *sql.DB, reservationID int64, measuredUsage float64, now time.Tim
 	if err != nil {
 		return err
 	}
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback() }()
 	backend, account, reserved, ok, err := claimReservation(tx, reservationID, now, false)
 	if err != nil {
 		return err
@@ -365,7 +365,7 @@ func expireOne(db *sql.DB, reservationID int64, now time.Time) error {
 	if err != nil {
 		return err
 	}
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback() }()
 	backend, account, reserved, ok, err := claimReservation(tx, reservationID, now, true)
 	if err != nil {
 		return err

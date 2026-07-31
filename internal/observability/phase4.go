@@ -248,7 +248,7 @@ func RunEvalSuite(home, dir string) ([]EvalResult, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback() }()
 	if _, err := tx.Exec("DELETE FROM eval_runs WHERE suite=?", suite); err != nil {
 		return nil, err
 	}
