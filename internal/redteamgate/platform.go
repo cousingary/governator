@@ -96,6 +96,24 @@ func ClassifyPlatformWithEvidence(platformID string, evidencePlatforms map[strin
 	return PlatformNonApproving, fmt.Sprintf("platform %q is cross-compiled without native acceptance evidence: approval requires executed acceptance on the target architecture (Sol15 P1-2)", platformID)
 }
 
+// PublicationDecision reports whether a platform archive may be published as
+// part of a release. An archive is publishable as approving only when its
+// platform carries executed native acceptance evidence (it is in
+// evidencePlatforms) AND its GOOS is eligible for approval. A platform absent
+// from the approving set is refused with a named error, so an archive built
+// for a non-approving or evidence-less platform can never silently ship marked
+// approving (v16 S6 / R4: "every published archive carries executed native
+// acceptance evidence, or is not published"). This is the publication-gate
+// wrapper over ClassifyPlatformWithEvidence: it makes the evidence-based
+// classification load-bearing at the point an archive leaves the release.
+func PublicationDecision(platformID string, evidencePlatforms map[string]bool) error {
+	status, reason := ClassifyPlatformWithEvidence(platformID, evidencePlatforms)
+	if status != PlatformApproving {
+		return fmt.Errorf("PUBLICATION_REFUSED: %s", reason)
+	}
+	return nil
+}
+
 // ApprovedForProduction reports whether goos may claim a fully-approving
 // rc5 production release: no degraded modes, no refusal. A non-approving
 // platform (Darwin) and an unsupported platform both return false --

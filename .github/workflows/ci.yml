@@ -246,3 +246,76 @@ jobs:
           GOOS: linux
           GOARCH: arm64
         run: go build ./...
+
+  # v16-release Session 6 (R4): native acceptance evidence per platform.
+  # Standing rule 12's constraint lifts here -- not because the rule relaxed,
+  # but because real macos-latest (arm64) and ubuntu-24.04-arm runners now
+  # execute the acceptance smoke test the release flow runs. Every published
+  # archive must carry executed native acceptance evidence, or not be
+  # published. These jobs produce that evidence: they build the binary for the
+  # runner's native architecture with the same ldflags identity the release
+  # embeds, then run the four acceptance checks (archive_extracted,
+  # executable_bit_preserved, binary_hash_matches_build,
+  # version_json_matches_manifest) via scripts/acceptance_smoke.sh -- the
+  # CI-runnable twin of release.sh's run_acceptance_check.
+  #
+  # The acceptance JSON is uploaded as a build artifact so it can be cited as
+  # the executed-evidence source for ClassifyPlatformWithEvidence /
+  # PublicationDecision (cases 401-402). A platform whose acceptance job is
+  # green on its native architecture is eligible to be approving; one without a
+  # green native run is not.
+  native-acceptance:
+    name: native acceptance (${{ matrix.runner }})
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [macos-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Compute release identity
+        shell: bash
+        run: |
+          COMMIT="$(git rev-parse HEAD)"
+          SHORT_COMMIT="$(git rev-parse --short=12 HEAD)"
+          EXACT_TAG="$(git describe --tags --exact-match HEAD 2>/dev/null || true)"
+          if [ -n "$EXACT_TAG" ]; then VERSION="${EXACT_TAG#v}"; else VERSION="ci-native-${SHORT_COMMIT}"; fi
+          CLAIMS_HASH="$(sha256sum docs/claims.yaml | awk '{print $1}')"
+          BUILD_TS="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          LDFLAGS="-s -w -X main.version=${VERSION} -X main.sourceCommit=${COMMIT} -X main.buildTimestamp=${BUILD_TS} -X main.claimsHash=${CLAIMS_HASH} -X main.adapterProtocolVersion=adapter-protocol-v1"
+          {
+            echo "VERSION=${VERSION}"
+            echo "COMMIT=${COMMIT}"
+            echo "CLAIMS_HASH=${CLAIMS_HASH}"
+            echo "LDFLAGS=${LDFLAGS}"
+          } >> "$GITHUB_ENV"
+
+      - name: Build and run native acceptance smoke test
+        shell: bash
+        run: |
+          CGO_ENABLED=0 go build -trimpath -ldflags "$LDFLAGS" -o gov ./cmd/gov
+          ./scripts/acceptance_smoke.sh ./gov "$VERSION" "$COMMIT" "$CLAIMS_HASH" acceptance.json
+
+
+      - name: Unit tests (native arch)
+        run: go test -count=1 ./...
+
+      - name: Race tests (native arch)
+        run: go test -race -count=1 ./...
+
+      - name: Upload native acceptance evidence
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: native-acceptance-${{ matrix.runner }}
+          path: acceptance.json
+

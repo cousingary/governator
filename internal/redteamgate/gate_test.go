@@ -71,7 +71,12 @@ func TestLoadManifestRejectsBlankName(t *testing.T) {
 // 353. rc8-upg15 S2b (Sol15 P0-1) appends 354-361 (the release
 // tool-substitution corpus) for a final total of 361. rc8-upg15 S3 (Sol15
 // P0-4/P2-2) appends 362-368 (the exact-artifact corpus) for a final total
-// of 368.
+// of 368. rc8-upg15 S4-S9 bring the corpus to 391. v16-release S1 appends
+// 392-393 (document-truth corpus), S2 appends 394 (branch-topology corpus),
+// S3 appends 395-397 (dist-dir-trap corpus), S4 appends 398-399
+// (architecture-restructure corpus), S5 appends 400 (assayer-pin corpus) for
+// a final total of 400, and S6 appends 401-402 (native-acceptance
+// publication-gate corpus) for a final total of 402.
 //
 // This constant was not updated by S7 or S8; it read 330 (the post-S6 count)
 // while the manifest held 342, so this package failed before the duplicate
@@ -82,8 +87,8 @@ func TestLoadManifestAcceptsRealManifest(t *testing.T) {
 	if err != nil {
 		t.Fatalf("LoadManifest(%s): %v", path, err)
 	}
-	if len(m.Cases) != 400 {
-		t.Fatalf("expected 400 cases in the mandatory final attack corpus, got %d", len(m.Cases))
+	if len(m.Cases) != 402 {
+		t.Fatalf("expected 402 cases in the mandatory final attack corpus, got %d", len(m.Cases))
 	}
 	seen := make(map[int]bool)
 	for _, c := range m.Cases {
