@@ -200,6 +200,18 @@ jobs:
         with:
           go-version-file: go.mod
 
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
+      - name: Enroll trusted tools
+        run: |
+          mkdir -p "$HOME/.governator"
+          go run ./cmd/gov tools enroll git /usr/bin/git || true
+          go run ./cmd/gov tools enroll bash /usr/bin/bash || true
+          go run ./cmd/gov tools enroll python3 /usr/bin/python3 || true
+
       - name: Fuzz FuzzClassifyShellCommand
         run: go test -fuzz=FuzzClassifyShellCommand -fuzztime=30s ./internal/policy
 

@@ -3,6 +3,7 @@ package runtime
 import (
 	"context"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -380,6 +381,13 @@ func TestPreflightOrgDenialIndependentOfConfiguredPolicyRules(t *testing.T) {
 // would be picked up by an independent load — so this isn't passing because
 // the edit silently failed to land.
 func TestPolicyBundleSharedBetweenGateAndIdentityIgnoresLaterDoctrineEdit(t *testing.T) {
+	if _, err := exec.LookPath("claude"); err != nil && os.Getenv("GOV_CLAUDE_BIN") == "" {
+		trueBin, _ := exec.LookPath("true")
+		if trueBin == "" {
+			t.Skip("no claude binary or GOV_CLAUDE_BIN available")
+		}
+		t.Setenv("GOV_CLAUDE_BIN", trueBin)
+	}
 	root := t.TempDir()
 	doctrinePath := filepath.Join(root, policy.ProjectDoctrineFilename)
 	original := []byte(`policy_rules:

@@ -688,6 +688,9 @@ func TestV10Case14RealPIDNamespaceLaunchExecutesExactVerifiedTarget(t *testing.T
 	if err != nil {
 		t.Skip("unshare not available on this host")
 	}
+	if out, err := exec.Command(unsharePath, "--pid", "--fork", "--mount-proc", "true").CombinedOutput(); err != nil {
+		t.Skipf("PID namespaces not usable on this host: %v: %s", err, out)
+	}
 	t.Setenv("GOV_TOOLREGISTRY_FILE", filepath.Join(t.TempDir(), "tools.yaml"))
 	if _, err := toolregistry.Enroll("unshare", unsharePath); err != nil {
 		t.Fatal(err)

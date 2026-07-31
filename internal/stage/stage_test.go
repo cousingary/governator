@@ -200,6 +200,9 @@ func TestExecutorRejectsAuthorityStrongScopeMismatch(t *testing.T) {
 }
 
 func TestExecutorRejectsAuthorityPlanContradiction(t *testing.T) {
+	if !enforce.Supported() {
+		t.Skip("host containment (Landlock + unshare) not available")
+	}
 	executable, err := HashExecutable(truePath(t))
 	if err != nil {
 		t.Fatal(err)
