@@ -375,6 +375,20 @@ if ! python3 "$ROOT/scripts/check_release_docs.py" "$ROOT/SECURITY.md" "$ROOT/do
   exit 1
 fi
 
+# v16 R1: the entire rc7/rc8 program lived on an unmerged side branch while
+# main was 45+ commits stale -- CI triggers on push: [main] and would test a
+# stale tree, and `go install ...@latest` resolves the highest non-prerelease
+# tag reachable from the default branch. release.sh fast-forwards nothing
+# itself; the operator owns the merge back to main (v16-release S2). This
+# checker is the durable half of that fix: it refuses a release while any v*
+# semver release tag is unreachable from the release branch. It runs against
+# the real repo ($SOURCE_ROOT), not the detached scratch worktree, so it sees
+# the `main` ref and every tag.
+if ! python3 "$ROOT/scripts/check_branch_topology.py" --repo "$SOURCE_ROOT"; then
+  echo "release: refusing to release with a stale branch/tag topology (see above)" >&2
+  exit 1
+fi
+
 BUILD_TS=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 CLAIMS_HASH=$(sha256sum docs/claims.yaml | awk '{print $1}')
 ADAPTER_PROTOCOL_VERSION=${ADAPTER_PROTOCOL_VERSION:-adapter-protocol-v1}

@@ -2,7 +2,7 @@
 
 Publishing is operator-executed. Automation must not create the public repository, push `main`, or tag a release without explicit approval.
 
-1. Run the complete local verification loop and confirm the working tree contains only the release commit.
+1. Run the complete local verification loop and confirm the working tree contains only the release commit. **Branch hygiene (v16 R1/R9):** `main` is the only branch that ships — confirm every `v*` release tag is reachable from `main` (`scripts/check_branch_topology.py` enforces this in `release.sh` and refuses a release while any release tag is unreachable), and delete any `gov/job/*` quarantine branches (governed-run detritus: `git branch -D $(git branch --list 'gov/job/*')`) so a naive `git push --all` cannot publish unreviewed agent workspace output. Historical feature branches (`rc7-upg14`, `rc8-upg15`, etc.) are real history and stay.
 2. Create the public repository with `gh repo create governator --public`, add the remote, and push `main`.
 3. Enable GitHub Actions and confirm `.github/workflows/ci.yml`'s Linux/macOS matrix (build, vet, unit + race tests, the black-box Sol3 security regression corpus, gofmt), lint, fuzz, and cross-compile smoke are green.
 4. Confirm repository security settings and replace the placeholder private-report contact in `SECURITY.md`.

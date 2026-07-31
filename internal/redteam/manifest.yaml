@@ -2218,6 +2218,11 @@ cases:
     session: v16-s1
     required: true
     status: implemented
+  - case: 394
+    name: TestV16Case394ReleaseTagUnreachableFromMainFailsTopology
+    session: v16-s2
+    required: true
+    status: implemented
 
 # Case 296 is not one of Sol13's original 51 findings (which occupy 245-295).
 # It closes a gap the rc6-upg13 S3 exclusion audit found: TestV6Case29's own
