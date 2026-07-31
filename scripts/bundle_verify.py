@@ -90,6 +90,12 @@ def verify_architecture(bundle: pathlib.Path, failures: list[str]) -> None:
     md_files = sorted(arch_dir.glob("*.md"))
     if not md_files:
         failures.append("UNBOUND: no architecture document in architecture/")
+    history = arch_dir / "governator_architecture_history.md"
+    if not history.is_file():
+        failures.append(
+            "UNBOUND: governator_architecture_history.md absent from architecture/ "
+            "-- the architecture doc's history companion must travel in the closure"
+        )
 
 
 def verify_install_evidence(bundle: pathlib.Path, failures: list[str]) -> None:

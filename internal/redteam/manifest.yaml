@@ -2238,6 +2238,16 @@ cases:
     session: v16-s3
     required: true
     status: implemented
+  - case: 398
+    name: TestV16Case398RestructuredDocMissingHistoryCompanionFailsClosure
+    session: v16-s4
+    required: true
+    status: implemented
+  - case: 399
+    name: TestV16Case399FrontMatterContradictionDetectionFiresOnNewStructure
+    session: v16-s4
+    required: true
+    status: implemented
 
 # Case 296 is not one of Sol13's original 51 findings (which occupy 245-295).
 # It closes a gap the rc6-upg13 S3 exclusion audit found: TestV6Case29's own

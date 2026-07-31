@@ -91,6 +91,7 @@ esac
 OUT_DIR=${OUT_DIR:-"$(cd "$ROOT/.." && pwd)/governator-audit-bundle"}
 DIST_DIR=${DIST_DIR:-dist}
 ARCHITECTURE_DOC=${GOV_ARCHITECTURE_DOC:-$ROOT/../agents/governator_architecture.md}
+ARCHITECTURE_HISTORY_DOC=${GOV_ARCHITECTURE_HISTORY_DOC:-$ROOT/../agents/governator_architecture_history.md}
 
 if [ -n "$("$GIT_BIN" status --porcelain --untracked-files=all)" ]; then
   echo "audit_bundle: refusing to bundle a dirty tree (uncommitted/untracked changes present) -- commit or stash first" >&2
@@ -206,6 +207,9 @@ if [ -f "$ARCHITECTURE_DOC" ]; then
 else
   echo "audit_bundle: WARNING: architecture doc not found at $ARCHITECTURE_DOC" >&2
 fi
+if [ -f "$ARCHITECTURE_HISTORY_DOC" ]; then
+  "$CP_BIN" "$ARCHITECTURE_HISTORY_DOC" "$OUT_DIR/architecture/"
+fi
 if [ -f "$OUT_DIR/dist/architecture-build-metadata.json" ]; then
   "$CP_BIN" "$OUT_DIR/dist/architecture-build-metadata.json" "$OUT_DIR/architecture/"
 fi
@@ -320,6 +324,9 @@ fi
 
 if [ -f "$OUT_DIR/architecture/$("$BASENAME_BIN" "$ARCHITECTURE_DOC" 2>/dev/null || true)" ]; then
   "$CP_BIN" "$OUT_DIR/architecture/$("$BASENAME_BIN" "$ARCHITECTURE_DOC")" "$OUT_DIR/closure/"
+fi
+if [ -f "$OUT_DIR/architecture/$("$BASENAME_BIN" "$ARCHITECTURE_HISTORY_DOC" 2>/dev/null || true)" ]; then
+  "$CP_BIN" "$OUT_DIR/architecture/$("$BASENAME_BIN" "$ARCHITECTURE_HISTORY_DOC")" "$OUT_DIR/closure/"
 fi
 if [ -f "$OUT_DIR/evidence/install-evidence.json" ]; then
   "$CP_BIN" "$OUT_DIR/evidence/install-evidence.json" "$OUT_DIR/closure/"
