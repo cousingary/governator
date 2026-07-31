@@ -13,6 +13,7 @@ jobs:
   test:
     name: build-vet-test (${{ matrix.os }})
     strategy:
+      fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
@@ -36,9 +37,13 @@ jobs:
         shell: bash
         run: |
           mkdir -p "$HOME/.governator"
-          go run ./cmd/gov tools enroll git "$(command -v git)"
-          go run ./cmd/gov tools enroll bash "$(command -v bash)"
-          go run ./cmd/gov tools enroll python3 "$(command -v python3)" || echo "::warning::python3 enrollment failed (group-writable ancestor); tests requiring it will skip"
+          git_bin="$(command -v git)"
+          if [ -x /usr/bin/git ]; then git_bin=/usr/bin/git; fi
+          go run ./cmd/gov tools enroll git "$git_bin" || echo "::warning::git enrollment failed"
+          go run ./cmd/gov tools enroll bash "$(command -v bash)" || echo "::warning::bash enrollment failed"
+          py_bin="$(command -v python3)"
+          if [ -x /usr/bin/python3 ]; then py_bin=/usr/bin/python3; fi
+          go run ./cmd/gov tools enroll python3 "$py_bin" || echo "::warning::python3 enrollment failed"
 
       - name: Build
         run: go build ./...
@@ -130,6 +135,13 @@ jobs:
           ref: ${{ steps.assayer-ref.outputs.ref }}
           path: assayer
           fetch-depth: 0
+
+      - name: Enroll trusted python3
+        run: |
+          mkdir -p "$HOME/.governator"
+          py="$(command -v python3)"
+          if [ -x /usr/bin/python3 ]; then py=/usr/bin/python3; fi
+          go run ./cmd/gov tools enroll python3 "$py"
 
       - name: Real Assayer CLI integration test
         env:

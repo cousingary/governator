@@ -217,7 +217,7 @@ func TestValidateRejectsUnknownConditionField(t *testing.T) {
 	// sound. Validate must fail loudly at load time instead.
 	r := ConditionRule{
 		ID:      "typo-rule",
-		When:    []Condition{{Field: "risk_class", Op: "eq", Value: "high"}},
+		When:    []Condition{{Field: "risk_clas", Op: "eq", Value: "high"}}, //nolint:misspell // intentional typo to test unknown-field rejection
 		Verdict: VerdictDeny,
 		Reason:  "should never load",
 	}
