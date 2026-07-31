@@ -107,6 +107,9 @@ func govTestBinary(t *testing.T) string {
 
 func fixture(t *testing.T) (string, string) {
 	t.Helper()
+	if !enforce.Supported() {
+		t.Skip("host containment (Landlock + unshare) not available")
+	}
 	t.Setenv("GOV_TEST_ALLOW_FAKE_ENV", "1")
 	if enforce.SelfExeOverride == "" {
 		enforce.SelfExeOverride = govTestBinary(t)
@@ -2253,7 +2256,7 @@ func TestCleanupCanaryFailurePermanentlyIsReported(t *testing.T) {
 	if err := os.Chmod(dir, 0555); err != nil {
 		t.Fatal(err)
 	}
-	defer os.Chmod(dir, 0755)
+	defer func() { _ = os.Chmod(dir, 0755) }()
 	if err := cleanupCanary(canary); err == nil {
 		t.Fatal("expected a permanently non-writable parent directory to produce a non-nil error")
 	}

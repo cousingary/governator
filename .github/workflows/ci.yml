@@ -38,7 +38,7 @@ jobs:
           mkdir -p "$HOME/.governator"
           go run ./cmd/gov tools enroll git "$(command -v git)"
           go run ./cmd/gov tools enroll bash "$(command -v bash)"
-          go run ./cmd/gov tools enroll python3 "$(command -v python3)"
+          go run ./cmd/gov tools enroll python3 "$(command -v python3)" || echo "::warning::python3 enrollment failed (group-writable ancestor); tests requiring it will skip"
 
       - name: Build
         run: go build ./...
@@ -129,6 +129,7 @@ jobs:
           repository: ${{ vars.ASSAYER_REPOSITORY || 'cousingary/assayer' }}
           ref: ${{ steps.assayer-ref.outputs.ref }}
           path: assayer
+          fetch-depth: 0
 
       - name: Real Assayer CLI integration test
         env:

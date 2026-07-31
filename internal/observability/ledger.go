@@ -434,7 +434,7 @@ func migratePolicyOverrideTimes(db *sql.DB) error {
 	if err != nil {
 		return err
 	}
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback() }()
 	rows, err := tx.Query(`SELECT id,created_at,expires_at,reserved_at FROM policy_overrides`)
 	if err != nil {
 		return err
@@ -523,7 +523,7 @@ func backfillSpendReservations(db *sql.DB) error {
 	if err != nil {
 		return err
 	}
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback() }()
 	rows, err := tx.Query(`SELECT id,expires_at,created_at,settled_at FROM spend_reservations`)
 	if err != nil {
 		return err
@@ -581,7 +581,7 @@ func backfillQuotaReservations(db *sql.DB) error {
 	if err != nil {
 		return err
 	}
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback() }()
 	rows, err := tx.Query(`SELECT id,expires_at,created_at,settled_at FROM quota_reservations`)
 	if err != nil {
 		return err
@@ -639,7 +639,7 @@ func backfillQuotaWindows(db *sql.DB) error {
 	if err != nil {
 		return err
 	}
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback() }()
 	rows, err := tx.Query(`SELECT backend,account,window_type,reset_at,window_started_at,updated_at FROM quota_windows`)
 	if err != nil {
 		return err
@@ -703,7 +703,7 @@ func migrateOutboxTimes(db *sql.DB) error {
 	if err != nil {
 		return err
 	}
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback() }()
 	rows, err := tx.Query(`SELECT id,created_at,updated_at,lease_until FROM maintenance_outbox WHERE created_unix_nano=?`, dbtime.UnsetUnixNano)
 	if err != nil {
 		return err
@@ -828,7 +828,7 @@ func RecordRouteDecision(db *sql.DB, rec RouteDecisionRecord) error {
 	if err != nil {
 		return err
 	}
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback() }()
 	for _, row := range rec.Rows {
 		if _, err = tx.Exec(`INSERT INTO route_decisions(run_id,job_id,job_type,objective,policy_hash,candidate,valid_rate_score,failure_severity_score,cost_score,breaker_score,quota_score,repair_affinity_score,assay_quality_score,total,excluded,exclusion_reason,selected,preview,created) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 			rec.RunID, rec.JobID, rec.JobType, rec.Objective, rec.PolicyHash, row.Candidate,
@@ -856,7 +856,7 @@ func RecordArtifacts(db *sql.DB, artifacts []ArtifactRecord, created string) err
 	if err != nil {
 		return err
 	}
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback() }()
 	for _, artifact := range artifacts {
 		if _, err := tx.Exec(`INSERT INTO artifacts(run_id,name,path,sha256,bytes,schema_ok,created) VALUES(?,?,?,?,?,?,?) ON CONFLICT(run_id,name) DO UPDATE SET path=excluded.path,sha256=excluded.sha256,bytes=excluded.bytes,schema_ok=excluded.schema_ok,created=excluded.created`,
 			artifact.RunID, artifact.Name, artifact.Path, artifact.SHA256, artifact.Bytes, boolInt(artifact.SchemaOK), created); err != nil {
@@ -1031,7 +1031,7 @@ func RecordPolicyRuleEvents(db *sql.DB, events []PolicyRuleEventRecord) error {
 	if err != nil {
 		return err
 	}
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback() }()
 	for _, e := range events {
 		if _, err := tx.Exec(`INSERT INTO policy_rule_events(run_id,rule,verdict,detail,cause_seq,trigger_seq,created) VALUES(?,?,?,?,?,?,?)`,
 			e.RunID, e.Rule, e.Verdict, e.Detail, e.CauseSeq, e.TriggerSeq, e.Created); err != nil {
@@ -1068,7 +1068,7 @@ func RecordPanelMembers(db *sql.DB, members []PanelMemberRecord, created string)
 	if err != nil {
 		return err
 	}
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback() }()
 	for _, member := range members {
 		if _, err := tx.Exec(`INSERT INTO panel_members(panel_id,member_label,job_id,agent,artifact_name,created) VALUES(?,?,?,?,?,?) ON CONFLICT(panel_id,member_label) DO UPDATE SET job_id=excluded.job_id,agent=excluded.agent,artifact_name=excluded.artifact_name,created=excluded.created`,
 			member.PanelID, member.MemberLabel, member.JobID, member.Agent, member.ArtifactName, created); err != nil {
@@ -1097,7 +1097,7 @@ func RecordCompletion(db *sql.DB, c Completion) error {
 	if err != nil {
 		return err
 	}
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback() }()
 	if _, err = tx.Exec(`UPDATE runs SET cost_usd=?,valid_output=?,failure_taxonomy=?,result_json=?,notes=?,input_tokens=?,output_tokens=?,cached_input_tokens=?,cache_creation_tokens=?,reasoning_tokens=?,total_tokens=?,usage_available=?,tool_calls=?,transcript_bytes=? WHERE id=?`,
 		c.CostUSD, c.ValidOutput, c.FailureTaxonomy, c.SelfReviewJSON, c.Notes, c.Usage.InputTokens, c.Usage.OutputTokens,
 		c.Usage.CachedInputTokens, c.Usage.CacheCreationTokens, c.Usage.ReasoningTokens, c.Usage.TotalTokens,

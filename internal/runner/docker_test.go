@@ -514,7 +514,7 @@ func TestCappedWriterAccounting(t *testing.T) {
 		var buf bytes.Buffer
 		c := &cappedWriter{w: &buf, remaining: 3}
 		// First write consumes the whole cap; second is entirely discarded.
-		c.Write([]byte("abc"))
+		_, _ = c.Write([]byte("abc"))
 		n, _ := c.Write([]byte("DEFGH"))
 		if n != 5 {
 			t.Fatalf("Write must report full length 5 (no short-write), got %d", n)
@@ -532,7 +532,7 @@ func TestCappedWriterAccounting(t *testing.T) {
 	t.Run("exact boundary discards nothing", func(t *testing.T) {
 		var buf bytes.Buffer
 		c := &cappedWriter{w: &buf, remaining: 4}
-		c.Write([]byte("abcd"))
+		_, _ = c.Write([]byte("abcd"))
 		c.mu.Lock()
 		defer c.mu.Unlock()
 		if c.accepted != 4 || c.discarded != 0 {

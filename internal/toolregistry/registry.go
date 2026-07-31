@@ -405,7 +405,7 @@ func updateRegistry(mut func(*fileFormat) error) error {
 	if err := syscall.Flock(int(lock.Fd()), syscall.LOCK_EX); err != nil {
 		return fmt.Errorf("lock tool registry %s: %w", lockPath, err)
 	}
-	defer syscall.Flock(int(lock.Fd()), syscall.LOCK_UN)
+	defer func() { _ = syscall.Flock(int(lock.Fd()), syscall.LOCK_UN) }()
 
 	ff, exists, err := readRegistryFile(target)
 	if err != nil {

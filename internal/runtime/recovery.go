@@ -178,7 +178,6 @@ func recoverInterruptedRun(ctx context.Context, db *sql.DB, r RunRecord, forced 
 		// missing worktree, a changed one, or a missing baseline digest are
 		// all treated as unsafe (fail-closed) rather than guessed.
 		safe = false
-		reason = "interrupted during or after agent execution"
 		switch {
 		case r.Worktree == "":
 			reason = "no worktree recorded"

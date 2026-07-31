@@ -81,7 +81,7 @@ func RecordEffects(db *sql.DB, records []EffectRecord) error {
 	if err != nil {
 		return err
 	}
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback() }()
 	for _, r := range records {
 		if _, err := tx.Exec(`INSERT INTO effect_events(run_id,kind,detail,created) VALUES(?,?,?,?)`,
 			r.RunID, string(r.Kind), r.Detail, r.Created); err != nil {
