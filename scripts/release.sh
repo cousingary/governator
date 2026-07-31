@@ -1862,6 +1862,7 @@ CHECKSUMS="$OUT_DIR/checksums.txt"
     claims.yaml test-summary.json acceptance-summary.json claims-verify-report.txt
     preflight.json toolset.json release-environment.json gov *.log.gz redteam-source-identity.json
     acceptance/gov integration-expected-names.txt integration-expected-packages.txt
+    .acceptance-pre-integration.json
   )
   for attestation_file in attestations/*.json; do
     [ -e "$attestation_file" ] || break
