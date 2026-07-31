@@ -55,6 +55,8 @@ import re
 import subprocess
 import sys
 
+from release_policy import dist_version_mismatch
+
 VERSION_RE = re.compile(r"v\d+\.\d+\.\d+(?:-rc\d+)?")
 CURRENT_STATE_SECTION_HEADING = "remediation history"
 FRONT_MATTER_RE = re.compile(r"\A---\n(.*?)\n---\n", re.DOTALL)
@@ -157,6 +159,23 @@ def check_conflicting_current_commits(fm: dict, body: str) -> list[str]:
 
 def check_front_matter(fm: dict, repo: str | None, dist_dir: str | None) -> list[str]:
     failures: list[str] = []
+
+    # v16-release S3 / R5: the latent trap. check_architecture_doc.py defaulted
+    # --dist-dir to dist/, and the artifact/manifest checks below only fired
+    # when release_state == "complete" -- so against a pending doc (today's
+    # shape) a --dist-dir pointing at a deleted failed attempt's output
+    # (gov_local-candidate-8044d02_*.tar.gz, no build-manifest.json) returned
+    # OK without ever looking at it. This stale-dist check runs whenever a
+    # --dist-dir is provided to a front-matter (release-identity) doc,
+    # REGARDLESS of release_state, and fails with the named STALE_DIST_ARTIFACTS
+    # error. It binds to the manifest's OWN version (internal consistency),
+    # never to the doc's governator_tag -- a fixture dist whose manifest version
+    # differs from the doc tag is a legitimate test shape; the complete-state
+    # artifact_manifest_sha256 binding is what ties a doc to a specific manifest.
+    if dist_dir is not None:
+        stale, reason = dist_version_mismatch(dist_dir, require_manifest=True)
+        if stale:
+            failures.append(reason)
 
     gov_commit = fm.get("governator_commit")
     gov_tag = fm.get("governator_tag")

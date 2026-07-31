@@ -109,6 +109,21 @@ OUT_DIR=$OUT_DIR_ABS
 "$RM_BIN" -rf "$OUT_DIR"
 "$MKDIR_BIN" -p "$OUT_DIR/source" "$OUT_DIR/dist" "$OUT_DIR/architecture" "$OUT_DIR/evidence"
 
+# v16-release S3 / R5: detect an OUT_DIR on a filesystem that silently coerces
+# file modes (9p/drvfs, e.g. /mnt/e, rewrites every extracted mode to 0777).
+# audit_bundle.sh extracts a git archive into source/, copies dist/ archives,
+# and writes signed closure files whose modes bundle_verify.py re-checks; on a
+# coercing filesystem those mode assertions are theater and the bundle ships
+# 0777 artifacts. Fail closed with the named OUT_DIR_COERCES_FILE_MODES error.
+# Detection is behavioural (chmod a probe dir 0500, read the mode back), never
+# a hardcoded path. The probe itself lives in scripts/release_policy.py
+# (out-dir-mode-probe) so release.sh and audit_bundle.sh share one
+# implementation and cannot drift.
+if ! "$PYTHON_BIN" "$ROOT/scripts/release_policy.py" out-dir-mode-probe --dist-dir "$OUT_DIR"; then
+  echo "audit_bundle: refusing to use a mode-coercing OUT_DIR (v16 S3 / R5). Set OUT_DIR to a native filesystem path (e.g. OUT_DIR=/home/lam/governator-audit-bundle)." >&2
+  exit 1
+fi
+
 # --- source/: exactly the tracked tree at REF, nothing else is possible ----
 "$GIT_BIN" archive --format=tar "$REF" | "$TAR_BIN" -x -C "$OUT_DIR/source"
 

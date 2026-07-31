@@ -79,6 +79,12 @@ func buildAuditBundleFixtureRepo(t *testing.T) string {
 	// behavior under test is ever reached.
 	mustWrite("scripts/source_closure.py", readRealFile(t, filepath.Join(repoRoot, "scripts", "source_closure.py")))
 	mustWrite("scripts/safe_extract.py", readRealFile(t, filepath.Join(repoRoot, "scripts", "safe_extract.py")))
+	// v16-release S3 (R5): audit_bundle.sh now runs the OUT_DIR mode-coercion
+	// probe via scripts/release_policy.py out-dir-mode-probe before extracting
+	// anything -- the fixture must carry release_policy.py or the probe fails
+	// before the behavior under test is ever reached (the same carry-every-
+	// script-it-calls rule as source_closure.py / safe_extract.py above).
+	mustWrite("scripts/release_policy.py", readRealFile(t, filepath.Join(repoRoot, "scripts", "release_policy.py")))
 	if err := os.Chmod(filepath.Join(fixture, "scripts", "audit_bundle.sh"), 0o755); err != nil {
 		t.Fatal(err)
 	}

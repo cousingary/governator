@@ -196,7 +196,7 @@ def main(argv: list[str]) -> int:
     # check: a bundle-local trust anchor (or none at all) can never
     # silently produce a "verified release" verdict. External sourcing is
     # the documented default; both opt-ins warn loudly on stderr.
-    from release_policy import bundle_local_trust_sources
+    from release_policy import bundle_local_trust_sources, dist_version_mismatch
     signature_unverified = False
     if not args.trusted_fingerprints_file and not args.trusted_public_keys_dir:
         if not args.allow_unverified_signature:
@@ -318,6 +318,15 @@ def main(argv: list[str]) -> int:
         missing.append(
             f"build-manifest.json source_commit ({manifest_commit!r}) does not match the release commit ({args.release_commit!r})"
         )
+    # v16-release S3 / R5: the archives present must describe the SAME release
+    # the manifest declares -- a hand-edited manifest claiming 1.0.2-rc8 next
+    # to a deleted attempt's gov_local-candidate-8044d02_*.tar.gz is stale even
+    # though every required file is nominally present. require_manifest=False:
+    # presence is already enforced by REQUIRED_TOP_LEVEL_FILES above; this is
+    # the version-consistency half only (anchor = the manifest's own version).
+    stale, stale_reason = dist_version_mismatch(str(dist), require_manifest=False)
+    if stale:
+        missing.append(stale_reason)
     if args.architecture_doc:
         arch_path = pathlib.Path(args.architecture_doc)
         if arch_path.is_file():

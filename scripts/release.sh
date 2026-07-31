@@ -532,6 +532,23 @@ RELEASE_TAG_FOR_IDENTITY="v${VERSION}"
 OUT_DIR=${OUT_DIR:-dist}
 CHECKPOINT_STATE_DIR="$OUT_DIR/.checkpoints"
 mkdir -p "$CHECKPOINT_STATE_DIR"
+
+# v16-release S3 / R5: detect an OUT_DIR on a filesystem that silently coerces
+# file modes (9p/drvfs, e.g. /mnt/e, rewrites every extracted mode to 0777).
+# This release writes mode-0500 toolbins and mode-0755 executables whose modes
+# release_policy.py / install_evidence.py re-check; on a coercing filesystem
+# those assertions are theater and every shipped artifact carries 0777. Fail
+# closed with the named OUT_DIR_COERCES_FILE_MODES error rather than producing
+# coerced artifacts -- this is the manual OUT_DIR redirect rc8 Session 8
+# applied, now an enforced invariant. Detection is behavioural (chmod a probe
+# dir 0500, read the mode back), never a hardcoded path. The probe itself
+# lives in scripts/release_policy.py (out-dir-mode-probe) so release.sh and
+# audit_bundle.sh share one implementation and cannot drift.
+if ! python3 "$ROOT/scripts/release_policy.py" out-dir-mode-probe --dist-dir "$OUT_DIR"; then
+  echo "release: refusing to use a mode-coercing OUT_DIR (rc8 Session 8's manual /mnt/e workaround is now enforced -- v16 S3 / R5). Set OUT_DIR to a native filesystem path (e.g. OUT_DIR=/home/lam/governator-release-dist)." >&2
+  exit 1
+fi
+
 CANDIDATE_IDENTITY=$(mktemp)
 python3 "$ROOT/scripts/release_checkpoint.py" identity \
   --governator-commit "$COMMIT" --governator-tag "$RELEASE_TAG_FOR_IDENTITY" \

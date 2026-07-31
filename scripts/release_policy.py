@@ -7,8 +7,10 @@ import json
 import os
 import pathlib
 import re
+import shutil
 import stat as stat_mod
 import sys
+import tempfile
 
 
 def minisig_signer_fingerprint(minisig_path: pathlib.Path) -> str:
@@ -78,6 +80,123 @@ def load_pinned_public_keys(dir_path: pathlib.Path) -> dict[str, pathlib.Path]:
         if entry.is_file() and entry.suffix == ".pub":
             pinned[minisign_pubkey_fingerprint(entry)] = entry
     return pinned
+
+
+def dist_version_mismatch(dist_dir: str, expected_version: str | None = None, *, require_manifest: bool = False) -> tuple[bool, str]:
+    """v16-release S3 / R5: STALE_DIST_ARTIFACTS -- a release gate pointed at
+    the WRONG release's dist/ must fail with a named error, never silently pass.
+
+    Session 8's /mnt/e 9p/drvfs OUT_DIR workaround left dist/ holding a deleted
+    failed attempt's output (gov_local-candidate-8044d02_*.tar.gz, no
+    build-manifest.json); any gate defaulting to dist/ would otherwise validate
+    rc8's release claims against it. Shared by check_architecture_doc.py,
+    release_policy.py and audit_bundle_validate.py so the three enforcement
+    points cannot drift -- the same sharing pattern as bundle_local_trust_sources.
+
+    expected_version: the bare version the caller is validating, no leading 'v'
+        (e.g. '1.0.2-rc8'). When given, archives in dist_dir must agree with it
+        (release_policy.py passes its --version). When None, the archives are
+        checked against the manifest's OWN declared version -- the dist's
+        self-description -- so check_architecture_doc.py / audit_bundle_validate.py
+        never cross-check the dist against the architecture doc's governator_tag
+        (a fixture dist whose manifest version differs from the doc tag is a
+        legitimate test shape, not a staleness finding; the complete-state
+        artifact_manifest_sha256 binding is what ties a doc to a manifest).
+    require_manifest: when True, a dist_dir without a readable build-manifest.json
+        is itself the staleness (check_architecture_doc.py treats a --dist-dir as
+        claimed release evidence; no manifest = a failed attempt's leftovers).
+
+    Returns (is_stale, reason). reason carries the STALE_DIST_ARTIFACTS tag and a
+    human-readable diagnostic; empty when the dir is internally consistent.
+    """
+    dist = pathlib.Path(dist_dir)
+    manifest_path = dist / "build-manifest.json"
+    manifest_version: str | None = None
+    if manifest_path.is_file():
+        try:
+            data = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest_version = str(data.get("version", "")).strip() or None
+        except (OSError, json.JSONDecodeError):
+            manifest_version = None
+
+    if require_manifest and manifest_version is None:
+        if not manifest_path.is_file():
+            return True, (
+                f"STALE_DIST_ARTIFACTS: {dist} contains no build-manifest.json -- this is not a "
+                "complete release dist directory. Session 8's /mnt/e OUT_DIR workaround left exactly "
+                "this shape: a deleted failed attempt's archives (gov_local-candidate-*) with no manifest. "
+                "Point --dist-dir at the release evidence directory (e.g. /home/lam/governator-release-dist)."
+            )
+        return True, f"STALE_DIST_ARTIFACTS: {manifest_path} exists but is not readable JSON -- the release manifest is corrupt"
+
+    # The version every gov_<version>_<platform>.tar.gz archive must agree with:
+    # an explicit anchor when given, otherwise the manifest's own declaration.
+    anchor = expected_version if expected_version else manifest_version
+    if not anchor:
+        # No version anchor discoverable and none required: nothing to cross-check
+        # (release_policy.py never required a manifest; the caller's own checksum /
+        # signature checks govern that path).
+        return False, ""
+    foreign = sorted({
+        p.name for p in dist.glob("gov_*_*.tar.gz")
+        if not p.name.startswith(f"gov_{anchor}_")
+    })
+    if foreign:
+        return True, (
+            f"STALE_DIST_ARTIFACTS: {dist} holds platform archives from a different release: {foreign} -- "
+            f"these do not match the validated version {anchor!r}. A gate that silently accepted them would "
+            "validate one release's claims against another's artifacts (the rc8 dist/ trap, R5)."
+        )
+    if expected_version and manifest_version and expected_version != manifest_version:
+        return True, (
+            f"STALE_DIST_ARTIFACTS: build-manifest.json in {dist} declares version {manifest_version!r} but the "
+            f"release being validated is {expected_version!r} -- this dist directory holds a different release's artifacts"
+        )
+    return False, ""
+
+
+def out_dir_preserves_modes(dist_dir) -> tuple[bool, int, str]:
+    """v16-release S3 / R5: detect an OUT_DIR on a filesystem that silently
+    coerces file modes (9p/drvfs, e.g. /mnt/e, rewrites every extracted mode
+    to 0777). The release writes mode-0500 toolbins and mode-0755 executables
+    whose modes release_policy.py / install_evidence.py / bundle_verify.py
+    re-check; on a coercing filesystem those assertions are theater and every
+    shipped artifact carries 0777.
+
+    Detection is behavioural and host-agnostic: mkdtemp a probe directory
+    inside dist_dir, chmod it 0500, read the mode back. A native filesystem
+    (ext4/tmpfs) holds 0500; a coercing mount reads back 0777 (or whatever the
+    mount's default is). Never hardcode a path -- the plan's explicit
+    requirement, and the only reason this is a runtime probe rather than a
+    static refusal of /mnt/e.
+
+    Shared by scripts/release.sh and scripts/audit_bundle.sh via the
+    out-dir-mode-probe subcommand so the two entry points cannot drift (the
+    same sharing pattern as bundle_local_trust_sources / dist_version_mismatch).
+
+    Returns (preserves, read_back_mode, message). preserves is True when the
+    0500 mode held; message is empty. On a coercing filesystem preserves is
+    False, read_back_mode is the coerced mode, and message carries the named
+    OUT_DIR_COERCES_FILE_MODES diagnostic.
+    """
+    probe = tempfile.mkdtemp(prefix=".modeprobe_", dir=str(dist_dir))
+    try:
+        os.chmod(probe, 0o500)
+        mode = stat_mod.S_IMODE(os.stat(probe).st_mode)
+    finally:
+        # Restore writability (a no-op on a coercing fs, where it was never
+        # lost) so the probe directory can always be cleaned up.
+        os.chmod(probe, 0o700)
+        shutil.rmtree(probe, ignore_errors=True)
+    if mode == 0o500:
+        return True, mode, ""
+    return False, mode, (
+        f"OUT_DIR_COERCES_FILE_MODES -- {dist_dir} silently rewrote a 0500 directory to {mode:o} "
+        "(a 9p/drvfs mount such as /mnt/e cannot hold file modes, so the toolbin 0500 lockdown, the "
+        "shipped executables' 0755 bit, and release_policy.py's mode assertions would all be theater; "
+        "every artifact would ship 0777). Set OUT_DIR to a native filesystem path. This is rc8 Session "
+        "8's manual workaround, now enforced (v16 S3 / R5)."
+    )
 
 
 def bundle_local_trust_sources(artifacts_dir: str, fingerprints_file: str, public_keys_dir: str) -> list[str]:
@@ -541,6 +660,17 @@ def command_signature(argv: list[str]) -> int:
 
     coverage_verified = False
     if args.artifacts_dir:
+        # v16-release S3 / R5: the artifacts-dir must not be a different
+        # release's dist/. release_policy.py has no --dist-dir and never
+        # required a build-manifest.json, so this is the version-anchor half
+        # (every gov_<version>_* archive must match --version), not the
+        # manifest-presence half. The manifest-presence half is enforced by
+        # check_architecture_doc.py and audit_bundle_validate.py, which treat
+        # a --dist-dir as claimed release evidence.
+        stale, stale_reason = dist_version_mismatch(args.artifacts_dir, args.version)
+        if stale:
+            print(f"release_policy: {stale_reason}", file=sys.stderr)
+            return 1
         cov_ok, cov_msg = verify_checksum_coverage(pathlib.Path(args.artifacts_dir), entries)
         if not cov_ok:
             print(cov_msg, file=sys.stderr)
@@ -567,6 +697,26 @@ def command_signature(argv: list[str]) -> int:
     return 0
 
 
+def command_out_dir_mode_probe(argv: list[str]) -> int:
+    """v16 S3 / R5: the OUT_DIR mode-coercion probe, exposed as a subcommand so
+    scripts/release.sh and scripts/audit_bundle.sh share one canonical
+    implementation (never a forked copy that can drift)."""
+    p = argparse.ArgumentParser()
+    p.add_argument("--dist-dir", required=True)
+    args = p.parse_args(argv)
+    if not pathlib.Path(args.dist_dir).is_dir():
+        print(
+            f"release_policy: OUT_DIR mode probe target {args.dist_dir} does not exist or is not a directory",
+            file=sys.stderr,
+        )
+        return 1
+    preserves, _mode, message = out_dir_preserves_modes(args.dist_dir)
+    if preserves:
+        return 0
+    print(f"release_policy: {message}", file=sys.stderr)
+    return 1
+
+
 def main(argv: list[str]) -> int:
     if not argv:
         print("usage: release_policy.py signature ...", file=sys.stderr)
@@ -574,6 +724,8 @@ def main(argv: list[str]) -> int:
     cmd, *rest = argv
     if cmd == "signature":
         return command_signature(rest)
+    if cmd == "out-dir-mode-probe":
+        return command_out_dir_mode_probe(rest)
     print(f"unknown command: {cmd}", file=sys.stderr)
     return 2
 
