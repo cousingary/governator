@@ -2248,6 +2248,11 @@ cases:
     session: v16-s4
     required: true
     status: implemented
+  - case: 400
+    name: TestV16Case400AssayerLockPinIsLoadBearingExactSHA
+    session: v16-s5
+    required: true
+    status: implemented
 
 # Case 296 is not one of Sol13's original 51 findings (which occupy 245-295).
 # It closes a gap the rc6-upg13 S3 exclusion audit found: TestV6Case29's own
