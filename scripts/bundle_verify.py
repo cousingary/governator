@@ -154,6 +154,19 @@ def verify_git_bundle(bundle: pathlib.Path, failures: list[str]) -> None:
         return
 
     with tempfile.TemporaryDirectory(prefix="bundle_verify_git_") as tmp:
+        # `git bundle verify` needs to run inside a repository (even an
+        # empty, unrelated one) -- it fails closed with "need a repository
+        # to verify a bundle" in a plain directory, which this scratch
+        # tmpdir always was until now. The repo it inits into has no
+        # relationship to the bundle's own history; it exists only so the
+        # bundle-verify command has a `.git` to run inside.
+        init_proc = subprocess.run(
+            ["git", "init", "-q", tmp],
+            capture_output=True, text=True,
+        )
+        if init_proc.returncode != 0:
+            failures.append(f"UNBOUND: could not init scratch repo for git bundle verification: {init_proc.stderr.strip()}")
+            return
         proc = subprocess.run(
             ["git", "bundle", "verify", str(git_bundle)],
             capture_output=True, text=True, cwd=tmp,
