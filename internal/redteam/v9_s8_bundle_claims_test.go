@@ -59,6 +59,13 @@ func buildAuditBundleFixtureRepo(t *testing.T) string {
 	}
 	mustWrite("main.go", "package main\n\nfunc main() {}\n")
 	mustWrite("docs/claims.yaml", "version: 1\ncases: []\n")
+	// v16-release S1 (R8): audit_bundle.sh's Governator source-closure call
+	// now passes --require-files LICENSE,NOTICE (source_closure.py refuses a
+	// tree missing either). Every fixture built by this helper must carry
+	// both or every test using it fails before the behavior under test is
+	// ever reached, not because of anything it's actually testing.
+	mustWrite("LICENSE", "MIT License\n\nCopyright (c) 2026 fixture\n")
+	mustWrite("NOTICE", "fixture NOTICE\n")
 	// dist/ is real build OUTPUT (scripts/release.sh's own OUT_DIR), never
 	// meant to be tracked -- mirrors governator's own .gitignore so a test
 	// that populates a fake dist/ (case 43) doesn't itself trip the

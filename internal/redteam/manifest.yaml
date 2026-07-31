@@ -2208,6 +2208,16 @@ cases:
     session: rc8-u15-s7
     required: true
     status: implemented
+  - case: 392
+    name: TestV16Case392SecurityMdContradictionRejected
+    session: v16-s1
+    required: true
+    status: implemented
+  - case: 393
+    name: TestV16Case393NoticeLessTreeFailsSourceClosure
+    session: v16-s1
+    required: true
+    status: implemented
 
 # Case 296 is not one of Sol13's original 51 findings (which occupy 245-295).
 # It closes a gap the rc6-upg13 S3 exclusion audit found: TestV6Case29's own

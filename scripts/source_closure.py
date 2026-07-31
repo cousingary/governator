@@ -45,7 +45,8 @@ def sha256_file(path: str) -> str:
 
 
 def generate(repo: str, ref: str, out_archive: str, out_tree: str,
-             git_bin: str = "git", tar_bin: str = "tar") -> int:
+             git_bin: str = "git", tar_bin: str = "tar",
+             require_files: tuple[str, ...] = ()) -> int:
     repo = os.path.abspath(repo)
     commit = subprocess.run(
         [git_bin, "-C", repo, "rev-parse", ref],
@@ -115,6 +116,22 @@ def generate(repo: str, ref: str, out_archive: str, out_tree: str,
             entries.append(entry)
 
     entries.sort(key=lambda e: e["path"])
+
+    # v16 R8: LICENSE alone does not carry third-party attribution for
+    # adapted content (internal/minimalism's ponytail ruleset). --require-files
+    # is opt-in per caller (audit_bundle.sh passes it for the Governator
+    # closure only, not Assayer's, which carries no such adaptation) so a
+    # repo with a genuinely different licensing shape isn't blocked by a
+    # requirement that doesn't apply to it.
+    missing_required_files = [f for f in require_files if f not in seen_paths]
+    if missing_required_files:
+        print(
+            f"source_closure: MISSING_REQUIRED_FILES: ref {ref!r} lacks required "
+            f"top-level file(s) {missing_required_files} -- a source closure without "
+            "third-party attribution is not a licensing-complete release",
+            file=sys.stderr,
+        )
+        return 1
 
     archive_proc = subprocess.run(
         [git_bin, "-C", repo, "archive", "--format=tar.gz", "--prefix=", ref],
@@ -313,6 +330,8 @@ def main(argv: list[str]) -> int:
     gen.add_argument("--out-tree", required=True)
     gen.add_argument("--git-bin", default="git")
     gen.add_argument("--tar-bin", default="tar")
+    gen.add_argument("--require-files", default="",
+                      help="comma-separated top-level paths that must be tracked at ref (e.g. LICENSE,NOTICE)")
 
     ver = sub.add_parser("verify")
     ver.add_argument("--archive", required=True)
@@ -321,8 +340,9 @@ def main(argv: list[str]) -> int:
 
     args = p.parse_args(argv)
     if args.command == "generate":
+        require_files = tuple(f for f in args.require_files.split(",") if f)
         return generate(args.repo, args.ref, args.out_archive, args.out_tree,
-                        args.git_bin, args.tar_bin)
+                        args.git_bin, args.tar_bin, require_files)
     elif args.command == "verify":
         return verify(args.archive, args.tree, args.dest)
     else:

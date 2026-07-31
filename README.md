@@ -17,6 +17,19 @@ gov doctor
 
 `gov init` is safe to run repeatedly: it creates a commented configuration, a valid example contract, and an empty protected-path manifest without overwriting existing files. Edit the generated contract's absolute workspace path and validator before a real `gov run`; running an agent may consume a paid subscription or API quota.
 
+### Platform support
+
+Published release archives are built for four platforms, but "built" is not the same claim as "approving." An archive is **approving** only when it carries *executed* native acceptance evidence (the archive was actually extracted and run on that architecture, not merely cross-compiled for it) — see [docs/containment.md](docs/containment.md) for what approval gates in a governed run.
+
+| Platform | Status | Notes |
+|---|---|---|
+| `linux_amd64` | **Approving** | Built and acceptance-tested natively on this platform. |
+| `linux_arm64` | Non-approving | Cross-compiled; no executed native acceptance evidence yet. |
+| `darwin_amd64` | Non-approving | Cross-compiled; no executed native acceptance evidence yet. |
+| `darwin_arm64` | Non-approving | Cross-compiled; no executed native acceptance evidence yet. |
+
+Approval is a property of the running platform, not only the downloaded archive: `gov` running on any GOOS/GOARCH other than `linux_amd64` — including a `go install ... @latest` build compiled locally on that host — currently cannot claim a fully-approving production release. This table reflects the current release; it is updated as each platform gains executed native acceptance evidence.
+
 For a source checkout:
 
 ```sh
@@ -96,7 +109,7 @@ RTK (Rust Token Killer) integration defaults to `rtk.mode: auto`: when an `rtk` 
 
 Structural context defaults to `graph.mode: auto` with the `codegraph` provider. When the binary is available, `gov doctor` reports its version and the current repository's index statistics; otherwise auto mode remains an optional warning. Use `graph.mode: required` to make a missing provider a hard preflight failure, or `off` to disable graph integration. `GOV_GRAPH_MODE`, `GOV_GRAPH_PROVIDER`, and `GOV_GRAPH_BIN` override the YAML settings. The first supported adapter is [CodeGraph-Rust](https://github.com/sunerpy/codegraph-rust), selected after a compatibility spike confirmed Go type, method, and relationship indexing.
 
-Minimalism defaults to `minimalism.mode: full`: Governator appends a YAGNI-first ruleset (adapted from the [ponytail](https://github.com/DietrichGebert/ponytail) project, MIT-licensed) to every governed prompt, biasing backends toward reuse, stdlib, and the smallest diff over new abstractions and dependencies. Use `lite` for a condensed version, `ultra` for a stricter "delete over add" framing, or `off` to disable. `GOV_MINIMALISM_MODE` overrides the YAML setting; `gov doctor` reports the active mode. Unlike RTK and the context graph, this optimizer has no external binary and is always available.
+Minimalism defaults to `minimalism.mode: full`: Governator appends a YAGNI-first ruleset (adapted from the [ponytail](https://github.com/DietrichGebert/ponytail) project, MIT-licensed — see [NOTICE](NOTICE) for the full copyright and permission notice) to every governed prompt, biasing backends toward reuse, stdlib, and the smallest diff over new abstractions and dependencies. Use `lite` for a condensed version, `ultra` for a stricter "delete over add" framing, or `off` to disable. `GOV_MINIMALISM_MODE` overrides the YAML setting; `gov doctor` reports the active mode. Unlike RTK and the context graph, this optimizer has no external binary and is always available.
 
 For each governed run, the controller builds or refreshes the graph inside the disposable worktree before baseline fingerprints, injects bounded read-only query forms into the runtime prompt, and excludes the controller-owned `.codegraph` index from source commits. The ledger records provider version, SHA-256 index fingerprint, file/node/edge counts, and database size. Operators can inspect or explicitly manage an index with `gov graph status [path]`, `gov graph refresh [path]`, and `gov graph query <search> [--path <path>] [--limit <n>]`.
 
@@ -147,9 +160,19 @@ gov parity report
 gov reconcile
 gov cleanup --stale [--max-attempts N]
 gov ask list|show <id>|approve <id>|deny <id> [--rule] [--ttl <duration>] [--by <name>] [--note <text>]
+gov containment message <job.yaml> [--reason <text>]
+gov attest <backend>
+gov tools enroll <name> <absolute-path>|verify <name>|status|rotate <name> <absolute-path>
 gov doctor
 gov health [reset <backend>]
 gov claims verify [--file <path>] [--repo <path>] [--artifact <path>] [--manifest <path>] [--release]
+gov redteam-gate verify --manifest <path> --log <path> [--capabilities <json>] [--inventory <path>] [--exact-manifest <path>...]
+    [--attestations <dir> --attestation-trust <path> --attestation-governator-commit <commit>
+    --attestation-assayer-commit <commit> --attestation-release-version <version>
+    --attestation-source-identity <path> --attestation-toolchain-hash <sha256>
+    --attestation-release-time <rfc3339> --attestation-max-age <duration>] [--require-zero-skips]
+gov integration-gate verify --log <path> --expected-names <path>
+    [--harness-evidence <dir> --governator-binary <path> --expected-packages <path> --assayer-commit <commit>]
 gov version
 ```
 

@@ -365,6 +365,16 @@ print(m.group(1) if m else "")' "$ARCHITECTURE_DOC")
   fi
 fi
 
+# v16 R3: SECURITY.md is the file GitHub surfaces in the security tab, and
+# went stale by roughly nineteen release-candidate-cycles' worth of work
+# because no checker ever looked at it. check_release_docs.py's second mode
+# asserts it still links to the real register/containment docs and does not
+# describe any docs/security.md-fixed finding as open.
+if ! python3 "$ROOT/scripts/check_release_docs.py" "$ROOT/SECURITY.md" "$ROOT/docs/security.md"; then
+  echo "release: refusing to release with a stale/contradictory SECURITY.md (see above)" >&2
+  exit 1
+fi
+
 BUILD_TS=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 CLAIMS_HASH=$(sha256sum docs/claims.yaml | awk '{print $1}')
 ADAPTER_PROTOCOL_VERSION=${ADAPTER_PROTOCOL_VERSION:-adapter-protocol-v1}

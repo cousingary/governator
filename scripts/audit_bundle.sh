@@ -282,7 +282,8 @@ GOV_SOURCE_TREE="$OUT_DIR/closure/governator-source-${GOV_VERSION_LABEL}.tree.js
 if ! "$PYTHON_BIN" "$ROOT/scripts/source_closure.py" generate \
   --repo "$ROOT" --ref "$REF" \
   --out-archive "$GOV_SOURCE_ARCHIVE" --out-tree "$GOV_SOURCE_TREE" \
-  --git-bin "$GIT_BIN" --tar-bin "$TAR_BIN"; then
+  --git-bin "$GIT_BIN" --tar-bin "$TAR_BIN" \
+  --require-files LICENSE,NOTICE; then
   echo "audit_bundle: source-closure generation failed for governator at ${REF}" >&2
   exit 1
 fi
