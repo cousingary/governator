@@ -985,7 +985,9 @@ func pathUnderRoot(path, root string) bool {
 // matches one of the operator's explicitly authorized directory mounts.
 func authorizedCredentialDir(resolved string, allow []string) bool {
 	for _, a := range allow {
-		if filepath.Clean(strings.TrimSpace(a)) == resolved {
+		cleaned := filepath.Clean(strings.TrimSpace(a))
+		resolvedAllowed, err := filepath.EvalSymlinks(cleaned)
+		if err == nil && filepath.Clean(resolvedAllowed) == resolved {
 			return true
 		}
 	}

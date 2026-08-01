@@ -220,7 +220,11 @@ func TestDockerRunArgsCredentialMounts(t *testing.T) {
 	if err != nil {
 		t.Fatalf("runArgs: %v", err)
 	}
-	want := netrc + ":" + credentialContainerRoot + "/.netrc:ro"
+	resolvedNetrc, err := filepath.EvalSymlinks(netrc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := resolvedNetrc + ":" + credentialContainerRoot + "/.netrc:ro"
 	found := false
 	for _, a := range args {
 		if a == want {
