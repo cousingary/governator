@@ -69,12 +69,16 @@ jobs:
             secure_bin="$RUNNER_TEMP/governator-tools"
             mkdir -p "$secure_bin"
             chmod 0700 "$secure_bin"
-            cp "$(command -v python3)" "$secure_bin/python3"
+            real_python="$(command -v python3)"
+            {
+              echo '#!/bin/sh'
+              printf 'exec "%s" "$@"\n' "$real_python"
+            } > "$secure_bin/python3"
             cp "$(brew --prefix util-linux)/bin/setsid" "$secure_bin/setsid"
             cp "$(command -v minisign)" "$secure_bin/minisign"
             chmod 0755 "$secure_bin/python3" "$secure_bin/setsid" "$secure_bin/minisign"
-            echo "$secure_bin" >> "$GITHUB_PATH"
           fi
+          printf '/assayer/\n' >> .git/info/exclude
 
       - name: Enroll trusted tools
         shell: bash
@@ -123,10 +127,20 @@ jobs:
       # (agents/governator-sol-upgrade6-plan.md). Full record fields land
       # in S8.
       - name: Red-team corpus (-tags redteam, -count=1)
-        run: go test -tags redteam -count=1 ./...
+        shell: bash
+        run: |
+          if [ "$RUNNER_OS" = "macOS" ]; then
+            export PATH="$RUNNER_TEMP/governator-tools:$PATH"
+          fi
+          go test -tags redteam -count=1 ./...
 
       - name: Red-team corpus (-race, -tags redteam, -count=1)
-        run: go test -race -tags redteam -count=1 ./...
+        shell: bash
+        run: |
+          if [ "$RUNNER_OS" = "macOS" ]; then
+            export PATH="$RUNNER_TEMP/governator-tools:$PATH"
+          fi
+          go test -race -tags redteam -count=1 ./...
 
       - name: gofmt check
         shell: bash
