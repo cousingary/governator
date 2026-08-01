@@ -1980,7 +1980,7 @@ rm -f "$ARTIFACTS_JSON"
 # without --artifact/--manifest.
 # ---------------------------------------------------------------------------
 CLAIMS_VERIFY_REPORT="$OUT_DIR/claims-verify-report.txt"
-if ! "$BASH_TOOL" "$ROOT/scripts/release_verify.sh" --out-dir "$OUT_DIR" --repo "$ROOT" --platform "$HOST_PLATFORM_ID" --python-bin "$PYTHON_TOOL" --tar-bin "$TAR_TOOL" --mktemp-bin "$MKTEMP_TOOL" --rm-bin "$RM_TOOL" --stat-bin "$STAT_TOOL" >"$CLAIMS_VERIFY_REPORT" 2>&1; then
+if ! GOV_TOOLREGISTRY_FILE="$TEST_TOOL_REGISTRY" "$BASH_TOOL" "$ROOT/scripts/release_verify.sh" --out-dir "$OUT_DIR" --repo "$ROOT" --platform "$HOST_PLATFORM_ID" --python-bin "$PYTHON_TOOL" --tar-bin "$TAR_TOOL" --mktemp-bin "$MKTEMP_TOOL" --rm-bin "$RM_TOOL" --stat-bin "$STAT_TOOL" >"$CLAIMS_VERIFY_REPORT" 2>&1; then
   echo "release: full claims verification FAILED — see ${CLAIMS_VERIFY_REPORT}" >&2
   cat "$CLAIMS_VERIFY_REPORT" >&2
   exit 1

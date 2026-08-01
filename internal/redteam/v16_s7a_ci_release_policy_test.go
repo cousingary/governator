@@ -210,6 +210,7 @@ func TestV16Case414ReleaseTiersUseAttemptScopedTrustedToolRegistry(t *testing.T)
 		`TEST_TOOL_REGISTRY="$OUT_DIR/.test-tools.yaml"`,
 		`GOV_TOOLREGISTRY_FILE="$TEST_TOOL_REGISTRY" "$INTEGRATION_GOV_BIN" tools enroll`,
 		`"git:$GIT_TOOL" "bash:$BASH_TOOL" "python3:$PYTHON_TOOL" "docker:$DOCKER_TOOL"`,
+		`GOV_TOOLREGISTRY_FILE="$TEST_TOOL_REGISTRY" "$BASH_TOOL" "$ROOT/scripts/release_verify.sh"`,
 	} {
 		if !strings.Contains(src, required) {
 			t.Fatalf("release pipeline omits attempt-scoped registry contract %q", required)
