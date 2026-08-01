@@ -177,3 +177,25 @@ func TestV16Case412CILocalArchiveByteComparisonRemainsMandatory(t *testing.T) {
 		t.Fatalf("different local/CI archives accepted: %v\n%s", err, out)
 	}
 }
+
+func TestV16Case413TierVerificationPropagatesExplicitCIProfile(t *testing.T) {
+	tierContent, err := os.ReadFile(s7aScript(t, "release_tier_pipeline.sh"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	tier := string(tierContent)
+	if !strings.Contains(tier, `--toolset-profile) TOOLSET_PROFILE=$2`) {
+		t.Fatal("tier runner does not accept an explicit toolset profile")
+	}
+	if strings.Count(tier, `--profile "$TOOLSET_PROFILE"`) != 2 {
+		t.Fatal("tier runner must pass its explicit profile to both pre- and post-tier verification")
+	}
+
+	releaseContent, err := os.ReadFile(s7aScript(t, "release.sh"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(releaseContent), `--toolset-profile "$RELEASE_TOOL_PROFILE"`) {
+		t.Fatal("release pipeline does not propagate its selected profile to the tier runner")
+	}
+}

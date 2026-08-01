@@ -18,7 +18,7 @@
 # Usage:
 #   release_tier_pipeline.sh run --state-dir DIR --identity-file FILE --spec SPECFILE
 #     --python-bin PATH --bash-bin PATH --sha256sum-bin PATH --date-bin PATH --awk-bin PATH
-#     [--policy PATH --toolset-json PATH --toolset-py PATH]
+#     [--policy PATH --toolset-json PATH --toolset-py PATH --toolset-profile PROFILE]
 #
 # Sol15 P0-1 (rc8-upg15 S2b): when --policy and --toolset-json are BOTH
 # supplied, every tier that actually runs (never one reused from a matching
@@ -55,7 +55,7 @@ ROOT=$(cd "${BASH_SOURCE[0]%/*}/.." && pwd -P)
 CHECKPOINT_PY="$ROOT/scripts/release_checkpoint.py"
 
 usage() {
-  echo "usage: $0 run --state-dir DIR --identity-file FILE --spec SPECFILE [--python-bin PATH --bash-bin PATH --sha256sum-bin PATH --date-bin PATH --awk-bin PATH] [--policy PATH --toolset-json PATH --toolset-py PATH]" >&2
+  echo "usage: $0 run --state-dir DIR --identity-file FILE --spec SPECFILE [--python-bin PATH --bash-bin PATH --sha256sum-bin PATH --date-bin PATH --awk-bin PATH] [--policy PATH --toolset-json PATH --toolset-py PATH --toolset-profile PROFILE]" >&2
   exit 2
 }
 
@@ -78,6 +78,7 @@ CAT_BIN=cat
 POLICY=""
 TOOLSET_JSON=""
 TOOLSET_PY="$ROOT/scripts/release_toolset.py"
+TOOLSET_PROFILE="reviewed-bytes"
 while [ $# -gt 0 ]; do
   case "$1" in
     --state-dir) STATE_DIR=$2; shift 2 ;;
@@ -96,6 +97,7 @@ while [ $# -gt 0 ]; do
     --policy) POLICY=$2; shift 2 ;;
     --toolset-json) TOOLSET_JSON=$2; shift 2 ;;
     --toolset-py) TOOLSET_PY=$2; shift 2 ;;
+    --toolset-profile) TOOLSET_PROFILE=$2; shift 2 ;;
     *) usage ;;
   esac
 done
@@ -178,7 +180,7 @@ while IFS=$'\t' read -r NAME LOG CMD || [ -n "$NAME" ]; do
     TOOL_IDENTITY_POST="SKIPPED"
     RUN_COMMAND=true
     if [ -n "$POLICY" ] && [ -n "$TOOLSET_JSON" ]; then
-      if "$PYTHON_BIN" "$TOOLSET_PY" --policy "$POLICY" --verify "$TOOLSET_JSON" >"$LOG" 2>&1; then
+      if "$PYTHON_BIN" "$TOOLSET_PY" --policy "$POLICY" --verify "$TOOLSET_JSON" --profile "$TOOLSET_PROFILE" >"$LOG" 2>&1; then
         TOOL_IDENTITY_PRE="PASS"
       else
         TOOL_IDENTITY_PRE="FAIL"
@@ -199,7 +201,7 @@ while IFS=$'\t' read -r NAME LOG CMD || [ -n "$NAME" ]; do
     fi
 
     if [ "$RUN_COMMAND" = true ] && [ -n "$POLICY" ] && [ -n "$TOOLSET_JSON" ]; then
-      if "$PYTHON_BIN" "$TOOLSET_PY" --policy "$POLICY" --verify "$TOOLSET_JSON" >>"$LOG" 2>&1; then
+      if "$PYTHON_BIN" "$TOOLSET_PY" --policy "$POLICY" --verify "$TOOLSET_JSON" --profile "$TOOLSET_PROFILE" >>"$LOG" 2>&1; then
         TOOL_IDENTITY_POST="PASS"
       else
         TOOL_IDENTITY_POST="FAIL"

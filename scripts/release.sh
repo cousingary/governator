@@ -1077,7 +1077,7 @@ fi
 # closing the window this one pipeline-wide preflight check (above) cannot:
 # a same-UID substitution between two tiers, or during one tier's own
 # execution.
-if ! "$BASH_TOOL" "$ROOT/scripts/release_tier_pipeline.sh" run --state-dir "$CHECKPOINT_STATE_DIR" --identity-file "$IDENTITY_FILE" --spec "$MAIN_TIER_SPEC" --python-bin "$PYTHON_TOOL" --bash-bin "$BASH_TOOL" --sha256sum-bin "$SHA256SUM_TOOL" --date-bin "$DATE_TOOL" --awk-bin "$AWK_TOOL" --mkdir-bin "$MKDIR_TOOL" --mktemp-bin "$MKTEMP_TOOL" --rm-bin "$RM_TOOL" --dirname-bin "$DIRNAME_TOOL" --cat-bin "$CAT_TOOL" --policy "$RELEASE_TOOL_POLICY" --toolset-json "$OUT_DIR/toolset.json" --toolset-py "$ROOT/scripts/release_toolset.py" >"$MAIN_TIER_JSONL"; then
+if ! "$BASH_TOOL" "$ROOT/scripts/release_tier_pipeline.sh" run --state-dir "$CHECKPOINT_STATE_DIR" --identity-file "$IDENTITY_FILE" --spec "$MAIN_TIER_SPEC" --python-bin "$PYTHON_TOOL" --bash-bin "$BASH_TOOL" --sha256sum-bin "$SHA256SUM_TOOL" --date-bin "$DATE_TOOL" --awk-bin "$AWK_TOOL" --mkdir-bin "$MKDIR_TOOL" --mktemp-bin "$MKTEMP_TOOL" --rm-bin "$RM_TOOL" --dirname-bin "$DIRNAME_TOOL" --cat-bin "$CAT_TOOL" --policy "$RELEASE_TOOL_POLICY" --toolset-json "$OUT_DIR/toolset.json" --toolset-py "$ROOT/scripts/release_toolset.py" --toolset-profile "$RELEASE_TOOL_PROFILE" >"$MAIN_TIER_JSONL"; then
   MAIN_TIER_PIPELINE_OK=false
 fi
 rm -f "$MAIN_TIER_SPEC"
