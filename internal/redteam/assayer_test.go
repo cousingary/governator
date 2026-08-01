@@ -9,9 +9,15 @@ import (
 	"testing"
 )
 
-// assayerRepoRoot is the sibling Python repo these three attacks are
-// actually fixed and fixture-tested in -- see each test's doc comment.
-const assayerRepoRoot = "/mnt/e/downloads/assayer"
+// assayerRepoRoot is the pinned Python repo these three attacks are actually
+// fixed and fixture-tested in. CI supplies ASSAYER_REPO explicitly; the
+// sibling default preserves the established local workspace layout.
+func assayerRepoRoot() string {
+	if repo := strings.TrimSpace(os.Getenv("ASSAYER_REPO")); repo != "" {
+		return repo
+	}
+	return "/mnt/e/downloads/assayer"
+}
 
 // assertAssayerTestFileContains is the cross-repo traceability primitive
 // shared by attacks 13/14/16: this Go corpus cannot execute Python, so it
@@ -22,7 +28,7 @@ const assayerRepoRoot = "/mnt/e/downloads/assayer"
 // check.
 func assertAssayerTestFileContains(t *testing.T, relPath string, markers ...string) {
 	t.Helper()
-	path := filepath.Join(assayerRepoRoot, relPath)
+	path := filepath.Join(assayerRepoRoot(), relPath)
 	data, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatalf("Assayer fixture file missing (%s): %v -- the real regression test for this attack must live here", path, err)

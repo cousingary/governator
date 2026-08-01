@@ -82,7 +82,7 @@ func TestV6Case32UnknownOutboxOperationIsDeadLettered(t *testing.T) {
 func TestV6Case33AssayerPytestExitsCleanlyOnSupportedPythonVersions(t *testing.T) {
 	repo := os.Getenv("ASSAYER_REPO")
 	if repo == "" {
-		repo = assayerRepoRoot
+		repo = assayerRepoRoot()
 	}
 	if _, err := os.Stat(repo); err != nil {
 		t.Skipf("ASSAYER_REPO %q not present on this machine: %v", repo, err)

@@ -12,6 +12,8 @@ permissions:
 jobs:
   test:
     name: build-vet-test (${{ matrix.os }})
+    env:
+      ASSAYER_REPO: ${{ github.workspace }}/assayer
     strategy:
       fail-fast: false
       matrix:
@@ -32,6 +34,47 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.x"
+
+      - name: Read pinned Assayer ref from assayer.lock
+        id: test-assayer-ref
+        shell: bash
+        run: |
+          ref="$(python3 -c "
+          import sys
+          for line in open(sys.argv[1]):
+              line = line.split('#', 1)[0].strip()
+              if line.startswith('ref='):
+                  print(line[4:]); break
+          " assayer.lock)"
+          if [ -z "$ref" ]; then
+            echo "::error::assayer.lock does not declare a ref= entry"
+            exit 1
+          fi
+          echo "ref=$ref" >> "$GITHUB_OUTPUT"
+
+      - name: Check out Assayer at its pinned ref
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ vars.ASSAYER_REPOSITORY || 'cousingary/assayer' }}
+          ref: ${{ steps.test-assayer-ref.outputs.ref }}
+          path: assayer
+          fetch-depth: 0
+
+      - name: Install portable red-team dependencies
+        shell: bash
+        run: |
+          python3 -m pip install cryptography pytest
+          if [ "$RUNNER_OS" = "macOS" ]; then
+            brew install minisign util-linux
+            secure_bin="$RUNNER_TEMP/governator-tools"
+            mkdir -p "$secure_bin"
+            chmod 0700 "$secure_bin"
+            cp "$(command -v python3)" "$secure_bin/python3"
+            cp "$(brew --prefix util-linux)/bin/setsid" "$secure_bin/setsid"
+            cp "$(command -v minisign)" "$secure_bin/minisign"
+            chmod 0755 "$secure_bin/python3" "$secure_bin/setsid" "$secure_bin/minisign"
+            echo "$secure_bin" >> "$GITHUB_PATH"
+          fi
 
       - name: Enroll trusted tools
         shell: bash

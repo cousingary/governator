@@ -163,7 +163,7 @@ print(json.dumps({
 }))
 `
 	cmd := exec.Command("python3", "-c", probe)
-	cmd.Dir = assayerRepoRoot
+	cmd.Dir = assayerRepoRoot()
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("python3 -c verify_scored probe against the real Assayer package failed: %v\n%s", err, out)
