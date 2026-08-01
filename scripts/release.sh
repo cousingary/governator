@@ -680,6 +680,51 @@ HOST_ARCHIVE_NAME=""
 HOST_ARCHIVE_SHA=""
 HOST_BIN_SHA=""
 
+# v16-release Session 6 (R4): executed native acceptance evidence feed.
+# EVIDENCE_DIR (optional) points at a directory of per-platform
+# acceptance.json files produced by the native-acceptance CI job
+# (.github/workflows/ci.yml :: native-acceptance, runners macos-latest and
+# ubuntu-24.04-arm). A platform is approving only with executed native
+# acceptance evidence -- this is the release-path mirror of
+# internal/redteamgate.ClassifyPlatformWithEvidence (Sol15 P1-2 / v16 S6),
+# kept in sync by hand because this script builds the very binary whose
+# package defines that function. An unset/empty EVIDENCE_DIR preserves the
+# historic behavior unchanged: only the host platform -- which this script
+# acceptance-tests itself below -- is approving, and every cross-compiled
+# platform is non-approving. A record with overall_result != PASS or any
+# failed check never promotes a platform (rule 13: evidence must be real).
+EVIDENCE_PLATFORMS=""
+if [ -n "${EVIDENCE_DIR:-}" ]; then
+  if [ ! -d "$EVIDENCE_DIR" ]; then
+    echo "release: EVIDENCE_DIR=$EVIDENCE_DIR is not a directory -- refusing rather than silently dropping native acceptance evidence" >&2
+    exit 1
+  fi
+  EVIDENCE_PLATFORMS=$(python3 - "$EVIDENCE_DIR" <<'PYEV'
+import json, pathlib, sys
+d = pathlib.Path(sys.argv[1])
+required = ("archive_extracted", "executable_bit_preserved",
+            "binary_hash_matches_build", "version_json_matches_manifest")
+evidence = []
+for f in sorted(d.glob("*.json")):
+    try:
+        rec = json.loads(f.read_text())
+    except Exception:
+        continue  # malformed evidence never promotes a platform
+    checks = rec.get("checks", {})
+    if (rec.get("overall_result") == "PASS"
+            and rec.get("extracted_platform")
+            and all(checks.get(k) is True for k in required)):
+        evidence.append(rec["extracted_platform"])
+print(" ".join(evidence))
+PYEV
+)
+  if [ -n "$EVIDENCE_PLATFORMS" ]; then
+    echo "release: native acceptance evidence promotes: ${EVIDENCE_PLATFORMS}" >&2
+  else
+    echo "release: EVIDENCE_DIR provided but contained no passing native acceptance evidence (all platforms stay cross-compiled/non-approving)" >&2
+  fi
+fi
+
 ARTIFACTS_JSON="$OUT_DIR/.artifacts.jsonl"
 : >"$ARTIFACTS_JSON"
 for platform in $PLATFORMS; do
@@ -728,21 +773,30 @@ for platform in $PLATFORMS; do
 import json, sys
 platform_id = sys.argv[1]
 host_platform_id = sys.argv[6]
-# Sol15 P1-2: approval is keyed on executed acceptance evidence, not on
-# GOOS. Only the host platform (which ran the acceptance check: extract,
-# mode, hash, version, commit, claims, dirty) has evidence. Cross-compiled
-# platforms ship as build artifacts but are non-approving.
+evidence_platforms = set(sys.argv[7].split()) if len(sys.argv) > 7 and sys.argv[7] else set()
+# v16 S6 / R4: approval mirrors internal/redteamgate.ClassifyPlatformWithEvidence
+# (kept in sync by hand). A platform is approving only when its GOOS is
+# approval-eligible (linux) AND it carries executed native acceptance evidence
+# (evidence_platforms, fed from EVIDENCE_DIR). The host platform is approving
+# unconditionally here because this script runs its own acceptance check on it
+# below; a cross-compiled linux platform needs CI evidence to promote, else it
+# stays non-approving (cross-compiled-no-native-acceptance). darwin is
+# non-approving (degradedPlatforms) until promoted with native evidence AND a
+# passing native corpus -- its acceptance smoke alone does not promote it.
 # Sol12 P1-1: the PLATFORMS validation loop above already refuses any GOOS
 # outside {linux, darwin} before this ever runs, so an unrecognized
 # platform_id here means that guard was bypassed; fail loud.
-if platform_id.startswith('linux_'):
-    if platform_id == host_platform_id:
-        feature_limited = False
-        degraded_modes = []
-    else:
-        feature_limited = True
-        degraded_modes = ['cross-compiled-no-native-acceptance']
-elif platform_id.startswith('darwin_'):
+goos = platform_id.split('_', 1)[0]
+if platform_id == host_platform_id:
+    feature_limited = False
+    degraded_modes = []
+elif goos == 'linux' and platform_id in evidence_platforms:
+    feature_limited = False
+    degraded_modes = []
+elif goos == 'linux':
+    feature_limited = True
+    degraded_modes = ['cross-compiled-no-native-acceptance']
+elif goos == 'darwin':
     feature_limited = True
     degraded_modes = ['non-approving']
 else:
@@ -758,7 +812,7 @@ print(json.dumps({
     'feature_limited': feature_limited,
     'approving': not feature_limited,
     'known_degraded_modes': degraded_modes,
-}))" "$PLATFORM_ID" "$ARCHIVE_NAME" "$ARCHIVE_SHA" "$BIN_SHA" "$SIZE" "$HOST_PLATFORM_ID" >>"$ARTIFACTS_JSON"
+}))" "$PLATFORM_ID" "$ARCHIVE_NAME" "$ARCHIVE_SHA" "$BIN_SHA" "$SIZE" "$HOST_PLATFORM_ID" "$EVIDENCE_PLATFORMS" >>"$ARTIFACTS_JSON"
   echo "release: built ${ARCHIVE_NAME} (${ARCHIVE_SHA})" >&2
   if [ "$PLATFORM_ID" = "$HOST_PLATFORM_ID" ]; then
     HOST_ARCHIVE_NAME=$ARCHIVE_NAME
