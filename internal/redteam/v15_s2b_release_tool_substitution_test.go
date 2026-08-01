@@ -72,6 +72,8 @@ func s2bProbeArgs(tool string) string {
 		return "version"
 	case "minisign":
 		return "-v"
+	case "date":
+		return "+%s"
 	default:
 		return "--version"
 	}

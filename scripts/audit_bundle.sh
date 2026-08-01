@@ -98,7 +98,7 @@ if [ -n "$("$GIT_BIN" status --porcelain --untracked-files=all)" ]; then
   exit 1
 fi
 
-OUT_DIR_ABS=$("$PYTHON_BIN" -c 'import os,sys; print(os.path.abspath(sys.argv[1]))' "$OUT_DIR")
+OUT_DIR_ABS=$("$PYTHON_BIN" -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$OUT_DIR")
 case "$OUT_DIR_ABS" in
   "$ROOT"|"$ROOT"/*)
     echo "audit_bundle: refusing to generate the bundle inside the source checkout (${OUT_DIR_ABS} is under ${ROOT}) -- set OUT_DIR to a sibling or /tmp path (P1-6)" >&2

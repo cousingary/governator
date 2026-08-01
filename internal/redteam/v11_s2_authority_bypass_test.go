@@ -137,6 +137,7 @@ func TestV11Case10ForceDegradedEnvOnEffectfulLowRiskRunHasNoEffect(t *testing.T)
 // "succeeding" degraded). Identical outcomes both times is the proof the
 // wrapper's injected variable has zero effect on the shipped binary.
 func TestV11Case11WrapperInjectedDegradedEnvironmentHasNoEffect(t *testing.T) {
+	requireLinuxSealedExecution(t, "external containment for the real gov CLI")
 	root := fixtureRepo(t)
 	bin := fakeBackend(t, standardBackendBody(""))
 	c := baseContract(root)

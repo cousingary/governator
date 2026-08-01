@@ -184,6 +184,7 @@ func TestV10Case32GraphDatabaseChangeImmediatelyBeforeReplayLookupInvalidatesRep
 // genuinely frozen at run start rather than silently re-read at
 // completion.
 func TestV10Case34GraphIndexMutationDuringRunHasNoEffectOnThatRunsRecordedSnapshot(t *testing.T) {
+	requireLinuxSealedExecution(t, "sealed controller-tool execution and external containment")
 	s6BypassHostContainment(t)
 
 	root := fixtureRepo(t)

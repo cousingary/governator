@@ -777,6 +777,7 @@ func copyToNewInode(t *testing.T, src string) string {
 // copy of the same real binary -- a different device/inode even though the
 // content is identical) must invalidate replay.
 func TestV7Case27GitIdentityChangeInvalidatesReplay(t *testing.T) {
+	requireLinuxSealedExecution(t, "sealed git execution and external containment")
 	strictReplayConfig(t)
 	enforce.SelfExeOverride = govBinary(t)
 	defer func() { enforce.SelfExeOverride = "" }()
@@ -813,6 +814,7 @@ func TestV7Case27GitIdentityChangeInvalidatesReplay(t *testing.T) {
 // TestV7Case28BashIdentityChangeInvalidatesReplay is Case 27's sibling for
 // the registered "bash" (shell) participant.
 func TestV7Case28BashIdentityChangeInvalidatesReplay(t *testing.T) {
+	requireLinuxSealedExecution(t, "sealed bash execution and external containment")
 	strictReplayConfig(t)
 	enforce.SelfExeOverride = govBinary(t)
 	defer func() { enforce.SelfExeOverride = "" }()

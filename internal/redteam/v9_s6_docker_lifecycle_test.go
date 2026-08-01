@@ -139,6 +139,7 @@ func launchDockerLifecycle(t *testing.T, d *runner.DockerRunner, ws runner.Works
 // a hard DOCKER_CONTAINER_NOT_OBSERVED failure -- absence is no longer
 // treated as a successful verification.
 func TestV9Case28DockerContainerNeverAppearsHardFails(t *testing.T) {
+	requireLinuxSealedExecution(t, "sealed Docker CLI execution")
 	pinFakeDockerLifecycle(t, `#!/bin/sh
 set -eu
 cmd=${1:-}
@@ -177,6 +178,7 @@ esac
 // return control within the fixed shutdown deadline, not the transaction's
 // (potentially much larger) timeout budget.
 func TestV9Case29DockerCLIBlockedAfterContainerRemovalIsBounded(t *testing.T) {
+	requireLinuxSealedExecution(t, "sealed Docker CLI execution")
 	pinFakeDockerLifecycle(t, `#!/bin/sh
 set -eu
 cmd=${1:-}
@@ -225,6 +227,7 @@ esac
 // per-call context -- the whole launch must still resolve promptly instead
 // of hanging for as long as the daemon stays wedged.
 func TestV9Case30DockerDaemonInspectionHangIsBounded(t *testing.T) {
+	requireLinuxSealedExecution(t, "sealed Docker CLI execution")
 	pinFakeDockerLifecycle(t, `#!/bin/sh
 set -eu
 cmd=${1:-}
@@ -286,6 +289,7 @@ esac
 // process-group kill and bounded CLI wait -- rather than depending on
 // daemon-side cleanup succeeding to ever make forward progress.
 func TestV9Case31DockerStopAndForceRemoveBothFailingStillReturns(t *testing.T) {
+	requireLinuxSealedExecution(t, "sealed Docker CLI execution")
 	pinFakeDockerLifecycle(t, `#!/bin/sh
 set -eu
 cmd=${1:-}
@@ -348,6 +352,7 @@ esac
 // internal/runtime.go gates workspace/final-state measurement on exactly
 // this bit (`if !ar.DescendantsGone { ... refuse ... }`).
 func TestV9Case32WorkspaceMeasurementRefusedBeforeExtinctionProof(t *testing.T) {
+	requireLinuxSealedExecution(t, "sealed Docker CLI execution")
 	pinFakeDockerLifecycle(t, `#!/bin/sh
 set -eu
 cmd=${1:-}
