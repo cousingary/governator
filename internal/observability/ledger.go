@@ -142,7 +142,7 @@ func Open(home string) (*sql.DB, error) {
 	// generous busy_timeout makes SQLite retry instead of returning
 	// SQLITE_BUSY when two connections do briefly contend for the single
 	// writer lock.
-	db, err := sql.Open("sqlite", filepath.Join(home, "ledger.db")+"?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)")
+	db, err := sql.Open("sqlite", filepath.Join(home, "ledger.db")+"?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_txlock=immediate")
 	if err != nil {
 		return nil, err
 	}
@@ -414,6 +414,9 @@ func ensureLedgerColumn(db *sql.DB, table, name, decl string) error {
 		return err
 	}
 	_, err = db.Exec(fmt.Sprintf("ALTER TABLE %s ADD COLUMN %s %s", table, name, decl))
+	if err != nil && strings.Contains(strings.ToLower(err.Error()), "duplicate column") {
+		return nil
+	}
 	return err
 }
 

@@ -2,7 +2,9 @@ package observability
 
 import (
 	"database/sql"
+	"fmt"
 	"path/filepath"
+	"sync"
 	"testing"
 
 	_ "modernc.org/sqlite"
@@ -280,5 +282,83 @@ func TestRecordPolicyRuleEventsAppendsRows(t *testing.T) {
 	}
 	if rows[1].Verdict != "flag" || rows[1].Rule != "suspected-injection-precedes-exec" {
 		t.Fatalf("flag row not persisted correctly: %+v", rows[1])
+	}
+}
+
+func TestConcurrentOpenMigrationsDoNotContend(t *testing.T) {
+	home := t.TempDir()
+
+	seed, err := sql.Open("sqlite", filepath.Join(home, "ledger.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := `CREATE TABLE IF NOT EXISTS spend_reservations(id INTEGER PRIMARY KEY AUTOINCREMENT, run_id TEXT NOT NULL DEFAULT '', day TEXT NOT NULL DEFAULT '', estimated_usd REAL NOT NULL DEFAULT 0, actual_usd REAL NOT NULL DEFAULT 0, status TEXT NOT NULL DEFAULT 'pending', expires_at TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL DEFAULT '', settled_at TEXT NOT NULL DEFAULT '');
+CREATE TABLE IF NOT EXISTS quota_reservations(id INTEGER PRIMARY KEY AUTOINCREMENT, run_id TEXT NOT NULL DEFAULT '', backend TEXT NOT NULL, account TEXT NOT NULL DEFAULT 'default', usage REAL NOT NULL DEFAULT 0, measured_usage REAL NOT NULL DEFAULT 0, expires_at TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL DEFAULT '', settled_at TEXT NOT NULL DEFAULT '');
+CREATE TABLE IF NOT EXISTS quota_windows(backend TEXT NOT NULL, account TEXT NOT NULL DEFAULT 'default', window_type TEXT NOT NULL, window_started_at TEXT NOT NULL DEFAULT '', reset_at TEXT NOT NULL DEFAULT '', estimated_limit REAL NOT NULL DEFAULT 0, measured_usage REAL NOT NULL DEFAULT 0, reserved_usage REAL NOT NULL DEFAULT 0, confidence REAL NOT NULL DEFAULT 0, source TEXT NOT NULL DEFAULT '', updated_at TEXT NOT NULL DEFAULT '', PRIMARY KEY(backend,account,window_type));
+CREATE TABLE IF NOT EXISTS policy_overrides(id INTEGER PRIMARY KEY AUTOINCREMENT, scope_key TEXT NOT NULL, target TEXT NOT NULL, verdict TEXT NOT NULL, reason TEXT NOT NULL DEFAULT '', created_by TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL, expires_at TEXT NOT NULL DEFAULT '', one_shot INTEGER NOT NULL DEFAULT 0, consumed_at TEXT NOT NULL DEFAULT '');
+CREATE TABLE IF NOT EXISTS maintenance_outbox(id INTEGER PRIMARY KEY AUTOINCREMENT, run_id TEXT NOT NULL DEFAULT '', op_kind TEXT NOT NULL, payload TEXT NOT NULL DEFAULT '', status TEXT NOT NULL DEFAULT 'pending', attempts INTEGER NOT NULL DEFAULT 0, last_error TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL, updated_at TEXT NOT NULL);`
+	if _, err := seed.Exec(base); err != nil {
+		seed.Close()
+		t.Fatal(err)
+	}
+	for i := 0; i < 5; i++ {
+		ts := fmt.Sprintf("2026-08-01T0%d:00:00Z", i)
+		if _, err := seed.Exec(`INSERT INTO spend_reservations(run_id,day,created_at,expires_at,settled_at) VALUES(?,?,?,?,?)`, fmt.Sprintf("run-%d", i), "2026-08-01", ts, ts, ""); err != nil {
+			seed.Close()
+			t.Fatal(err)
+		}
+		if _, err := seed.Exec(`INSERT INTO quota_reservations(run_id,backend,created_at,expires_at,settled_at) VALUES(?,?,?,?,?)`, fmt.Sprintf("run-%d", i), "anthropic", ts, ts, ""); err != nil {
+			seed.Close()
+			t.Fatal(err)
+		}
+		if _, err := seed.Exec(`INSERT INTO policy_overrides(scope_key,target,verdict,created_at,expires_at) VALUES(?,?,?,?,?)`, fmt.Sprintf("key-%d", i), "target", "allow", ts, ts); err != nil {
+			seed.Close()
+			t.Fatal(err)
+		}
+		if _, err := seed.Exec(`INSERT INTO maintenance_outbox(run_id,op_kind,created_at,updated_at) VALUES(?,?,?,?)`, fmt.Sprintf("run-%d", i), "test", ts, ts); err != nil {
+			seed.Close()
+			t.Fatal(err)
+		}
+	}
+	if _, err := seed.Exec(`INSERT INTO quota_windows(backend,account,window_type,window_started_at,reset_at,updated_at) VALUES('anthropic','default','daily','2026-08-01T00:00:00Z','2026-08-02T00:00:00Z','2026-08-01T00:00:00Z')`); err != nil {
+		seed.Close()
+		t.Fatal(err)
+	}
+	if err := seed.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	const goroutines = 6
+	var wg sync.WaitGroup
+	errs := make(chan error, goroutines)
+	for i := 0; i < goroutines; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			db, err := Open(home)
+			if err != nil {
+				errs <- err
+				return
+			}
+			db.Close()
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Errorf("concurrent Open failed: %v", err)
+	}
+
+	db, err := Open(home)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	var count int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM spend_reservations WHERE created_unix_nano != -9223372036854775808`).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 5 {
+		t.Fatalf("expected 5 backfilled spend_reservations, got %d", count)
 	}
 }
