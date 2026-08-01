@@ -64,8 +64,10 @@ if [ -f "$extracted_bin" ]; then
 		notes+=("extracted binary mode is ${extracted_mode}, must be exactly 755")
 	fi
 
-	built_sha=$(sha256sum "$GOV_BIN" | awk '{print $1}')
-	extracted_sha=$(sha256sum "$extracted_bin" | awk '{print $1}')
+	built_sha=$(sha256sum "$GOV_BIN" 2>/dev/null | awk '{print $1}')
+	[ -n "$built_sha" ] || built_sha=$(shasum -a 256 "$GOV_BIN" | awk '{print $1}')
+	extracted_sha=$(sha256sum "$extracted_bin" 2>/dev/null | awk '{print $1}')
+	[ -n "$extracted_sha" ] || extracted_sha=$(shasum -a 256 "$extracted_bin" | awk '{print $1}')
 	if [ "$extracted_sha" = "$built_sha" ]; then
 		hash_match_ok=true
 	else
