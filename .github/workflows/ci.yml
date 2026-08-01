@@ -282,6 +282,17 @@ jobs:
         with:
           go-version-file: go.mod
 
+      - name: Enroll trusted tools
+        shell: bash
+        run: |
+          mkdir -p "$HOME/.governator"
+          git_bin="$(command -v git)"
+          if [ -x /usr/bin/git ]; then git_bin=/usr/bin/git; fi
+          go run ./cmd/gov tools enroll git "$git_bin"
+          py_bin="$(command -v python3)"
+          if [ -x /usr/bin/python3 ]; then py_bin=/usr/bin/python3; fi
+          go run ./cmd/gov tools enroll python3 "$py_bin"
+
       - name: Compute release identity
         shell: bash
         run: |
@@ -318,4 +329,3 @@ jobs:
         with:
           name: native-acceptance-${{ matrix.runner }}
           path: acceptance.json
-

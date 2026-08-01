@@ -455,7 +455,11 @@ func TestCredentialMountDirectoryRequiresAuthorization(t *testing.T) {
 	if err != nil {
 		t.Fatalf("expected an explicitly authorized directory to mount, got: %v", err)
 	}
-	want := sub + ":" + credentialContainerRoot + "/aws:ro"
+	resolvedSub, err := filepath.EvalSymlinks(sub)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := resolvedSub + ":" + credentialContainerRoot + "/aws:ro"
 	found := false
 	for _, a := range args {
 		if a == want {
