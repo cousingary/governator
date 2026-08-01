@@ -45,7 +45,6 @@ import (
 	"github.com/cousingary/governator/internal/assay"
 	"github.com/cousingary/governator/internal/containment"
 	"github.com/cousingary/governator/internal/redteamgate"
-	"github.com/cousingary/governator/internal/toolregistry"
 )
 
 // darwinNativeHostSkipReason is the manifest's allowed_skip reason text for
@@ -130,17 +129,12 @@ func TestV12Case35DarwinNativeAssayerRefusesRatherThanDegrades(t *testing.T) {
 	if runtime.GOOS != "darwin" {
 		t.Skipf("%s (Sol12 P1-1: requires a native Darwin Assayer refusal)", darwinNativeHostSkipReason)
 	}
-	enrollRealPython3(t)
-	registry, rerr := toolregistry.Load()
-	if rerr != nil {
-		t.Fatal(rerr)
-	}
 	stubDir := t.TempDir()
 	stub := "import json\nprint(json.dumps({'verdict':'pass','failed_checks':[],'had_error':False}))\n"
 	if werr := os.WriteFile(filepath.Join(stubDir, "cli.py"), []byte(stub), 0o755); werr != nil {
 		t.Fatal(werr)
 	}
-	_, serr := assay.BuildSnapshot(registry, assay.Config{Repo: stubDir, Python: "python3"})
+	_, serr := assay.BuildSnapshot(nil, assay.Config{Repo: stubDir, Python: "python3"})
 	if serr == nil {
 		t.Fatal("expected BuildSnapshot to refuse sealed-memfd package execution on darwin, got nil error")
 	}

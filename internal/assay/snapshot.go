@@ -280,6 +280,9 @@ func BuildSnapshot(registry *toolregistry.Registry, cfg Config) (*Snapshot, erro
 	if !cfg.Configured() {
 		return nil, fmt.Errorf("assay: cannot build an execution snapshot for an unconfigured repo")
 	}
+	if runtime.GOOS != "linux" {
+		return nil, fmt.Errorf("assay: sealed-memfd package execution is unsupported on %s", runtime.GOOS)
+	}
 	if registry == nil {
 		return nil, fmt.Errorf("assay: cannot build an execution snapshot without a frozen tool registry")
 	}
@@ -314,10 +317,6 @@ func BuildSnapshot(registry *toolregistry.Registry, cfg Config) (*Snapshot, erro
 	if _, statErr := os.Stat(filepath.Join(cfg.Repo, "cli.py")); statErr != nil {
 		return nil, fmt.Errorf("assay: cli.py missing from repo %s: %w", cfg.Repo, statErr)
 	}
-	if runtime.GOOS != "linux" {
-		return nil, fmt.Errorf("assay: sealed-memfd package execution is unsupported on %s", runtime.GOOS)
-	}
-
 	var packaged []packagedFile
 
 	buf := &bytes.Buffer{}
