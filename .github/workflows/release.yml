@@ -71,6 +71,18 @@ jobs:
           ref: ${{ steps.assayer-ref.outputs.ref }}
           path: assayer
 
+      # Assayer is a pinned release input, not Governator source. Keep this
+      # runner-local checkout out of Governator's untracked-file cleanliness
+      # check without weakening the repository-wide .gitignore.
+      - name: Isolate the pinned Assayer checkout from source cleanliness
+        run: |
+          printf '/assayer/\n' >> .git/info/exclude
+          if [ -n "$(git status --porcelain --untracked-files=all)" ]; then
+            echo "::error::Governator source checkout is dirty after isolating Assayer"
+            git status --short
+            exit 1
+          fi
+
       - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
           go-version-file: go.mod
