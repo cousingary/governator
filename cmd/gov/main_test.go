@@ -411,9 +411,13 @@ func TestShadowParityMatchMismatchUnavailable(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("GOV_HOME", home)
 	t.Setenv("GOV_TOOLREGISTRY_FILE", filepath.Join(t.TempDir(), "tools.yaml"))
-	python, err := exec.LookPath("python3")
-	if err != nil {
-		t.Fatal(err)
+	python := os.Getenv("GOV_SYSTEM_PYTHON3")
+	if python == "" {
+		var err error
+		python, err = exec.LookPath("python3")
+		if err != nil {
+			t.Fatal(err)
+		}
 	}
 	if _, err := toolregistry.Enroll("python3", python); err != nil {
 		t.Skipf("python3 cannot be enrolled on this platform: %v", err)

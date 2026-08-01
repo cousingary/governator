@@ -51,6 +51,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"testing"
 
@@ -64,6 +65,9 @@ import (
 // effect on the exact launch Evaluate performs, because that launch never
 // imports `site` at all.
 func TestV10Case25SitecustomizeAttemptsToAlterEvaluationHasNoEffect(t *testing.T) {
+	if runtime.GOOS == "darwin" {
+		t.Skip("requires Linux sealed Python runtime execution; TestV12Case35DarwinNativeAssayerRefusesRatherThanDegrades verifies the paired Darwin fail-closed boundary")
+	}
 	requirePython3(t)
 	repo := fixtureRepo(t)
 	snap := buildTestSnapshot(t, repo)
@@ -126,6 +130,9 @@ func TestV10Case25SitecustomizeAttemptsToAlterEvaluationHasNoEffect(t *testing.T
 // exact launch Evaluate performs, for the same structural reason as case
 // 25: that launch never imports `site`.
 func TestV10Case26PthFileAttemptsStartupExecutionHasNoEffect(t *testing.T) {
+	if runtime.GOOS == "darwin" {
+		t.Skip("requires Linux sealed Python runtime execution; TestV12Case35DarwinNativeAssayerRefusesRatherThanDegrades verifies the paired Darwin fail-closed boundary")
+	}
 	requirePython3(t)
 	repo := fixtureRepo(t)
 	snap := buildTestSnapshot(t, repo)

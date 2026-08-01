@@ -1,4 +1,4 @@
-#!/usr/bin/bash
+#!/bin/bash
 # scripts/audit_bundle.sh — Sol9 P2-2 / Sol11 P0-2: the single, canonical
 # audit/source bundle generator.
 #

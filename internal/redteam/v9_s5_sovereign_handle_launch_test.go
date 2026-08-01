@@ -92,6 +92,7 @@ func swapInPlace(t *testing.T, target, script string) {
 // operation the session performs afterward must still succeed via the
 // pre-swap wrapper, and the marker file must never show the hostile mark.
 func TestV9Case4EnrolledGitSwapAfterSessionOpenCannotChangeExecutedBytes(t *testing.T) {
+	requireLinuxSealedExecution(t, "/proc/self/fd held-git execution")
 	realGit := resolveRealTool(t, "git", "/usr/bin/git")
 
 	regDir := t.TempDir()
@@ -181,6 +182,7 @@ func TestV9Case4EnrolledGitSwapAfterSessionOpenCannotChangeExecutedBytes(t *test
 // v9_s1_wrapper_composition_test.go's TestV9Case2 (which proves the
 // identical shape for unshare).
 func TestV9Case5EnrolledBashSwapAfterHandleOpenCannotChangeExecutedBytes(t *testing.T) {
+	requireLinuxSealedExecution(t, "/proc/self/fd held-bash execution")
 	regDir := t.TempDir()
 	t.Setenv("GOV_TOOLREGISTRY_FILE", filepath.Join(regDir, "tools.yaml"))
 

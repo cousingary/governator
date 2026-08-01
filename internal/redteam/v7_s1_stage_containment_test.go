@@ -226,6 +226,7 @@ func enrollRealPython3(t *testing.T) string {
 // readOnly=true -- no writable root at all -- so this attack should never
 // reach disk regardless of where it targets.
 func TestV7Case11AssayerExternalWriteBlockedOrContained(t *testing.T) {
+	requireLinuxSealedExecution(t, "sealed Assayer execution and external containment")
 	enforce.SelfExeOverride = govBinary(t)
 	defer func() { enforce.SelfExeOverride = "" }()
 	enrollRealPython3(t)
@@ -267,6 +268,7 @@ print(json.dumps({"verdict":"pass","failed_checks":[],"had_error":False}))
 // TestV7Case12AssayerNetworkExfiltrationBlockedOrContained is Case 11's
 // network-exfiltration sibling.
 func TestV7Case12AssayerNetworkExfiltrationBlockedOrContained(t *testing.T) {
+	requireLinuxSealedExecution(t, "sealed Assayer execution and external containment")
 	enforce.SelfExeOverride = govBinary(t)
 	defer func() { enforce.SelfExeOverride = "" }()
 	enrollRealPython3(t)

@@ -33,6 +33,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -124,6 +125,9 @@ func dockerLifecycleRunner(container string) (*runner.DockerRunner, runner.Works
 
 func launchDockerLifecycle(t *testing.T, d *runner.DockerRunner, ws runner.Workspace, timeout time.Duration) (agents.Result, error) {
 	t.Helper()
+	if runtime.GOOS == "darwin" {
+		t.Skip("requires Linux sealed Docker CLI execution; the Darwin native platform cases verify the paired fail-closed boundary")
+	}
 	return d.Launch(context.Background(), ws, runner.LaunchRequest{
 		Agent:   dockerLifecycleFakeAgent{},
 		Request: agents.Request{Workdir: ws.Path, Timeout: timeout},

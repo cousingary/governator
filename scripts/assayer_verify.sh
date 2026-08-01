@@ -1,4 +1,4 @@
-#!/usr/bin/bash
+#!/bin/bash
 # Sol redteam v7 S8 (corpus case 37): Assayer's declared version must have a
 # matching Git tag in its own repo, pointing at the exact commit that
 # actually shipped. Sol's audit found Assayer at declared version 1.1.0 with

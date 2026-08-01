@@ -46,6 +46,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -57,6 +58,9 @@ import (
 // there is no window during which an in-flight read could observe altered
 // bytes.
 func TestV11Case36ConsumedArtifactSealedMemfdReopenWriteAttemptRejected(t *testing.T) {
+	if runtime.GOOS == "darwin" {
+		t.Skip("requires Linux sealed memfd consumed-artifact projection; TestV12Case35DarwinNativeAssayerRefusesRatherThanDegrades verifies the paired Darwin fail-closed boundary")
+	}
 	original := []byte("original-consumed-artifact-content")
 	sum := sha256.Sum256(original)
 	sealed, err := sealConsumedArtifacts([]stagedArtifact{{

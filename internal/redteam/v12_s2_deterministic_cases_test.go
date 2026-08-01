@@ -4,6 +4,7 @@ package redteam
 
 import (
 	"context"
+	"runtime"
 	"testing"
 	"time"
 
@@ -113,6 +114,9 @@ func TestV12Case9LiveSystemdSuccessPathRequiredInAttestation(t *testing.T) {
 // cgroup, Landlock, or hangfuse needed) is sufficient to exercise the gate, so
 // this case is fully deterministic and never host-skips.
 func TestV12Case10ExtinctionFiresOnlyAfterConfirmedBlockingRead(t *testing.T) {
+	if runtime.GOOS == "darwin" {
+		t.Skip("requires Linux /proc descendant-extinction proof; TestV12Case34DarwinNativeContainmentNeverClaimsStrongScope verifies the paired Darwin fail-closed boundary")
+	}
 	ready := make(chan struct{})
 	gateFired := make(chan struct{}, 1)
 	containment.ExtinguishGateForTesting = func() error {

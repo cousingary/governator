@@ -1,4 +1,4 @@
-#!/usr/bin/bash
+#!/bin/bash
 # scripts/release_tier_pipeline.sh -- Sol11 rc5 Session 3 (P1-5): runs a
 # sequence of named tiers, each backed by an atomic, identity-scoped
 # checkpoint (scripts/release_checkpoint.py), with fail-fast semantics: the

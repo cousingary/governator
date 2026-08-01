@@ -26,6 +26,7 @@ func v14S6Evidence(t *testing.T, commit string) string {
 }
 
 func TestV14Case324RealAssayerPassVerdictIsHonored(t *testing.T) {
+	requireLinuxSealedExecution(t, "Landlock and sealed Assayer integration execution")
 	candidate, evidence, log := v14S5CandidateAndTier(t, "^TestEvaluateAgainstRealCLIPassAndFail$", "./internal/assay")
 	if res := redteamgate.EvaluateIntegrationWithOptions(log, []string{"TestEvaluateAgainstRealCLIPassAndFail"}, redteamgate.IntegrationOptions{HarnessEvidencePath: evidence, ExpectedGovernorBinarySHA256: v14S5SHA256(t, candidate), ExpectedEvidencePackages: []string{"assay"}, ExpectedAssayerCommit: "258770ddabb098f43a4b550a00d55b1cd77a658f"}); !res.OK {
 		t.Fatalf("real Assayer pass/fail bridge was not accepted: %+v", res)
@@ -48,6 +49,7 @@ func TestV14Case329PostEvaluationArtifactMutationIsDetected(t *testing.T) {
 
 func v14S6RequireBridge(t *testing.T, name string) {
 	t.Helper()
+	requireLinuxSealedExecution(t, "external enforcement and sealed Assayer execution")
 	candidate, evidence, log := v14S5CandidateAndTier(t, "^"+name+"$", "./internal/assay")
 	if res := redteamgate.EvaluateIntegrationWithOptions(log, []string{name}, redteamgate.IntegrationOptions{HarnessEvidencePath: evidence, ExpectedGovernorBinarySHA256: v14S5SHA256(t, candidate), ExpectedEvidencePackages: []string{"assay"}}); !res.OK {
 		t.Fatalf("mandatory bridge test %s was not accepted: %+v", name, res)

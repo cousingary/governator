@@ -6,6 +6,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -24,6 +25,9 @@ func writeV7S3Probe(t *testing.T, dir, result string) {
 
 func runV7S3Stage(t *testing.T, workdir string, env controllerenv.Frozen, command string) string {
 	t.Helper()
+	if runtime.GOOS == "darwin" {
+		t.Skip("requires Linux sealed controller-tool execution; the Darwin native platform cases verify the paired fail-closed boundary")
+	}
 	registryFile := filepath.Join(t.TempDir(), "tools.yaml")
 	t.Setenv("GOV_TOOLREGISTRY_FILE", registryFile)
 	if _, err := toolregistry.Enroll("bash", "/bin/sh"); err != nil {

@@ -1,4 +1,4 @@
-#!/usr/bin/bash
+#!/bin/bash
 # Sol redteam v4 S8 (P0-7, report attacks 24/25): the hard, release-blocking
 # gate that closes the gap the audit found -- a shipped binary two security
 # commits behind the submitted source, packaged at mode 0777, with full

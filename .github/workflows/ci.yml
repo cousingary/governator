@@ -79,6 +79,9 @@ jobs:
             chmod 0755 "$secure_bin/python3" "$secure_bin/setsid" "$secure_bin/minisign"
           fi
           printf '/assayer/\n' >> .git/info/exclude
+          if ! git show-ref --verify --quiet refs/heads/main; then
+            git branch --track main origin/main
+          fi
 
       - name: Enroll trusted tools
         shell: bash
@@ -130,6 +133,7 @@ jobs:
         shell: bash
         run: |
           if [ "$RUNNER_OS" = "macOS" ]; then
+            export GOV_SYSTEM_PYTHON3="$(command -v python3)"
             export PATH="$RUNNER_TEMP/governator-tools:$PATH"
           fi
           go test -tags redteam -count=1 ./...
@@ -138,6 +142,7 @@ jobs:
         shell: bash
         run: |
           if [ "$RUNNER_OS" = "macOS" ]; then
+            export GOV_SYSTEM_PYTHON3="$(command -v python3)"
             export PATH="$RUNNER_TEMP/governator-tools:$PATH"
           fi
           go test -race -tags redteam -count=1 ./...

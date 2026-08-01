@@ -40,6 +40,7 @@ import (
 	"encoding/hex"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 	"time"
 
@@ -48,6 +49,9 @@ import (
 )
 
 func TestV13Case298ConsumedArtifactSelectionIsNotLexicographicOnRFC3339Nano(t *testing.T) {
+	if runtime.GOOS == "darwin" {
+		t.Skip("requires Linux openat2 beneath-root artifact reads; the production boundary refuses rather than falling back to weaker path checks on Darwin")
+	}
 	// Earlier run, whose all-zero fraction RFC3339Nano trims away entirely.
 	const olderCreated = "2026-07-27T12:00:00Z"
 	// Later run (by 500ms), whose fraction survives.

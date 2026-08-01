@@ -227,6 +227,7 @@ func TestV15Case366PathnameHelperSwappedDuringTestIsDetected(t *testing.T) {
 }
 
 func TestV15Case367ProcSelfExeDescriptorRouteIsRequiredInMandatoryIntegration(t *testing.T) {
+	requireLinuxSealedExecution(t, "/proc/self/exe descriptor-routed integration execution")
 	_, evidenceDir, log := v14S5CandidateAndTier(t, "^"+v15S3ExpectedTest+"$", "./internal/contextgraph")
 	res := redteamgate.EvaluateIntegrationWithOptions(log, []string{v15S3ExpectedTest}, redteamgate.IntegrationOptions{
 		HarnessEvidencePath:      evidenceDir,

@@ -19,6 +19,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -67,6 +68,9 @@ func v12s4FrozenRunEnvironment(t *testing.T) *toolregistry.Registry {
 // shell() calls made through that same object for the rest of the
 // transaction -- shell() must never reload the registry itself.
 func TestV12Case20GitRegistryRotatedAfterRunFreezeHasNoEffect(t *testing.T) {
+	if runtime.GOOS == "darwin" {
+		t.Skip("requires Linux sealed controller-tool execution; the Darwin native platform cases verify the paired fail-closed boundary")
+	}
 	dir := t.TempDir()
 	registry := v12s4FrozenRunEnvironment(t)
 
@@ -122,6 +126,9 @@ func TestV12Case20GitRegistryRotatedAfterRunFreezeHasNoEffect(t *testing.T) {
 // weaker, more relevant property that the NEXT shell() call (still passed
 // the same frozen *Registry) also keeps resolving the original bash.
 func TestV12Case21BashRegistryRotatedAfterRunFreezeHasNoEffect(t *testing.T) {
+	if runtime.GOOS == "darwin" {
+		t.Skip("requires Linux sealed controller-tool execution; the Darwin native platform cases verify the paired fail-closed boundary")
+	}
 	dir := t.TempDir()
 	registry := v12s4FrozenRunEnvironment(t)
 
@@ -196,6 +203,9 @@ func TestV12Case22ShellRefusesToRunWithoutAFrozenRegistry(t *testing.T) {
 // genuinely provides (sed, in this case: present in the test process's own
 // ambient PATH, but absent from shell()'s private launch PATH).
 func TestV12Case23ShellCommandStringCannotResolveAmbientTools(t *testing.T) {
+	if runtime.GOOS == "darwin" {
+		t.Skip("requires Linux sealed controller-tool execution; the Darwin native platform cases verify the paired fail-closed boundary")
+	}
 	dir := t.TempDir()
 	registry := v12s4FrozenRunEnvironment(t)
 

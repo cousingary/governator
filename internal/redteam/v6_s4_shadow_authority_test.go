@@ -149,6 +149,7 @@ func TestV6Case20ShadowEmptyOutputNeverOverridesGoDeny(t *testing.T) {
 // distinct script content each time (not a stale, cached PythonDecision
 // from the first script silently reused for the second).
 func TestV6Case21ShadowScriptChangeBetweenReplaysIsDetected(t *testing.T) {
+	requireLinuxSealedExecution(t, "sealed Python shadow execution")
 	home := t.TempDir()
 	enrollPythonForShadow(t)
 	// Both scripts are chosen to MISMATCH the Go deny (so both calls'

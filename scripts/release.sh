@@ -1,4 +1,4 @@
-#!/usr/bin/bash
+#!/bin/bash
 # Sol redteam v3 S14 (finding #20 / P2.2): the single, canonical release
 # pipeline. Before this session, two incompatible generations existed side
 # by side: this script (single-platform, real ldflags identity, no

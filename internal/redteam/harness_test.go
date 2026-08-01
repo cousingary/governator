@@ -36,6 +36,13 @@ var (
 	govBinaryErr  error
 )
 
+func requireLinuxSealedExecution(t *testing.T, capability string) {
+	t.Helper()
+	if runtime.GOOS == "darwin" {
+		t.Skipf("requires Linux %s; TestV12Case34DarwinNativeContainmentNeverClaimsStrongScope and TestV12Case35DarwinNativeAssayerRefusesRatherThanDegrades verify the paired Darwin fail-closed production boundaries", capability)
+	}
+}
+
 // useDegradedContainmentScopeForTest swaps in the test-only descendant-
 // fixture can drive Governator's approval/merge/replay paths end to end on a
 // host that lacks systemd --user, a usable cgroup v2 subtree, or a PID
@@ -209,6 +216,7 @@ func runGoverned(t *testing.T, home, bin string, c contracts.Contract) govruntim
 
 func runGovernedAllowError(t *testing.T, home, bin string, c contracts.Contract) (govruntime.RunRecord, error) {
 	t.Helper()
+	requireLinuxSealedExecution(t, "sealed controller-tool execution and descendant-owning containment")
 	// Authority-derived containment makes effectful local fixtures use the
 	// same Landlock/netns prerequisites as production.
 	enrollRealControllerTools(t)

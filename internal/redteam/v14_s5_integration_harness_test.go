@@ -124,6 +124,7 @@ func TestV14Case321IntegrationTierWithAnySkipIsRejected(t *testing.T) {
 }
 
 func TestV14Case322RealGovernatorSandboxHelperExecutes(t *testing.T) {
+	requireLinuxSealedExecution(t, "Landlock and namespace integration enforcement")
 	candidate, evidenceDir, log := v14S5CandidateAndTier(t, "^TestEvaluateAgainstRealCLIPassAndFail$", "./internal/assay")
 	res := redteamgate.EvaluateIntegrationWithOptions(log, []string{"TestEvaluateAgainstRealCLIPassAndFail"}, redteamgate.IntegrationOptions{
 		HarnessEvidencePath:          evidenceDir,
@@ -136,6 +137,7 @@ func TestV14Case322RealGovernatorSandboxHelperExecutes(t *testing.T) {
 }
 
 func TestV14Case323ContextGraphInitSyncAndQueryThroughRealSandbox(t *testing.T) {
+	requireLinuxSealedExecution(t, "Landlock and namespace integration enforcement")
 	candidate, evidenceDir, log := v14S5CandidateAndTier(t, "^TestPrepareBuildsFingerprintAndQueries$", "./internal/contextgraph")
 	res := redteamgate.EvaluateIntegrationWithOptions(log, []string{"TestPrepareBuildsFingerprintAndQueries"}, redteamgate.IntegrationOptions{
 		HarnessEvidencePath:          evidenceDir,

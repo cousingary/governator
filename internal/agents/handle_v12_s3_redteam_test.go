@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -14,6 +15,9 @@ import (
 )
 
 func TestV12Case14ReplaceBackendPathAfterVerifyUsesHeldDescriptor(t *testing.T) {
+	if runtime.GOOS == "darwin" {
+		t.Skip("requires Linux /proc/self/fd executable launch; TestV12Case35DarwinNativeAssayerRefusesRatherThanDegrades verifies the paired Darwin fail-closed boundary")
+	}
 	binDir := t.TempDir()
 	binPath := filepath.Join(binDir, "claude")
 	writeHandleFixture(t, binPath, "printf original\n")

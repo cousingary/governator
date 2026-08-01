@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync/atomic"
@@ -83,6 +84,7 @@ func TestV8Case5CleanupValidatorCannotWriteOutsideDeclaredRoots(t *testing.T) {
 }
 
 func TestV8Case6AssayerFailsClosedWithoutExternalSandbox(t *testing.T) {
+	requireLinuxSealedExecution(t, "sealed Assayer execution and external containment")
 	enrollRealPython3(t)
 	enforce.ForceUnsupported = true
 	defer func() { enforce.ForceUnsupported = false }()
@@ -130,7 +132,11 @@ func TestV8Case7GraphProviderFailsClosedWithoutExternalSandbox(t *testing.T) {
 func TestV8Case8AuthorityRejectsContradictorySuppliedPlan(t *testing.T) {
 	registryFile := filepath.Join(t.TempDir(), "tools.yaml")
 	t.Setenv("GOV_TOOLREGISTRY_FILE", registryFile)
-	if _, err := toolregistry.Enroll("true", "/bin/true"); err != nil {
+	trueBin, err := exec.LookPath("true")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := toolregistry.Enroll("true", trueBin); err != nil {
 		t.Fatal(err)
 	}
 	registry, err := toolregistry.Load()
