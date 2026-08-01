@@ -405,7 +405,14 @@ GO_TEST_PARALLELISM=${GO_TEST_PARALLELISM:-2}
 # Sol3 P1.8 (S12) confirmed session's own machine can build all four
 # platforms with CGO_ENABLED=0 (modernc.org/sqlite is pure Go, no cgo
 # toolchain needed for cross-compilation).
-PLATFORMS=${PLATFORMS:-"linux/amd64 linux/arm64 darwin/amd64 darwin/arm64"}
+# v16-release Session 6 (R4): darwin/amd64 is dropped from the default
+# platform set. GitHub's free macOS runners are Apple-silicon (arm64) only;
+# there is no free native host that could ever produce executed acceptance
+# evidence for darwin/amd64, so publishing it would ship an archive nobody
+# can attest -- exactly the credibility risk R4 names. Rosetta 2 runs the
+# arm64 archive on Intel Macs. darwin/arm64 is retained for the eventual
+# evidence-based promotion once its native acceptance + corpus clear.
+PLATFORMS=${PLATFORMS:-"linux/amd64 linux/arm64 darwin/arm64"}
 # Sol12 P1-1 (rc5 Session 6): PLATFORMS is caller-controlled with no prior
 # validation -- an operator setting PLATFORMS="windows/amd64" would reach
 # the build loop below unchecked, and the per-artifact "approving" flag
