@@ -665,14 +665,29 @@ func dockerTestInspectMatching(digest string) dockerInspect {
 	return insp
 }
 
+func dockerTestResolvedImage(digest string) *ImageIdentity {
+	return &ImageIdentity{
+		Reference: "busybox@sha256:" + digest,
+		ID:        "sha256:" + digest,
+	}
+}
+
 // TestHardenedMismatchesCleanConfigNoMismatch is the positive control: a
 // docker inspect payload matching the declared hardened config exactly must
 // report zero mismatches. No daemon required — hardenedMismatches is pure.
 func TestHardenedMismatchesCleanConfigNoMismatch(t *testing.T) {
 	digest := strings.Repeat("a", 64)
 	cfg := hardenedTestConfig(digest)
-	if got := hardenedMismatches(cfg, dockerTestInspectMatching(digest)); len(got) != 0 {
+	if got := hardenedMismatches(cfg, dockerTestResolvedImage(digest), dockerTestInspectMatching(digest)); len(got) != 0 {
 		t.Fatalf("expected no mismatches for a matching inspect payload, got: %v", got)
+	}
+}
+
+func TestHardenedMismatchesRequiresFrozenResolvedImage(t *testing.T) {
+	digest := strings.Repeat("a", 64)
+	got := hardenedMismatches(hardenedTestConfig(digest), nil, dockerTestInspectMatching(digest))
+	if len(got) == 0 || !strings.Contains(strings.Join(got, "; "), "no frozen resolved image identity") {
+		t.Fatalf("missing frozen image identity must fail closed, got: %v", got)
 	}
 }
 
@@ -707,7 +722,7 @@ func TestHardenedMismatchesDetectsEachControl(t *testing.T) {
 		t.Run(c.name, func(t *testing.T) {
 			insp := dockerTestInspectMatching(digest)
 			c.mutate(&insp)
-			got := hardenedMismatches(hardenedTestConfig(digest), insp)
+			got := hardenedMismatches(hardenedTestConfig(digest), dockerTestResolvedImage(digest), insp)
 			if len(got) == 0 {
 				t.Fatal("expected at least one mismatch, got none")
 			}

@@ -1042,7 +1042,7 @@ type dockerInspect struct {
 // empty means the applied configuration matches the declaration. A pure
 // function (no docker/network access) so it is fully unit-testable against
 // fabricated inspect payloads.
-func hardenedMismatches(cfg contracts.DockerRunnerConfig, insp dockerInspect) []string {
+func hardenedMismatches(cfg contracts.DockerRunnerConfig, resolved *ImageIdentity, insp dockerInspect) []string {
 	var out []string
 	if insp.Config.User != cfg.User {
 		out = append(out, fmt.Sprintf("user: declared %q, applied %q", cfg.User, insp.Config.User))
@@ -1066,9 +1066,12 @@ func hardenedMismatches(cfg contracts.DockerRunnerConfig, insp dockerInspect) []
 		out = append(out, "apparmor_profile: declared but no apparmor= security profile applied")
 	}
 	if digest := strings.TrimPrefix(imageDigestSuffix(cfg.Image), "@"); digest != "" {
-		wantID := "sha256:" + strings.TrimPrefix(digest, "sha256:")
-		if insp.Image != wantID {
-			out = append(out, fmt.Sprintf("image: declared digest %s, applied running image id %s", wantID, insp.Image))
+		if resolved == nil || strings.TrimSpace(resolved.ID) == "" {
+			out = append(out, fmt.Sprintf("image: declared digest %s has no frozen resolved image identity", digest))
+		} else if resolved.Reference != cfg.Image {
+			out = append(out, fmt.Sprintf("image: frozen reference %q does not match declared reference %q", resolved.Reference, cfg.Image))
+		} else if insp.Image != resolved.ID {
+			out = append(out, fmt.Sprintf("image: resolved image id %s, applied running image id %s", resolved.ID, insp.Image))
 		}
 	}
 	if cfg.MemoryLimit != "" && insp.HostConfig.Memory <= 0 {
@@ -1249,7 +1252,7 @@ func (d *DockerRunner) Observe(ctx context.Context, ws Workspace) (ObserveResult
 	if !hardened {
 		return base, nil
 	}
-	if mismatches := hardenedMismatches(d.Config, insp); len(mismatches) > 0 {
+	if mismatches := hardenedMismatches(d.Config, d.ResolvedImage, insp); len(mismatches) > 0 {
 		detail := strings.Join(mismatches, "; ")
 		base.Notes = appendDockerNote(base.Notes, "hardened_mismatch: "+detail)
 		return base, fmt.Errorf("docker hardened observation: applied configuration does not match declared hardened config: %s", detail)
