@@ -77,6 +77,7 @@ jobs:
           repository: ${{ vars.ASSAYER_REPOSITORY || 'cousingary/assayer' }}
           ref: ${{ steps.assayer-ref.outputs.ref }}
           path: assayer
+          fetch-depth: 0
 
       # Assayer is a pinned release input, not Governator source. Keep this
       # runner-local checkout out of Governator's untracked-file cleanliness
@@ -89,6 +90,14 @@ jobs:
             git status --short
             exit 1
           fi
+
+      # Ubuntu 24.04 runner images ship AppArmor's additional unprivileged
+      # user-namespace restriction enabled. Governator's mandatory Linux
+      # integration tests exercise the real Landlock+unshare containment
+      # path, so fail closed unless this ephemeral runner can enable that
+      # kernel capability.
+      - name: Enable the mandatory Linux containment capability
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
 
       - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:

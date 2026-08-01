@@ -244,3 +244,29 @@ func TestV16Case415GenericCIPythonUsesTrustedRunnerImage(t *testing.T) {
 		t.Fatalf("absolute root-owned runner-image python policy rejected: %v\n%s", err, out)
 	}
 }
+
+func TestV16Case416HostedAssayerCheckoutRetainsPinnedReleaseTag(t *testing.T) {
+	content, err := os.ReadFile(filepath.Join(repoRootForBundleTests(t), ".github", "workflows", "release.yml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	src := string(content)
+	checkout := "repository: ${{ vars.ASSAYER_REPOSITORY || 'cousingary/assayer' }}\n" +
+		"          ref: ${{ steps.assayer-ref.outputs.ref }}\n" +
+		"          path: assayer\n" +
+		"          fetch-depth: 0"
+	if !strings.Contains(src, checkout) {
+		t.Fatal("hosted Assayer checkout must retain tag history for exact pinned-release identity")
+	}
+}
+
+func TestV16Case417HostedRunnerEnablesMandatoryLinuxContainment(t *testing.T) {
+	content, err := os.ReadFile(filepath.Join(repoRootForBundleTests(t), ".github", "workflows", "release.yml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(content),
+		"sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0") {
+		t.Fatal("Ubuntu 24.04 hosted release must enable the mandatory Landlock+unshare containment path")
+	}
+}

@@ -2328,6 +2328,16 @@ cases:
     session: v16-s7a
     required: true
     status: implemented
+  - case: 416
+    name: TestV16Case416HostedAssayerCheckoutRetainsPinnedReleaseTag
+    session: v16-s7a
+    required: true
+    status: implemented
+  - case: 417
+    name: TestV16Case417HostedRunnerEnablesMandatoryLinuxContainment
+    session: v16-s7a
+    required: true
+    status: implemented
 
 # Case 296 is not one of Sol13's original 51 findings (which occupy 245-295).
 # It closes a gap the rc6-upg13 S3 exclusion audit found: TestV6Case29's own
