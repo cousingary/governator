@@ -40,6 +40,11 @@ fi
 # object before even asking Git whether the tree is clean. There is no PATH
 # lookup for go, python3, sha256sum, tar, gzip, minisign, or git below.
 RELEASE_TOOL_POLICY=${GOV_RELEASE_TOOL_POLICY:-"$ROOT/scripts/release_tool_policy.yaml"}
+RELEASE_TOOL_PROFILE=${RELEASE_TOOL_PROFILE:-reviewed-bytes}
+case "$RELEASE_TOOL_PROFILE" in
+  reviewed-bytes|github-hosted-ephemeral) ;;
+  *) echo "release: unsupported RELEASE_TOOL_PROFILE: $RELEASE_TOOL_PROFILE" >&2; exit 1 ;;
+esac
 release_tool_value() {
   local wanted_tool=$1 wanted_field=$2 line active=0
   while IFS= read -r line || [ -n "$line" ]; do
@@ -70,8 +75,18 @@ release_tool_value() {
   return 1
 }
 
+resolve_release_tool_path() {
+  local wanted_tool=$1 value
+  if [ "$RELEASE_TOOL_PROFILE" = "reviewed-bytes" ]; then
+    release_tool_value "$wanted_tool" path
+    return
+  fi
+  value=$(release_tool_value "$wanted_tool" command) || return 1
+  command -v "$value"
+}
+
 for release_tool in go python3 python3.10 python3.11 python3.12 python3.13 sha256sum tar gzip minisign git bash date awk env cp rm mkdir find sort mktemp dirname pwd grep uname cat chmod stat basename timeout mv ls systemctl docker tail; do
-  release_tool_path=$(release_tool_value "$release_tool" path) || {
+  release_tool_path=$(resolve_release_tool_path "$release_tool") || {
     echo "release: approved tool ${release_tool} is absent from ${RELEASE_TOOL_POLICY}" >&2
     exit 1
   }
@@ -142,7 +157,7 @@ BOOTSTRAP_MKDIR_TOOL=$MKDIR_TOOL
 # wherever the source checkout happens to be mounted.
 TOOLBIN_DIR=$("$PYTHON_TOOL" -c 'import tempfile; print(tempfile.mkdtemp(prefix="governator-release-toolbin-"))')
 BOOTSTRAP_TOOLSET=$("$PYTHON_TOOL" -c 'import tempfile; print(tempfile.mkstemp(prefix="governator-release-toolset-")[1])')
-if ! "$PYTHON_TOOL" "$ROOT/scripts/release_toolset.py" --policy "$RELEASE_TOOL_POLICY" --out "$BOOTSTRAP_TOOLSET" --toolbin "$TOOLBIN_DIR" >/dev/null; then
+if ! "$PYTHON_TOOL" "$ROOT/scripts/release_toolset.py" --policy "$RELEASE_TOOL_POLICY" --profile "$RELEASE_TOOL_PROFILE" --out "$BOOTSTRAP_TOOLSET" --toolbin "$TOOLBIN_DIR" >/dev/null; then
   "$PYTHON_TOOL" -c 'import os,sys; os.unlink(sys.argv[1])' "$BOOTSTRAP_TOOLSET"
   echo "release: approved release-tool policy verification failed" >&2
   exit 1
@@ -491,7 +506,7 @@ GO_SUM_HASH=$(sha256sum go.sum | awk '{print $1}')
 # attempt) and moved into place once OUT_DIR is settled.
 # ---------------------------------------------------------------------------
 TOOLSET_JSON_TEMP=$(mktemp)
-TOOLSET_HASH=$(python3 "$ROOT/scripts/release_toolset.py" --policy "$RELEASE_TOOL_POLICY" --out "$TOOLSET_JSON_TEMP")
+TOOLSET_HASH=$(python3 "$ROOT/scripts/release_toolset.py" --policy "$RELEASE_TOOL_POLICY" --profile "$RELEASE_TOOL_PROFILE" --out "$TOOLSET_JSON_TEMP")
 
 # ---------------------------------------------------------------------------
 # P1-5 (Sol11): release-attempt state machine identity + resumable
@@ -597,7 +612,13 @@ fi
 # mismatch still fails loudly rather than being silently papered over by a
 # wipe-and-recreate.
 "$BOOTSTRAP_RM_TOOL" -f "$TOOLSET_JSON_TEMP"
-"$BOOTSTRAP_PYTHON_TOOL" "$ROOT/scripts/release_toolset.py" --policy "$RELEASE_TOOL_POLICY" --out "$OUT_DIR/toolset.json" --toolbin "$TOOLBIN_DIR" >/dev/null
+"$BOOTSTRAP_PYTHON_TOOL" "$ROOT/scripts/release_toolset.py" --policy "$RELEASE_TOOL_POLICY" --profile "$RELEASE_TOOL_PROFILE" --out "$OUT_DIR/toolset.json" --toolbin "$TOOLBIN_DIR" >/dev/null
+if [ "$RELEASE_TOOL_PROFILE" = "github-hosted-ephemeral" ]; then
+  "$BOOTSTRAP_PYTHON_TOOL" "$ROOT/scripts/builder_provenance.py" \
+    --workflow "$ROOT/.github/workflows/release.yml" \
+    --policy "$RELEASE_TOOL_POLICY" \
+    --out "$OUT_DIR/builder-provenance.json"
+fi
 export PATH="$TOOLBIN_DIR"
 IDENTITY_FILE="$CHECKPOINT_STATE_DIR/identity.json"
 python3 "$ROOT/scripts/release_checkpoint.py" init --state-dir "$CHECKPOINT_STATE_DIR" --identity-file "$CANDIDATE_IDENTITY" --attempt-id "$RELEASE_ATTEMPT_ID" >/dev/null
@@ -671,7 +692,7 @@ LDFLAGS="-s -w -X main.version=${VERSION} -X main.sourceCommit=${COMMIT} -X main
 # substituted between preflight and build would produce artifacts whose
 # toolset_hash claim is a lie.
 # ---------------------------------------------------------------------------
-if ! python3 "$ROOT/scripts/release_toolset.py" --policy "$RELEASE_TOOL_POLICY" --verify "$OUT_DIR/toolset.json"; then
+if ! python3 "$ROOT/scripts/release_toolset.py" --policy "$RELEASE_TOOL_POLICY" --verify "$OUT_DIR/toolset.json" --profile "$RELEASE_TOOL_PROFILE"; then
   echo "release: refusing to build -- a release tool changed identity since preflight (Sol12 P1-4)" >&2
   exit 1
 fi
@@ -1046,7 +1067,7 @@ MAIN_TIER_PIPELINE_OK=true
 # preflight (toolset.json creation) and the first tier execution. A same-UID
 # process could swap a tool binary after the hash was recorded; this check
 # catches it before any tier evidence is produced with a different tool.
-if ! python3 "$ROOT/scripts/release_toolset.py" --policy "$RELEASE_TOOL_POLICY" --verify "$OUT_DIR/toolset.json"; then
+if ! python3 "$ROOT/scripts/release_toolset.py" --policy "$RELEASE_TOOL_POLICY" --verify "$OUT_DIR/toolset.json" --profile "$RELEASE_TOOL_PROFILE"; then
   echo "release: refusing to run test tiers -- a release tool changed identity since preflight (Sol12 P1-4)" >&2
   exit 1
 fi
@@ -1961,6 +1982,9 @@ CHECKSUMS="$OUT_DIR/checksums.txt"
     acceptance/gov integration-expected-names.txt integration-expected-packages.txt
     .acceptance-pre-integration.json
   )
+  if [ -f builder-provenance.json ]; then
+    checksum_inputs+=(builder-provenance.json)
+  fi
   for attestation_file in attestations/*.json; do
     [ -e "$attestation_file" ] || break
     checksum_inputs+=("$attestation_file")
@@ -2061,7 +2085,7 @@ python3 "$ROOT/scripts/release_policy.py" signature \
 # S4 closes the same-UID replacement window through the final release gate.
 # The shipped toolset evidence is valid only if the approved objects still
 # match after signing and in-process verification have completed.
-if ! python3 "$ROOT/scripts/release_toolset.py" --policy "$RELEASE_TOOL_POLICY" --verify "$OUT_DIR/toolset.json"; then
+if ! python3 "$ROOT/scripts/release_toolset.py" --policy "$RELEASE_TOOL_POLICY" --verify "$OUT_DIR/toolset.json" --profile "$RELEASE_TOOL_PROFILE"; then
   echo "release: refusing to complete -- a release tool changed after preflight (Sol13 P0-2/P1-4)" >&2
   exit 1
 fi

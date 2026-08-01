@@ -2263,6 +2263,56 @@ cases:
     session: v16-s6
     required: true
     status: implemented
+  - case: 403
+    name: TestV16Case403ReviewedBytesProfileRemainsUnchanged
+    session: v16-s7a
+    required: true
+    status: implemented
+  - case: 404
+    name: TestV16Case404ForgedGitHubEnvironmentNeverAuthenticatesMeasurements
+    session: v16-s7a
+    required: true
+    status: implemented
+  - case: 405
+    name: TestV16Case405MutableActionOrRunnerReferenceIsRejected
+    session: v16-s7a
+    required: true
+    status: implemented
+  - case: 406
+    name: TestV16Case406MismatchedCIIdentityIsRejected
+    session: v16-s7a
+    required: true
+    status: implemented
+  - case: 407
+    name: TestV16Case407CIToolChangedAfterMeasurementFailsVerification
+    session: v16-s7a
+    required: true
+    status: implemented
+  - case: 408
+    name: TestV16Case408CIMeasurementCannotSerializeApprovedIdentity
+    session: v16-s7a
+    required: true
+    status: implemented
+  - case: 409
+    name: TestV16Case409BuilderProvenanceIsCoveredByChecksums
+    session: v16-s7a
+    required: true
+    status: implemented
+  - case: 410
+    name: TestV16Case410MissingOrMismatchedGitHubAttestationBlocksVerification
+    session: v16-s7a
+    required: true
+    status: implemented
+  - case: 411
+    name: TestV16Case411ReleaseWorkflowPassesStaticHostedPolicy
+    session: v16-s7a
+    required: true
+    status: implemented
+  - case: 412
+    name: TestV16Case412CILocalArchiveByteComparisonRemainsMandatory
+    session: v16-s7a
+    required: true
+    status: implemented
 
 # Case 296 is not one of Sol13's original 51 findings (which occupy 245-295).
 # It closes a gap the rc6-upg13 S3 exclusion audit found: TestV6Case29's own

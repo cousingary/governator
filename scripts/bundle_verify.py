@@ -181,6 +181,39 @@ def verify_git_bundle(bundle: pathlib.Path, failures: list[str]) -> None:
             failures.append(f"UNBOUND: git bundle verification failed: {proc.stderr.strip()}")
 
 
+def verify_github_provenance(bundle: pathlib.Path, failures: list[str], gh_bin: str,
+                             expected_tag: str, expected_commit: str,
+                             attestation_bundle: str | None) -> None:
+    checksums = bundle / "evidence" / "checksums.txt"
+    if not checksums.is_file():
+        checksums = bundle / "dist" / "checksums.txt"
+    if not checksums.is_file():
+        failures.append("UNBOUND: GITHUB_PROVENANCE_MISSING_SUBJECT: checksums.txt absent")
+        return
+    cmd = [
+        gh_bin, "attestation", "verify", str(checksums),
+        "--repo", "cousingary/governator",
+        "--signer-repo", "cousingary/governator",
+        "--signer-workflow", "cousingary/governator/.github/workflows/release.yml",
+        "--source-ref", f"refs/tags/{expected_tag}",
+        "--source-digest", expected_commit,
+        "--signer-digest", expected_commit,
+        "--deny-self-hosted-runners",
+    ]
+    if attestation_bundle:
+        cmd += ["--bundle", attestation_bundle]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True)
+    except OSError as exc:
+        failures.append(f"UNBOUND: GITHUB_PROVENANCE_VERIFIER_UNAVAILABLE: {exc}")
+        return
+    if proc.returncode != 0:
+        failures.append(
+            "UNBOUND: GITHUB_PROVENANCE_INVALID: repository/workflow/ref/commit/digest "
+            f"attestation verification failed: {proc.stderr.strip() or proc.stdout.strip()}"
+        )
+
+
 def verify_trust_anchor(bundle: pathlib.Path, failures: list[str],
                         warnings: list[str],
                         trusted_fingerprints_file: str | None,
@@ -252,6 +285,11 @@ def main(argv: list[str]) -> int:
                    help="explicit, warned opt-in to a fingerprints file that resolves inside the bundle (Sol15 P2-3)")
     p.add_argument("--closure-minisig", default=None)
     p.add_argument("--skip-git-bundle", action="store_true")
+    p.add_argument("--require-github-provenance", action="store_true")
+    p.add_argument("--gh-bin", default="gh")
+    p.add_argument("--expected-tag")
+    p.add_argument("--expected-commit")
+    p.add_argument("--attestation-bundle")
     args = p.parse_args(argv)
 
     bundle = pathlib.Path(args.bundle_dir).resolve()
@@ -271,6 +309,12 @@ def main(argv: list[str]) -> int:
                         args.allow_bundle_local_trust_anchor)
     if not args.skip_git_bundle:
         verify_git_bundle(bundle, failures)
+    if args.require_github_provenance:
+        if not args.expected_tag or not args.expected_commit:
+            failures.append("UNBOUND: GITHUB_PROVENANCE_EXPECTATION_MISSING: --expected-tag and --expected-commit are required")
+        else:
+            verify_github_provenance(bundle, failures, args.gh_bin, args.expected_tag,
+                                     args.expected_commit, args.attestation_bundle)
 
     for w in warnings:
         print(f"bundle_verify: WARNING: {w}", file=sys.stderr)

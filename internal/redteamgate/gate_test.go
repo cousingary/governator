@@ -76,7 +76,8 @@ func TestLoadManifestRejectsBlankName(t *testing.T) {
 // S3 appends 395-397 (dist-dir-trap corpus), S4 appends 398-399
 // (architecture-restructure corpus), S5 appends 400 (assayer-pin corpus) for
 // a final total of 400, and S6 appends 401-402 (native-acceptance
-// publication-gate corpus) for a final total of 402.
+// publication-gate corpus) for a final total of 402. v16-release S7a
+// appends 403-412 (CI release-tool trust and provenance) for 412.
 //
 // This constant was not updated by S7 or S8; it read 330 (the post-S6 count)
 // while the manifest held 342, so this package failed before the duplicate
@@ -87,8 +88,8 @@ func TestLoadManifestAcceptsRealManifest(t *testing.T) {
 	if err != nil {
 		t.Fatalf("LoadManifest(%s): %v", path, err)
 	}
-	if len(m.Cases) != 402 {
-		t.Fatalf("expected 402 cases in the mandatory final attack corpus, got %d", len(m.Cases))
+	if len(m.Cases) != 412 {
+		t.Fatalf("expected 412 cases in the mandatory final attack corpus, got %d", len(m.Cases))
 	}
 	seen := make(map[int]bool)
 	for _, c := range m.Cases {

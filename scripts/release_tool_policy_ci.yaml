@@ -1,0 +1,110 @@
+schema_version: 2
+profile: github-hosted-ephemeral
+runner_label: ubuntu-24.04
+runner_arch: X64
+tools:
+  go:
+    command: go
+    declared_source: actions/setup-go
+  python3:
+    command: python3
+    declared_source: actions/setup-python
+  python3.10:
+    command: python3.10
+    declared_source: actions/setup-python
+  python3.11:
+    command: python3.11
+    declared_source: actions/setup-python
+  python3.12:
+    command: python3.12
+    declared_source: actions/setup-python
+  python3.13:
+    command: python3.13
+    declared_source: actions/setup-python
+  git:
+    command: git
+    declared_source: runner-image
+  bash:
+    command: bash
+    declared_source: runner-image
+  sha256sum:
+    command: sha256sum
+    declared_source: runner-image
+  tar:
+    command: tar
+    declared_source: runner-image
+  gzip:
+    command: gzip
+    declared_source: runner-image
+  minisign:
+    command: minisign
+    declared_source: apt:minisign=0.11-1
+  date:
+    command: date
+    declared_source: runner-image
+  awk:
+    command: awk
+    declared_source: runner-image
+  env:
+    command: env
+    declared_source: runner-image
+  cp:
+    command: cp
+    declared_source: runner-image
+  rm:
+    command: rm
+    declared_source: runner-image
+  mkdir:
+    command: mkdir
+    declared_source: runner-image
+  find:
+    command: find
+    declared_source: runner-image
+  sort:
+    command: sort
+    declared_source: runner-image
+  mktemp:
+    command: mktemp
+    declared_source: runner-image
+  dirname:
+    command: dirname
+    declared_source: runner-image
+  pwd:
+    command: pwd
+    declared_source: runner-image
+  grep:
+    command: grep
+    declared_source: runner-image
+  uname:
+    command: uname
+    declared_source: runner-image
+  cat:
+    command: cat
+    declared_source: runner-image
+  chmod:
+    command: chmod
+    declared_source: runner-image
+  stat:
+    command: stat
+    declared_source: runner-image
+  basename:
+    command: basename
+    declared_source: runner-image
+  timeout:
+    command: timeout
+    declared_source: runner-image
+  mv:
+    command: mv
+    declared_source: runner-image
+  ls:
+    command: ls
+    declared_source: runner-image
+  systemctl:
+    command: systemctl
+    declared_source: runner-image
+  docker:
+    command: docker
+    declared_source: runner-image
+  tail:
+    command: tail
+    declared_source: runner-image

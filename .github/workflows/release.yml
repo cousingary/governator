@@ -32,12 +32,14 @@ on:
 
 permissions:
   contents: write
+  id-token: write
+  attestations: write
 
 jobs:
   release:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           fetch-depth: 0
 
@@ -63,13 +65,13 @@ jobs:
           echo "ref=$ref" >> "$GITHUB_OUTPUT"
 
       - name: Check out Assayer at its pinned ref
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           repository: ${{ vars.ASSAYER_REPOSITORY || 'cousingary/assayer' }}
           ref: ${{ steps.assayer-ref.outputs.ref }}
           path: assayer
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
           go-version-file: go.mod
           cache: false
@@ -80,19 +82,19 @@ jobs:
       # minor explicitly so the matrix runs for real, not four invocations of
       # the same interpreter mislabeled as a matrix.
       - name: Install Python 3.10
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: '3.10'
       - name: Install Python 3.11
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: '3.11'
       - name: Install Python 3.12
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: '3.12'
       - name: Install Python 3.13
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: '3.13'
 
@@ -102,7 +104,7 @@ jobs:
       - name: Install Minisign
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y minisign
+          sudo apt-get install -y minisign=0.11-1
           command -v minisign && minisign -v 2>&1 || true
 
       # P1-4: assert every interpreter the Assayer matrix requires is actually
@@ -119,13 +121,16 @@ jobs:
             echo "$py: $("$py" -c 'import platform; print(platform.python_version())')"
           done
 
-      - name: Verify reviewed release-tool policy
-        # A GitHub runner whose executables do not exactly match the reviewed
-        # policy fails closed. Updating a tool requires policy review, never
-        # a fresh observed hash supplied by the runner itself.
+      - name: Verify CI release-tool policy and workflow identity
+        env:
+          GOV_RELEASE_RUNNER_LABEL: ubuntu-24.04
         run: |
+          python3 scripts/builder_provenance.py \
+            --workflow .github/workflows/release.yml \
+            --check-workflow
           python3 scripts/release_toolset.py \
-            --policy scripts/release_tool_policy.yaml \
+            --policy scripts/release_tool_policy_ci.yaml \
+            --profile github-hosted-ephemeral \
             --out "$RUNNER_TEMP/toolset-preflight.json"
 
       - name: Derive VERSION from the pushed tag
@@ -169,41 +174,34 @@ jobs:
           # to document intent -- a tag push is always a real release.
           REQUIRE_TAG: "1"
           REQUIRE_ASYMMETRIC_SIGNATURE: "1"
+          GOV_RELEASE_TOOL_POLICY: ${{ github.workspace }}/scripts/release_tool_policy_ci.yaml
+          RELEASE_TOOL_PROFILE: github-hosted-ephemeral
+          GOV_RELEASE_RUNNER_LABEL: ubuntu-24.04
+          OUT_DIR: ${{ runner.temp }}/governator-release-dist
         run: scripts/release.sh
 
       - name: Upload release artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: gov-${{ env.VERSION }}
           path: |
-            dist/*.tar.gz
-            dist/checksums.txt
-            dist/checksums.txt.minisig
-            dist/build-manifest.json
-            dist/architecture-build-metadata.json
-            dist/sbom.json
-            dist/claims.yaml
-            dist/test-summary.json
-            dist/acceptance-summary.json
-            dist/claims-verify-report.txt
-            dist/toolset.json
-            dist/checksums.txt.hmac
+            ${{ runner.temp }}/governator-release-dist/**
           if-no-files-found: warn
 
+      - name: Attest the signed release manifest
+        id: attest
+        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3
+        with:
+          subject-path: ${{ runner.temp }}/governator-release-dist/checksums.txt
+
       - name: Create GitHub release (draft)
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           draft: true
           files: |
-            dist/*.tar.gz
-            dist/checksums.txt
-            dist/checksums.txt.minisig
-            dist/build-manifest.json
-            dist/architecture-build-metadata.json
-            dist/sbom.json
-            dist/claims.yaml
-            dist/test-summary.json
-            dist/acceptance-summary.json
-            dist/claims-verify-report.txt
-            dist/toolset.json
-            dist/checksums.txt.hmac
+            ${{ runner.temp }}/governator-release-dist/*.tar.gz
+            ${{ runner.temp }}/governator-release-dist/*.json
+            ${{ runner.temp }}/governator-release-dist/*.yaml
+            ${{ runner.temp }}/governator-release-dist/*.txt
+            ${{ runner.temp }}/governator-release-dist/*.minisig
+            ${{ runner.temp }}/governator-release-dist/*.hmac
