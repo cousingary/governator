@@ -112,7 +112,7 @@ print(f'{goos}_{goarch}')
 ")"
 
 python3 - "$OUT_JSON" "$overall" "$platform_id" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-	"$archive_extracted" "$executable_bit_ok" "$hash_match_ok" "$version_match_ok" "${notes[@]}" <<'PYACCEPT'
+	"$archive_extracted" "$executable_bit_ok" "$hash_match_ok" "$version_match_ok" ${notes[@]+"${notes[@]}"} <<'PYACCEPT'
 import json, pathlib, sys
 
 (path, result, platform, generated_at,
