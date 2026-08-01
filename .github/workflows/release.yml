@@ -200,11 +200,13 @@ jobs:
         run: scripts/release.sh
 
       - name: Upload release artifacts
+        if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: gov-${{ env.VERSION }}
           path: |
             ${{ runner.temp }}/governator-release-dist/**
+          include-hidden-files: true
           if-no-files-found: warn
 
       - name: Attest the signed release manifest
