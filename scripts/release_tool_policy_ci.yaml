@@ -7,8 +7,8 @@ tools:
     command: go
     declared_source: actions/setup-go
   python3:
-    command: python3
-    declared_source: actions/setup-python
+    command: /usr/bin/python3
+    declared_source: runner-image
   python3.10:
     command: python3.10
     declared_source: actions/setup-python

@@ -219,3 +219,20 @@ func TestV16Case414ReleaseTiersUseAttemptScopedTrustedToolRegistry(t *testing.T)
 		t.Fatal("all six test tiers plus the integration gate must receive the attempt-scoped registry")
 	}
 }
+
+func TestV16Case415GenericCIPythonUsesTrustedRunnerImage(t *testing.T) {
+	content, err := os.ReadFile(s7aScript(t, "release_tool_policy_ci.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	src := string(content)
+	if !strings.Contains(src, "  python3:\n    command: /usr/bin/python3\n    declared_source: runner-image\n") {
+		t.Fatal("generic CI python3 must use the root-owned runner-image interpreter")
+	}
+	for _, version := range []string{"3.10", "3.11", "3.12", "3.13"} {
+		want := "  python" + version + ":\n    command: python" + version + "\n    declared_source: actions/setup-python\n"
+		if !strings.Contains(src, want) {
+			t.Fatalf("explicit Python %s matrix entry must remain supplied by setup-python", version)
+		}
+	}
+}
