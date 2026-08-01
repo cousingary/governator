@@ -522,7 +522,45 @@ TOOLSET_HASH=$(python3 "$ROOT/scripts/release_toolset.py" --policy "$RELEASE_TOO
 # binary changed underneath it (same go version string, different binary)
 # is correctly invalidated.
 TOOLCHAIN_HASH=$(printf '%s|%s|%s\n' "$("$GO_TOOL" version)" "$(python3 --version 2>&1)" "$TOOLSET_HASH" | sha256sum | awk '{print $1}')
-ENVIRONMENT_HASH=$(printf '%s|GOMAXPROCS=%s|parallelism=%s|platforms=%s\n' "$(uname -a)" "${GOMAXPROCS:-}" "$GO_TEST_PARALLELISM" "$PLATFORMS" | sha256sum | awk '{print $1}')
+DARWIN_REDTEAM_EVIDENCE_DIR=${GOV_DARWIN_REDTEAM_EVIDENCE_DIR:-}
+DARWIN_REDTEAM_LOG=""
+DARWIN_REDTEAM_RACE_LOG=""
+DARWIN_REDTEAM_EVIDENCE_HASH="absent"
+if [ -n "$DARWIN_REDTEAM_EVIDENCE_DIR" ]; then
+  DARWIN_REDTEAM_LOG="$DARWIN_REDTEAM_EVIDENCE_DIR/test-redteam-darwin.log"
+  DARWIN_REDTEAM_RACE_LOG="$DARWIN_REDTEAM_EVIDENCE_DIR/test-redteam-race-darwin.log"
+  DARWIN_REDTEAM_METADATA="$DARWIN_REDTEAM_EVIDENCE_DIR/darwin-redteam-evidence.json"
+  if ! "$PYTHON_TOOL" - "$DARWIN_REDTEAM_METADATA" "$DARWIN_REDTEAM_LOG" "$DARWIN_REDTEAM_RACE_LOG" "$COMMIT" <<'PYDARWIN'
+import hashlib, json, pathlib, sys
+metadata_path, normal_path, race_path = map(pathlib.Path, sys.argv[1:4])
+commit = sys.argv[4]
+metadata = json.loads(metadata_path.read_text())
+if metadata.get("schema_version") != 1 or metadata.get("platform") != "darwin_arm64":
+    raise SystemExit("DARWIN_REDTEAM_EVIDENCE_INVALID: schema/platform")
+if metadata.get("governator_commit") != commit:
+    raise SystemExit("DARWIN_REDTEAM_EVIDENCE_INVALID: commit mismatch")
+for path in (normal_path, race_path):
+    digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    if metadata.get("logs", {}).get(path.name) != digest:
+        raise SystemExit(f"DARWIN_REDTEAM_EVIDENCE_INVALID: hash mismatch for {path.name}")
+    text = path.read_text()
+    for name in ("TestV12Case34DarwinNativeContainmentNeverClaimsStrongScope",
+                 "TestV12Case35DarwinNativeAssayerRefusesRatherThanDegrades"):
+        if f"--- PASS: {name}" not in text:
+            raise SystemExit(f"DARWIN_REDTEAM_EVIDENCE_INVALID: missing PASS for {name} in {path.name}")
+    if "--- FAIL:" in text or "--- SKIP:" in text:
+        raise SystemExit(f"DARWIN_REDTEAM_EVIDENCE_INVALID: non-PASS result in {path.name}")
+PYDARWIN
+  then
+    echo "release: refusing invalid native Darwin red-team evidence" >&2
+    exit 1
+  fi
+  DARWIN_REDTEAM_EVIDENCE_HASH=$("$SHA256SUM_TOOL" "$DARWIN_REDTEAM_METADATA" | "$AWK_TOOL" '{print $1}')
+elif [ "$REQUIRE_ZERO_SKIPS" = 1 ]; then
+  echo "release: strict release requires GOV_DARWIN_REDTEAM_EVIDENCE_DIR with native Darwin red-team evidence" >&2
+  exit 1
+fi
+ENVIRONMENT_HASH=$(printf '%s|GOMAXPROCS=%s|parallelism=%s|platforms=%s|darwin_redteam_evidence=%s\n' "$(uname -a)" "${GOMAXPROCS:-}" "$GO_TEST_PARALLELISM" "$PLATFORMS" "$DARWIN_REDTEAM_EVIDENCE_HASH" | sha256sum | awk '{print $1}')
 # Sol14 rc7 Session 10: host CAPABILITY STATE is part of release identity.
 # A red-team tier's result is a function of which capabilities the host
 # actually had -- a Docker-absent run legitimately SKIPs the real-daemon
@@ -1042,7 +1080,7 @@ fi
 # on an operator's ambient $HOME registry. Enroll only policy-verified tools,
 # through the exact extracted release candidate, into an attempt-scoped
 # registry that every tier receives explicitly.
-for test_tool_entry in "git:$GIT_TOOL" "bash:$BASH_TOOL" "python3:$PYTHON_TOOL"; do
+for test_tool_entry in "git:$GIT_TOOL" "bash:$BASH_TOOL" "python3:$PYTHON_TOOL" "docker:$DOCKER_TOOL"; do
   test_tool_name=${test_tool_entry%%:*}
   test_tool_path=${test_tool_entry#*:}
   GOV_TOOLREGISTRY_FILE="$TEST_TOOL_REGISTRY" "$INTEGRATION_GOV_BIN" tools enroll "$test_tool_name" "$test_tool_path"
@@ -1084,8 +1122,8 @@ EOF_INTEGRATION_PACKAGES
   # tests were only ever exercised by hand from the real checkout, where the
   # sibling fallback happens to resolve. Same defect class as every other
   # rc6/rc7 release blocker: a path that had never executed end to end.
-  printf 'redteam\t%s\tPATH=%q GOV_TOOLREGISTRY_FILE=%q ASSAYER_REPO=%q ASSAYER_TEST_PYTHON=%q GOV_INTEGRATION_ASSAYER_COMMIT=%q %q test -v -timeout=30m -tags redteam -p %s -parallel %s -count=1 ./...\n' "$REDTEAM_LOG" "$TEST_TIER_PATH" "$TEST_TOOL_REGISTRY" "$ASSAYER_REPO" "$ASSAYER_REDTEAM_VENV/bin/python" "$ASSAYER_COMMIT" "$GO_TOOL" "$GO_TEST_PARALLELISM" "$GO_TEST_PARALLELISM"
-  printf 'redteam_race\t%s\tPATH=%q GOV_TOOLREGISTRY_FILE=%q ASSAYER_REPO=%q ASSAYER_TEST_PYTHON=%q GOV_INTEGRATION_ASSAYER_COMMIT=%q %q test -v -race -timeout=30m -tags redteam -p %s -parallel %s -count=1 ./...\n' "$REDTEAM_RACE_LOG" "$TEST_TIER_PATH" "$TEST_TOOL_REGISTRY" "$ASSAYER_REPO" "$ASSAYER_REDTEAM_VENV/bin/python" "$ASSAYER_COMMIT" "$GO_TOOL" "$GO_TEST_PARALLELISM" "$GO_TEST_PARALLELISM"
+  printf 'redteam\t%s\tPATH=%q GOV_TOOLREGISTRY_FILE=%q ASSAYER_REPO=%q ASSAYER_TEST_PYTHON=%q GOV_INTEGRATION_ASSAYER_COMMIT=%q %q test -v -timeout=30m -tags redteam -skip %q -p %s -parallel %s -count=1 ./... && %q %q\n' "$REDTEAM_LOG" "$TEST_TIER_PATH" "$TEST_TOOL_REGISTRY" "$ASSAYER_REPO" "$ASSAYER_REDTEAM_VENV/bin/python" "$ASSAYER_COMMIT" "$GO_TOOL" '^(TestV12Case34DarwinNativeContainmentNeverClaimsStrongScope|TestV12Case35DarwinNativeAssayerRefusesRatherThanDegrades)$' "$GO_TEST_PARALLELISM" "$GO_TEST_PARALLELISM" "$CAT_TOOL" "$DARWIN_REDTEAM_LOG"
+  printf 'redteam_race\t%s\tPATH=%q GOV_TOOLREGISTRY_FILE=%q ASSAYER_REPO=%q ASSAYER_TEST_PYTHON=%q GOV_INTEGRATION_ASSAYER_COMMIT=%q %q test -v -race -timeout=30m -tags redteam -skip %q -p %s -parallel %s -count=1 ./... && %q %q\n' "$REDTEAM_RACE_LOG" "$TEST_TIER_PATH" "$TEST_TOOL_REGISTRY" "$ASSAYER_REPO" "$ASSAYER_REDTEAM_VENV/bin/python" "$ASSAYER_COMMIT" "$GO_TOOL" '^(TestV12Case34DarwinNativeContainmentNeverClaimsStrongScope|TestV12Case35DarwinNativeAssayerRefusesRatherThanDegrades)$' "$GO_TEST_PARALLELISM" "$GO_TEST_PARALLELISM" "$CAT_TOOL" "$DARWIN_REDTEAM_RACE_LOG"
 } >"$MAIN_TIER_SPEC"
 
 MAIN_TIER_JSONL="$OUT_DIR/.tier-pipeline-main.jsonl"

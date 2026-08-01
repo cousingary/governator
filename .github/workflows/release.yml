@@ -36,7 +36,56 @@ permissions:
   attestations: write
 
 jobs:
+  darwin-native-evidence:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - name: Run native Darwin acceptance and red-team tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p native-evidence
+          commit="$(git rev-parse HEAD)"
+          version="${GITHUB_REF_NAME#v}"
+          claims_hash="$(shasum -a 256 docs/claims.yaml | awk '{print $1}')"
+          build_ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          ldflags="-s -w -X main.version=${version} -X main.sourceCommit=${commit} -X main.buildTimestamp=${build_ts} -X main.claimsHash=${claims_hash} -X main.adapterProtocolVersion=adapter-protocol-v1"
+          CGO_ENABLED=0 go build -trimpath -ldflags "$ldflags" -o native-evidence/gov ./cmd/gov
+          ./scripts/acceptance_smoke.sh native-evidence/gov "$version" "$commit" "$claims_hash" native-evidence/acceptance.json
+          test_re='^(TestV12Case34DarwinNativeContainmentNeverClaimsStrongScope|TestV12Case35DarwinNativeAssayerRefusesRatherThanDegrades)$'
+          go test -v -count=1 -tags redteam -run "$test_re" ./internal/redteam | tee native-evidence/test-redteam-darwin.log
+          go test -v -race -count=1 -tags redteam -run "$test_re" ./internal/redteam | tee native-evidence/test-redteam-race-darwin.log
+          python3 - native-evidence "$commit" <<'PY'
+          import hashlib, json, pathlib, sys
+          root, commit = pathlib.Path(sys.argv[1]), sys.argv[2]
+          logs = ("test-redteam-darwin.log", "test-redteam-race-darwin.log")
+          data = {
+              "schema_version": 1,
+              "governator_commit": commit,
+              "platform": "darwin_arm64",
+              "logs": {name: hashlib.sha256((root / name).read_bytes()).hexdigest() for name in logs},
+          }
+          (root / "darwin-redteam-evidence.json").write_text(
+              json.dumps(data, indent=2, sort_keys=True) + "\n")
+          PY
+
+      - name: Upload native Darwin evidence
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: darwin-native-evidence
+          path: native-evidence/**
+          if-no-files-found: error
+
   release:
+    needs: darwin-native-evidence
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -164,6 +213,12 @@ jobs:
       - name: Derive VERSION from the pushed tag
         run: echo "VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
 
+      - name: Download native Darwin evidence
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: darwin-native-evidence
+          path: ${{ runner.temp }}/darwin-native-evidence
+
       - name: Materialize the minisign secret key (optional)
         # GOV_RELEASE_MINISIGN_KEY (scripts/release.sh's expected env var)
         # is a FILE PATH minisign reads with -s; a GitHub secret is a
@@ -205,6 +260,8 @@ jobs:
           GOV_RELEASE_TOOL_POLICY: ${{ github.workspace }}/scripts/release_tool_policy_ci.yaml
           RELEASE_TOOL_PROFILE: github-hosted-ephemeral
           GOV_RELEASE_RUNNER_LABEL: ubuntu-24.04
+          GOV_DARWIN_REDTEAM_EVIDENCE_DIR: ${{ runner.temp }}/darwin-native-evidence
+          EVIDENCE_DIR: ${{ runner.temp }}/darwin-native-evidence
           OUT_DIR: ${{ runner.temp }}/governator-release-dist
         run: scripts/release.sh
 
