@@ -13,6 +13,18 @@ Publishing is operator-executed. Automation must not create the public repositor
 `checksums.txt.minisig` is an Ed25519 signature over `checksums.txt`, publicly verifiable with only the corresponding **public** key — no shared secret required. To verify a downloaded release:
 
 1. Obtain the project's minisign public key. **Do not trust a public key or fingerprint bundled inside the release archive or repository itself** — a compromised release could ship a forged key alongside a forged signature. The trust root is published out-of-band (e.g. directly by the maintainer, on a separate channel from the release download) and must be cross-checked there before use. **External sourcing is the documented default for every verifier in this repo** (Sol15 P2-3): `scripts/audit_bundle_validate.py` fails closed with `NO_EXTERNAL_TRUST_ANCHOR` unless `--trusted-fingerprints-file` and `--trusted-public-keys-dir` are supplied from outside the bundle, and both it and `scripts/release_policy.py signature` reject trust material resolving inside the artifacts directory (`BUNDLE_LOCAL_TRUST_ANCHOR`) unless the explicit, warned-about `--allow-bundle-local-trust-anchor` opt-in is passed — a key that travels beside the payload proves integrity but not origin. `scripts/bundle_verify.py` accepts the same `--trusted-fingerprints-file` and cross-checks the bundle's signer fingerprint against it; without one it verifies integrity but warns `WEAK_ORIGIN_AUTHENTICATION`. The production fingerprint `B5CBEE8BBA8826A7` is published out-of-band in `agents/governator-signing-key-fingerprint.txt` (a separate nested repository) and mirrored to VPS `216.158.228.204` — see [signing_key.md](signing_key.md) for the full channel list and ceremony.
+
+   **Primary out-of-band channel (v16 D4):** `https://jeremylamkin.com/governator-signing-key.txt` — served from Hostinger infrastructure independent of GitHub entirely, so a compromised GitHub account or repo cannot also forge this copy. `docs/signing_keys/B5CBEE8BBA8826A7.pub` in this repo is the **secondary** copy only — proves nothing about origin on its own; cross-check it against the primary URL before trusting it. Retrieval:
+
+   ```
+   curl -fsSL -A "Mozilla/5.0" https://jeremylamkin.com/governator-signing-key.txt -o governator.pub
+   ```
+
+   The `-A "Mozilla/5.0"` is required: the site's edge WAF returns `403` to requests with no `User-Agent` header (bare `curl`/`urllib` defaults included) but serves the file normally to a browser-shaped one — this is a hosting quirk, not a security gate, and does not change what is being trusted. The file's own `untrusted comment` line names the fingerprint; confirm it reads `B5CBEE8BBA8826A7` before use:
+
+   ```
+   grep -F 'B5CBEE8BBA8826A7' governator.pub
+   ```
 2. `minisign -V -p governator.pub -m checksums.txt -x checksums.txt.minisig`
 3. Only after the signature verifies, cross-check `sha256sum -c checksums.txt` against the downloaded archives.
 
