@@ -43,6 +43,13 @@ jobs:
         with:
           fetch-depth: 0
 
+      # A tag-triggered checkout is detached and does not materialize a local
+      # main branch, even when origin/main exists. The canonical topology gate
+      # intentionally checks refs/heads/main, so fetch that exact branch
+      # without moving HEAD or rewriting any existing ref.
+      - name: Materialize the release branch for the topology gate
+        run: git fetch --no-tags origin refs/heads/main:refs/heads/main
+
       # P1-4 (Sol11 rc5 Session 8): read the pinned Assayer ref from the
       # version-controlled assayer.lock so CI and local releases check out
       # the exact same Assayer commit. scripts/assayer_verify.sh (run inside
