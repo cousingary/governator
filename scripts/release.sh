@@ -776,13 +776,12 @@ host_platform_id = sys.argv[6]
 evidence_platforms = set(sys.argv[7].split()) if len(sys.argv) > 7 and sys.argv[7] else set()
 # v16 S6 / R4: approval mirrors internal/redteamgate.ClassifyPlatformWithEvidence
 # (kept in sync by hand). A platform is approving only when its GOOS is
-# approval-eligible (linux) AND it carries executed native acceptance evidence
+# approval-eligible (linux or darwin) AND it carries executed native acceptance evidence
 # (evidence_platforms, fed from EVIDENCE_DIR). The host platform is approving
 # unconditionally here because this script runs its own acceptance check on it
 # below; a cross-compiled linux platform needs CI evidence to promote, else it
-# stays non-approving (cross-compiled-no-native-acceptance). darwin is
-# non-approving (degradedPlatforms) until promoted with native evidence AND a
-# passing native corpus -- its acceptance smoke alone does not promote it.
+# stays non-approving (cross-compiled-no-native-acceptance). S6b promoted
+# darwin after its native unit, race, Sol3, red-team, and red-team-race chain.
 # Sol12 P1-1: the PLATFORMS validation loop above already refuses any GOOS
 # outside {linux, darwin} before this ever runs, so an unrecognized
 # platform_id here means that guard was bypassed; fail loud.
@@ -790,15 +789,12 @@ goos = platform_id.split('_', 1)[0]
 if platform_id == host_platform_id:
     feature_limited = False
     degraded_modes = []
-elif goos == 'linux' and platform_id in evidence_platforms:
+elif goos in {'linux', 'darwin'} and platform_id in evidence_platforms:
     feature_limited = False
     degraded_modes = []
-elif goos == 'linux':
+elif goos in {'linux', 'darwin'}:
     feature_limited = True
     degraded_modes = ['cross-compiled-no-native-acceptance']
-elif goos == 'darwin':
-    feature_limited = True
-    degraded_modes = ['non-approving']
 else:
     sys.exit('release: unrecognized platform_id %r reached artifact labeling despite the PLATFORMS guard (internal/redteamgate.ClassifyPlatform, Sol12 P1-1) -- refusing to default it to approving' % platform_id)
 print(json.dumps({
@@ -1777,22 +1773,21 @@ fi
 ARCHITECTURE_METADATA="$OUT_DIR/architecture-build-metadata.json"
 ASSAYER_COMMIT=$(git -C "$ASSAYER_REPO" rev-parse HEAD)
 ASSAYER_VERSION=$(git -C "$ASSAYER_REPO" describe --tags --exact-match HEAD 2>/dev/null || echo "untagged-${ASSAYER_COMMIT}")
-python3 - "$ARCHITECTURE_METADATA" "$VERSION" "$COMMIT" "$ASSAYER_COMMIT" "$ASSAYER_VERSION" "$PLATFORMS" "$HOST_PLATFORM_ID" <<'PYARCH'
+python3 - "$ARCHITECTURE_METADATA" "$VERSION" "$COMMIT" "$ASSAYER_COMMIT" "$ASSAYER_VERSION" "$PLATFORMS" "$HOST_PLATFORM_ID" "$EVIDENCE_PLATFORMS" <<'PYARCH'
 import json, pathlib, sys
-metadata_path, version, commit, assayer_commit, assayer_version, platforms, host_platform_id = sys.argv[1:]
+metadata_path, version, commit, assayer_commit, assayer_version, platforms, host_platform_id, evidence_platforms_raw = sys.argv[1:]
 platform_list = [p for p in platforms.split() if p]
+evidence_platforms = set(evidence_platforms_raw.split())
 degraded = []
 for platform in platform_list:
     # Sol12 P1-1: same explicit allow-list as the artifact-labeling block
     # above -- the PLATFORMS guard already refuses anything outside
     # {linux, darwin} before this runs.
     pid = platform.replace('/', '_')
-    if platform.startswith('darwin/'):
-        degraded.append({'platform': pid, 'mode': 'non-approving'})
-    elif platform.startswith('linux/'):
-        # Sol15 P1-2: a linux platform that is not the host has no native
-        # acceptance evidence and is non-approving.
-        if pid != host_platform_id:
+    if platform.startswith(('darwin/', 'linux/')):
+        # Sol15 P1-2 / v16 S6b: a platform that is neither the host nor
+        # represented by native evidence is non-approving.
+        if pid != host_platform_id and pid not in evidence_platforms:
             degraded.append({'platform': pid, 'mode': 'cross-compiled-no-native-acceptance'})
     else:
         sys.exit('release: unrecognized platform %r reached architecture metadata despite the PLATFORMS guard (Sol12 P1-1) -- refusing' % platform)

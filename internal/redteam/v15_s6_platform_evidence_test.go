@@ -44,7 +44,11 @@ func TestV15Case388PlatformWithoutExecutedAcceptanceEvidenceIsNotApproving(t *te
 
 	status, _ = redteamgate.ClassifyPlatformWithEvidence("darwin_arm64", withEvidence)
 	if status == redteamgate.PlatformApproving {
-		t.Fatal("darwin must remain non-approving regardless of evidence set (Sol12 P1-1)")
+		t.Fatal("darwin_arm64 must not borrow linux_amd64 evidence")
+	}
+	status, reason = redteamgate.ClassifyPlatformWithEvidence("darwin_arm64", map[string]bool{"darwin_arm64": true})
+	if status != redteamgate.PlatformApproving {
+		t.Fatalf("darwin_arm64 WITH its own native S6b evidence = %q (%q), want approving", status, reason)
 	}
 
 	status, _ = redteamgate.ClassifyPlatformWithEvidence("windows_amd64", empty)

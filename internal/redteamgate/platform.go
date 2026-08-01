@@ -17,16 +17,16 @@ import "fmt"
 type PlatformStatus string
 
 const (
-	// PlatformApproving is a platform whose build is production-capable
-	// with no known degraded modes. Only "linux" today.
+	// PlatformApproving is a platform whose release artifacts are eligible
+	// for approval when the specific architecture carries executed native
+	// acceptance evidence. Linux and Darwin are eligible today.
 	PlatformApproving PlatformStatus = "approving"
 	// PlatformNonApproving is a platform that builds and cross-compiles
 	// cleanly (internal/assay/snapshot_other.go, internal/runtime/
-	// artifacts_other.go and their _linux.go siblings), and MAY ship, but
-	// never claims production approval: no native acceptance evidence
-	// exists for it (see AttestationCategoryDarwin), so every artifact for
-	// it is labeled non-approving/degraded rather than silently trusted.
-	// Only "darwin" today.
+	// artifacts_other.go and their _linux.go siblings), and MAY ship, but is
+	// not GOOS-eligible for production approval. No platform currently has
+	// this classification; exact artifacts without evidence are separately
+	// demoted by ClassifyPlatformWithEvidence.
 	PlatformNonApproving PlatformStatus = "non-approving"
 	// PlatformUnsupported is any GOOS this codebase has made no claim
 	// about at all. Building for it, let alone shipping it as part of a
@@ -38,16 +38,14 @@ const (
 // approvingPlatforms/degradedPlatforms are the only two recognized GOOS
 // sets. Adding a platform to either requires the corresponding real
 // evidence: approvingPlatforms needs full native acceptance evidence
-// (AttestationCategory* in attestation.go); degradedPlatforms only needs
-// the cross-compile + explicit non-approving declaration this session
-// establishes for Darwin.
+// (AttestationCategory* in attestation.go). degradedPlatforms is retained
+// for a recognized GOOS that may build but has not earned eligibility.
 var approvingPlatforms = map[string]bool{
-	"linux": true,
+	"darwin": true,
+	"linux":  true,
 }
 
-var degradedPlatforms = map[string]bool{
-	"darwin": true,
-}
+var degradedPlatforms = map[string]bool{}
 
 // ClassifyPlatform reports goos's PlatformStatus. This is the GOOS-level
 // build-eligibility classification used by the gate's release-scope
@@ -116,7 +114,7 @@ func PublicationDecision(platformID string, evidencePlatforms map[string]bool) e
 
 // ApprovedForProduction reports whether goos may claim a fully-approving
 // rc5 production release: no degraded modes, no refusal. A non-approving
-// platform (Darwin) and an unsupported platform both return false --
+// platform and an unsupported platform both return false --
 // callers that need to distinguish "ships, but degraded" from "refuse to
 // build at all" should call ClassifyPlatform directly.
 func ApprovedForProduction(goos string) (bool, string) {

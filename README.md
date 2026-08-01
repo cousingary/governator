@@ -24,12 +24,12 @@ Published release archives are built for three platforms, but "built" is not the
 | Platform | Status | Notes |
 |---|---|---|
 | `linux_amd64` | **Approving** | Built and acceptance-tested natively on this platform. |
-| `linux_arm64` | Non-approving | Cross-compiled; native acceptance evidence is being gathered on CI runners and will promote this row once wired into release labeling. |
-| `darwin_arm64` | Non-approving | Cross-compiled; no executed native acceptance evidence yet. |
+| `linux_arm64` | **Approving with evidence** | Native acceptance evidence is available from CI and is consumed by release labeling. |
+| `darwin_arm64` | **Approving with evidence** | Native acceptance, unit, race, Sol3, red-team, and red-team-race tiers passed on Apple silicon in CI run `30688682689`. Linux-only primitives remain explicit fail-closed capabilities. |
 
 `darwin/amd64` is intentionally not published: GitHub's free macOS runners are Apple-silicon only, so no free native host can ever attest it, and Rosetta 2 runs the `darwin/arm64` archive on Intel Macs.
 
-Approval is a property of the running platform, not only the downloaded archive: `gov` running on any GOOS/GOARCH other than `linux_amd64` — including a `go install ... @latest` build compiled locally on that host — currently cannot claim a fully-approving production release. This table reflects the current release; it is updated as each platform gains executed native acceptance evidence.
+Approval is attached to the exact published archive and its executed native evidence; a locally cross-compiled or `go install ... @latest` binary does not inherit another artifact's evidence. Governed operations that require unavailable Linux-only primitives still refuse safely on Darwin rather than silently degrading.
 
 For a source checkout:
 

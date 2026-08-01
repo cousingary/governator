@@ -293,9 +293,9 @@ func CategoryPlatform(category string) string {
 // the release could never be cut, which is a gate defect, not evidence of a
 // missing machine.
 //
-// The exemption is self-tightening: it is derived from ClassifyPlatform, so
-// the day darwin moves into approvingPlatforms the exemption disappears on its
-// own and real darwin coverage becomes mandatory again.
+// The exemption is self-tightening: it is derived from ClassifyPlatform.
+// Darwin's S6b promotion removed its exemption, so real Darwin coverage is
+// mandatory; this remains available for any future explicitly degraded GOOS.
 func SkipOutOfReleaseScope(caseEntry CaseEntry) bool {
 	platform := CategoryPlatform(caseEntry.AttestationCategory)
 	if platform == "" {
@@ -324,8 +324,8 @@ func SkipCoveredByAttestations(test string, aggregation AggregationResult, caseE
 
 func verifyCategoryCapabilityProof(a CapabilityAttestation) error {
 	if a.Category == AttestationCategoryDarwin {
-		if !a.NonApproving {
-			return fmt.Errorf("darwin evidence must be explicitly non-approving")
+		if a.NonApproving {
+			return fmt.Errorf("darwin evidence must be approving after native S6b acceptance")
 		}
 		if platformGOOS(a.Platform) != "darwin" {
 			return fmt.Errorf("darwin category requires a Darwin host, got %q", a.Platform)
@@ -333,7 +333,7 @@ func verifyCategoryCapabilityProof(a CapabilityAttestation) error {
 		return verifyCapabilityRecord(a, "has_darwin_native_host", CapabilityPresent)
 	}
 	if a.NonApproving {
-		return fmt.Errorf("only darwin may be marked non-approving")
+		return fmt.Errorf("approving capability categories may not be marked non-approving")
 	}
 	switch a.Category {
 	case AttestationCategoryCore:

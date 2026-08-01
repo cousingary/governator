@@ -1730,7 +1730,7 @@ cases:
     required: true
     status: implemented
   - case: 297
-    name: TestV13Case297NonApprovingPlatformSkipIsOutOfReleaseScopeNotAGap
+    name: TestV13Case297ApprovingPlatformSkipRequiresNativeEvidence
     session: rc6-u13-s9
     required: true
     status: implemented

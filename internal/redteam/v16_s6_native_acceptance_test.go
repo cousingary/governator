@@ -14,12 +14,9 @@
 // evidence, confirm the demotion) so the classifier cannot silently widen to
 // approve a platform the evidence never covered.
 //
-// They reflect the CURRENT true state: darwin remains non-approving (it sits
-// in degradedPlatforms until real native evidence promotes it) and only linux
-// platforms are eligible for approval-with-evidence. The day darwin's evidence
-// lands and it moves into approvingPlatforms, these cases' darwin assertions
-// must be revisited -- but the strip-mutation invariant (no evidence, no
-// approval) holds for every eligible platform forever.
+// They reflect the S6b state: Linux and Darwin are approval-eligible, while
+// the strip-mutation invariant (no evidence, no approval) holds for every
+// exact platform forever.
 package redteam
 
 import (
@@ -39,8 +36,8 @@ import (
 func TestV16Case401PlatformWithoutExecutedAcceptanceEvidenceIsNeverApproving(t *testing.T) {
 	// A platform eligible for approval (linux GOOS) WITH its own evidence is
 	// approving; this is the only state the classifier may call approving.
-	evidence := map[string]bool{"linux_amd64": true, "linux_arm64": true}
-	for _, pid := range []string{"linux_amd64", "linux_arm64"} {
+	evidence := map[string]bool{"linux_amd64": true, "linux_arm64": true, "darwin_arm64": true}
+	for _, pid := range []string{"linux_amd64", "linux_arm64", "darwin_arm64"} {
 		status, reason := redteamgate.ClassifyPlatformWithEvidence(pid, evidence)
 		if status != redteamgate.PlatformApproving {
 			t.Fatalf("ClassifyPlatformWithEvidence(%q, with own evidence) = %q (%q), want approving", pid, status, reason)
@@ -50,7 +47,7 @@ func TestV16Case401PlatformWithoutExecutedAcceptanceEvidenceIsNeverApproving(t *
 	// MUTATION: strip each platform's evidence and confirm it demotes to
 	// non-approving. Evidence is load-bearing -- removing it must never leave
 	// the platform approving.
-	for _, pid := range []string{"linux_amd64", "linux_arm64"} {
+	for _, pid := range []string{"linux_amd64", "linux_arm64", "darwin_arm64"} {
 		stripped := map[string]bool{}
 		for k, v := range evidence {
 			if k != pid {
@@ -79,14 +76,11 @@ func TestV16Case401PlatformWithoutExecutedAcceptanceEvidenceIsNeverApproving(t *
 		t.Fatal("expected a specific reason for linux_arm64 non-approval under linux_amd64-only evidence")
 	}
 
-	// darwin is ineligible for approval regardless of evidence: it sits in
-	// degradedPlatforms until real native acceptance evidence promotes it
-	// (Sol12 P1-1). Asserting this here keeps the promotion honest -- the day
-	// darwin moves to approvingPlatforms this assertion must change, and the
-	// strip-mutation above must then cover it too.
+	// Darwin is approval-eligible after S6b, but only its exact native
+	// evidence can promote the artifact.
 	status, _ = redteamgate.ClassifyPlatformWithEvidence("darwin_arm64", map[string]bool{"darwin_arm64": true})
-	if status == redteamgate.PlatformApproving {
-		t.Fatal("ClassifyPlatformWithEvidence(\"darwin_arm64\", {darwin_arm64}) = approving; darwin must remain non-approving until real native evidence promotes it out of degradedPlatforms (Sol12 P1-1)")
+	if status != redteamgate.PlatformApproving {
+		t.Fatal("ClassifyPlatformWithEvidence(\"darwin_arm64\", {darwin_arm64}) must be approving after native S6b evidence")
 	}
 
 	// An unknown GOOS is unsupported, never silently approving.
@@ -129,9 +123,12 @@ func TestV16Case402ArchivePublishedForPlatformAbsentFromApprovingSetFailsGate(t 
 		t.Fatal("PublicationDecision(\"linux_arm64\", {linux_amd64}) = nil; evidence for a different platform must not clear publication")
 	}
 
-	// darwin is refused at publication regardless of evidence (degradedPlatforms).
-	if err := redteamgate.PublicationDecision("darwin_arm64", map[string]bool{"darwin_arm64": true}); err == nil {
-		t.Fatal("PublicationDecision(\"darwin_arm64\", {darwin_arm64}) = nil; darwin must be refused at publication until it leaves degradedPlatforms")
+	// Darwin publication now clears only with its exact native evidence.
+	if err := redteamgate.PublicationDecision("darwin_arm64", map[string]bool{"darwin_arm64": true}); err != nil {
+		t.Fatalf("PublicationDecision(\"darwin_arm64\", {darwin_arm64}) = %v, want nil after native S6b evidence", err)
+	}
+	if err := redteamgate.PublicationDecision("darwin_arm64", map[string]bool{}); err == nil {
+		t.Fatal("PublicationDecision(\"darwin_arm64\", no evidence) = nil; Darwin evidence must remain load-bearing")
 	}
 
 	// An unsupported platform is refused outright, never defaulting to approving.

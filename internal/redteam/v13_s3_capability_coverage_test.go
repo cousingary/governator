@@ -29,7 +29,6 @@ func v13S3Attestation(t *testing.T, category string) (redteamgate.CapabilityAtte
 	nonApproving := false
 	if category == redteamgate.AttestationCategoryDarwin {
 		platform = "darwin/amd64"
-		nonApproving = true
 	}
 	log := "=== RUN   " + v13S3CoveredTest + "\n--- PASS: " + v13S3CoveredTest + " (0.00s)\nPASS\n"
 	record := func(state redteamgate.CapabilityState, probe, result string) redteamgate.CapabilityRecord {
@@ -145,15 +144,8 @@ func TestV13Case18SameEvidenceRelabeledUnderMultipleCategoriesIsRejected(t *test
 	}
 }
 
-// Sol13 rc6 Session 9: this case originally used the darwin category as its
-// vehicle, which conflated two independent rules -- "a NonApproving category
-// never covers a skip" (this case) and "a case bound to a platform the
-// release declares non-approving is out of release scope entirely" (case
-// 297). Conflated, they deadlocked: darwin attestations MUST be NonApproving
-// (verifyCategoryCapabilityProof) yet NonApproving never covered, so no host
-// could ever clear cases 34/35 and no rc6 could ever be cut. The invariant
-// this case exists for is unchanged and asserted here on a category that is
-// NOT platform-bound, so it stays orthogonal to release scope.
+// Sol13 rc6 Session 9: this invariant remains independent of platform
+// classification and is asserted on a non-platform-bound category.
 func TestV13Case19NonApprovingCategoryCannotCoverProductionTest(t *testing.T) {
 	manifest := redteamgate.Manifest{Cases: []redteamgate.CaseEntry{{Case: 1, Name: "TestDockerOnly", Required: true, AttestationCategory: redteamgate.AttestationCategoryDockerEnabled}}}
 	log := "=== RUN   TestDockerOnly\n--- SKIP: TestDockerOnly (0.00s)\n"

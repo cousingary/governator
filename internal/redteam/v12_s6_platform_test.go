@@ -18,14 +18,11 @@
 // pattern), so the package now cross-compiles for every scripts/release.sh
 // PLATFORMS target.
 //
-// Cross-compiling is NOT the same claim as "Darwin is production-approved":
-// this dev host (standing rule 11) cannot produce real Darwin acceptance
-// evidence, and faking it is explicitly forbidden. rc5 instead declares
-// Darwin explicitly NON-APPROVING (internal/redteamgate.ClassifyPlatform),
-// ships it anyway (buildable, degraded), and refuses anything outside
-// {linux, darwin} outright rather than defaulting an unrecognized platform
-// to approving (scripts/release.sh's new PLATFORMS validation loop, plus
-// the artifact-labeling and architecture-metadata blocks it feeds).
+// Cross-compiling is NOT the same claim as "Darwin is production-approved."
+// S6b supplied real native darwin/arm64 acceptance, unit, race, Sol3,
+// red-team, and red-team-race evidence. Darwin is now approval-eligible, but
+// ClassifyPlatformWithEvidence still requires evidence for the exact
+// architecture. Anything outside {linux, darwin} remains refused outright.
 //
 // Cases 34/35 are real acceptance tests, not placeholders: on a genuine
 // Darwin host they exercise the actual containment/Assayer refusal paths.
@@ -113,7 +110,7 @@ func TestV12Case33DarwinCrossBuildSucceeds(t *testing.T) {
 // the three, never a falsely-claimed strong scope.
 func TestV12Case34DarwinNativeContainmentNeverClaimsStrongScope(t *testing.T) {
 	if runtime.GOOS != "darwin" {
-		t.Skipf("%s (Sol12 P1-1, Session 6: rc5 declares Darwin non-approving pending real native containment evidence)", darwinNativeHostSkipReason)
+		t.Skipf("%s (Sol12 P1-1: requires a native Darwin containment refusal)", darwinNativeHostSkipReason)
 	}
 	scope, err := containment.NewScope("v12-case34-darwin-native", true, containment.ContainmentEnvironment{})
 	if err == nil {
@@ -131,7 +128,7 @@ func TestV12Case34DarwinNativeContainmentNeverClaimsStrongScope(t *testing.T) {
 // instead of degrading to some weaker unsealed form.
 func TestV12Case35DarwinNativeAssayerRefusesRatherThanDegrades(t *testing.T) {
 	if runtime.GOOS != "darwin" {
-		t.Skipf("%s (Sol12 P1-1, Session 6: rc5 declares Darwin non-approving pending real native Assayer evidence)", darwinNativeHostSkipReason)
+		t.Skipf("%s (Sol12 P1-1: requires a native Darwin Assayer refusal)", darwinNativeHostSkipReason)
 	}
 	enrollRealPython3(t)
 	registry, rerr := toolregistry.Load()
@@ -170,19 +167,18 @@ func TestV12Case36UnsupportedPlatformRefusedProductionApproval(t *testing.T) {
 			t.Fatalf("ClassifyPlatform(%q) = %q, want %q", goos, status, redteamgate.PlatformUnsupported)
 		}
 	}
-	// Sanity companions: the two real release platforms must classify
-	// exactly as rc5 declares, so this test fails loud if a future change
-	// silently widens or narrows the approved/degraded sets.
+	// Sanity companions: both real release GOOS values are approval-eligible;
+	// per-architecture evidence remains mandatory at publication.
 	if approved, reason := redteamgate.ApprovedForProduction("linux"); !approved || reason != "" {
 		t.Fatalf(`ApprovedForProduction("linux") = (%v, %q), want (true, "")`, approved, reason)
 	}
 	if status := redteamgate.ClassifyPlatform("linux"); status != redteamgate.PlatformApproving {
 		t.Fatalf(`ClassifyPlatform("linux") = %q, want %q`, status, redteamgate.PlatformApproving)
 	}
-	if approved, reason := redteamgate.ApprovedForProduction("darwin"); approved || reason == "" {
-		t.Fatalf(`ApprovedForProduction("darwin") = (%v, %q), want (false, non-empty reason) -- Darwin is explicitly non-approving for rc5 (Sol12 P1-1)`, approved, reason)
+	if approved, reason := redteamgate.ApprovedForProduction("darwin"); !approved || reason != "" {
+		t.Fatalf(`ApprovedForProduction("darwin") = (%v, %q), want (true, "") after native S6b acceptance`, approved, reason)
 	}
-	if status := redteamgate.ClassifyPlatform("darwin"); status != redteamgate.PlatformNonApproving {
-		t.Fatalf(`ClassifyPlatform("darwin") = %q, want %q`, status, redteamgate.PlatformNonApproving)
+	if status := redteamgate.ClassifyPlatform("darwin"); status != redteamgate.PlatformApproving {
+		t.Fatalf(`ClassifyPlatform("darwin") = %q, want %q`, status, redteamgate.PlatformApproving)
 	}
 }
