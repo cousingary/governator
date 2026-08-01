@@ -23,6 +23,12 @@ func truePath(t *testing.T) string {
 }
 
 func TestExecutorUsesOnlyFrozenEnvironment(t *testing.T) {
+	// This test asserts the child environment, not host scope selection.
+	// Keep a hosted runner's ambient systemd-run from turning that unrelated
+	// capability into a fixture dependency.
+	containment.ForceDegradedScopeForTesting.Store(true)
+	t.Cleanup(func() { containment.ForceDegradedScopeForTesting.Store(false) })
+
 	executable, err := HashExecutable("/bin/sh")
 	if err != nil {
 		t.Fatal(err)

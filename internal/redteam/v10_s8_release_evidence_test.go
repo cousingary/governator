@@ -43,8 +43,12 @@ func assayerRepoForTests() string {
 // fails a run that leaks a non-daemon thread -- proving the mechanism
 // itself works even on a host that can't reproduce the original hang.
 func TestV10Case30FullPython3135SuiteExitsCleanly(t *testing.T) {
-	if _, err := exec.LookPath("python3"); err != nil {
-		t.Skip("python3 not on PATH")
+	python := os.Getenv("ASSAYER_TEST_PYTHON")
+	if python == "" {
+		python = "python3"
+	}
+	if _, err := exec.LookPath(python); err != nil {
+		t.Skipf("Assayer test interpreter %q not on PATH", python)
 	}
 
 	t.Run("real Assayer suite exits within a bounded deadline", func(t *testing.T) {
@@ -60,7 +64,7 @@ func TestV10Case30FullPython3135SuiteExitsCleanly(t *testing.T) {
 		if _, err := os.Stat(repo); err != nil {
 			t.Skip("ASSAYER_REPO not present on this host")
 		}
-		cmd := exec.Command("python3", "-m", "pytest", "-q")
+		cmd := exec.Command(python, "-m", "pytest", "-q")
 		cmd.Dir = repo
 		var out bytes.Buffer
 		cmd.Stdout = &out
@@ -107,7 +111,7 @@ def test_leaks_a_nondaemon_thread():
 			t.Fatal(err)
 		}
 
-		cmd := exec.Command("python3", "-m", "pytest", "-q")
+		cmd := exec.Command(python, "-m", "pytest", "-q")
 		cmd.Dir = fixture
 		out, err := cmd.CombinedOutput()
 		if err == nil {

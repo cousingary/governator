@@ -270,3 +270,31 @@ func TestV16Case417HostedRunnerEnablesMandatoryLinuxContainment(t *testing.T) {
 		t.Fatal("Ubuntu 24.04 hosted release must enable the mandatory Landlock+unshare containment path")
 	}
 }
+
+// TestV16Case418HostedRedteamUsesPinnedAssayerEnvironment closes the rc18
+// hosted-runner failure where the red-team tier invoked the trusted
+// runner-image python directly even though that interpreter did not provide
+// pytest or Assayer's runtime dependencies. The release must provision from
+// Assayer's pinned lock and explicitly hand that interpreter to both red-team
+// tiers; ambient Python packages are not release evidence.
+func TestV16Case418HostedRedteamUsesPinnedAssayerEnvironment(t *testing.T) {
+	content, err := os.ReadFile(s7aScript(t, "release.sh"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	src := string(content)
+	for _, required := range []string{
+		`ASSAYER_REDTEAM_VENV="$OUT_DIR/assayer-redteam-venv"`,
+		`"$PYTHON313_TOOL" -m venv "$ASSAYER_REDTEAM_VENV"`,
+		`-r "$ASSAYER_REPO/requirements-lock.txt"`,
+		`ASSAYER_TEST_PYTHON=%q`,
+		`"$ASSAYER_REDTEAM_VENV/bin/python"`,
+	} {
+		if !strings.Contains(src, required) {
+			t.Fatalf("release pipeline omits pinned Assayer red-team environment contract %q", required)
+		}
+	}
+	if strings.Count(src, `ASSAYER_TEST_PYTHON=%q`) != 2 {
+		t.Fatal("both redteam and redteam_race must receive the pinned Assayer interpreter")
+	}
+}

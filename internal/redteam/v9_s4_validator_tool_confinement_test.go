@@ -116,7 +116,21 @@ func main() {
 // validator exits non-zero (quarantining the run).
 func TestV9Case21DeclaredGoInvokingPython3IsDenied(t *testing.T) {
 	validatorConfinementSkipIfUnsupported(t)
-	enrollValidatorTool(t, "go")
+	// The validator never executes the declared tool; it only proves that
+	// declaring one tool cannot expose python3 through PATH. Enroll a
+	// runner-image executable under the logical name "go" so the invariant
+	// is deterministic even when actions/setup-go lives below a mutable
+	// hosted-toolcache ancestor that the production registry must reject.
+	inertTool, err := exec.LookPath("true")
+	if err != nil {
+		t.Skipf("conditional: runner-image true is unavailable: %v", err)
+	}
+	if canonical, cerr := filepath.EvalSymlinks(inertTool); cerr == nil {
+		inertTool = canonical
+	}
+	if _, err := toolregistry.Enroll("go", inertTool); err != nil {
+		t.Fatalf("enroll declared validator tool %q: %v", "go", err)
+	}
 
 	root := fixtureRepo(t)
 	c := baseContract(root)

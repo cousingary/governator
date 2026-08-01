@@ -1944,7 +1944,8 @@ func TestWorkspaceCleanupGuardRemovesGraphPrepareFailureResources(t *testing.T) 
 }
 
 func TestRunRejectsTrackedSymlinkBeforeLaunch(t *testing.T) {
-	root, _ := fixture(t)
+	root, bin := fixture(t)
+	t.Setenv("GOV_CLAUDE_BIN", bin)
 	external := filepath.Join(t.TempDir(), "outside.txt")
 	if err := os.WriteFile(external, []byte("secret\n"), 0600); err != nil {
 		t.Fatal(err)
@@ -1970,7 +1971,8 @@ func TestRunRejectsTrackedSymlinkBeforeLaunch(t *testing.T) {
 }
 
 func TestRunRejectsSymlinkedWriteParentBeforeLaunch(t *testing.T) {
-	root, _ := fixture(t)
+	root, bin := fixture(t)
+	t.Setenv("GOV_CLAUDE_BIN", bin)
 	outside := filepath.Join(t.TempDir(), "outside-output")
 	if err := os.MkdirAll(outside, 0700); err != nil {
 		t.Fatal(err)

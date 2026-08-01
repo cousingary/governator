@@ -1002,6 +1002,8 @@ CORPUS_LOG="$OUT_DIR/test-corpus.log"
 REDTEAM_LOG="$OUT_DIR/test-redteam.log"
 REDTEAM_RACE_LOG="$OUT_DIR/test-redteam-race.log"
 TEST_TOOL_REGISTRY="$OUT_DIR/.test-tools.yaml"
+ASSAYER_REDTEAM_VENV="$OUT_DIR/assayer-redteam-venv"
+ASSAYER_REDTEAM_SETUP_LOG="$OUT_DIR/assayer-redteam-venv.log"
 
 MAIN_TIER_SPEC=$(mktemp)
 if [ ! -f "$INTEGRATION_GOV_BIN" ]; then
@@ -1021,6 +1023,21 @@ if [ "$INTEGRATION_GOV_BIN_SHA" != "$HOST_BIN_SHA" ]; then
   exit 1
 fi
 mkdir -p "$INTEGRATION_EVIDENCE_DIR"
+# The build-tagged red-team corpus invokes the real Assayer pytest suite.
+# Provision its interpreter from Assayer's pinned dependency lock before the
+# tiers, rather than assuming the runner-image python happens to contain
+# pytest and Assayer's runtime dependencies.
+if [ ! -f "$ASSAYER_REPO/requirements-lock.txt" ]; then
+  echo "release: refusing to run red-team tiers -- ${ASSAYER_REPO}/requirements-lock.txt is missing" >&2
+  exit 1
+fi
+if ! "$PYTHON313_TOOL" -m venv "$ASSAYER_REDTEAM_VENV" >"$ASSAYER_REDTEAM_SETUP_LOG" 2>&1 ||
+   ! "$ASSAYER_REDTEAM_VENV/bin/pip" install --quiet --disable-pip-version-check \
+      -r "$ASSAYER_REPO/requirements-lock.txt" >>"$ASSAYER_REDTEAM_SETUP_LOG" 2>&1; then
+  echo "release: failed to provision the pinned Assayer red-team environment" >&2
+  cat "$ASSAYER_REDTEAM_SETUP_LOG" >&2
+  exit 1
+fi
 # Tests exercise the production trusted-tool boundary and must never depend
 # on an operator's ambient $HOME registry. Enroll only policy-verified tools,
 # through the exact extracted release candidate, into an attempt-scoped
@@ -1067,8 +1084,8 @@ EOF_INTEGRATION_PACKAGES
   # tests were only ever exercised by hand from the real checkout, where the
   # sibling fallback happens to resolve. Same defect class as every other
   # rc6/rc7 release blocker: a path that had never executed end to end.
-  printf 'redteam\t%s\tPATH=%q GOV_TOOLREGISTRY_FILE=%q ASSAYER_REPO=%q GOV_INTEGRATION_ASSAYER_COMMIT=%q %q test -v -timeout=30m -tags redteam -p %s -parallel %s -count=1 ./...\n' "$REDTEAM_LOG" "$TEST_TIER_PATH" "$TEST_TOOL_REGISTRY" "$ASSAYER_REPO" "$ASSAYER_COMMIT" "$GO_TOOL" "$GO_TEST_PARALLELISM" "$GO_TEST_PARALLELISM"
-  printf 'redteam_race\t%s\tPATH=%q GOV_TOOLREGISTRY_FILE=%q ASSAYER_REPO=%q GOV_INTEGRATION_ASSAYER_COMMIT=%q %q test -v -race -timeout=30m -tags redteam -p %s -parallel %s -count=1 ./...\n' "$REDTEAM_RACE_LOG" "$TEST_TIER_PATH" "$TEST_TOOL_REGISTRY" "$ASSAYER_REPO" "$ASSAYER_COMMIT" "$GO_TOOL" "$GO_TEST_PARALLELISM" "$GO_TEST_PARALLELISM"
+  printf 'redteam\t%s\tPATH=%q GOV_TOOLREGISTRY_FILE=%q ASSAYER_REPO=%q ASSAYER_TEST_PYTHON=%q GOV_INTEGRATION_ASSAYER_COMMIT=%q %q test -v -timeout=30m -tags redteam -p %s -parallel %s -count=1 ./...\n' "$REDTEAM_LOG" "$TEST_TIER_PATH" "$TEST_TOOL_REGISTRY" "$ASSAYER_REPO" "$ASSAYER_REDTEAM_VENV/bin/python" "$ASSAYER_COMMIT" "$GO_TOOL" "$GO_TEST_PARALLELISM" "$GO_TEST_PARALLELISM"
+  printf 'redteam_race\t%s\tPATH=%q GOV_TOOLREGISTRY_FILE=%q ASSAYER_REPO=%q ASSAYER_TEST_PYTHON=%q GOV_INTEGRATION_ASSAYER_COMMIT=%q %q test -v -race -timeout=30m -tags redteam -p %s -parallel %s -count=1 ./...\n' "$REDTEAM_RACE_LOG" "$TEST_TIER_PATH" "$TEST_TOOL_REGISTRY" "$ASSAYER_REPO" "$ASSAYER_REDTEAM_VENV/bin/python" "$ASSAYER_COMMIT" "$GO_TOOL" "$GO_TEST_PARALLELISM" "$GO_TEST_PARALLELISM"
 } >"$MAIN_TIER_SPEC"
 
 MAIN_TIER_JSONL="$OUT_DIR/.tier-pipeline-main.jsonl"

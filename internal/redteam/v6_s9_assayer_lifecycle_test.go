@@ -87,13 +87,17 @@ func TestV6Case33AssayerPytestExitsCleanlyOnSupportedPythonVersions(t *testing.T
 	if _, err := os.Stat(repo); err != nil {
 		t.Skipf("ASSAYER_REPO %q not present on this machine: %v", repo, err)
 	}
-	if _, err := exec.LookPath("python3"); err != nil {
-		t.Skipf("python3 not available: %v", err)
+	python := os.Getenv("ASSAYER_TEST_PYTHON")
+	if python == "" {
+		python = "python3"
+	}
+	if _, err := exec.LookPath(python); err != nil {
+		t.Skipf("Assayer test interpreter %q not available: %v", python, err)
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, "python3", "-m", "pytest", "-q")
+	cmd := exec.CommandContext(ctx, python, "-m", "pytest", "-q")
 	cmd.Dir = repo
 	out, err := cmd.CombinedOutput()
 
