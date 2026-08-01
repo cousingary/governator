@@ -199,3 +199,23 @@ func TestV16Case413TierVerificationPropagatesExplicitCIProfile(t *testing.T) {
 		t.Fatal("release pipeline does not propagate its selected profile to the tier runner")
 	}
 }
+
+func TestV16Case414ReleaseTiersUseAttemptScopedTrustedToolRegistry(t *testing.T) {
+	content, err := os.ReadFile(s7aScript(t, "release.sh"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	src := string(content)
+	for _, required := range []string{
+		`TEST_TOOL_REGISTRY="$OUT_DIR/.test-tools.yaml"`,
+		`GOV_TOOLREGISTRY_FILE="$TEST_TOOL_REGISTRY" "$INTEGRATION_GOV_BIN" tools enroll`,
+		`"git:$GIT_TOOL" "bash:$BASH_TOOL" "python3:$PYTHON_TOOL"`,
+	} {
+		if !strings.Contains(src, required) {
+			t.Fatalf("release pipeline omits attempt-scoped registry contract %q", required)
+		}
+	}
+	if strings.Count(src, `GOV_TOOLREGISTRY_FILE=%q`) != 7 {
+		t.Fatal("all six test tiers plus the integration gate must receive the attempt-scoped registry")
+	}
+}

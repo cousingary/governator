@@ -1001,6 +1001,7 @@ INTEGRATION_GATE_JSON="$OUT_DIR/.integration-gate.json"
 CORPUS_LOG="$OUT_DIR/test-corpus.log"
 REDTEAM_LOG="$OUT_DIR/test-redteam.log"
 REDTEAM_RACE_LOG="$OUT_DIR/test-redteam-race.log"
+TEST_TOOL_REGISTRY="$OUT_DIR/.test-tools.yaml"
 
 MAIN_TIER_SPEC=$(mktemp)
 if [ ! -f "$INTEGRATION_GOV_BIN" ]; then
@@ -1020,6 +1021,15 @@ if [ "$INTEGRATION_GOV_BIN_SHA" != "$HOST_BIN_SHA" ]; then
   exit 1
 fi
 mkdir -p "$INTEGRATION_EVIDENCE_DIR"
+# Tests exercise the production trusted-tool boundary and must never depend
+# on an operator's ambient $HOME registry. Enroll only policy-verified tools,
+# through the exact extracted release candidate, into an attempt-scoped
+# registry that every tier receives explicitly.
+for test_tool_entry in "git:$GIT_TOOL" "bash:$BASH_TOOL" "python3:$PYTHON_TOOL"; do
+  test_tool_name=${test_tool_entry%%:*}
+  test_tool_path=${test_tool_entry#*:}
+  GOV_TOOLREGISTRY_FILE="$TEST_TOOL_REGISTRY" "$INTEGRATION_GOV_BIN" tools enroll "$test_tool_name" "$test_tool_path"
+done
 cat >"$INTEGRATION_EXPECTED_NAMES" <<'EOF_INTEGRATION_NAMES'
 TestEvaluateAgainstRealCLIPassAndFail
 TestEvaluateShaMismatchAfterEvaluationIsError
@@ -1036,15 +1046,15 @@ assay
 contextgraph
 EOF_INTEGRATION_PACKAGES
 {
-  printf 'unit\t%s\tPATH=%q %q test -p %s -parallel %s -count=1 ./...\n' "$UNIT_LOG" "$TEST_TIER_PATH" "$GO_TOOL" "$GO_TEST_PARALLELISM" "$GO_TEST_PARALLELISM"
-  printf 'race\t%s\tPATH=%q %q test -race -timeout=30m -p %s -parallel %s -count=1 ./...\n' "$RACE_LOG" "$TEST_TIER_PATH" "$GO_TOOL" "$GO_TEST_PARALLELISM" "$GO_TEST_PARALLELISM"
-  printf 'integration\t%s\tPATH=%q ASSAYER_REPO=%q GOV_INTEGRATION_ASSAYER_COMMIT=%q GOV_INTEGRATION_GOV_BIN=%q GOV_INTEGRATION_EVIDENCE_OUT=%q %q test -json -tags integration -p %s -parallel %s -count=1 ./internal/assay/... ./internal/contextgraph/... > %q && %q integration-gate verify --log %q --expected-names %q --harness-evidence %q --governator-binary %q --expected-packages %q --assayer-commit %q > %q && %q %q\n' "$INTEGRATION_LOG" "$TEST_TIER_PATH" "$ASSAYER_REPO" "$ASSAYER_COMMIT" "$INTEGRATION_GOV_BIN" "$INTEGRATION_EVIDENCE_DIR" "$GO_TOOL" "$GO_TEST_PARALLELISM" "$GO_TEST_PARALLELISM" "$INTEGRATION_JSON_LOG" "$INTEGRATION_GOV_BIN" "$INTEGRATION_JSON_LOG" "$INTEGRATION_EXPECTED_NAMES" "$INTEGRATION_EVIDENCE_DIR" "$INTEGRATION_GOV_BIN" "$INTEGRATION_EXPECTED_PACKAGES" "$ASSAYER_COMMIT" "$INTEGRATION_GATE_JSON" "$CAT_TOOL" "$INTEGRATION_JSON_LOG"
+  printf 'unit\t%s\tPATH=%q GOV_TOOLREGISTRY_FILE=%q %q test -p %s -parallel %s -count=1 ./...\n' "$UNIT_LOG" "$TEST_TIER_PATH" "$TEST_TOOL_REGISTRY" "$GO_TOOL" "$GO_TEST_PARALLELISM" "$GO_TEST_PARALLELISM"
+  printf 'race\t%s\tPATH=%q GOV_TOOLREGISTRY_FILE=%q %q test -race -timeout=30m -p %s -parallel %s -count=1 ./...\n' "$RACE_LOG" "$TEST_TIER_PATH" "$TEST_TOOL_REGISTRY" "$GO_TOOL" "$GO_TEST_PARALLELISM" "$GO_TEST_PARALLELISM"
+  printf 'integration\t%s\tPATH=%q GOV_TOOLREGISTRY_FILE=%q ASSAYER_REPO=%q GOV_INTEGRATION_ASSAYER_COMMIT=%q GOV_INTEGRATION_GOV_BIN=%q GOV_INTEGRATION_EVIDENCE_OUT=%q %q test -json -tags integration -p %s -parallel %s -count=1 ./internal/assay/... ./internal/contextgraph/... > %q && GOV_TOOLREGISTRY_FILE=%q %q integration-gate verify --log %q --expected-names %q --harness-evidence %q --governator-binary %q --expected-packages %q --assayer-commit %q > %q && %q %q\n' "$INTEGRATION_LOG" "$TEST_TIER_PATH" "$TEST_TOOL_REGISTRY" "$ASSAYER_REPO" "$ASSAYER_COMMIT" "$INTEGRATION_GOV_BIN" "$INTEGRATION_EVIDENCE_DIR" "$GO_TOOL" "$GO_TEST_PARALLELISM" "$GO_TEST_PARALLELISM" "$INTEGRATION_JSON_LOG" "$TEST_TOOL_REGISTRY" "$INTEGRATION_GOV_BIN" "$INTEGRATION_JSON_LOG" "$INTEGRATION_EXPECTED_NAMES" "$INTEGRATION_EVIDENCE_DIR" "$INTEGRATION_GOV_BIN" "$INTEGRATION_EXPECTED_PACKAGES" "$ASSAYER_COMMIT" "$INTEGRATION_GATE_JSON" "$CAT_TOOL" "$INTEGRATION_JSON_LOG"
   # Sol redteam v6 S0 (P0-18, partial): the build-tagged internal/redteam/
   # corpus was never actually compiled by any release or CI command --
   # "black_box_corpus" here only runs Sol3-prefixed tests, which never
   # triggers the `redteam` build tag. redteam/redteam_race below are the
   # exact commands the v6 report requires.
-  printf 'corpus\t%s\tPATH=%q %q test -run '"'"'Sol3'"'"' -v -p %s -parallel %s -count=1 ./...\n' "$CORPUS_LOG" "$TEST_TIER_PATH" "$GO_TOOL" "$GO_TEST_PARALLELISM" "$GO_TEST_PARALLELISM"
+  printf 'corpus\t%s\tPATH=%q GOV_TOOLREGISTRY_FILE=%q %q test -run '"'"'Sol3'"'"' -v -p %s -parallel %s -count=1 ./...\n' "$CORPUS_LOG" "$TEST_TIER_PATH" "$TEST_TOOL_REGISTRY" "$GO_TOOL" "$GO_TEST_PARALLELISM" "$GO_TEST_PARALLELISM"
   # Sol14 P0-2/P0-3 (rc7 Session 10): the redteam tiers MUST carry the same
   # ASSAYER_REPO/commit binding the integration tier above does. The S5/S6
   # corpus cases (TestV14Case322-329) spawn a nested real integration tier,
@@ -1057,8 +1067,8 @@ EOF_INTEGRATION_PACKAGES
   # tests were only ever exercised by hand from the real checkout, where the
   # sibling fallback happens to resolve. Same defect class as every other
   # rc6/rc7 release blocker: a path that had never executed end to end.
-  printf 'redteam\t%s\tPATH=%q ASSAYER_REPO=%q GOV_INTEGRATION_ASSAYER_COMMIT=%q %q test -v -timeout=30m -tags redteam -p %s -parallel %s -count=1 ./...\n' "$REDTEAM_LOG" "$TEST_TIER_PATH" "$ASSAYER_REPO" "$ASSAYER_COMMIT" "$GO_TOOL" "$GO_TEST_PARALLELISM" "$GO_TEST_PARALLELISM"
-  printf 'redteam_race\t%s\tPATH=%q ASSAYER_REPO=%q GOV_INTEGRATION_ASSAYER_COMMIT=%q %q test -v -race -timeout=30m -tags redteam -p %s -parallel %s -count=1 ./...\n' "$REDTEAM_RACE_LOG" "$TEST_TIER_PATH" "$ASSAYER_REPO" "$ASSAYER_COMMIT" "$GO_TOOL" "$GO_TEST_PARALLELISM" "$GO_TEST_PARALLELISM"
+  printf 'redteam\t%s\tPATH=%q GOV_TOOLREGISTRY_FILE=%q ASSAYER_REPO=%q GOV_INTEGRATION_ASSAYER_COMMIT=%q %q test -v -timeout=30m -tags redteam -p %s -parallel %s -count=1 ./...\n' "$REDTEAM_LOG" "$TEST_TIER_PATH" "$TEST_TOOL_REGISTRY" "$ASSAYER_REPO" "$ASSAYER_COMMIT" "$GO_TOOL" "$GO_TEST_PARALLELISM" "$GO_TEST_PARALLELISM"
+  printf 'redteam_race\t%s\tPATH=%q GOV_TOOLREGISTRY_FILE=%q ASSAYER_REPO=%q GOV_INTEGRATION_ASSAYER_COMMIT=%q %q test -v -race -timeout=30m -tags redteam -p %s -parallel %s -count=1 ./...\n' "$REDTEAM_RACE_LOG" "$TEST_TIER_PATH" "$TEST_TOOL_REGISTRY" "$ASSAYER_REPO" "$ASSAYER_COMMIT" "$GO_TOOL" "$GO_TEST_PARALLELISM" "$GO_TEST_PARALLELISM"
 } >"$MAIN_TIER_SPEC"
 
 MAIN_TIER_JSONL="$OUT_DIR/.tier-pipeline-main.jsonl"
