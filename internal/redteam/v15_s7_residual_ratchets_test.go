@@ -32,6 +32,7 @@ package redteam
 
 import (
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"fmt"
 	"os"
@@ -93,12 +94,18 @@ func s7MinisignFixture(t *testing.T) (artifactsDir, checksums, minisig, trustFil
 	if err != nil {
 		t.Fatal(err)
 	}
-	comment := strings.SplitN(string(pubData), "\n", 2)[0]
-	idx := strings.LastIndex(comment, " ")
-	if idx < 0 {
-		t.Fatalf("unexpected pub comment line %q", comment)
+	pubLines := strings.Split(string(pubData), "\n")
+	if len(pubLines) < 2 {
+		t.Fatalf("unexpected minisign public key file")
 	}
-	fingerprint = strings.TrimSpace(comment[idx+1:])
+	pubPacket, err := base64.StdEncoding.DecodeString(strings.TrimSpace(pubLines[1]))
+	if err != nil || len(pubPacket) != 42 || string(pubPacket[:2]) != "Ed" {
+		t.Fatalf("unexpected minisign public key packet: len=%d err=%v", len(pubPacket), err)
+	}
+	// Derive the cryptographic key ID from the packet, exactly as
+	// release_policy.py does. Minisign's human-readable comment is
+	// untrusted metadata and differs across packaged Minisign versions.
+	fingerprint = strings.ToUpper(hex.EncodeToString(reverseBytes(pubPacket[2:10])))
 
 	artifact := filepath.Join(artifactsDir, "gov_1.0.0_linux_amd64.tar.gz")
 	if err := os.WriteFile(artifact, []byte("release artifact bytes\n"), 0o644); err != nil {
@@ -140,6 +147,14 @@ func s7MinisignFixture(t *testing.T) (artifactsDir, checksums, minisig, trustFil
 		t.Fatal(err)
 	}
 	return artifactsDir, checksums, minisig, trustFile, keyDir, localTrust, localKeys, fingerprint
+}
+
+func reverseBytes(in []byte) []byte {
+	out := append([]byte(nil), in...)
+	for left, right := 0, len(out)-1; left < right; left, right = left+1, right-1 {
+		out[left], out[right] = out[right], out[left]
+	}
+	return out
 }
 
 func s7RunPolicy(t *testing.T, args ...string) (string, error) {
