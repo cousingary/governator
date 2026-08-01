@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	goruntime "runtime"
 	"strings"
 	"testing"
 
@@ -614,6 +615,9 @@ func writeAssayerIdentityFixture(t *testing.T) string {
 // against a since-mutated live checkout.
 func buildIdentityTestSnapshot(t *testing.T, repo string) *assay.Snapshot {
 	t.Helper()
+	if goruntime.GOOS != "linux" {
+		t.Skip("Assayer frozen runtime snapshots require Linux sealed-memfd execution")
+	}
 	registry, err := toolregistry.Load()
 	if err != nil {
 		t.Fatal(err)

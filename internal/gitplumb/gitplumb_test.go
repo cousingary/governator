@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -22,6 +23,9 @@ func git(t *testing.T, dir string, args ...string) string {
 
 func newRepo(t *testing.T) string {
 	t.Helper()
+	if runtime.GOOS != "linux" {
+		t.Skip("gitplumb requires Linux sealed controller-tool launch")
+	}
 	root := t.TempDir()
 	git(t, root, "init", "-b", "main")
 	git(t, root, "config", "user.email", "test@example.invalid")

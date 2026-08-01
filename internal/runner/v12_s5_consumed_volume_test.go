@@ -44,6 +44,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -185,6 +186,9 @@ func v12s5MutateFile(t *testing.T, path, content string) {
 // bytes after ProvisionConsumedVolume, and VerifyConsumedVolume -- run
 // exactly as a Sol10 P0-1 checkpoint would -- must detect it.
 func TestV12Case27DockerVolumeMutationDuringReadDetected(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("Docker volume evidence requires Linux sealed controller-tool launch")
+	}
 	de, frozen, fakeHome := v12s5Setup(t)
 	ctx := context.Background()
 	artifacts := []ConsumedArtifactContent{v12s5Content("recon.json", `{"summary":"ok"}`)}
@@ -214,6 +218,9 @@ func TestV12Case27DockerVolumeMutationDuringReadDetected(t *testing.T) {
 // mechanism, and the same limitation the pre-existing sealed-memfd and
 // mode-bits-degraded verification paths already have.
 func TestV12Case28DockerVolumeMutationCaughtAtCheckpointThenRestoredVerifiesClean(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("Docker volume evidence requires Linux sealed controller-tool launch")
+	}
 	de, frozen, fakeHome := v12s5Setup(t)
 	ctx := context.Background()
 	original := "original-consumed-bytes"
@@ -247,6 +254,9 @@ func TestV12Case28DockerVolumeMutationCaughtAtCheckpointThenRestoredVerifiesClea
 // silently trusting/reusing whatever identity that volume name already
 // carried.
 func TestV12Case29PreexistingVolumeContentNotTrustedOnProvision(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("Docker volume evidence requires Linux sealed controller-tool launch")
+	}
 	de, frozen, fakeHome := v12s5Setup(t)
 	ctx := context.Background()
 	volumeName := ConsumedVolumeName("case29")
@@ -280,6 +290,9 @@ func TestV12Case29PreexistingVolumeContentNotTrustedOnProvision(t *testing.T) {
 // VerifyConsumedVolume's entry-count/name check, not just its per-file hash
 // check, closes the gap.
 func TestV12Case30DockerVolumeContentReplacementDetected(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("Docker volume evidence requires Linux sealed controller-tool launch")
+	}
 	de, frozen, fakeHome := v12s5Setup(t)
 	ctx := context.Background()
 	artifacts := []ConsumedArtifactContent{

@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -66,6 +67,9 @@ func testContainmentEnvironmentRequiring(t *testing.T, require ...string) Contai
 // outlives its parent's own exit must not survive Extinguish, regardless of
 // which method NewScope selected for this host.
 func TestScopeKillsDetachedSetsidDescendant(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("detached-descendant extinction proof requires Linux containment primitives and /proc")
+	}
 	dir := t.TempDir()
 	transcriptDir := t.TempDir() // deliberately outside dir -- mirrors runtime.go's transcripts/ living outside the worktree
 	marker := filepath.Join(dir, "escaped.txt")
@@ -124,6 +128,9 @@ func TestScopeKillsDetachedSetsidDescendant(t *testing.T) {
 // in runtime.go: a Scope that never launched anything must still produce a
 // clean Proof instead of erroring.
 func TestScopeExtinguishNoopWhenNothingStarted(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("scope extinction proof requires Linux containment primitives and /proc")
+	}
 	env := testContainmentEnvironment(t, "systemd-run", "unshare")
 	scope, err := NewScope("containment-unit-test-noop", false, env)
 	if err != nil {
@@ -506,6 +513,9 @@ func TestV10Case10SystemdRunReplacedAfterFrozenEnvironmentConstructionHasNoEffec
 // every call, so a live-running stage could pick up exactly this kind of
 // mutation mid-run, diverging from the identity already computed.
 func TestV10Case11ContainmentRegistryMutatedAfterEnvironmentResolvedHasNoEffect(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("sealed containment-tool handles are Linux-only")
+	}
 	t.Setenv("GOV_TOOLREGISTRY_FILE", filepath.Join(t.TempDir(), "tools.yaml"))
 	const original = "#!/bin/sh\nprintf original-unshare\n"
 	v10s2EnrollTamperableScript(t, "unshare", original)

@@ -3,6 +3,7 @@ package runtime
 import (
 	"context"
 	"os/exec"
+	goruntime "runtime"
 	"strconv"
 	"sync"
 	"testing"
@@ -115,6 +116,9 @@ func TestChaos_ConcurrentLifecycleRecordersUnderRealSQLiteContention(t *testing.
 // restriction since this test is proving the ctx-kill mechanism, not
 // PATH-based tool resolution.
 func TestChaos_HungValidatorKilledAtContextDeadline(t *testing.T) {
+	if goruntime.GOOS != "linux" {
+		t.Skip("validator shell execution requires Linux sealed controller-tool launch")
+	}
 	dir := t.TempDir()
 	registry, rerr := toolregistry.Load()
 	if rerr != nil {

@@ -7,6 +7,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
+	"slices"
 	"strings"
 	"syscall"
 	"testing"
@@ -228,6 +230,41 @@ func TestDockerRunArgsCredentialMounts(t *testing.T) {
 	}
 	if !found {
 		t.Errorf("expected mount arg %q in runArgs output:\n%s", want, strings.Join(args, "\n"))
+	}
+}
+
+// TestDockerRunArgsCredentialMountsCanonicalizesConfiguredRoot covers the
+// Darwin /var -> /private/var shape: both the credential and its configured
+// root must be compared after symlink resolution.
+func TestDockerRunArgsCredentialMountsCanonicalizesConfiguredRoot(t *testing.T) {
+	realRoot := t.TempDir()
+	linkParent := t.TempDir()
+	rootLink := filepath.Join(linkParent, "credentials")
+	if err := os.Symlink(realRoot, rootLink); err != nil {
+		t.Fatal(err)
+	}
+	credential := filepath.Join(rootLink, "token")
+	if err := os.WriteFile(credential, []byte("secret"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	isolateConfig(t, rootLink)
+
+	d := &DockerRunner{
+		Config:          contracts.DockerRunnerConfig{Image: dockerTestImage, CredentialMounts: []string{credential}},
+		CredentialRoots: []string{rootLink},
+		ResolvedImage:   fakeResolvedImage(),
+	}
+	args, err := d.runArgs(Workspace{Container: "c", Path: "/ws"}, "bin", nil)
+	if err != nil {
+		t.Fatalf("symlinked configured root rejected: %v", err)
+	}
+	resolvedCredential, err := filepath.EvalSymlinks(credential)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := resolvedCredential + ":" + credentialContainerRoot + "/token:ro"
+	if !slices.Contains(args, want) {
+		t.Fatalf("expected canonicalized mount %q in args:\n%s", want, strings.Join(args, "\n"))
 	}
 }
 
@@ -740,6 +777,9 @@ func dockerTestImageDigest(t *testing.T) string {
 // control for Sol High 8/10: a container actually launched with every
 // hardened flag runArgs would emit passes Observe with no error.
 func TestDockerExecutorTimeoutRequiresProvenContainerExtinction(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("fake Docker CLI execution requires Linux sealed controller-tool launch")
+	}
 	stateDir := t.TempDir()
 	stateFile := filepath.Join(stateDir, "state")
 	if err := os.WriteFile(stateFile, []byte("running"), 0644); err != nil {
@@ -797,6 +837,9 @@ esac
 // window must be a hard DOCKER_CONTAINER_NOT_OBSERVED failure, never a
 // silent nil "verified" return.
 func TestDockerExecutorContainerNeverAppearsHardFails(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("fake Docker CLI execution requires Linux sealed controller-tool launch")
+	}
 	pinFakeDocker(t, `#!/bin/sh
 set -eu
 cmd=${1:-}
@@ -843,6 +886,9 @@ esac
 // CLI's "run" case sleeps far longer than this test's overall timeout
 // budget; the test asserts the whole call returns quickly anyway.
 func TestDockerExecutorAbandonsHungCLIAfterVerificationFailure(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("fake Docker CLI execution requires Linux sealed controller-tool launch")
+	}
 	pinFakeDocker(t, `#!/bin/sh
 set -eu
 cmd=${1:-}
@@ -1046,6 +1092,9 @@ func TestResolveImageIdentityDetectsRetaggedMutableTag(t *testing.T) {
 // registry, then prepends a different, hostile "docker" earlier on PATH,
 // and asserts resolveDocker() still returns the pinned path.
 func TestVerifyStartedContainerRejectsImageMismatch(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("fake Docker CLI execution requires Linux sealed controller-tool launch")
+	}
 	pinFakeDocker(t, "#!/bin/sh\nset -eu\nif [ \"${1:-}\" = inspect ]; then\n  printf '{\"Image\":\"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"State\":{\"Running\":true,\"Status\":\"running\"}}'\n  exit 0\nfi\nexit 1\n")
 	d := &DockerRunner{ResolvedImage: &ImageIdentity{ID: "sha256:" + strings.Repeat("a", 64)}, ControllerEnvironment: controllerenv.Freeze()}
 	err := d.verifyStartedContainer(context.Background(), Workspace{Container: "gov-image-mismatch"}, time.Now())

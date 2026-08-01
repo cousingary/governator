@@ -21,6 +21,7 @@ package containment
 
 import (
 	"os"
+	"runtime"
 	"testing"
 )
 
@@ -58,6 +59,9 @@ func TestV11Case45FDScanIndeterminatePermissionDeniedFailsClosed(t *testing.T) {
 // ordinary busy host's routine, permission-denied processes spuriously fail
 // every extinction proof.
 func TestV11Case45CounterpartUnrelatedUnreadableProcessNeverBlocksScan(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("/proc fd scanning is Linux-only")
+	}
 	if os.Geteuid() == 0 {
 		t.Skip("running as root: /proc/1/fd is readable, cannot exercise the permission-denied path on this host")
 	}

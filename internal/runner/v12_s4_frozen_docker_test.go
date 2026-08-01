@@ -18,6 +18,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -62,6 +63,9 @@ func v12s4EnrollFakeDockerAt(t *testing.T, script string) string {
 // for the launch-adjacent inspect a real transaction performs -- and asserts
 // it still executed through "A", never "B".
 func TestV12Case24DockerCLIRotatesBetweenInspectAndLaunchHasNoEffect(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("frozen Docker CLI handles require Linux sealed launch")
+	}
 	registryFile := filepath.Join(t.TempDir(), "tools.yaml")
 	t.Setenv("GOV_TOOLREGISTRY_FILE", registryFile)
 	imageA := strings.Repeat("a", 64)
@@ -123,6 +127,9 @@ func TestV12Case24DockerCLIRotatesBetweenInspectAndLaunchHasNoEffect(t *testing.
 // invoked through the frozen DockerEnvironment's CLI handle after a
 // same-UID rotation, and must still execute through the ORIGINAL binary.
 func TestV12Case25DockerCLIRotatesBetweenLaunchAndExtinctionHasNoEffect(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("frozen Docker CLI handles require Linux sealed launch")
+	}
 	registryFile := filepath.Join(t.TempDir(), "tools.yaml")
 	t.Setenv("GOV_TOOLREGISTRY_FILE", registryFile)
 	rmMarkerA := filepath.Join(t.TempDir(), "rm-marker-a")
@@ -174,6 +181,9 @@ func TestV12Case25DockerCLIRotatesBetweenLaunchAndExtinctionHasNoEffect(t *testi
 // the ambient DOCKER_HOST changes mid-transaction -- neither is re-derived
 // by any later docker operation the frozen environment performs.
 func TestV12Case26DockerDaemonEndpointChangeDuringRunHasNoEffect(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("frozen Docker CLI handles require Linux sealed launch")
+	}
 	registryFile := filepath.Join(t.TempDir(), "tools.yaml")
 	t.Setenv("GOV_TOOLREGISTRY_FILE", registryFile)
 	imageA := strings.Repeat("a", 64)

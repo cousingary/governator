@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"os"
 	"path/filepath"
+	goruntime "runtime"
 	"testing"
 )
 
@@ -34,6 +35,9 @@ func TestUnknownRequiredParticipantDisablesStrictReplay(t *testing.T) {
 }
 
 func TestSealedArtifactStagesCapturedBytes(t *testing.T) {
+	if goruntime.GOOS != "linux" {
+		t.Skip("sealed artifact staging requires Linux openat2")
+	}
 	data := []byte("before replay")
 	sum := sha256.Sum256(data)
 	a := stagedArtifact{Name: "a.txt", Path: ".governator/consumed/a.txt", SHA256: hex.EncodeToString(sum[:]), Bytes: int64(len(data)), data: append([]byte(nil), data...)}

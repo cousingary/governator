@@ -508,6 +508,17 @@ func TestProcessStartTicksReadsRealStarttime(t *testing.T) {
 	}
 }
 
+func TestLiveLockWithPortableStartTickSentinelIsNotImmediatelyStale(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "portable.lock")
+	body := fmt.Sprintf("%d %d - token", os.Getpid(), time.Now().UTC().UnixNano())
+	if err := os.WriteFile(p, []byte(body), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if !isLiveLock(p) {
+		t.Fatal("fresh live-process lock with portable start-tick sentinel was classified stale")
+	}
+}
+
 func TestLockReclaimsStaleTimestampFallback(t *testing.T) {
 	home := t.TempDir()
 	root := t.TempDir()

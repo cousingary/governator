@@ -388,7 +388,14 @@ func lock(root, home string) (func(), error) {
 		return nil, fmt.Errorf("workspace locked by an in-flight governator run (lock %s)", p)
 	}
 	token := randomLockToken()
-	body := fmt.Sprintf("%d %d %s %s", os.Getpid(), time.Now().UTC().UnixNano(), processStartTicks(os.Getpid()), token)
+	startTicks := processStartTicks(os.Getpid())
+	if startTicks == "" {
+		// Keep the four-field format stable off Linux. Without a sentinel,
+		// strings.Fields shifts token into the start-ticks field and every
+		// live Darwin lock is immediately misclassified as stale.
+		startTicks = "-"
+	}
+	body := fmt.Sprintf("%d %d %s %s", os.Getpid(), time.Now().UTC().UnixNano(), startTicks, token)
 	if err := f.Truncate(0); err != nil {
 		_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
 		locked = false
@@ -448,7 +455,7 @@ func isLiveLock(p string) bool {
 	if syscall.Kill(pid, 0) != nil {
 		return false
 	}
-	if len(parts) >= 3 && parts[2] != "" {
+	if len(parts) >= 3 && parts[2] != "" && parts[2] != "-" {
 		return parts[2] == processStartTicks(pid)
 	}
 	if len(parts) >= 2 {

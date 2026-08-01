@@ -941,7 +941,12 @@ func (d *DockerRunner) resolveCredentialMount(hostRaw string, roots []string) (c
 	}
 	underRoot := false
 	for _, root := range roots {
-		if pathUnderRoot(resolved, filepath.Clean(strings.TrimSpace(root))) {
+		cleanRoot := filepath.Clean(strings.TrimSpace(root))
+		resolvedRoot, resolveErr := filepath.EvalSymlinks(cleanRoot)
+		if resolveErr != nil {
+			continue
+		}
+		if pathUnderRoot(resolved, filepath.Clean(resolvedRoot)) {
 			underRoot = true
 			break
 		}

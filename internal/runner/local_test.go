@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"testing"
 	"time"
 
@@ -103,6 +104,9 @@ func (f fakeAgent) Run(ctx context.Context, req agents.Request) (agents.Result, 
 }
 
 func TestLocalWorktreeRunnerGitLifecycleApproved(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("local git lifecycle requires Linux sealed controller-tool launch")
+	}
 	root := gitFixture(t)
 	home := t.TempDir()
 	registry := testRegistry(t)
@@ -151,6 +155,9 @@ func TestLocalWorktreeRunnerGitLifecycleApproved(t *testing.T) {
 }
 
 func TestLocalWorktreeRunnerGitLifecycleQuarantinedKeepsBranch(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("local git lifecycle requires Linux sealed controller-tool launch")
+	}
 	root := gitFixture(t)
 	home := t.TempDir()
 	registry := testRegistry(t)

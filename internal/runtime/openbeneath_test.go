@@ -3,6 +3,7 @@ package runtime
 import (
 	"os"
 	"path/filepath"
+	goruntime "runtime"
 	"testing"
 
 	"github.com/cousingary/governator/internal/pathsafe"
@@ -47,6 +48,9 @@ func TestOpenBeneathRefusesParentComponentSymlink(t *testing.T) {
 // refused -- there is no cached "this was safe" state that survives the
 // swap, because every openBeneath call re-resolves from scratch.
 func TestOpenBeneathRefusesParentComponentSymlinkEvenAfterPriorSafeResolution(t *testing.T) {
+	if goruntime.GOOS != "linux" {
+		t.Skip("ordinary beneath-open success requires Linux openat2")
+	}
 	base := t.TempDir()
 	escapeTarget := t.TempDir()
 	parent := filepath.Join(base, "artifacts")
@@ -82,6 +86,9 @@ func TestOpenBeneathRefusesParentComponentSymlinkEvenAfterPriorSafeResolution(t 
 // keep working -- P1-7's fix must not turn every ordinary artifact write
 // into a refusal.
 func TestOpenBeneathAllowsOrdinaryNestedPaths(t *testing.T) {
+	if goruntime.GOOS != "linux" {
+		t.Skip("ordinary beneath-open success requires Linux openat2")
+	}
 	base := t.TempDir()
 	if err := os.MkdirAll(filepath.Join(base, "a", "b"), 0700); err != nil {
 		t.Fatal(err)
