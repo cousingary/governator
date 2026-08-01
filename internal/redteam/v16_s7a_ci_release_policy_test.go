@@ -221,7 +221,8 @@ func TestV16Case414ReleaseTiersUseAttemptScopedTrustedToolRegistry(t *testing.T)
 }
 
 func TestV16Case415GenericCIPythonUsesTrustedRunnerImage(t *testing.T) {
-	content, err := os.ReadFile(s7aScript(t, "release_tool_policy_ci.yaml"))
+	policy := s7aScript(t, "release_tool_policy_ci.yaml")
+	content, err := os.ReadFile(policy)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -234,5 +235,12 @@ func TestV16Case415GenericCIPythonUsesTrustedRunnerImage(t *testing.T) {
 		if !strings.Contains(src, want) {
 			t.Fatalf("explicit Python %s matrix entry must remain supplied by setup-python", version)
 		}
+	}
+	cmd := exec.Command("python3", s7aScript(t, "release_toolset.py"),
+		"--policy", policy, "--profile", "github-hosted-ephemeral",
+		"--tools", "python3", "--out", filepath.Join(t.TempDir(), "toolset.json"))
+	cmd.Env = s7aCIEnv()
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("absolute root-owned runner-image python policy rejected: %v\n%s", err, out)
 	}
 }

@@ -91,8 +91,17 @@ def load_policy_document(path: pathlib.Path) -> tuple[dict, dict[str, dict[str, 
         else:
             if set(record) != {"command", "declared_source"}:
                 raise ValueError(f"{path}: {name} must declare exactly command and declared_source")
-            if record["command"] != name:
-                raise ValueError(f"{path}: {name} command must equal its inventory name")
+            command = record["command"]
+            absolute_runner_command = (
+                pathlib.PurePath(command).is_absolute()
+                and pathlib.PurePath(command).name == name
+                and record["declared_source"] == "runner-image"
+            )
+            if command != name and not absolute_runner_command:
+                raise ValueError(
+                    f"{path}: {name} command must equal its inventory name, or be an "
+                    "absolute runner-image path with the same basename"
+                )
     if profile == "github-hosted-ephemeral":
         if metadata.get("schema_version") != "2":
             raise ValueError(f"{path}: CI policy must use schema_version: 2")
