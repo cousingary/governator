@@ -84,8 +84,49 @@ jobs:
           path: native-evidence/**
           if-no-files-found: error
 
+  # v16-release S8: scripts/release.sh's EVIDENCE_DIR promotion mechanism
+  # (any *.json in EVIDENCE_DIR with a passing extracted_platform record
+  # promotes that platform) is fully generic -- it was only ever fed
+  # Darwin's evidence here, so linux_arm64 published non-approving in the
+  # first real v1.0.2 cut despite ci.yml's native-acceptance
+  # (ubuntu-24.04-arm) job already proving the capability exists. Unlike
+  # Darwin, linux_arm64 has no dedicated native red-team corpus (S6b's
+  # case 34/35 native-vs-cross-compiled distinction is Darwin-specific), so
+  # this only needs the plain acceptance smoke evidence, not a red-team run.
+  linux-arm64-native-evidence:
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - name: Run native linux/arm64 acceptance smoke test
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p native-evidence
+          commit="$(git rev-parse HEAD)"
+          version="${GITHUB_REF_NAME#v}"
+          claims_hash="$(sha256sum docs/claims.yaml | awk '{print $1}')"
+          build_ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          ldflags="-s -w -X main.version=${version} -X main.sourceCommit=${commit} -X main.buildTimestamp=${build_ts} -X main.claimsHash=${claims_hash} -X main.adapterProtocolVersion=adapter-protocol-v1"
+          CGO_ENABLED=0 go build -trimpath -ldflags "$ldflags" -o native-evidence/gov ./cmd/gov
+          ./scripts/acceptance_smoke.sh native-evidence/gov "$version" "$commit" "$claims_hash" native-evidence/acceptance.json
+
+      - name: Upload native linux/arm64 evidence
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: linux-arm64-native-evidence
+          path: native-evidence/**
+          if-no-files-found: error
+
   release:
-    needs: darwin-native-evidence
+    needs: [darwin-native-evidence, linux-arm64-native-evidence]
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -219,6 +260,26 @@ jobs:
           name: darwin-native-evidence
           path: ${{ runner.temp }}/darwin-native-evidence
 
+      - name: Download native linux/arm64 evidence
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: linux-arm64-native-evidence
+          path: ${{ runner.temp }}/linux-arm64-native-evidence
+
+      - name: Merge native acceptance evidence
+        # release.sh's EVIDENCE_DIR scanner globs *.json non-recursively in
+        # one directory; each platform's artifact carries its own
+        # acceptance.json (and Darwin's carries additional red-team-
+        # specific files consumed separately via
+        # GOV_DARWIN_REDTEAM_EVIDENCE_DIR, which still points at the raw
+        # darwin-native-evidence dir below). Copy under unique names so
+        # neither acceptance.json overwrites the other.
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/native-acceptance-evidence"
+          cp "$RUNNER_TEMP/darwin-native-evidence/acceptance.json" "$RUNNER_TEMP/native-acceptance-evidence/darwin_arm64-acceptance.json"
+          cp "$RUNNER_TEMP/linux-arm64-native-evidence/acceptance.json" "$RUNNER_TEMP/native-acceptance-evidence/linux_arm64-acceptance.json"
+
       - name: Materialize the minisign secret key (optional)
         # GOV_RELEASE_MINISIGN_KEY (scripts/release.sh's expected env var)
         # is a FILE PATH minisign reads with -s; a GitHub secret is a
@@ -261,7 +322,7 @@ jobs:
           RELEASE_TOOL_PROFILE: github-hosted-ephemeral
           GOV_RELEASE_RUNNER_LABEL: ubuntu-24.04
           GOV_DARWIN_REDTEAM_EVIDENCE_DIR: ${{ runner.temp }}/darwin-native-evidence
-          EVIDENCE_DIR: ${{ runner.temp }}/darwin-native-evidence
+          EVIDENCE_DIR: ${{ runner.temp }}/native-acceptance-evidence
           OUT_DIR: ${{ runner.temp }}/governator-release-dist
         run: scripts/release.sh
 
