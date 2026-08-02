@@ -2016,6 +2016,18 @@ rm -f "$OUT_DIR/.redteam-gate.json" "$OUT_DIR/.redteam-gate.stderr" "$OUT_DIR/.r
 # below, so the first rc7 release to reach packaging failed the coverage
 # check on it.
 rm -f "$INTEGRATION_GATE_JSON"
+# v16 S7 (rc27): the attempt-scoped test-tool registry ($TEST_TOOL_REGISTRY =
+# .test-tools.yaml, plus its .lock, the latter written by `gov tools enroll`'s
+# locking) and the Assayer red-team venv setup log ($ASSAYER_REDTEAM_SETUP_LOG
+# = assayer-redteam-venv.log) are test-harness working scratch, not shipped
+# release evidence -- exactly the same shape as .integration-gate.json above.
+# They are regular top-level $OUT_DIR files that release_policy.py's
+# checksum-coverage check (which requires every top-level file to appear in
+# checksums.txt) would otherwise flag as unlisted, and rc27 was the first
+# signed release to reach packaging and failed that check on exactly these
+# three files. Safe to remove here: the registry's last consumer is
+# release_verify.sh (the acceptance smoke), which already ran above.
+rm -f "$TEST_TOOL_REGISTRY" "$TEST_TOOL_REGISTRY.lock" "$ASSAYER_REDTEAM_SETUP_LOG"
 
 CHECKSUMS="$OUT_DIR/checksums.txt"
 # Sol13 rc6 Session 9: attestations/ exists only when the operator supplied

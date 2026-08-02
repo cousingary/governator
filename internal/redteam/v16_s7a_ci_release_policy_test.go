@@ -299,3 +299,34 @@ func TestV16Case418HostedRedteamUsesPinnedAssayerEnvironment(t *testing.T) {
 		t.Fatal("both redteam and redteam_race must receive the pinned Assayer interpreter")
 	}
 }
+
+// TestV16Case419TestHarnessScratchCleanedBeforeChecksums closes the rc27
+// release failure where three test-harness working files -- the attempt-scoped
+// tool registry (.test-tools.yaml), its lock (.test-tools.yaml.lock, written
+// by `gov tools enroll`'s locking), and the Assayer red-team venv setup log
+// (assayer-redteam-venv.log) -- were written into $OUT_DIR by the v16 CI
+// wiring without being removed before checksum generation. Like the
+// .integration-gate.json cleanup they are not shipped release evidence, so
+// release_policy.py's checksum-coverage check (which requires every top-level
+// $OUT_DIR file to be checksummed) rejected the first signed rc27 release on
+// exactly these files. The registry's last consumer is release_verify.sh
+// (the acceptance smoke), which must run before this cleanup.
+func TestV16Case419TestHarnessScratchCleanedBeforeChecksums(t *testing.T) {
+	content, err := os.ReadFile(s7aScript(t, "release.sh"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	src := string(content)
+	if !strings.Contains(src, `rm -f "$TEST_TOOL_REGISTRY" "$TEST_TOOL_REGISTRY.lock" "$ASSAYER_REDTEAM_SETUP_LOG"`) {
+		t.Fatal("release.sh does not clean test-harness scratch (.test-tools.yaml, .lock, venv log) before checksum generation")
+	}
+	cleanupAt := strings.Index(src, `rm -f "$TEST_TOOL_REGISTRY" "$TEST_TOOL_REGISTRY.lock"`)
+	checksumsAt := strings.Index(src, `CHECKSUMS="$OUT_DIR/checksums.txt"`)
+	verifyAt := strings.Index(src, `"$BASH_TOOL" "$ROOT/scripts/release_verify.sh"`)
+	if cleanupAt < 0 || checksumsAt < 0 || cleanupAt >= checksumsAt {
+		t.Fatal("test-harness scratch cleanup must precede checksums.txt generation")
+	}
+	if verifyAt < 0 || cleanupAt <= verifyAt {
+		t.Fatal("test-harness scratch cleanup must run after release_verify.sh, the registry's last consumer")
+	}
+}
