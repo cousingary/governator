@@ -193,7 +193,14 @@ jobs:
             export GOV_SYSTEM_PYTHON3="$(command -v python3)"
             export PATH="$RUNNER_TEMP/governator-tools:$PATH"
           fi
-          go test -race -tags redteam -count=1 ./...
+          # v16-release S8: the non-race red-team run alone took ~9.5m for
+          # internal/redteam; -race's instrumentation overhead pushed
+          # internal/runtime's suite past Go's default 10m per-package test
+          # timeout on this runner (the goroutine dump at the panic showed a
+          # live, bounded 20ms poll inside containment.resolveNSInitPID --
+          # not an actual hang, just mid-cycle when the clock ran out).
+          # Widen the budget rather than touching the containment code.
+          go test -race -tags redteam -count=1 -timeout=30m ./...
 
       - name: gofmt check
         shell: bash
