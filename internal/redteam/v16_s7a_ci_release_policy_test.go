@@ -330,3 +330,103 @@ func TestV16Case419TestHarnessScratchCleanedBeforeChecksums(t *testing.T) {
 		t.Fatal("test-harness scratch cleanup must run after release_verify.sh, the registry's last consumer")
 	}
 }
+
+// TestV16Case420CleanRoomVerificationDetectsSingleByteMutation enrolls S7's
+// clean-room case: the two-layer procedure docs/publishing.md documents for
+// an operator verifying a downloaded release --
+//
+//	minisign -V -p <pub> -m checksums.txt -x checksums.txt.minisig
+//	sha256sum -c checksums.txt
+//
+// -- must succeed against an untampered bundle and must detect a one-byte
+// mutation in ANY published object (the archive, build-manifest.json,
+// checksums.txt itself, or checksums.txt.minisig itself). This is the exact
+// procedure S7 ran by hand against the published v1.0.2-rc28 bundle from a
+// second host (VPS 216.158.228.204, not this repo's build machine): fetch
+// the trust anchor out-of-band, verify the signature, verify checksums,
+// extract, and compare the extracted binary's hash to build-manifest.json.
+// This case pins that boundary hermetically with an ephemeral, purpose-built
+// key pair -- never the real production key (same discipline as v11_s1's
+// TestV11Case5/6 above, which this case's mutation loop generalizes across
+// every object type instead of one case per object).
+//
+// Scope note: `gov claims verify` (docs/publishing.md step 6) is a
+// functional-correctness gate over the shipped binary's capabilities, not an
+// independent integrity check of build-manifest.json's bytes -- S7 confirmed
+// by hand that a build_timestamp-only mutation, isolated from the checksum
+// layer, passes `gov claims verify --release` cleanly (it does not hash or
+// otherwise validate that field against anything). Detection of a tampered
+// manifest is provided entirely by the two-layer procedure this case tests,
+// not by claims verify. This case does not assert claims-verify coverage it
+// does not have.
+func TestV16Case420CleanRoomVerificationDetectsSingleByteMutation(t *testing.T) {
+	if _, err := exec.LookPath("minisign"); err != nil {
+		t.Skip("minisign not on PATH")
+	}
+	if _, err := exec.LookPath("sha256sum"); err != nil {
+		t.Skip("sha256sum not on PATH")
+	}
+
+	dist := t.TempDir()
+	keyDir := t.TempDir()
+	secKey := filepath.Join(keyDir, "sec.key")
+	pubKey := filepath.Join(keyDir, "pub.key")
+	s1GenKey(t, secKey, pubKey)
+
+	archive := filepath.Join(dist, "gov_1.0.2-test_linux_amd64.tar.gz")
+	manifest := filepath.Join(dist, "build-manifest.json")
+	if err := os.WriteFile(archive, []byte("release archive bytes\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(manifest, []byte(`{"version":"1.0.2-test","source_commit":"deadbeef"}`+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	checksums := filepath.Join(dist, "checksums.txt")
+	s1WriteChecksums(t, checksums, dist)
+	minisig := filepath.Join(dist, "checksums.txt.minisig")
+	s1Sign(t, secKey, checksums, minisig)
+
+	verify := func() (sigErr, sumErr error) {
+		sig := exec.Command("minisign", "-V", "-p", pubKey, "-m", checksums, "-x", minisig)
+		sigErr = sig.Run()
+		sum := exec.Command("sha256sum", "-c", "checksums.txt")
+		sum.Dir = dist
+		sumErr = sum.Run()
+		return sigErr, sumErr
+	}
+
+	if sigErr, sumErr := verify(); sigErr != nil || sumErr != nil {
+		t.Fatalf("documented verification procedure rejected an untampered bundle: sig=%v sum=%v", sigErr, sumErr)
+	}
+
+	for _, name := range []string{
+		"gov_1.0.2-test_linux_amd64.tar.gz",
+		"build-manifest.json",
+		"checksums.txt",
+		"checksums.txt.minisig",
+	} {
+		t.Run(name, func(t *testing.T) {
+			path := filepath.Join(dist, name)
+			backup, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			mutated := append([]byte{}, backup...)
+			mutated[len(mutated)-1] ^= 0xFF
+			if err := os.WriteFile(path, mutated, 0o644); err != nil {
+				t.Fatal(err)
+			}
+			defer func() {
+				if err := os.WriteFile(path, backup, 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}()
+
+			sigErr, sumErr := verify()
+			if sigErr == nil && sumErr == nil {
+				t.Fatalf("one-byte mutation in %s was not detected by minisign -V or sha256sum -c", name)
+			}
+		})
+	}
+}
