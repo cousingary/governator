@@ -49,6 +49,23 @@ jobs:
         with:
           python-version: "3.x"
 
+      # v16-release S8: actions/setup-python prepends its hostedtoolcache
+      # Python to PATH ahead of /usr/bin on every platform. That install is
+      # group-writable (toolregistry.inspectPath rightly refuses to trust
+      # it) AND, on Linux, any wrapper built to dodge that check breaks
+      # Landlock instead: internal/enforce/landlock.go's exactReadClosure
+      # only computes a read closure for real ELF executables (see
+      # internal/contextgraph/graph_test.go's buildCodegraphELF comment) --
+      # a #!/bin/sh wrapper script is denied at exec time with "enforce:
+      # exec sandboxed executable: permission denied". The actual fix is to
+      # never resolve "python3" to the hostedtoolcache copy at all: prefer
+      # the real system /usr/bin/python3 (root-owned, a genuine ELF, never
+      # group-writable) for every subsequent step in this job, matching
+      # what "Enroll trusted tools" below already does explicitly.
+      - name: Prefer system python3 (Landlock/toolregistry compatibility)
+        if: runner.os == 'Linux'
+        run: echo "/usr/bin" >> "$GITHUB_PATH"
+
       - name: Read pinned Assayer ref from assayer.lock
         id: test-assayer-ref
         shell: bash
@@ -77,7 +94,11 @@ jobs:
       - name: Install portable red-team dependencies
         shell: bash
         run: |
-          python3 -m pip install cryptography pytest
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            sudo /usr/bin/python3 -m pip install --break-system-packages cryptography pytest
+          else
+            python3 -m pip install cryptography pytest
+          fi
           if [ "$RUNNER_OS" = "Linux" ]; then
             sudo apt-get update -qq
             sudo apt-get install -y minisign=0.11-1
@@ -86,31 +107,25 @@ jobs:
           if [ "$RUNNER_OS" = "macOS" ]; then
             brew install minisign util-linux
           fi
-          # v16-release S8: actions/setup-python's hostedtoolcache install is
-          # group-writable on both platforms (multiple runner-image UIDs can
-          # share it), which internal/toolregistry's inspectPath rightly
-          # refuses to trust (0022 mode bits / writable-ancestor check). The
-          # macOS red-team steps have always dodged this by resolving python3
-          # through a private, tightly-permissioned wrapper instead of the
-          # raw PATH entry; Linux never got the same treatment, so any test
-          # that resolves "python3" fresh (rather than reusing the
-          # pre-enrolled alias below) failed RESOLVE_TOOL group-writable on
-          # ubuntu-latest. Build the same wrapper on both platforms.
-          secure_bin="$RUNNER_TEMP/governator-tools"
-          mkdir -p "$secure_bin"
-          chmod 0700 "$secure_bin"
-          real_python="$(command -v python3)"
-          {
-            echo '#!/bin/sh'
-            printf 'exec "%s" "$@"\n' "$real_python"
-          } > "$secure_bin/python3"
-          real_setsid="$(command -v setsid || true)"
+          # macOS has no Landlock, so the private-wrapper trick below (a
+          # #!/bin/sh script standing in for python3, dodging the group-
+          # writable hostedtoolcache install) is safe there. It is NOT safe
+          # on Linux -- see the "Prefer system python3" step above for why;
+          # Linux instead avoids the hostedtoolcache python entirely via
+          # PATH ordering and never needs this wrapper.
           if [ "$RUNNER_OS" = "macOS" ]; then
-            real_setsid="$(brew --prefix util-linux)/bin/setsid"
+            secure_bin="$RUNNER_TEMP/governator-tools"
+            mkdir -p "$secure_bin"
+            chmod 0700 "$secure_bin"
+            real_python="$(command -v python3)"
+            {
+              echo '#!/bin/sh'
+              printf 'exec "%s" "$@"\n' "$real_python"
+            } > "$secure_bin/python3"
+            cp "$(brew --prefix util-linux)/bin/setsid" "$secure_bin/setsid"
+            cp "$(command -v minisign)" "$secure_bin/minisign"
+            chmod 0755 "$secure_bin/python3" "$secure_bin/setsid" "$secure_bin/minisign"
           fi
-          cp "$real_setsid" "$secure_bin/setsid"
-          cp "$(command -v minisign)" "$secure_bin/minisign"
-          chmod 0755 "$secure_bin/python3" "$secure_bin/setsid" "$secure_bin/minisign"
           printf '/assayer/\n' >> .git/info/exclude
           if ! git show-ref --verify --quiet refs/heads/main; then
             git branch --track main origin/main
@@ -165,15 +180,19 @@ jobs:
       - name: Red-team corpus (-tags redteam, -count=1)
         shell: bash
         run: |
-          export GOV_SYSTEM_PYTHON3="$(command -v python3)"
-          export PATH="$RUNNER_TEMP/governator-tools:$PATH"
+          if [ "$RUNNER_OS" = "macOS" ]; then
+            export GOV_SYSTEM_PYTHON3="$(command -v python3)"
+            export PATH="$RUNNER_TEMP/governator-tools:$PATH"
+          fi
           go test -tags redteam -count=1 ./...
 
       - name: Red-team corpus (-race, -tags redteam, -count=1)
         shell: bash
         run: |
-          export GOV_SYSTEM_PYTHON3="$(command -v python3)"
-          export PATH="$RUNNER_TEMP/governator-tools:$PATH"
+          if [ "$RUNNER_OS" = "macOS" ]; then
+            export GOV_SYSTEM_PYTHON3="$(command -v python3)"
+            export PATH="$RUNNER_TEMP/governator-tools:$PATH"
+          fi
           go test -race -tags redteam -count=1 ./...
 
       - name: gofmt check
