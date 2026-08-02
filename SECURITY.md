@@ -2,7 +2,7 @@
 
 ## Supported versions
 
-Security fixes are applied to the latest tagged release candidate or stable release. The current release is `v1.0.2-rc8`.
+Security fixes are applied to the latest tagged release candidate or stable release. The current release is `v1.0.2`.
 
 ## Reporting
 
