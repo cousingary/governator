@@ -64,6 +64,11 @@ jobs:
         shell: bash
         run: |
           python3 -m pip install cryptography pytest
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            sudo apt-get update -qq
+            sudo apt-get install -y minisign=0.11-1
+            command -v minisign && minisign -v 2>&1 || true
+          fi
           if [ "$RUNNER_OS" = "macOS" ]; then
             brew install minisign util-linux
             secure_bin="$RUNNER_TEMP/governator-tools"
