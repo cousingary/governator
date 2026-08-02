@@ -7,10 +7,13 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 
 	"github.com/cousingary/governator/internal/dbtime"
 	_ "modernc.org/sqlite"
 )
+
+var openMu sync.Mutex
 
 type AgentScore struct {
 	Agent           string  `json:"agent"`
@@ -146,6 +149,8 @@ func Open(home string) (*sql.DB, error) {
 	if err != nil {
 		return nil, err
 	}
+	openMu.Lock()
+	defer openMu.Unlock()
 	schema := `CREATE TABLE IF NOT EXISTS runs(
 id TEXT PRIMARY KEY, job_id TEXT, job_type TEXT, agent TEXT, mode TEXT, status TEXT, root TEXT, worktree TEXT, branch TEXT,
 contract_hash TEXT, base_head TEXT, approved_head TEXT, diff TEXT, transcript TEXT, message TEXT, commit_hash TEXT, created TEXT,
