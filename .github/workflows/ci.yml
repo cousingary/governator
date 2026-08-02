@@ -25,6 +25,20 @@ jobs:
         with:
           fetch-depth: 0
 
+      # v16-release S8: Ubuntu 24.04's AppArmor profile restricts
+      # unprivileged user-namespace creation by default (the April-2024
+      # kernel security update); GitHub's ubuntu-latest image now resolves
+      # to a 24.04 base, so any code path that unshares a user namespace
+      # (Assayer's sandboxed checks call unshare(2)) fails with "write
+      # failed /proc/self/uid_map: Operation not permitted" -- a runner
+      # environment restriction, not an application defect. Real containers
+      # (Docker) opt into this properly; a bare CI runner has no equivalent,
+      # so this is the documented relaxation used by Chromium/Docker's own
+      # GitHub Actions runners for the identical symptom.
+      - name: Allow unprivileged user namespaces (Ubuntu 24.04 AppArmor restriction)
+        if: runner.os == 'Linux'
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
@@ -71,18 +85,32 @@ jobs:
           fi
           if [ "$RUNNER_OS" = "macOS" ]; then
             brew install minisign util-linux
-            secure_bin="$RUNNER_TEMP/governator-tools"
-            mkdir -p "$secure_bin"
-            chmod 0700 "$secure_bin"
-            real_python="$(command -v python3)"
-            {
-              echo '#!/bin/sh'
-              printf 'exec "%s" "$@"\n' "$real_python"
-            } > "$secure_bin/python3"
-            cp "$(brew --prefix util-linux)/bin/setsid" "$secure_bin/setsid"
-            cp "$(command -v minisign)" "$secure_bin/minisign"
-            chmod 0755 "$secure_bin/python3" "$secure_bin/setsid" "$secure_bin/minisign"
           fi
+          # v16-release S8: actions/setup-python's hostedtoolcache install is
+          # group-writable on both platforms (multiple runner-image UIDs can
+          # share it), which internal/toolregistry's inspectPath rightly
+          # refuses to trust (0022 mode bits / writable-ancestor check). The
+          # macOS red-team steps have always dodged this by resolving python3
+          # through a private, tightly-permissioned wrapper instead of the
+          # raw PATH entry; Linux never got the same treatment, so any test
+          # that resolves "python3" fresh (rather than reusing the
+          # pre-enrolled alias below) failed RESOLVE_TOOL group-writable on
+          # ubuntu-latest. Build the same wrapper on both platforms.
+          secure_bin="$RUNNER_TEMP/governator-tools"
+          mkdir -p "$secure_bin"
+          chmod 0700 "$secure_bin"
+          real_python="$(command -v python3)"
+          {
+            echo '#!/bin/sh'
+            printf 'exec "%s" "$@"\n' "$real_python"
+          } > "$secure_bin/python3"
+          real_setsid="$(command -v setsid || true)"
+          if [ "$RUNNER_OS" = "macOS" ]; then
+            real_setsid="$(brew --prefix util-linux)/bin/setsid"
+          fi
+          cp "$real_setsid" "$secure_bin/setsid"
+          cp "$(command -v minisign)" "$secure_bin/minisign"
+          chmod 0755 "$secure_bin/python3" "$secure_bin/setsid" "$secure_bin/minisign"
           printf '/assayer/\n' >> .git/info/exclude
           if ! git show-ref --verify --quiet refs/heads/main; then
             git branch --track main origin/main
@@ -137,19 +165,15 @@ jobs:
       - name: Red-team corpus (-tags redteam, -count=1)
         shell: bash
         run: |
-          if [ "$RUNNER_OS" = "macOS" ]; then
-            export GOV_SYSTEM_PYTHON3="$(command -v python3)"
-            export PATH="$RUNNER_TEMP/governator-tools:$PATH"
-          fi
+          export GOV_SYSTEM_PYTHON3="$(command -v python3)"
+          export PATH="$RUNNER_TEMP/governator-tools:$PATH"
           go test -tags redteam -count=1 ./...
 
       - name: Red-team corpus (-race, -tags redteam, -count=1)
         shell: bash
         run: |
-          if [ "$RUNNER_OS" = "macOS" ]; then
-            export GOV_SYSTEM_PYTHON3="$(command -v python3)"
-            export PATH="$RUNNER_TEMP/governator-tools:$PATH"
-          fi
+          export GOV_SYSTEM_PYTHON3="$(command -v python3)"
+          export PATH="$RUNNER_TEMP/governator-tools:$PATH"
           go test -race -tags redteam -count=1 ./...
 
       - name: gofmt check
@@ -168,6 +192,12 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      # v16-release S8: see the identical step in the test job -- Ubuntu
+      # 24.04's default AppArmor restriction on unprivileged user namespaces
+      # breaks Assayer's unshare(2)-based sandboxed checks on ubuntu-latest.
+      - name: Allow unprivileged user namespaces (Ubuntu 24.04 AppArmor restriction)
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
 
       - name: Set up Go
         uses: actions/setup-go@v5
@@ -359,6 +389,12 @@ jobs:
           py_bin="$(command -v python3)"
           if [ -x /usr/bin/python3 ]; then py_bin=/usr/bin/python3; fi
           go run ./cmd/gov tools enroll python3 "$py_bin"
+          # v16-release S8: this job never enrolled bash, so any unit test
+          # that resolves a trusted bash handle (LocalWorktreeRunner.Prepare,
+          # the chaos hung-validator test's shell()) failed immediately with
+          # "no enrolled path" rather than exercising the behavior under
+          # test -- unrelated to the platform this job exists to evidence.
+          go run ./cmd/gov tools enroll bash "$(command -v bash)"
 
       - name: Compute release identity
         shell: bash
