@@ -2,7 +2,7 @@
 
 **Let coding agents do real work — without them touching the wrong file, running the wrong command, or shipping a change nothing verified.**
 
-Governator is the supervisor that sits above [Claude Code](docs/backends.md), Codex, GLM, OpenCode, and Pi. You write a short contract that says what the agent may touch, what it may run, what "done" looks like, and what it may cost — and the operating system enforces it. The model proposes changes; validators and the merge gate decide whether they land.
+Governator is the supervisor that sits above [Claude Code](docs/backends.md), Codex, OpenCode, and Pi. You write a short contract that says what the agent may touch, what it may run, what "done" looks like, and what it may cost — and the operating system enforces it. The model proposes changes; validators and the merge gate decide whether they land.
 
 > *The model proposes. The governor disposes. The validator decides. The ledger remembers.*
 
