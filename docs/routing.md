@@ -46,7 +46,7 @@ These govern every routing decision and every future session of the plan:
 agent: auto            # defers selection to the broker; explicit names still work
 routing:               # optional; only valid with agent: auto
   objective: balanced  # balanced | cheapest | most_reliable
-  candidates: [claude-code, codex, glm]   # optional allowlist; default = all registered
+  candidates: [claude-code, codex, opencode]   # optional allowlist; default = all registered
   max_attempts: 2      # 0 defaults to 2; >3 rejected (Session 3 wires the chain)
   fallback: infrastructure_only           # reserved enum (Session 3)
   requirements:                           # HARD capability filters — fail closed

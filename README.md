@@ -33,7 +33,7 @@ Governator supervises and verifies; it doesn't try to be everything. So it compo
 | **[RTK](https://github.com/rtk-ai/rtk)** | **Filter before it lands** — a token-saving CLI proxy on `PATH` that compacts command output before it reaches the model. | rtk-ai (third-party) |
 | **Ponytail ruleset** | **Smallest diff** — a YAGNI-first discipline injected into every prompt, biasing toward reuse, stdlib, and the smallest change over new abstractions. | adapted from [DietrichGebert/ponytail](https://github.com/DietrichGebert/ponytail) (MIT) — see [NOTICE](NOTICE) |
 
-Governator auto-detects Context Mode and RTK when they're on `PATH` and wires them in (`rtk.mode: auto`, graph `auto`). The Ponytail-derived minimalism ruleset partially ships inside Governator itself (`minimalism.mode: full`) — but it's best to also install this separately to get the full effect. Toggle any of them under [Configuration](#configuration); `gov doctor` reports which are active.
+Governator auto-detects Context Mode and RTK when they're on `PATH` and wires them in (`rtk.mode: auto`, graph `auto`). The Ponytail-derived minimalism ruleset ships inside Governator itself (`minimalism.mode: full`) as a prompt annotation Governator's own compiler adds to every `gov run`/`gov batch run` execution — no external binary needed for that path. It does not reach interactive or hook-only sessions (a Claude Code session gated by `gov hook pre-tool-use` without going through `gov run`, or any use of these CLIs outside Governator entirely) — nothing in that path calls Governator's prompt compiler. Install [ponytail](https://github.com/DietrichGebert/ponytail) directly if you want the same discipline there too; it hooks into Claude Code, Codex, and other CLIs through their own plugin systems, so it isn't limited to governed runs. Toggle any of them under [Configuration](#configuration); `gov doctor` reports which are active.
 
 ### What it does, technically
 
@@ -88,7 +88,7 @@ job.yaml -> strict parser -> preflight policy -> disposable Git worktree
                                           re-verified pre-launch)        │ S3
                                                   |                       ┘
                                            backend adapter
-                                      (Claude/Codex/GLM/
+                                      (Claude/Codex/
                                          OpenCode/Pi)
                                                   |
                           toolregistry gates every controller tool      ┐ S4
@@ -225,23 +225,27 @@ gov version
 - [Publishing checklist](docs/publishing.md)
 - [Security policy](SECURITY.md) and [contributing guide](CONTRIBUTING.md)
 
-## v1.0.0 — first production release (Sol redteam repair program)
+## v1.0.2 — current release (first public distribution)
 
-> Versioning note: v1.0.0 is Governator's first released version. The v1.1–v1.5 numbers that appear in the changelog, branch names, and internal planning documents were pre-release development milestones of the initial build — they were never released, and this release supersedes all of them.
+`v1.0.2` (commit `130e22d`, cut 2026-08-02) is Governator's first publicly distributed release: `github.com/cousingary/governator` and `github.com/cousingary/assayer` are now public, GitHub Actions builds and tests every push, and all three published platforms — `linux_amd64`, `linux_arm64`, `darwin_arm64` — carry *executed* native acceptance evidence (`known_degraded_modes: []`) rather than a cross-compiled claim; `darwin/amd64` stays unpublished since no free native Apple-silicon-only runner can attest it. The release is Minisign-signed against the out-of-band-published key `B5CBEE8BBA8826A7`, `gov claims verify --release` confirms all 62 documentation claims, and a clean-room checkout on a separate machine rebuilds a byte-identical `linux_amd64` binary and independently verifies the published bundle end to end — the reproducibility claim CI's release workflow has asserted since Sol11 and had never actually been tested until this cut. See [CHANGELOG.md](CHANGELOG.md) for the full distribution-cycle summary.
 
-The Sol redteam repair program ran in three rounds against this codebase:
+> Versioning note: `v1.0.0` was Governator's first *released* version — the v1.1–v1.5 numbers that appear in the changelog, branch names, and internal planning documents were pre-release development milestones of the initial build that were never themselves released. `v1.0.2` is the first version a stranger, on a different machine, can obtain, verify, and independently confirm.
+
+### Sol redteam repair program (through v1.0.0)
+
+The Sol redteam repair program that produced `v1.0.0` ran in three rounds against this codebase:
 
 - **Round 1 (v2)** reproduced eight Critical and twelve High-severity gaps in v1.4.1 (replay bypasses, symlink escapes, unattested backend trust, non-atomic live-root merges, and more). All were repaired across seven sessions, plus a documentation pass (S8) and one follow-up session that closed the single gap S8's own cross-check found (High 11's local-runner output capping).
 - **Round 2 (v3)** reproduced twenty further findings against the v1.0.0 binary round 1 shipped — mostly transaction/concurrency, identity, and containment gaps the first pass's fixes didn't reach. All twenty were repaired across fifteen sessions (S1–S15) plus one standalone flake fix.
 - **Round 3 (v4)** reproduced a 25-item black-box attack corpus against the binary round 2 shipped — git-tree sovereignty, descendant/process containment, executable identity, externally enforced (not self-reported) capability attestation, and release/supply-chain integrity. All twenty-five were repaired across ten sessions (S0–S9).
 
-The v1.0.0 binary at `HEAD` carries all three rounds. The defining v4 change is that the load-bearing invariants are now **enforced by the operating system rather than promised by the backend**: Landlock LSM confines filesystem writes; a network namespace with no route removes egress at the kernel level; a cgroup v2 scope owns the whole process tree through a `DESCENDANTS_TERMINATED` stage before final-state capture; an immutable `BackendExecutionHandle` resolves the executable exactly once from a single open file descriptor; a trusted-tool registry gates every controller-invoked external process; and `internal/gitplumb` performs merge/commit with no shell, no hooks, and literal pathspecs only. `scripts/redteam.sh` is the executable acceptance criterion for the v4 round — 25/25 attacks green, zero skips, both plain and `-race`. See [docs/security.md](docs/security.md) for the full finding-by-finding register, [docs/containment.md](docs/containment.md) for the containment model, [docs/claims.md](docs/claims.md) for how `docs/claims.yaml`'s `sol-s*`/`sol3-s*`/`sol4-s*` entries mechanically re-derive many of these fixes from the repository, and [CHANGELOG.md](CHANGELOG.md) for the per-session summary. `gov version` reports the build's real semantic version, source commit, and claims hash, embedded at build time by `scripts/release.sh` — there is exactly one version story now, not the source/archive/repo-claim divergence Sol found.
+The defining v4 change, still load-bearing today, is that the core invariants are **enforced by the operating system rather than promised by the backend**: Landlock LSM confines filesystem writes; a network namespace with no route removes egress at the kernel level; a cgroup v2 scope owns the whole process tree through a `DESCENDANTS_TERMINATED` stage before final-state capture; an immutable `BackendExecutionHandle` resolves the executable exactly once from a single open file descriptor; a trusted-tool registry gates every controller-invoked external process; and `internal/gitplumb` performs merge/commit with no shell, no hooks, and literal pathspecs only. Three further rc cycles (rc6 through rc8) then hardened the release *ceremony* itself — trust chain, boundary correctness, provenance — closing with a mandatory red-team corpus that runs clean, zero unexpected skips, both plain and `-race`, on every tagged cut. See [docs/security.md](docs/security.md) for the full finding-by-finding register, [docs/containment.md](docs/containment.md) for the containment model, [docs/claims.md](docs/claims.md) for how `docs/claims.yaml` mechanically re-derives many of these fixes from the repository, and [CHANGELOG.md](CHANGELOG.md) for the per-release summary. `gov version` reports the build's real semantic version, source commit, and claims hash, embedded at build time by `scripts/release.sh` — there is exactly one version story now, not the source/archive/repo-claim divergence Sol found.
 
 ## Roadmap (not built)
 
 These items from the Sol audit's strategic-enhancements list (§9/P3) are deliberately out of scope for the repair program and are not implemented:
 
-- An external backend adapter protocol (adapters beyond the five built-in CLIs).
+- An external backend adapter protocol (adapters beyond the four built-in CLIs).
 - A versioned harness profile registry (today's harness/eval fixtures are not versioned as a registry).
 - Panel independence across provider, account, model lineage, prompt, and policy (today's panel mode anonymizes labels but doesn't enforce cross-panelist independence on these axes).
 - An offline Governator Evolver Lab.
