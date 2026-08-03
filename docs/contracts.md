@@ -9,7 +9,7 @@ A job contract is strict YAML: unknown fields, multiple documents, malformed pat
 | `task` | Human-readable instruction compiled into the agent prompt. |
 | `job_id` | Stable alphanumeric, dot, underscore, or hyphen identifier. |
 | `job_type` | Operator-defined category used by scoring and routing. |
-| `agent` | `claude-code`, `codex`, `glm`, `opencode`, `pi`, or `auto` (route broker). |
+| `agent` | `claude-code`, `codex`, `opencode`, `pi`, or `auto` (route broker). |
 | `mode` | `scout`, `surgeon`, `batch_worker`, `verifier`, `repair`, `architect`, or `planner`. |
 | `workspace.root` | Absolute path to the source Git repository. |
 | `workspace.worktree` | `auto`; every run uses a disposable Git worktree. |
@@ -219,7 +219,7 @@ Setting `output.style: terse` appends prompt guidance capping the agent's final 
 agent: auto
 routing:
   objective: balanced          # balanced | cheapest | most_reliable
-  candidates: [claude-code, codex, glm]
+  candidates: [claude-code, codex, opencode]
   max_attempts: 2
   fallback: infrastructure_only
   requirements:
