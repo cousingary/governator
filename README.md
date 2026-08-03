@@ -1,8 +1,43 @@
 # Governator
 
-Governator is a contract-first runtime for replaceable coding-agent backends. It turns file scope, command authority, budgets, and success criteria into deterministic checks around an isolated agent run. Models can propose changes, but only validators and the merge gate can approve them.
+**Let coding agents do real work — without them touching the wrong file, running the wrong command, or shipping a change nothing verified.**
+
+Governator is the supervisor that sits above [Claude Code](docs/backends.md), Codex, GLM, OpenCode, and Pi. You write a short contract that says what the agent may touch, what it may run, what "done" looks like, and what it may cost — and the operating system enforces it. The model proposes changes; validators and the merge gate decide whether they land.
 
 > *The model proposes. The governor disposes. The validator decides. The ledger remembers.*
+
+## Why you'd run it
+
+Most agent harnesses trust the backend's own sandbox and its own definition of success. Governator doesn't — it's for the cases where "it worked" isn't good enough:
+
+- **Unattended runs** — cron jobs, CI, overnight batch runs where a stray `rm`, an escaped sandbox, or a quietly edited protected file costs real money while you sleep.
+- **Multi-agent / panel runs** — compare backends side by side and pick the winner on recorded evidence (pass rate, cost, tokens), not vibes.
+- **Auditable changes** — every run writes to an append-only SQLite WAL ledger: what was scoped, what was enforced, what passed, what was quarantined. Never "trust me."
+
+| Without Governator | With Governator |
+|---|---|
+| "It succeeded" — but it rewrote a file it shouldn't have. | File-scope contracts + a protected-path gate stop it at the kernel. |
+| "The sandbox caught it." (the backend says so) | Containment is **enforced by the OS** — Landlock, a network namespace with no route, a cgroup v2 descendant kill before final-state capture. |
+| "Which model is best?" — gut feel. | Scorecards, a route broker, and `gov cost --per-valid-output` from ledger data. |
+| A run dies mid-task — lost work. | Crash recovery, quarantine, repair packets, resumable runs. |
+
+## The stack: one unit, four allies
+
+Governator supervises and verifies; it doesn't try to be everything. So it composes with four tools that each kill a different failure mode of an unattended agent run. Together they're the difference between *the model proposed* and *it shipped safely at 3am* — yet each one is independent and useful on its own.
+
+| Tool | Role in the run | Made by |
+|---|---|---|
+| **Governator** | **Supervise** — scope, authority, OS-enforced containment, validators, merge gate, ledger. The hub. | this repo |
+| **[Assayer](https://github.com/cousingary/assayer)** | **Verify output** — schema / boilerplate / placeholder / dedup checks, durable quarantine, traceable verdicts. | cousingary |
+| **[Context Mode](https://github.com/mksglu/context-mode)** | **Protect the context window** — keep raw bytes out, session continuity across compaction, "think in code" sandbox tools. | mksglu (third-party) |
+| **[RTK](https://github.com/rtk-ai/rtk)** | **Filter before it lands** — a token-saving CLI proxy on `PATH` that compacts command output before it reaches the model. | rtk-ai (third-party) |
+| **Ponytail ruleset** | **Smallest diff** — a YAGNI-first discipline injected into every governed prompt, biasing toward reuse, stdlib, and the smallest change over new abstractions. | adapted from [DietrichGebert/ponytail](https://github.com/DietrichGebert/ponytail) (MIT) — see [NOTICE](NOTICE) |
+
+Governator auto-detects Context Mode and RTK when they're on `PATH` and wires them in (`rtk.mode: auto`, graph `auto`). The Ponytail-derived minimalism ruleset ships inside Governator itself (`minimalism.mode: full`) — no external binary, always on. Toggle any of them under [Configuration](#configuration); `gov doctor` reports which are active.
+
+### What it does, technically
+
+Governator is a contract-first runtime for replaceable coding-agent backends. It turns file scope, command authority, budgets, and success criteria into deterministic checks around an isolated agent run. Models can propose changes, but only validators and the merge gate can approve them.
 
 ## Quickstart
 
