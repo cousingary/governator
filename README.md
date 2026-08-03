@@ -31,9 +31,9 @@ Governator supervises and verifies; it doesn't try to be everything. So it compo
 | **[Assayer](https://github.com/cousingary/assayer)** | **Verify output** — schema / boilerplate / placeholder / dedup checks, durable quarantine, traceable verdicts. | cousingary |
 | **[Context Mode](https://github.com/mksglu/context-mode)** | **Protect the context window** — keep raw bytes out, session continuity across compaction, "think in code" sandbox tools. | mksglu (third-party) |
 | **[RTK](https://github.com/rtk-ai/rtk)** | **Filter before it lands** — a token-saving CLI proxy on `PATH` that compacts command output before it reaches the model. | rtk-ai (third-party) |
-| **Ponytail ruleset** | **Smallest diff** — a YAGNI-first discipline injected into every governed prompt, biasing toward reuse, stdlib, and the smallest change over new abstractions. | adapted from [DietrichGebert/ponytail](https://github.com/DietrichGebert/ponytail) (MIT) — see [NOTICE](NOTICE) |
+| **Ponytail ruleset** | **Smallest diff** — a YAGNI-first discipline injected into every prompt, biasing toward reuse, stdlib, and the smallest change over new abstractions. | adapted from [DietrichGebert/ponytail](https://github.com/DietrichGebert/ponytail) (MIT) — see [NOTICE](NOTICE) |
 
-Governator auto-detects Context Mode and RTK when they're on `PATH` and wires them in (`rtk.mode: auto`, graph `auto`). The Ponytail-derived minimalism ruleset ships inside Governator itself (`minimalism.mode: full`) — no external binary, always on. Toggle any of them under [Configuration](#configuration); `gov doctor` reports which are active.
+Governator auto-detects Context Mode and RTK when they're on `PATH` and wires them in (`rtk.mode: auto`, graph `auto`). The Ponytail-derived minimalism ruleset partially ships inside Governator itself (`minimalism.mode: full`) — but it's best to also install this separately to get the full effect. Toggle any of them under [Configuration](#configuration); `gov doctor` reports which are active.
 
 ### What it does, technically
 
