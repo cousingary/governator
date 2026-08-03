@@ -125,7 +125,6 @@ Every backend implements one abstract execution specification. Native controls a
 |---|---:|---:|---:|---:|---|
 | Claude Code | native | native | native | compensated | `claude-stream-json` |
 | Codex | native | native | native | native (explicitly disabled by default) | `codex-json` |
-| GLM | compensated | compensated | native | compensated | `glm-stream-json` |
 | OpenCode | compensated | config projection | native | compensated | `opencode-json` |
 | Pi | compensated | native tool reduction | compensated | compensated | `pi-json` |
 
@@ -145,7 +144,7 @@ RTK (Rust Token Killer) integration defaults to `rtk.mode: auto`: when an `rtk` 
 
 Structural context defaults to `graph.mode: auto` with the `codegraph` provider. When the binary is available, `gov doctor` reports its version and the current repository's index statistics; otherwise auto mode remains an optional warning. Use `graph.mode: required` to make a missing provider a hard preflight failure, or `off` to disable graph integration. `GOV_GRAPH_MODE`, `GOV_GRAPH_PROVIDER`, and `GOV_GRAPH_BIN` override the YAML settings. The first supported adapter is [CodeGraph-Rust](https://github.com/sunerpy/codegraph-rust), selected after a compatibility spike confirmed Go type, method, and relationship indexing.
 
-Minimalism defaults to `minimalism.mode: full`: Governator appends a YAGNI-first ruleset (adapted from the [ponytail](https://github.com/DietrichGebert/ponytail) project, MIT-licensed — see [NOTICE](NOTICE) for the full copyright and permission notice) to every governed prompt, biasing backends toward reuse, stdlib, and the smallest diff over new abstractions and dependencies. Use `lite` for a condensed version, `ultra` for a stricter "delete over add" framing, or `off` to disable. `GOV_MINIMALISM_MODE` overrides the YAML setting; `gov doctor` reports the active mode. Unlike RTK and the context graph, this optimizer has no external binary and is always available.
+Minimalism defaults to `minimalism.mode: full`: Governator appends a YAGNI-first ruleset (adapted from the [ponytail](https://github.com/DietrichGebert/ponytail) project, MIT-licensed — see [NOTICE](NOTICE) for the full copyright and permission notice) to every governed prompt, biasing backends toward reuse, stdlib, and the smallest diff over new abstractions and dependencies. Use `lite` for a condensed version, `ultra` for a stricter "delete over add" framing, or `off` to disable. `GOV_MINIMALISM_MODE` overrides the YAML setting; `gov doctor` reports the active mode.
 
 For each governed run, the controller builds or refreshes the graph inside the disposable worktree before baseline fingerprints, injects bounded read-only query forms into the runtime prompt, and excludes the controller-owned `.codegraph` index from source commits. The ledger records provider version, SHA-256 index fingerprint, file/node/edge counts, and database size. Operators can inspect or explicitly manage an index with `gov graph status [path]`, `gov graph refresh [path]`, and `gov graph query <search> [--path <path>] [--limit <n>]`.
 
