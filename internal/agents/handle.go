@@ -468,15 +468,26 @@ func hashFrozenNodeClosure(root string) (string, error) {
 	return hex.EncodeToString(sum.Sum(nil)), nil
 }
 
-// lockdownFrozenTree chmods every file beneath root to 0400 and every
-// directory (including root) to 0500, best-effort -- except "entry" itself,
-// which copyVerifiedFD already wrote at 0500 (read+execute) and must keep
-// that bit: it is what composeBackendLaunch execs directly (a Node script's
-// shebang doesn't grant its own execute permission -- the kernel still
-// requires the launched file's own mode to carry the x bit before it will
-// even look at "#!"). A blanket 0400 here silently strips it, and the
-// backend's exec then fails closed with a plain EACCES on "entry" that reads
-// like a sandbox/Landlock denial but is really just this dir's own DAC bits.
+// lockdownFrozenTree chmods every directory beneath root (including root) to
+// 0500 and every regular file to 0400 -- except a file that already carries
+// an owner-execute bit, which keeps 0500. copyVerifiedFD writes "entry" at
+// 0500 and copyTreeHashed/copyTreeFile now propagate any source exec bit the
+// same way, because "entry" is not the only thing a Node backend may exec
+// directly: its own bin script commonly child_process.spawns a second,
+// native binary bundled inside its own node_modules tree (an optional
+// platform package, e.g. a vendored codex binary). Downgrading either to
+// 0400 here would silently strip the bit the kernel's own DAC check requires
+// before it will even look at a file's shebang or run it as ELF, and the
+// backend's exec then fails closed with a plain EACCES that reads like a
+// sandbox/Landlock denial but is really just this dir's own permission bits.
+//
+// Symlink entries are skipped outright rather than chmod'd: os.Chmod follows
+// symlinks (there is no portable lchmod here), and a symlink's own Lstat
+// mode is always effectively rwxrwxrwx on Linux -- chmodding through it
+// would re-stamp the resolved target (already correctly set by its own,
+// separate visit to this same walk) with a mode taken from the link, not the
+// target's real classification.
+//
 // filepath.Walk visits a directory before its contents, and 0500 retains the
 // execute bit needed to traverse into it, so the post-lockdown walk ordering
 // stays consistent.
@@ -485,12 +496,15 @@ func lockdownFrozenTree(root string) {
 		if err != nil {
 			return nil
 		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			return nil
+		}
 		if info.IsDir() {
 			_ = os.Chmod(path, 0500)
 			return nil
 		}
 		mode := os.FileMode(0400)
-		if rel, rerr := filepath.Rel(root, path); rerr == nil && rel == "entry" {
+		if info.Mode()&0100 != 0 {
 			mode = 0500
 		}
 		_ = os.Chmod(path, mode)
@@ -612,7 +626,21 @@ func copyTreeHashed(src, dst, relPrefix string, hasher hash.Hash) error {
 			fmt.Fprintf(hasher, "%s/%s::SYMLINK::%s::TARGET::%s\n", relPrefix, rel, link, objectHash)
 			return nil
 		default:
-			return copyTreeFile(path, target, relPrefix+"/"+rel, hasher)
+			// codex-node-closure-exec-denied follow-up: a Node CLI's own
+			// bin/*.js entry commonly child_process.spawns a second, native
+			// binary bundled inside its own node_modules tree (an optional
+			// platform package -- e.g. @openai/codex-linux-x64's vendored
+			// codex binary), not just the entry script itself. That file
+			// must freeze with its execute bit intact or the exact same
+			// EACCES that used to hit "entry" alone just recurs one level
+			// deeper. Any exec bit on the source (owner/group/other -- npm
+			// packages ship these inconsistently) copies forward as 0500;
+			// everything else stays 0400.
+			mode := os.FileMode(0400)
+			if info.Mode()&0111 != 0 {
+				mode = 0500
+			}
+			return copyTreeFile(path, target, relPrefix+"/"+rel, mode, hasher)
 		}
 	})
 }
@@ -665,7 +693,10 @@ func hashFrozenNodeObject(path string, active map[string]bool) (string, error) {
 }
 
 // copyTreeFile copies one regular dependency file and hashes its content.
-func copyTreeFile(src, dst, relKey string, hasher hash.Hash) error {
+// mode is 0500 for a file that carried an execute bit at the source (a
+// vendored native binary or wrapper script a Node backend may itself spawn)
+// and 0400 otherwise.
+func copyTreeFile(src, dst, relKey string, mode os.FileMode, hasher hash.Hash) error {
 	if cerr := copyTreeEnsureParent(dst); cerr != nil {
 		return cerr
 	}
@@ -674,7 +705,7 @@ func copyTreeFile(src, dst, relKey string, hasher hash.Hash) error {
 		return err
 	}
 	defer in.Close()
-	out, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0400)
+	out, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_EXCL, mode)
 	if err != nil {
 		return err
 	}
