@@ -357,6 +357,15 @@ func TestNodeBackendClosureFrozenAndHashed(t *testing.T) {
 	if string(frozenBytes) != string(entryBody) {
 		t.Fatalf("frozen entry content drifted from the original entry")
 	}
+	// The frozen entry is what composeBackendLaunch execs directly, so
+	// lockdownFrozenTree's blanket 0400 pass must not strip its execute bit
+	// (a regression here fails the launch closed with a bare EACCES on
+	// "entry" that looks like a sandbox denial but is really just this).
+	if fi, err := os.Stat(frozenEntry); err != nil {
+		t.Fatalf("stat frozen entry: %v", err)
+	} else if fi.Mode().Perm() != 0500 {
+		t.Fatalf("frozen entry mode = %v, want 0500 (read+execute) so it can still be exec'd", fi.Mode().Perm())
+	}
 	// VerifyUnchanged must re-verify the frozen entry (launchPath), not the
 	// original path -- and pass while it is untouched.
 	if err := h.VerifyUnchanged(); err != nil {

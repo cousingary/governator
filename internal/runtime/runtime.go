@@ -3643,6 +3643,14 @@ func (r *Runner) runOnce(ctx context.Context, c contracts.Contract) (RunRecord, 
 	// implementation) is the equivalent proof for the backend specifically,
 	// and must block the run exactly as strictly as descErr does above.
 	if !ar.DescendantsGone {
+		// aerr (already captured above from rn.Launch) is the backend's own
+		// launch/run error when there is one -- e.g. a pre-exec permission
+		// failure -- and is far more useful than this generic message, which
+		// reads like an unrelated process-cleanup failure and previously hid
+		// the real cause in the run's transcript file only.
+		if aerr != nil {
+			return RunRecord{}, fmt.Errorf("descendant containment: backend stage did not confirm descendant extinction: %w", aerr)
+		}
 		return RunRecord{}, fmt.Errorf("descendant containment: backend stage did not confirm descendant extinction")
 	}
 	// Sol10 P0-1 checkpoint 2/4: verify every consumed artifact immediately

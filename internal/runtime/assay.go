@@ -178,10 +178,17 @@ func runAssayStep(ctx context.Context, db *sql.DB, cfg config.Config, c contract
 		// regardless of the artifact's own internal format (JSON, markdown,
 		// code, ...) — see assayer/profiles.py's CODING_OUTPUT_REQUIRED_FIELDS
 		// doc comment for the matching design choice on the Python side.
+		//
+		// "language" is also forwarded into the payload (not just the request
+		// envelope's ArtifactLanguage field below) because coding-output-v2's
+		// CODING_OUTPUT_V2_REQUIRED_FIELDS checks the *payload* for it — a
+		// profile that never received it here would fail required_fields
+		// (and every check downstream of it) on every single evaluation,
+		// regardless of the artifact's actual content.
 		data, readErr := os.ReadFile(artifact.Path)
 		var payloadMap map[string]string
 		if readErr == nil {
-			payloadMap = map[string]string{"content": string(data)}
+			payloadMap = map[string]string{"content": string(data), "language": artifact.Language}
 		} else {
 			payloadMap = map[string]string{}
 		}

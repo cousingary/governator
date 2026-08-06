@@ -469,9 +469,17 @@ func hashFrozenNodeClosure(root string) (string, error) {
 }
 
 // lockdownFrozenTree chmods every file beneath root to 0400 and every
-// directory (including root) to 0500, best-effort. filepath.Walk visits a
-// directory before its contents, and 0500 retains the execute bit needed to
-// traverse into it, so the post-lockdown walk ordering stays consistent.
+// directory (including root) to 0500, best-effort -- except "entry" itself,
+// which copyVerifiedFD already wrote at 0500 (read+execute) and must keep
+// that bit: it is what composeBackendLaunch execs directly (a Node script's
+// shebang doesn't grant its own execute permission -- the kernel still
+// requires the launched file's own mode to carry the x bit before it will
+// even look at "#!"). A blanket 0400 here silently strips it, and the
+// backend's exec then fails closed with a plain EACCES on "entry" that reads
+// like a sandbox/Landlock denial but is really just this dir's own DAC bits.
+// filepath.Walk visits a directory before its contents, and 0500 retains the
+// execute bit needed to traverse into it, so the post-lockdown walk ordering
+// stays consistent.
 func lockdownFrozenTree(root string) {
 	_ = filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
@@ -479,9 +487,13 @@ func lockdownFrozenTree(root string) {
 		}
 		if info.IsDir() {
 			_ = os.Chmod(path, 0500)
-		} else {
-			_ = os.Chmod(path, 0400)
+			return nil
 		}
+		mode := os.FileMode(0400)
+		if rel, rerr := filepath.Rel(root, path); rerr == nil && rel == "entry" {
+			mode = 0500
+		}
+		_ = os.Chmod(path, mode)
 		return nil
 	})
 }
