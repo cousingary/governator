@@ -1,6 +1,7 @@
 package policy
 
 import (
+	"path/filepath"
 	"regexp"
 	"strings"
 )
@@ -74,4 +75,118 @@ func ClassifyShellCommand(command string, highDangerOnly bool) *CommandClass {
 		}
 	}
 	return nil
+}
+
+// scratchRootRE matches a Claude Code session scratchpad and anything under
+// it. Matched against resolved paths only (symlinks followed first).
+var scratchRootRE = regexp.MustCompile(`^/tmp/claude-\d+/[^/]+/[^/]+/scratchpad(?:/|$)`)
+
+var devNullRE = regexp.MustCompile(`\d*>\s*/dev/null`)
+
+// ScratchOnlyDelete reports whether every classified delete in command is a
+// recursive rm or a find-delete whose targets all resolve inside a scratchpad.
+// Anything it cannot prove (variables, quotes, mid-path globs, "..", find -L,
+// find -exec, shred, a non-scratch target) returns false so the deny stands.
+func ScratchOnlyDelete(command, cwd string) bool {
+	command = devNullRE.ReplaceAllString(NormalizeShellCommand(command), "")
+	if strings.ContainsAny(command, "$`<>(){}~\\\"'") {
+		return false
+	}
+	sawDelete := false
+	for _, segment := range chainRE.Split(command, -1) {
+		s := strings.TrimSpace(segment)
+		for {
+			before := s
+			s = wrapperRE.ReplaceAllString(s, "")
+			s = assignmentRE.ReplaceAllString(s, "")
+			if s == before {
+				break
+			}
+		}
+		if s == "" || ClassifyShellCommand(s, true) == nil {
+			continue
+		}
+		f := strings.Fields(s)
+		var targets []string
+		globOK := false
+		switch f[0] {
+		case "rm":
+			globOK = true
+			opts := true
+			for _, t := range f[1:] {
+				switch {
+				case opts && t == "--":
+					opts = false
+				case opts && strings.HasPrefix(t, "-"):
+				default:
+					targets = append(targets, t)
+				}
+			}
+		case "find":
+			if strings.Contains(s, "-exec") || strings.Contains(s, "-ok") {
+				return false
+			}
+		paths:
+			for _, t := range f[1:] {
+				switch {
+				case t == "-L" || strings.Contains(s, "-follow"):
+					return false
+				case t == "-H" || t == "-P":
+				case strings.HasPrefix(t, "-") || t == "!" || t == ",":
+					break paths
+				default:
+					targets = append(targets, t)
+				}
+			}
+		default:
+			return false
+		}
+		if len(targets) == 0 {
+			return false
+		}
+		for _, t := range targets {
+			if !scratchTarget(t, cwd, globOK) {
+				return false
+			}
+		}
+		sawDelete = true
+	}
+	return sawDelete
+}
+
+func scratchTarget(t, cwd string, globOK bool) bool {
+	if !filepath.IsAbs(t) {
+		t = filepath.Join(cwd, t)
+	}
+	for _, part := range strings.Split(t, "/") {
+		if part == ".." {
+			return false
+		}
+	}
+	if strings.ContainsAny(t, "*?[]") {
+		// A glob only in the last component expands to children of an
+		// in-scratch directory; anywhere else it could escape.
+		if !globOK || strings.HasSuffix(t, "/") || strings.ContainsAny(filepath.Dir(t), "*?[]") {
+			return false
+		}
+		t = filepath.Dir(t)
+	}
+	return scratchRootRE.MatchString(resolveExisting(filepath.Clean(t)) + "/")
+}
+
+// resolveExisting follows symlinks through the deepest existing ancestor, so a
+// link inside the scratchpad that points elsewhere is judged by its target.
+func resolveExisting(p string) string {
+	rest := ""
+	for {
+		if r, err := filepath.EvalSymlinks(p); err == nil {
+			return filepath.Join(r, rest)
+		}
+		parent := filepath.Dir(p)
+		if parent == p {
+			return p
+		}
+		rest = filepath.Join(filepath.Base(p), rest)
+		p = parent
+	}
 }
