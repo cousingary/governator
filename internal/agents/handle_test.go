@@ -322,6 +322,17 @@ func TestNodeBackendClosureFrozenAndHashed(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(depDir, "package.json"), []byte(`{"name":"dep","version":"1.0.0"}`), 0644); err != nil {
 		t.Fatal(err)
 	}
+	// A vendored native binary an optional-platform-package dependency ships
+	// (the shape of @openai/codex-linux-x64's bundled codex binary): the
+	// entry script isn't the only thing a Node backend execs from its own
+	// closure -- it commonly child_process.spawns this too.
+	nativeBinDir := filepath.Join(pkgDir, "node_modules", "native-pkg", "vendor")
+	if err := os.MkdirAll(nativeBinDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(nativeBinDir, "native-tool"), []byte("#!/bin/sh\necho native\n"), 0755); err != nil {
+		t.Fatal(err)
+	}
 
 	agent, err := New("claude-code")
 	if err != nil {
@@ -356,6 +367,32 @@ func TestNodeBackendClosureFrozenAndHashed(t *testing.T) {
 	}
 	if string(frozenBytes) != string(entryBody) {
 		t.Fatalf("frozen entry content drifted from the original entry")
+	}
+	// The frozen entry is what composeBackendLaunch execs directly, so
+	// lockdownFrozenTree's blanket 0400 pass must not strip its execute bit
+	// (a regression here fails the launch closed with a bare EACCES on
+	// "entry" that looks like a sandbox denial but is really just this).
+	if fi, err := os.Stat(frozenEntry); err != nil {
+		t.Fatalf("stat frozen entry: %v", err)
+	} else if fi.Mode().Perm() != 0500 {
+		t.Fatalf("frozen entry mode = %v, want 0500 (read+execute) so it can still be exec'd", fi.Mode().Perm())
+	}
+	// A vendored native binary elsewhere in the frozen node_modules tree must
+	// also keep its execute bit -- codex-node-closure-exec-denied's follow-up:
+	// the entry script isn't the only thing the backend may itself execve.
+	frozenNativeTool := filepath.Join(h.closureRoot, "node_modules", "native-pkg", "vendor", "native-tool")
+	if fi, err := os.Stat(frozenNativeTool); err != nil {
+		t.Fatalf("stat frozen native tool: %v", err)
+	} else if fi.Mode().Perm() != 0500 {
+		t.Fatalf("frozen native tool mode = %v, want 0500 (read+execute)", fi.Mode().Perm())
+	}
+	// A plain, non-executable dependency file must NOT gain an execute bit
+	// it never had at the source.
+	frozenDepIndex := filepath.Join(h.closureRoot, "node_modules", "dep", "index.js")
+	if fi, err := os.Stat(frozenDepIndex); err != nil {
+		t.Fatalf("stat frozen dep index.js: %v", err)
+	} else if fi.Mode().Perm() != 0400 {
+		t.Fatalf("frozen dep index.js mode = %v, want 0400 (read-only, no source exec bit)", fi.Mode().Perm())
 	}
 	// VerifyUnchanged must re-verify the frozen entry (launchPath), not the
 	// original path -- and pass while it is untouched.

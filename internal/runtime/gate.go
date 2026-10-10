@@ -349,6 +349,10 @@ func GateDecide(in GateInput) (decision GateDecision) {
 	if class == nil {
 		return attachProvenance(GateDecision{Allow: true, Finding: "F3"})
 	}
+	// Only carve-out: recursive deletes confined to a session scratchpad.
+	if class.Verb == "delete" && policy.ScratchOnlyDelete(cmd, cwd) {
+		return attachProvenance(GateDecision{Allow: true, Finding: "F3"})
+	}
 	// DELIBERATE DIVERGENCE from harness_gate.py: Python consults
 	// authority.check(verb, resource) and can allow a classified command the
 	// manifest permits. The Go gate denies every classified (delete/push-main/
