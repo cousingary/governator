@@ -14,6 +14,9 @@ func TestScratchOnlyDelete(t *testing.T) {
 	if scratchRootRE.MatchString("/tmp/claude-1000/-mnt-e-downloads/6c9b49e0/") {
 		t.Fatal("the session dir above the scratchpad must not match")
 	}
+	if !scratchRootRE.MatchString("/private/tmp/claude-501/-Users-x/6c9b49e0/scratchpad/") {
+		t.Fatal("macOS resolved scratchpad must match")
+	}
 
 	base := t.TempDir()
 	sp := filepath.Join(base, "scratchpad")
@@ -26,8 +29,14 @@ func TestScratchOnlyDelete(t *testing.T) {
 	if err := os.Symlink(outside, filepath.Join(sp, "link")); err != nil {
 		t.Fatal(err)
 	}
+	// The root pattern sees resolved paths; macOS temp dirs sit behind the
+	// /var -> /private/var symlink, while commands keep the unresolved path.
+	realSP, err := filepath.EvalSymlinks(sp)
+	if err != nil {
+		t.Fatal(err)
+	}
 	saved := scratchRootRE
-	scratchRootRE = regexp.MustCompile("^" + regexp.QuoteMeta(sp) + "(?:/|$)")
+	scratchRootRE = regexp.MustCompile("^" + regexp.QuoteMeta(realSP) + "(?:/|$)")
 	defer func() { scratchRootRE = saved }()
 
 	cases := []struct {

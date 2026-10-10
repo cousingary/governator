@@ -78,8 +78,9 @@ func ClassifyShellCommand(command string, highDangerOnly bool) *CommandClass {
 }
 
 // scratchRootRE matches a Claude Code session scratchpad and anything under
-// it. Matched against resolved paths only (symlinks followed first).
-var scratchRootRE = regexp.MustCompile(`^/tmp/claude-\d+/[^/]+/[^/]+/scratchpad(?:/|$)`)
+// it. Matched against resolved paths only (symlinks followed first), so the
+// optional /private covers macOS, where /tmp resolves to /private/tmp.
+var scratchRootRE = regexp.MustCompile(`^(?:/private)?/tmp/claude-\d+/[^/]+/[^/]+/scratchpad(?:/|$)`)
 
 var devNullRE = regexp.MustCompile(`\d*>\s*/dev/null`)
 
